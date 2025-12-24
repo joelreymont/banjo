@@ -1,0 +1,258 @@
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+const log = std.log.scoped(.cli_bridge);
+
+/// Stream JSON message types from Claude CLI
+pub const MessageType = enum {
+    system,
+    assistant,
+    user,
+    result,
+    stream_event,
+    unknown,
+
+    pub fn fromString(s: []const u8) MessageType {
+        const map = std.StaticStringMap(MessageType).initComptime(.{
+            .{ "system", .system },
+            .{ "assistant", .assistant },
+            .{ "user", .user },
+            .{ "result", .result },
+            .{ "stream_event", .stream_event },
+        });
+        return map.get(s) orelse .unknown;
+    }
+};
+
+/// Parsed stream message
+pub const StreamMessage = struct {
+    type: MessageType,
+    subtype: ?[]const u8 = null,
+    raw: std.json.Value,
+    arena: std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *StreamMessage) void {
+        self.arena.deinit();
+    }
+
+    /// Get content from assistant message
+    pub fn getContent(self: *const StreamMessage) ?[]const u8 {
+        if (self.type != .assistant) return null;
+        const message = self.raw.object.get("message") orelse return null;
+        if (message != .object) return null;
+        const content = message.object.get("content") orelse return null;
+        if (content != .array) return null;
+        // Get first text block
+        for (content.array.items) |item| {
+            if (item != .object) continue;
+            const item_type = item.object.get("type") orelse continue;
+            if (item_type != .string) continue;
+            if (!std.mem.eql(u8, item_type.string, "text")) continue;
+            const text = item.object.get("text") orelse continue;
+            if (text == .string) return text.string;
+        }
+        return null;
+    }
+
+    /// Check if this is a tool use event
+    pub fn isToolUse(self: *const StreamMessage) bool {
+        if (self.type != .assistant) return false;
+        const message = self.raw.object.get("message") orelse return false;
+        if (message != .object) return false;
+        const content = message.object.get("content") orelse return false;
+        if (content != .array) return false;
+        for (content.array.items) |item| {
+            if (item != .object) continue;
+            const item_type = item.object.get("type") orelse continue;
+            if (item_type != .string) continue;
+            if (std.mem.eql(u8, item_type.string, "tool_use")) return true;
+        }
+        return false;
+    }
+
+    /// Get stop reason from result message
+    pub fn getStopReason(self: *const StreamMessage) ?[]const u8 {
+        if (self.type != .result) return null;
+        const subtype = self.raw.object.get("subtype") orelse return null;
+        if (subtype == .string) return subtype.string;
+        return null;
+    }
+};
+
+/// Claude CLI Bridge - spawns and communicates with Claude CLI
+pub const Bridge = struct {
+    allocator: Allocator,
+    process: ?std.process.Child = null,
+    cwd: []const u8,
+    session_id: ?[]const u8 = null,
+
+    pub fn init(allocator: Allocator, cwd: []const u8) Bridge {
+        return .{
+            .allocator = allocator,
+            .cwd = cwd,
+        };
+    }
+
+    pub fn deinit(self: *Bridge) void {
+        self.stop();
+        if (self.session_id) |sid| {
+            self.allocator.free(sid);
+        }
+    }
+
+    /// Start Claude CLI process
+    pub fn start(self: *Bridge, opts: StartOptions) !void {
+        var args = std.ArrayList([]const u8).init(self.allocator);
+        defer args.deinit();
+
+        try args.append("claude");
+        try args.append("-p");
+        try args.append("--input-format");
+        try args.append("stream-json");
+        try args.append("--output-format");
+        try args.append("stream-json");
+        try args.append("--include-partial-messages");
+
+        if (opts.resume_session_id) |sid| {
+            try args.append("--resume");
+            try args.append(sid);
+        }
+
+        if (opts.permission_mode) |mode| {
+            try args.append("--permission-mode");
+            try args.append(mode);
+        }
+
+        if (opts.mcp_config) |config| {
+            try args.append("--mcp-config");
+            try args.append(config);
+        }
+
+        var child = std.process.Child.init(args.items, self.allocator);
+        child.cwd = self.cwd;
+        child.stdin_behavior = .pipe;
+        child.stdout_behavior = .pipe;
+        child.stderr_behavior = .inherit;
+
+        try child.spawn();
+        self.process = child;
+
+        log.info("Started Claude CLI in {s}", .{self.cwd});
+    }
+
+    pub const StartOptions = struct {
+        resume_session_id: ?[]const u8 = null,
+        permission_mode: ?[]const u8 = null,
+        mcp_config: ?[]const u8 = null,
+    };
+
+    /// Stop the CLI process
+    pub fn stop(self: *Bridge) void {
+        if (self.process) |*proc| {
+            _ = proc.kill() catch {};
+            _ = proc.wait() catch {};
+            self.process = null;
+            log.info("Stopped Claude CLI", .{});
+        }
+    }
+
+    /// Send a prompt to the CLI
+    pub fn sendPrompt(self: *Bridge, prompt: []const u8) !void {
+        const proc = self.process orelse return error.NotStarted;
+        const stdin = proc.stdin orelse return error.NoStdin;
+
+        // Stream-json input format: {"type": "user", "content": "..."}
+        var out: std.io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        const w = &out.writer;
+
+        try w.writeAll("{\"type\":\"user\",\"content\":");
+        try std.json.Stringify.encodeJsonString(prompt, .{}, w);
+        try w.writeAll("}\n");
+
+        const data = try out.toOwnedSlice();
+        defer self.allocator.free(data);
+
+        try stdin.writeAll(data);
+    }
+
+    /// Read next message from CLI stdout
+    pub fn readMessage(self: *Bridge) !?StreamMessage {
+        const proc = self.process orelse return error.NotStarted;
+        const stdout = proc.stdout orelse return error.NoStdout;
+
+        var line_buf: [64 * 1024]u8 = undefined;
+        const line = stdout.reader().readUntilDelimiter(&line_buf, '\n') catch |e| switch (e) {
+            error.EndOfStream => return null,
+            else => return e,
+        };
+
+        if (line.len == 0) return null;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer arena.deinit();
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), line, .{});
+
+        const msg_type = if (parsed.value.object.get("type")) |t|
+            if (t == .string) MessageType.fromString(t.string) else .unknown
+        else
+            .unknown;
+
+        const subtype = if (parsed.value.object.get("subtype")) |s|
+            if (s == .string) s.string else null
+        else
+            null;
+
+        return StreamMessage{
+            .type = msg_type,
+            .subtype = subtype,
+            .raw = parsed.value,
+            .arena = arena,
+        };
+    }
+
+    /// Check if process is still running
+    pub fn isRunning(self: *Bridge) bool {
+        if (self.process) |*proc| {
+            const result = proc.wait() catch return false;
+            if (result.Exited != null or result.Signal != null) {
+                self.process = null;
+                return false;
+            }
+            return true;
+        }
+        return false;
+    }
+};
+
+// Tests
+const testing = std.testing;
+
+test "MessageType.fromString" {
+    try testing.expectEqual(MessageType.system, MessageType.fromString("system"));
+    try testing.expectEqual(MessageType.assistant, MessageType.fromString("assistant"));
+    try testing.expectEqual(MessageType.result, MessageType.fromString("result"));
+    try testing.expectEqual(MessageType.unknown, MessageType.fromString("invalid"));
+}
+
+test "StreamMessage parsing" {
+    const json =
+        \\{"type":"assistant","message":{"content":[{"type":"text","text":"Hello"}]}}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json, .{});
+
+    var msg = StreamMessage{
+        .type = .assistant,
+        .subtype = null,
+        .raw = parsed.value,
+        .arena = undefined, // Not used in this test
+    };
+
+    try testing.expectEqualStrings("Hello", msg.getContent().?);
+    try testing.expect(!msg.isToolUse());
+}

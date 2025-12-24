@@ -1,7 +1,7 @@
 .{
     .name = .banjo,
     .version = "0.1.0",
-    .fingerprint = 0xabc123def456789a,
+    .fingerprint = 0xa61c5a9888632055,
     .minimum_zig_version = "0.14.0",
     .dependencies = .{
         .ohsnap = .{
