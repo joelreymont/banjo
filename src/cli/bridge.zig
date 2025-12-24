@@ -35,22 +35,35 @@ pub const StreamMessage = struct {
         self.arena.deinit();
     }
 
-    /// Get content from assistant message
+    /// Get content from message (works for assistant and system messages)
     pub fn getContent(self: *const StreamMessage) ?[]const u8 {
-        if (self.type != .assistant) return null;
-        const message = self.raw.object.get("message") orelse return null;
-        if (message != .object) return null;
-        const content = message.object.get("content") orelse return null;
-        if (content != .array) return null;
-        // Get first text block
-        for (content.array.items) |item| {
-            if (item != .object) continue;
-            const item_type = item.object.get("type") orelse continue;
-            if (item_type != .string) continue;
-            if (!std.mem.eql(u8, item_type.string, "text")) continue;
-            const text = item.object.get("text") orelse continue;
-            if (text == .string) return text.string;
+        // For system messages, content may be a direct string
+        if (self.type == .system) {
+            if (self.raw.object.get("content")) |content| {
+                if (content == .string) return content.string;
+            }
+            if (self.raw.object.get("message")) |message| {
+                if (message == .string) return message.string;
+            }
         }
+
+        // For assistant messages, content is nested
+        if (self.type == .assistant) {
+            const message = self.raw.object.get("message") orelse return null;
+            if (message != .object) return null;
+            const content = message.object.get("content") orelse return null;
+            if (content != .array) return null;
+            // Get first text block
+            for (content.array.items) |item| {
+                if (item != .object) continue;
+                const item_type = item.object.get("type") orelse continue;
+                if (item_type != .string) continue;
+                if (!std.mem.eql(u8, item_type.string, "text")) continue;
+                const text = item.object.get("text") orelse continue;
+                if (text == .string) return text.string;
+            }
+        }
+
         return null;
     }
 

@@ -275,9 +275,27 @@ pub const Agent = struct {
                 .system => {
                     // Check for auth required
                     if (msg.subtype) |subtype| {
-                        if (std.mem.eql(u8, subtype, "auth_required")) {
-                            // TODO: Handle auth without losing session
-                            log.warn("Auth required for session {s}", .{session_id.?});
+                        if (std.mem.eql(u8, subtype, "auth_required") or
+                            std.mem.eql(u8, subtype, "init"))
+                        {
+                            // Check content for login prompt
+                            if (msg.getContent()) |content| {
+                                if (std.mem.indexOf(u8, content, "/login") != null or
+                                    std.mem.indexOf(u8, content, "authenticate") != null)
+                                {
+                                    log.warn("Auth required for session {s}", .{session_id.?});
+                                    // Send friendly message to user instead of error
+                                    try self.sendSessionUpdate(session_id.?, .{
+                                        .kind = .text,
+                                        .content = "Authentication required. Please run `claude /login` in your terminal, then try again.",
+                                    });
+                                    stop_reason = "auth_required";
+                                    // Stop the bridge - user needs to login externally
+                                    session.bridge.?.stop();
+                                    session.bridge = null;
+                                    break;
+                                }
+                            }
                         }
                     }
                 },
