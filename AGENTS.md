@@ -21,6 +21,30 @@ banjo
 Claude Code CLI
 ```
 
+## State Machine Pattern
+
+For complex state machines, use labeled switch with `continue :label`:
+
+```zig
+const State = enum { start, parsing, done };
+
+state: switch (State.start) {
+    .start => {
+        if (condition) continue :state .parsing;
+        continue :state .done;
+    },
+    .parsing => {
+        // process...
+        continue :state .done;
+    },
+    .done => {
+        return result;
+    },
+}
+```
+
+See `../dixie/src/compiler/parser/lexer.zig` for real example.
+
 ## Testing
 
 - Use ohsnap for snapshot tests

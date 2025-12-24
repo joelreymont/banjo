@@ -51,5 +51,6 @@ test {
     _ = @import("acp/agent.zig");
     _ = @import("acp/protocol.zig");
     _ = @import("cli/bridge.zig");
+    _ = @import("settings/loader.zig");
     _ = @import("util/quickcheck.zig");
 }
