@@ -69,18 +69,26 @@ pub const StreamMessage = struct {
 
     /// Check if this is a tool use event
     pub fn isToolUse(self: *const StreamMessage) bool {
-        if (self.type != .assistant) return false;
-        const message = self.raw.object.get("message") orelse return false;
-        if (message != .object) return false;
-        const content = message.object.get("content") orelse return false;
-        if (content != .array) return false;
+        return self.getToolName() != null;
+    }
+
+    /// Get the tool name from a tool_use message
+    pub fn getToolName(self: *const StreamMessage) ?[]const u8 {
+        if (self.type != .assistant) return null;
+        const message = self.raw.object.get("message") orelse return null;
+        if (message != .object) return null;
+        const content = message.object.get("content") orelse return null;
+        if (content != .array) return null;
         for (content.array.items) |item| {
             if (item != .object) continue;
             const item_type = item.object.get("type") orelse continue;
             if (item_type != .string) continue;
-            if (std.mem.eql(u8, item_type.string, "tool_use")) return true;
+            if (!std.mem.eql(u8, item_type.string, "tool_use")) continue;
+            // Found tool_use, get the name
+            const name = item.object.get("name") orelse continue;
+            if (name == .string) return name.string;
         }
-        return false;
+        return null;
     }
 
     /// Get stop reason from result message

@@ -3,6 +3,8 @@ const Allocator = std.mem.Allocator;
 const jsonrpc = @import("../jsonrpc.zig");
 const protocol = @import("protocol.zig");
 const Bridge = @import("../cli/bridge.zig").Bridge;
+const settings_loader = @import("../settings/loader.zig");
+const Settings = settings_loader.Settings;
 
 const log = std.log.scoped(.agent);
 
@@ -18,11 +20,25 @@ pub const Agent = struct {
         cancelled: bool = false,
         permission_mode: protocol.PermissionMode = .default,
         bridge: ?Bridge = null,
+        settings: ?Settings = null,
 
         pub fn deinit(self: *Session, allocator: Allocator) void {
             if (self.bridge) |*b| b.deinit();
+            if (self.settings) |*s| s.deinit();
             allocator.free(self.id);
             allocator.free(self.cwd);
+        }
+
+        /// Check if a tool is allowed based on settings
+        pub fn isToolAllowed(self: *const Session, tool_name: []const u8) bool {
+            if (self.settings) |*s| {
+                // Explicit deny takes precedence
+                if (s.isDenied(tool_name)) return false;
+                // Explicit allow
+                if (s.isAllowed(tool_name)) return true;
+            }
+            // Default: allow (will prompt user via ACP permission request)
+            return true;
         }
     };
 
@@ -170,11 +186,18 @@ pub const Agent = struct {
             }
         }
 
+        // Load settings from project directory
+        const settings = settings_loader.loadSettings(self.allocator, cwd) catch |err| blk: {
+            log.warn("Failed to load settings: {}", .{err});
+            break :blk null;
+        };
+
         // Create session
         const session = try self.allocator.create(Session);
         session.* = .{
             .id = session_id,
             .cwd = try self.allocator.dupe(u8, cwd),
+            .settings = settings,
         };
         try self.sessions.put(session_id, session);
 
@@ -258,12 +281,21 @@ pub const Agent = struct {
                         });
                     }
 
-                    // Check for tool use (for future hook support)
-                    if (msg.isToolUse()) {
-                        try self.sendSessionUpdate(session_id.?, .{
-                            .kind = .tool_use,
-                            .title = "Tool execution",
-                        });
+                    // Check for tool use - apply permission hooks
+                    if (msg.getToolName()) |tool_name| {
+                        if (!session.isToolAllowed(tool_name)) {
+                            log.warn("Tool {s} denied by settings", .{tool_name});
+                            try self.sendSessionUpdate(session_id.?, .{
+                                .kind = .text,
+                                .content = "Tool execution blocked by settings.",
+                            });
+                            // Note: CLI will continue, we're just notifying user
+                        } else {
+                            try self.sendSessionUpdate(session_id.?, .{
+                                .kind = .tool_call,
+                                .title = tool_name,
+                            });
+                        }
                     }
                 },
                 .result => {
