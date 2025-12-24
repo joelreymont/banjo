@@ -188,14 +188,17 @@ pub const Agent = struct {
     }
 
     fn handlePrompt(self: *Agent, request: jsonrpc.Request) !void {
-        // Parse session ID
+        // Parse params
         var session_id: ?[]const u8 = null;
+        var prompt_text: ?[]const u8 = null;
+
         if (request.params) |params| {
             if (params == .object) {
                 if (params.object.get("sessionId")) |sid| {
-                    if (sid == .string) {
-                        session_id = sid.string;
-                    }
+                    if (sid == .string) session_id = sid.string;
+                }
+                if (params.object.get("prompt")) |p| {
+                    if (p == .string) prompt_text = p.string;
                 }
             }
         }
@@ -219,20 +222,72 @@ pub const Agent = struct {
         };
 
         session.cancelled = false;
-
-        // TODO: Spawn Claude CLI and process response
-        // For now, send a simple acknowledgment
         log.info("Prompt received for session {s}", .{session_id.?});
 
-        // Send a test text update
-        try self.sendSessionUpdate(session_id.?, .{
-            .kind = .text,
-            .content = "Hello from Banjo! Claude CLI integration coming soon...",
-        });
+        // Start bridge if not running
+        if (session.bridge == null) {
+            session.bridge = Bridge.init(self.allocator, session.cwd);
+            try session.bridge.?.start(.{
+                .permission_mode = @tagName(session.permission_mode),
+            });
+        }
 
-        // Return success
+        // Send prompt to CLI
+        if (prompt_text) |text| {
+            try session.bridge.?.sendPrompt(text);
+        }
+
+        // Read and process CLI messages
+        var stop_reason: []const u8 = "end_turn";
+        const bridge = &session.bridge.?;
+
+        while (!session.cancelled) {
+            var msg = bridge.readMessage() catch |err| {
+                log.err("Failed to read CLI message: {}", .{err});
+                break;
+            } orelse break;
+            defer msg.deinit();
+
+            switch (msg.type) {
+                .assistant => {
+                    // Forward text content as session update
+                    if (msg.getContent()) |content| {
+                        try self.sendSessionUpdate(session_id.?, .{
+                            .kind = .text,
+                            .content = content,
+                        });
+                    }
+
+                    // Check for tool use (for future hook support)
+                    if (msg.isToolUse()) {
+                        try self.sendSessionUpdate(session_id.?, .{
+                            .kind = .tool_use,
+                            .title = "Tool execution",
+                        });
+                    }
+                },
+                .result => {
+                    if (msg.getStopReason()) |reason| {
+                        stop_reason = reason;
+                    }
+                    break;
+                },
+                .system => {
+                    // Check for auth required
+                    if (msg.subtype) |subtype| {
+                        if (std.mem.eql(u8, subtype, "auth_required")) {
+                            // TODO: Handle auth without losing session
+                            log.warn("Auth required for session {s}", .{session_id.?});
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // Return result
         var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
-        try result.object.put("stopReason", .{ .string = "end_turn" });
+        try result.object.put("stopReason", .{ .string = stop_reason });
 
         try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
     }
@@ -252,6 +307,10 @@ pub const Agent = struct {
         if (session_id) |sid| {
             if (self.sessions.get(sid)) |session| {
                 session.cancelled = true;
+                // Stop the CLI bridge
+                if (session.bridge) |*bridge| {
+                    bridge.stop();
+                }
                 log.info("Cancelled session {s}", .{sid});
             }
         }
