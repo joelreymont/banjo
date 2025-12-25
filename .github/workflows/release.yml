@@ -9,14 +9,14 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: macos-latest
+          - os: macos-14
             target: aarch64-macos
             artifact: banjo-darwin-arm64.tar.gz
-          - os: macos-latest
+          - os: macos-14
             target: x86_64-macos
             artifact: banjo-darwin-x64.tar.gz
-          - os: ubuntu-latest
-            target: x86_64-linux-gnu
+          - os: ubuntu-24.04
+            target: x86_64-linux
             artifact: banjo-linux-x64.tar.gz
     runs-on: ${{ matrix.os }}
     steps:
@@ -26,7 +26,7 @@ jobs:
 
       - uses: mlugg/setup-zig@v2
         with:
-          version: master
+          version: 0.15.2
 
       - name: Build
         run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
