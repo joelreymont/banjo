@@ -240,6 +240,35 @@ pub const Writer = struct {
         try self.stream.writeByte('\n');
     }
 
+    /// Write a response with a typed result (avoids Value intermediary)
+    pub fn writeTypedResponse(self: *Writer, id: ?Request.Id, result: anytype) !void {
+        var out: std.io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        var jw: std.json.Stringify = .{ .writer = &out.writer };
+
+        try jw.beginObject();
+        try jw.objectField("jsonrpc");
+        try jw.write("2.0");
+        try jw.objectField("result");
+        try std.json.stringify(result, .{}, &out.writer);
+        try jw.objectField("id");
+        if (id) |i| {
+            switch (i) {
+                .string => |s| try jw.write(s),
+                .number => |n| try jw.write(n),
+                .null => try jw.write(null),
+            }
+        } else {
+            try jw.write(null);
+        }
+        try jw.endObject();
+
+        const json = try out.toOwnedSlice();
+        defer self.allocator.free(json);
+        try self.stream.writeAll(json);
+        try self.stream.writeByte('\n');
+    }
+
     pub fn writeNotification(self: *Writer, notification: Notification) !void {
         const json = try serializeNotification(self.allocator, notification);
         defer self.allocator.free(json);

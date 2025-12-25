@@ -58,7 +58,7 @@ pub const McpCapabilities = struct {
 
 pub const SessionCapabilities = struct {
     fork: ?struct {} = null,
-    resume_: ?struct {} = null,
+    @"resume": ?struct {} = null,
 };
 
 pub const AuthMethod = struct {

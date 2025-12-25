@@ -116,24 +116,26 @@ pub const Agent = struct {
         if (request.params) |params| {
             if (params == .object) {
                 if (params.object.get("clientCapabilities")) |caps| {
-                    const parsed = std.json.parseFromValue(
+                    if (std.json.parseFromValue(
                         protocol.ClientCapabilities,
                         self.allocator,
                         caps,
                         .{ .ignore_unknown_fields = true },
-                    ) catch null;
-                    if (parsed) |p| {
-                        defer p.deinit();
-                        self.client_capabilities = p.value;
+                    )) |parsed| {
+                        defer parsed.deinit();
+                        self.client_capabilities = parsed.value;
                         log.info("Client capabilities: fs={?}, terminal={?}", .{
                             if (self.client_capabilities.?.fs) |fs| fs.readTextFile else null,
                             self.client_capabilities.?.terminal,
                         });
+                    } else |err| {
+                        log.warn("Failed to parse client capabilities: {}", .{err});
                     }
                 }
             }
         }
 
+        // Build response struct and serialize directly
         const response = protocol.InitializeResponse{
             .agentInfo = .{
                 .name = "banjo",
@@ -151,7 +153,7 @@ pub const Agent = struct {
                 },
                 .sessionCapabilities = .{
                     .fork = .{},
-                    .resume_ = .{},
+                    .@"resume" = .{},
                 },
             },
             .authMethods = &.{
@@ -163,46 +165,7 @@ pub const Agent = struct {
             },
         };
 
-        // Serialize response to JSON value
-        var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
-        try result.object.put("protocolVersion", .{ .integer = protocol.ProtocolVersion });
-
-        // AgentInfo
-        var agent_info = std.json.ObjectMap.init(self.allocator);
-        try agent_info.put("name", .{ .string = response.agentInfo.name });
-        try agent_info.put("title", .{ .string = response.agentInfo.title });
-        try agent_info.put("version", .{ .string = response.agentInfo.version });
-        try result.object.put("agentInfo", .{ .object = agent_info });
-
-        // AgentCapabilities
-        var caps = std.json.ObjectMap.init(self.allocator);
-        var prompt_caps = std.json.ObjectMap.init(self.allocator);
-        try prompt_caps.put("image", .{ .bool = true });
-        try prompt_caps.put("embeddedContext", .{ .bool = true });
-        try caps.put("promptCapabilities", .{ .object = prompt_caps });
-
-        var mcp_caps = std.json.ObjectMap.init(self.allocator);
-        try mcp_caps.put("http", .{ .bool = true });
-        try mcp_caps.put("sse", .{ .bool = true });
-        try caps.put("mcpCapabilities", .{ .object = mcp_caps });
-
-        var session_caps = std.json.ObjectMap.init(self.allocator);
-        try session_caps.put("fork", .{ .object = std.json.ObjectMap.init(self.allocator) });
-        try session_caps.put("resume", .{ .object = std.json.ObjectMap.init(self.allocator) });
-        try caps.put("sessionCapabilities", .{ .object = session_caps });
-
-        try result.object.put("agentCapabilities", .{ .object = caps });
-
-        // AuthMethods
-        var auth_methods = std.json.Array.init(self.allocator);
-        var auth_method = std.json.ObjectMap.init(self.allocator);
-        try auth_method.put("id", .{ .string = "claude-login" });
-        try auth_method.put("name", .{ .string = "Log in with Claude Code" });
-        try auth_method.put("description", .{ .string = "Run `claude /login` in the terminal" });
-        try auth_methods.append(.{ .object = auth_method });
-        try result.object.put("authMethods", .{ .array = auth_methods });
-
-        try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
+        try self.writer.writeTypedResponse(request.id, response);
     }
 
     fn handleNewSession(self: *Agent, request: jsonrpc.Request) !void {
@@ -324,8 +287,8 @@ pub const Agent = struct {
                 },
                 .result => {
                     if (msg.getStopReason()) |reason| {
-                        stop_reason_owned = self.allocator.dupe(u8, reason) catch null;
-                        if (stop_reason_owned) |s| stop_reason = s;
+                        stop_reason_owned = try self.allocator.dupe(u8, reason);
+                        stop_reason = stop_reason_owned.?;
                     }
                     break;
                 },
