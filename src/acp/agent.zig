@@ -132,6 +132,24 @@ pub const Agent = struct {
     }
 
     fn handleInitialize(self: *Agent, request: jsonrpc.Request) !void {
+        // Validate protocol version
+        if (request.params) |params| {
+            if (params == .object) {
+                if (params.object.get("protocolVersion")) |ver| {
+                    if (ver == .integer) {
+                        if (ver.integer != protocol.ProtocolVersion) {
+                            try self.writer.writeResponse(jsonrpc.Response.err(
+                                request.id,
+                                jsonrpc.Error.InvalidParams,
+                                "Unsupported protocol version",
+                            ));
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
         // Parse client capabilities
         if (request.params) |params| {
             if (params == .object) {
@@ -286,7 +304,12 @@ pub const Agent = struct {
         defer if (stop_reason_owned) |s| self.allocator.free(s);
         const bridge = &session.bridge.?;
 
-        while (!session.cancelled) {
+        while (true) {
+            // Check cancellation at loop start
+            if (session.cancelled) {
+                stop_reason = "cancelled";
+                break;
+            }
             var msg = bridge.readMessage() catch |err| {
                 log.err("Failed to read CLI message: {}", .{err});
                 break;
@@ -455,25 +478,13 @@ pub const Agent = struct {
 
     /// Send a session update notification
     pub fn sendSessionUpdate(self: *Agent, session_id: []const u8, update: protocol.SessionUpdate.Update) !void {
-        var params = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
-        defer params.object.deinit();
-        try params.object.put("sessionId", .{ .string = session_id });
-
-        var update_obj = std.json.ObjectMap.init(self.allocator);
-        defer update_obj.deinit();
-        try update_obj.put("kind", .{ .string = @tagName(update.kind) });
-        if (update.content) |content| {
-            try update_obj.put("content", .{ .string = content });
-        }
-        if (update.title) |title| {
-            try update_obj.put("title", .{ .string = title });
-        }
-        try params.object.put("update", .{ .object = update_obj });
-
-        try self.writer.writeNotification(.{
-            .method = "session/update",
-            .params = params,
-        });
+        // Use typed notification to avoid manual json.Value construction
+        // (prevents use-after-free from nested ObjectMap aliasing)
+        const session_update = protocol.SessionUpdate{
+            .sessionId = session_id,
+            .update = update,
+        };
+        try self.writer.writeTypedNotification("session/update", session_update);
     }
 };
 
@@ -740,6 +751,102 @@ test "Agent handleRequest - resumeSession existing" {
     defer parsed.deinit();
     const result = parsed.value.object.get("result").?.object;
     try testing.expectEqualStrings(session_id, result.get("sessionId").?.string);
+}
+
+// =============================================================================
+// Property Tests for Prompt Extraction
+// =============================================================================
+
+const quickcheck = @import("../util/quickcheck.zig");
+
+/// Build a prompt JSON from test parameters
+fn buildTestPrompt(
+    allocator: std.mem.Allocator,
+    num_non_text: u8,
+    has_text: bool,
+    text_idx: u8,
+) !std.json.Value {
+    var array = std.json.Array.init(allocator);
+    errdefer array.deinit();
+
+    const actual_text_pos = if (has_text) text_idx % (num_non_text + 1) else num_non_text + 1;
+    var pos: u8 = 0;
+
+    // Insert non-text blocks and optionally a text block
+    for (0..num_non_text + 1) |_| {
+        if (has_text and pos == actual_text_pos) {
+            var text_block = std.json.ObjectMap.init(allocator);
+            errdefer text_block.deinit();
+            try text_block.put("type", .{ .string = "text" });
+            try text_block.put("text", .{ .string = "expected_text" });
+            try array.append(.{ .object = text_block });
+        }
+        if (pos < num_non_text) {
+            var img_block = std.json.ObjectMap.init(allocator);
+            errdefer img_block.deinit();
+            try img_block.put("type", .{ .string = "image" });
+            try array.append(.{ .object = img_block });
+        }
+        pos += 1;
+    }
+
+    return .{ .array = array };
+}
+
+fn freeTestPrompt(allocator: std.mem.Allocator, prompt: *std.json.Value) void {
+    _ = allocator;
+    for (prompt.array.items) |*item| {
+        item.object.deinit();
+    }
+    prompt.array.deinit();
+}
+
+test "property: extractTextFromPrompt finds text regardless of position" {
+    try quickcheck.check(struct {
+        fn prop(args: struct { num_non_text: u4, text_pos: u4 }) bool {
+            var prompt = buildTestPrompt(
+                testing.allocator,
+                args.num_non_text,
+                true,
+                args.text_pos,
+            ) catch return false;
+            defer freeTestPrompt(testing.allocator, &prompt);
+
+            const result = extractTextFromPrompt(prompt);
+            return result != null and std.mem.eql(u8, result.?, "expected_text");
+        }
+    }.prop, .{});
+}
+
+test "property: extractTextFromPrompt returns null when no text block" {
+    try quickcheck.check(struct {
+        fn prop(args: struct { num_non_text: u4 }) bool {
+            var prompt = buildTestPrompt(
+                testing.allocator,
+                args.num_non_text,
+                false,
+                0,
+            ) catch return false;
+            defer freeTestPrompt(testing.allocator, &prompt);
+
+            return extractTextFromPrompt(prompt) == null;
+        }
+    }.prop, .{});
+}
+
+test "property: extractTextFromPrompt null/non-array always returns null" {
+    // Null always returns null
+    if (extractTextFromPrompt(null) != null) return error.TestFailed;
+
+    // Non-array types always return null
+    try quickcheck.check(struct {
+        fn prop(args: struct { int_val: i32, bool_val: bool }) bool {
+            if (extractTextFromPrompt(.{ .integer = args.int_val }) != null) return false;
+            if (extractTextFromPrompt(.{ .bool = args.bool_val }) != null) return false;
+            if (extractTextFromPrompt(.{ .float = 3.14 }) != null) return false;
+            return true;
+        }
+    }.prop, .{});
 }
 
 test "Agent handleRequest - cancel" {

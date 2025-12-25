@@ -306,6 +306,27 @@ pub const Writer = struct {
         try self.stream.writeByte('\n');
     }
 
+    /// Write a notification with typed params (avoids Value intermediary)
+    pub fn writeTypedNotification(self: *Writer, method: []const u8, params: anytype) !void {
+        var out: std.io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        var jw: std.json.Stringify = .{ .writer = &out.writer };
+
+        try jw.beginObject();
+        try jw.objectField("jsonrpc");
+        try jw.write("2.0");
+        try jw.objectField("method");
+        try jw.write(method);
+        try jw.objectField("params");
+        try jw.write(params);
+        try jw.endObject();
+
+        const json = try out.toOwnedSlice();
+        defer self.allocator.free(json);
+        try self.stream.writeAll(json);
+        try self.stream.writeByte('\n');
+    }
+
     /// Write a request (for bidirectional communication)
     pub fn writeRequest(self: *Writer, request: Request) !void {
         const json = try serializeRequest(self.allocator, request);
@@ -466,4 +487,65 @@ test "property: request id types are preserved" {
             };
         }
     }.prop, .{});
+}
+
+// =============================================================================
+// Snapshot Tests for JSON-RPC Responses
+// =============================================================================
+
+const ohsnap = @import("ohsnap");
+
+test "snapshot: success response with object result" {
+    var result_obj = std.json.ObjectMap.init(testing.allocator);
+    defer result_obj.deinit();
+    try result_obj.put("sessionId", .{ .string = "abc123" });
+    try result_obj.put("status", .{ .string = "active" });
+
+    const response = Response.success(.{ .number = 1 }, .{ .object = result_obj });
+    const json = try serializeResponse(testing.allocator, response);
+    defer testing.allocator.free(json);
+
+    try (ohsnap{}).snap(@src(),
+        \\{"jsonrpc":"2.0","result":{"sessionId":"abc123","status":"active"},"id":1}
+    ).diff(json, true);
+}
+
+test "snapshot: error response with code and message" {
+    const response = Response.err(.{ .string = "req-42" }, Error.MethodNotFound, "Unknown method");
+    const json = try serializeResponse(testing.allocator, response);
+    defer testing.allocator.free(json);
+
+    try (ohsnap{}).snap(@src(),
+        \\{"jsonrpc":"2.0","error":{"code":-32601,"message":"Unknown method"},"id":"req-42"}
+    ).diff(json, true);
+}
+
+test "snapshot: notification without id" {
+    var params = std.json.ObjectMap.init(testing.allocator);
+    defer params.deinit();
+    try params.put("event", .{ .string = "connected" });
+
+    const notification = Notification{
+        .method = "session/update",
+        .params = .{ .object = params },
+    };
+    const json = try serializeNotification(testing.allocator, notification);
+    defer testing.allocator.free(json);
+
+    try (ohsnap{}).snap(@src(),
+        \\{"jsonrpc":"2.0","method":"session/update","params":{"event":"connected"}}
+    ).diff(json, true);
+}
+
+test "snapshot: request with null id" {
+    const request = Request{
+        .method = "initialize",
+        .id = .null,
+    };
+    const json = try serializeRequest(testing.allocator, request);
+    defer testing.allocator.free(json);
+
+    try (ohsnap{}).snap(@src(),
+        \\{"jsonrpc":"2.0","method":"initialize","id":null}
+    ).diff(json, true);
 }

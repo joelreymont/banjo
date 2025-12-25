@@ -68,6 +68,38 @@ See `../dixie/src/compiler/parser/lexer.zig` for real example.
 
 ## Testing
 
-- Use ohsnap for snapshot tests
-- Use quickcheck for property tests
-- Run: `zig build test`
+### Property Tests (MANDATORY for data transformations)
+
+Use `src/util/quickcheck.zig` for property-based testing. Test invariants, not specific cases:
+
+```zig
+const quickcheck = @import("util/quickcheck.zig");
+
+test "property: addition is commutative" {
+    try quickcheck.check(struct {
+        fn prop(args: struct { a: i16, b: i16 }) bool {
+            const sum1 = @as(i32, args.a) + @as(i32, args.b);
+            const sum2 = @as(i32, args.b) + @as(i32, args.a);
+            return sum1 == sum2;
+        }
+    }.prop, .{});
+}
+```
+
+Quickcheck generates random values and shrinks failures to minimal counterexamples.
+**DO NOT** write unit tests with hardcoded values when a property test is possible.
+
+### Snapshot Tests
+
+Use ohsnap for testing complex output (JSON responses, formatted strings):
+
+```zig
+const ohsnap = @import("ohsnap");
+try ohsnap.snap(@src(), actual_output);
+```
+
+### Run Tests
+
+```bash
+zig build test
+```
