@@ -1,40 +1,42 @@
-# Session Context - Banjo ACP Agent
+# Banjo - Current State
 
-## Current Task
-**`bd` CLI in Zig** - fast beads issue tracker for Claude hooks. **COMPLETE**
+## Completed
 
-## Status
+All issues from review fixed:
+- P0: UAF in agent.zig (stop_reason duplication before msg.deinit)
+- P0: Memory leak in handleResumeSession (check existing session first)
+- P1: Deleted unused isRunning()
+- P1: Use sid_copy instead of session_id from request arena
+- P2: Security - log settings parse failure at error level
+- P2: DRY - Typed JSON param structs with parseFromValue
+- P2: DRY - handleInitialize uses writeTypedResponse (no double serialize)
 
-Built and installed `/Users/joel/Work/bd` - a Zig implementation of essential `bd` commands:
-- `bd init [--stealth]` - create .beads directory
-- `bd list --json [--status S]` - list/filter issues
-- `bd ready --json` - list ready issues (open, no blocking deps)
-- `bd create <title> -p <priority> -d <desc> --json` - create issue
-- `bd update <id> [-d desc] [--status S]` - update issue
-- `bd close <id> --reason R` - close issue
+Zig 0.15 API migration complete:
+- ArrayList unmanaged API
+- StdIo PascalCase enums
+- File.reader() buffer requirement
+- fmt.bytesToHex
+- std.json.Stringify for writing
+- std.json.parseFromValue for typed parsing
 
-Installed to: `~/bin/bd`
-Source: `/Users/joel/Work/zig-beads/`
-Beads reference: `/Users/joel/Work/beads/`
+## Key Patterns
 
-### What Works
-- Reads/writes beads JSONL format directly
-- Preserves all fields when updating (doesn't lose data)
-- Dependency checking for `ready` command
-- RFC3339 timestamps with microseconds (`2025-12-24T19:20:50.123456Z`)
-- Compatible with bd-load.py and bd-sync.py hooks
-
-### Not Implemented (not needed by hooks)
-- `bd show` - display single issue
-- `bd deps` - dependency management
-- `bd config` - configuration
-- Daemon mode (direct JSONL access is fast enough)
-
-## Banjo Status
-Core ACP implementation complete. Tool proxy placeholder added.
+1. **JSON parsing**: Define typed structs, use `std.json.parseFromValue(T, allocator, value, .{})`
+2. **JSON writing**: Use `std.json.Stringify` or `jsonrpc.Writer.writeTypedResponse`
+3. **Error handling**: Propagate errors with try, log failures, never silently ignore
 
 ## Files
-- `/Users/joel/Work/bd/src/main.zig` - main implementation
-- `/Users/joel/Work/bd/build.zig` - Zig 0.15 build config
-- `~/.claude/scripts/bd-load.py` - SessionStart hook
-- `~/.claude/scripts/bd-sync.py` - PostToolUse[TodoWrite] hook
+
+- `src/main.zig` - Entry point, event loop
+- `src/jsonrpc.zig` - JSON-RPC 2.0 protocol
+- `src/acp/agent.zig` - ACP handler (typed param structs at top)
+- `src/acp/protocol.zig` - ACP protocol types
+- `src/cli/bridge.zig` - Claude CLI subprocess
+- `src/settings/loader.zig` - .claude/settings.json loader
+- `src/tools/proxy.zig` - Stub for bidirectional tool proxy
+
+## Next Steps
+
+1. Implement bidirectional ACP for tool proxy (fs/terminal delegation to Zed)
+2. Add tests for ACP message handling
+3. Integration testing with actual Zed
