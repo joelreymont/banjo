@@ -112,11 +112,24 @@ pub const Agent = struct {
     }
 
     fn handleInitialize(self: *Agent, request: jsonrpc.Request) !void {
-        // Parse client capabilities from params
+        // Parse client capabilities
         if (request.params) |params| {
             if (params == .object) {
                 if (params.object.get("clientCapabilities")) |caps| {
-                    _ = caps; // TODO: Parse capabilities
+                    const parsed = std.json.parseFromValue(
+                        protocol.ClientCapabilities,
+                        self.allocator,
+                        caps,
+                        .{ .ignore_unknown_fields = true },
+                    ) catch null;
+                    if (parsed) |p| {
+                        defer p.deinit();
+                        self.client_capabilities = p.value;
+                        log.info("Client capabilities: fs={?}, terminal={?}", .{
+                            if (self.client_capabilities.?.fs) |fs| fs.readTextFile else null,
+                            self.client_capabilities.?.terminal,
+                        });
+                    }
                 }
             }
         }
