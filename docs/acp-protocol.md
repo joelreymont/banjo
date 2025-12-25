@@ -279,6 +279,72 @@ Custom agents in `~/.config/zed/settings.json`:
 
 Restart Zed (Cmd+Q) after config changes.
 
+## Zed Agent Server Extension
+
+Package agents for distribution via Zed's extension system.
+
+### Directory Structure
+
+```
+banjo-zed/
+├── extension.toml
+├── icon/
+│   └── banjo.svg      # 16x16 SVG, monochrome
+└── README.md
+```
+
+### extension.toml
+
+```toml
+id = "banjo"
+name = "Banjo"
+version = "0.1.0"
+description = "Claude Code ACP agent in Zig"
+authors = ["Your Name"]
+repository = "https://github.com/user/banjo"
+
+[agent_servers.banjo]
+name = "Banjo"
+icon = "icon/banjo.svg"
+
+[agent_servers.banjo.targets.darwin-aarch64]
+archive = "https://github.com/user/banjo/releases/download/v0.1.0/banjo-darwin-arm64.tar.gz"
+cmd = "./banjo"
+args = ["--output-format", "stream-json", "--input-format", "stream-json"]
+
+[agent_servers.banjo.targets.darwin-x86_64]
+archive = "https://github.com/user/banjo/releases/download/v0.1.0/banjo-darwin-x86_64.tar.gz"
+cmd = "./banjo"
+args = ["--output-format", "stream-json", "--input-format", "stream-json"]
+
+[agent_servers.banjo.targets.linux-x86_64]
+archive = "https://github.com/user/banjo/releases/download/v0.1.0/banjo-linux-x86_64.tar.gz"
+cmd = "./banjo"
+args = ["--output-format", "stream-json", "--input-format", "stream-json"]
+```
+
+### Icon Requirements
+
+- **Format**: SVG only
+- **Size**: 16x16 bounding box
+- **Padding**: 1-2px recommended
+- **Color**: Auto-converted to monochrome (opacity allowed)
+- **Optimization**: Use SVGOMG
+
+### Testing Locally
+
+1. Create extension dir with `extension.toml` and icon
+2. In Zed: `zed: install dev extension`
+3. Select extension directory
+4. Agent appears in Agent Panel dropdown
+
+### Publishing
+
+1. Build release binaries for all targets
+2. Create GitHub release with archives
+3. Update archive URLs in `extension.toml`
+4. Submit to Zed extension registry
+
 ## NOT in Protocol
 
 - Message editing

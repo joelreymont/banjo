@@ -1,0 +1,25 @@
+id = "banjo"
+name = "Banjo"
+version = "0.1.0"
+description = "Claude Code ACP agent (small and fast!)"
+authors = ["Joel Reymont"]
+repository = "https://github.com/joelreymont/banjo"
+
+[agent_servers.banjo]
+name = "Banjo"
+icon = "icon/banjo.svg"
+
+[agent_servers.banjo.targets.darwin-aarch64]
+archive = "https://github.com/joelreymont/banjo/releases/download/v0.1.0/banjo-darwin-aarch64.tar.gz"
+cmd = "./banjo"
+args = ["--output-format", "stream-json", "--input-format", "stream-json"]
+
+[agent_servers.banjo.targets.darwin-x86_64]
+archive = "https://github.com/joelreymont/banjo/releases/download/v0.1.0/banjo-darwin-x86_64.tar.gz"
+cmd = "./banjo"
+args = ["--output-format", "stream-json", "--input-format", "stream-json"]
+
+[agent_servers.banjo.targets.linux-x86_64]
+archive = "https://github.com/joelreymont/banjo/releases/download/v0.1.0/banjo-linux-x86_64.tar.gz"
+cmd = "./banjo"
+args = ["--output-format", "stream-json", "--input-format", "stream-json"]
