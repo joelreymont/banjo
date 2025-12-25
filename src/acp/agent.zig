@@ -562,6 +562,65 @@ test "Agent handleRequest - initialize" {
     try testing.expectEqual(@as(i64, 1), parsed.value.object.get("id").?.integer);
 }
 
+test "Agent handleRequest - initialize rejects wrong protocol version" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    defer agent.deinit();
+
+    // Build params with wrong protocol version
+    var params = std.json.ObjectMap.init(testing.allocator);
+    defer params.deinit();
+    try params.put("protocolVersion", .{ .integer = 999 }); // Wrong version
+
+    const request = jsonrpc.Request{
+        .method = "initialize",
+        .id = .{ .number = 1 },
+        .params = .{ .object = params },
+    };
+
+    try agent.handleRequest(request);
+
+    // Parse the response
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getOutput(), .{});
+    defer parsed.deinit();
+
+    // Should be an error response
+    const err = parsed.value.object.get("error").?.object;
+    try testing.expectEqual(@as(i64, jsonrpc.Error.InvalidParams), err.get("code").?.integer);
+    try testing.expectEqualStrings("Unsupported protocol version", err.get("message").?.string);
+}
+
+test "Agent handleRequest - initialize accepts correct protocol version" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    defer agent.deinit();
+
+    // Build params with correct protocol version
+    var params = std.json.ObjectMap.init(testing.allocator);
+    defer params.deinit();
+    try params.put("protocolVersion", .{ .integer = protocol.ProtocolVersion });
+
+    const request = jsonrpc.Request{
+        .method = "initialize",
+        .id = .{ .number = 1 },
+        .params = .{ .object = params },
+    };
+
+    try agent.handleRequest(request);
+
+    // Parse the response
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getOutput(), .{});
+    defer parsed.deinit();
+
+    // Should be a success response
+    try testing.expect(parsed.value.object.get("result") != null);
+    try testing.expect(parsed.value.object.get("error") == null);
+}
+
 test "Agent handleRequest - newSession" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
@@ -893,4 +952,134 @@ test "Agent handleRequest - cancel" {
     // Verify session was marked as cancelled
     const session = agent.sessions.get(session_id).?;
     try testing.expect(session.cancelled);
+}
+
+// =============================================================================
+// Error Path Tests
+// =============================================================================
+
+test "Agent handleRequest - prompt missing sessionId" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    defer agent.deinit();
+
+    // Empty params - missing sessionId
+    var params = std.json.ObjectMap.init(testing.allocator);
+    defer params.deinit();
+
+    const request = jsonrpc.Request{
+        .method = "session/prompt",
+        .id = .{ .number = 1 },
+        .params = .{ .object = params },
+    };
+
+    try agent.handleRequest(request);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getOutput(), .{});
+    defer parsed.deinit();
+
+    // Should be an error response
+    const err = parsed.value.object.get("error").?.object;
+    try testing.expectEqual(@as(i64, jsonrpc.Error.InvalidParams), err.get("code").?.integer);
+}
+
+test "Agent handleRequest - prompt session not found" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    defer agent.deinit();
+
+    var params = std.json.ObjectMap.init(testing.allocator);
+    defer params.deinit();
+    try params.put("sessionId", .{ .string = "nonexistent-session" });
+
+    const request = jsonrpc.Request{
+        .method = "session/prompt",
+        .id = .{ .number = 1 },
+        .params = .{ .object = params },
+    };
+
+    try agent.handleRequest(request);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getOutput(), .{});
+    defer parsed.deinit();
+
+    // Should be an error response
+    const err = parsed.value.object.get("error").?.object;
+    try testing.expectEqual(@as(i64, jsonrpc.Error.InvalidParams), err.get("code").?.integer);
+    try testing.expectEqualStrings("Session not found", err.get("message").?.string);
+}
+
+test "Agent handleRequest - setMode missing params" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    defer agent.deinit();
+
+    // Empty params
+    const request = jsonrpc.Request{
+        .method = "session/set_mode",
+        .id = .{ .number = 1 },
+        .params = null,
+    };
+
+    try agent.handleRequest(request);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getOutput(), .{});
+    defer parsed.deinit();
+
+    // Should be an error response
+    const err = parsed.value.object.get("error").?.object;
+    try testing.expectEqual(@as(i64, jsonrpc.Error.InvalidParams), err.get("code").?.integer);
+}
+
+test "Agent handleRequest - resumeSession missing params" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    defer agent.deinit();
+
+    // Empty params - missing sessionId
+    const request = jsonrpc.Request{
+        .method = "unstable_resumeSession",
+        .id = .{ .number = 1 },
+        .params = null,
+    };
+
+    try agent.handleRequest(request);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getOutput(), .{});
+    defer parsed.deinit();
+
+    // Should be an error response
+    const err = parsed.value.object.get("error").?.object;
+    try testing.expectEqual(@as(i64, jsonrpc.Error.InvalidParams), err.get("code").?.integer);
+}
+
+test "Agent handleRequest - authenticate returns success" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    defer agent.deinit();
+
+    const request = jsonrpc.Request{
+        .method = "authenticate",
+        .id = .{ .number = 1 },
+        .params = null,
+    };
+
+    try agent.handleRequest(request);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getOutput(), .{});
+    defer parsed.deinit();
+
+    // Should be a success response (empty result object)
+    try testing.expect(parsed.value.object.get("result") != null);
+    try testing.expect(parsed.value.object.get("error") == null);
 }

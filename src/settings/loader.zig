@@ -160,3 +160,145 @@ test "Settings init/deinit" {
     try testing.expect(!settings.isAllowed("test"));
     try testing.expect(!settings.isDenied("test"));
 }
+
+// =============================================================================
+// Property Tests for Settings Permissions
+// =============================================================================
+
+const quickcheck = @import("../util/quickcheck.zig");
+
+/// Tool name options for property tests (avoids generating slices)
+const test_tools = [_][]const u8{ "Read", "Write", "Bash", "Edit", "Grep", "Glob", "WebFetch" };
+
+fn getTestTool(idx: u3) []const u8 {
+    return test_tools[@min(idx, test_tools.len - 1)];
+}
+
+test "property: isAllowed returns true only for added tools" {
+    try quickcheck.check(struct {
+        fn prop(args: struct { add_idx: u3, check_idx: u3 }) bool {
+            var settings = Settings.init(testing.allocator);
+            defer settings.deinit();
+
+            const add_tool = getTestTool(args.add_idx);
+            const check_tool = getTestTool(args.check_idx);
+
+            // Add the tool
+            const owned = testing.allocator.dupe(u8, add_tool) catch return false;
+            settings.allowed_tools.put(owned, {}) catch {
+                testing.allocator.free(owned);
+                return false;
+            };
+
+            // Check: should be allowed only if same tool
+            const is_allowed = settings.isAllowed(check_tool);
+            const should_be_allowed = std.mem.eql(u8, add_tool, check_tool);
+            return is_allowed == should_be_allowed;
+        }
+    }.prop, .{});
+}
+
+test "property: isDenied returns true only for added tools" {
+    try quickcheck.check(struct {
+        fn prop(args: struct { add_idx: u3, check_idx: u3 }) bool {
+            var settings = Settings.init(testing.allocator);
+            defer settings.deinit();
+
+            const add_tool = getTestTool(args.add_idx);
+            const check_tool = getTestTool(args.check_idx);
+
+            // Add to denied
+            const owned = testing.allocator.dupe(u8, add_tool) catch return false;
+            settings.denied_tools.put(owned, {}) catch {
+                testing.allocator.free(owned);
+                return false;
+            };
+
+            // Check: should be denied only if same tool
+            const is_denied = settings.isDenied(check_tool);
+            const should_be_denied = std.mem.eql(u8, add_tool, check_tool);
+            return is_denied == should_be_denied;
+        }
+    }.prop, .{});
+}
+
+test "property: allowed and denied are independent" {
+    try quickcheck.check(struct {
+        fn prop(args: struct { allow_idx: u3, deny_idx: u3, check_idx: u3 }) bool {
+            var settings = Settings.init(testing.allocator);
+            defer settings.deinit();
+
+            const allow_tool = getTestTool(args.allow_idx);
+            const deny_tool = getTestTool(args.deny_idx);
+            const check_tool = getTestTool(args.check_idx);
+
+            // Add to allowed
+            const owned_allow = testing.allocator.dupe(u8, allow_tool) catch return false;
+            settings.allowed_tools.put(owned_allow, {}) catch {
+                testing.allocator.free(owned_allow);
+                return false;
+            };
+
+            // Add to denied
+            const owned_deny = testing.allocator.dupe(u8, deny_tool) catch return false;
+            settings.denied_tools.put(owned_deny, {}) catch {
+                testing.allocator.free(owned_deny);
+                return false;
+            };
+
+            // isAllowed and isDenied should be independent checks
+            const is_allowed = settings.isAllowed(check_tool);
+            const is_denied = settings.isDenied(check_tool);
+
+            const expect_allowed = std.mem.eql(u8, allow_tool, check_tool);
+            const expect_denied = std.mem.eql(u8, deny_tool, check_tool);
+
+            return is_allowed == expect_allowed and is_denied == expect_denied;
+        }
+    }.prop, .{});
+}
+
+test "property: empty settings allows/denies nothing" {
+    try quickcheck.check(struct {
+        fn prop(args: struct { tool_idx: u3 }) bool {
+            var settings = Settings.init(testing.allocator);
+            defer settings.deinit();
+
+            const tool = getTestTool(args.tool_idx);
+            return !settings.isAllowed(tool) and !settings.isDenied(tool);
+        }
+    }.prop, .{});
+}
+
+test "property: multiple tools can be allowed/denied" {
+    try quickcheck.check(struct {
+        fn prop(args: struct { num_allowed: u2, num_denied: u2 }) bool {
+            var settings = Settings.init(testing.allocator);
+            defer settings.deinit();
+
+            // Add some allowed tools
+            for (0..args.num_allowed) |i| {
+                const tool = test_tools[i % test_tools.len];
+                const owned = testing.allocator.dupe(u8, tool) catch return false;
+                settings.allowed_tools.put(owned, {}) catch {
+                    testing.allocator.free(owned);
+                    return false;
+                };
+            }
+
+            // Add some denied tools (from the other end)
+            for (0..args.num_denied) |i| {
+                const tool = test_tools[(test_tools.len - 1 - i) % test_tools.len];
+                const owned = testing.allocator.dupe(u8, tool) catch return false;
+                settings.denied_tools.put(owned, {}) catch {
+                    testing.allocator.free(owned);
+                    return false;
+                };
+            }
+
+            // Counts should match (accounting for potential duplicates in put)
+            return settings.allowed_tools.count() <= args.num_allowed and
+                settings.denied_tools.count() <= args.num_denied;
+        }
+    }.prop, .{});
+}
