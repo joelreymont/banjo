@@ -736,6 +736,14 @@ pub const Agent = struct {
         return false;
     }
 
+    /// Check if command is a banjo command (to avoid duplicates)
+    fn isBanjoCommand(name: []const u8) bool {
+        for (banjo_commands) |cmd| {
+            if (std.mem.eql(u8, name, cmd.name)) return true;
+        }
+        return false;
+    }
+
     /// Send available_commands_update with CLI commands + banjo commands
     fn sendAvailableCommands(self: *Agent, session_id: []const u8, cli_commands: []const []const u8) !void {
         // Build command list: banjo commands + CLI commands (filtered)
@@ -747,9 +755,14 @@ pub const Agent = struct {
             try commands.append(self.allocator, cmd);
         }
 
-        // Add CLI commands, filtering unsupported ones
+        // Add CLI commands, filtering unsupported, duplicates, and banjo commands
         for (cli_commands) |name| {
-            if (!isUnsupportedCommand(name)) {
+            if (isUnsupportedCommand(name) or isBanjoCommand(name)) continue;
+            // Check if already added (CLI might send duplicates)
+            const already_added = for (commands.items) |cmd| {
+                if (std.mem.eql(u8, cmd.name, name)) break true;
+            } else false;
+            if (!already_added) {
                 try commands.append(self.allocator, .{ .name = name, .description = "" });
             }
         }
