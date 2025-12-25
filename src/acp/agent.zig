@@ -18,7 +18,7 @@ const NewSessionParams = struct {
 
 const PromptParams = struct {
     sessionId: []const u8,
-    prompt: ?[]const u8 = null,
+    prompt: ?std.json.Value = null, // Array of content blocks
 };
 
 const CancelParams = struct {
@@ -34,6 +34,21 @@ const ResumeSessionParams = struct {
     sessionId: []const u8,
     cwd: []const u8 = ".",
 };
+
+/// Extract text content from ACP prompt content blocks array
+fn extractTextFromPrompt(prompt: ?std.json.Value) ?[]const u8 {
+    const blocks = prompt orelse return null;
+    if (blocks != .array) return null;
+    for (blocks.array.items) |block| {
+        if (block != .object) continue;
+        const block_type = block.object.get("type") orelse continue;
+        if (block_type != .string) continue;
+        if (!std.mem.eql(u8, block_type.string, "text")) continue;
+        const text = block.object.get("text") orelse continue;
+        if (text == .string) return text.string;
+    }
+    return null;
+}
 
 pub const Agent = struct {
     allocator: Allocator,
@@ -92,6 +107,8 @@ pub const Agent = struct {
 
         if (std.mem.eql(u8, request.method, "initialize")) {
             try self.handleInitialize(request);
+        } else if (std.mem.eql(u8, request.method, "authenticate")) {
+            try self.handleAuthenticate(request);
         } else if (std.mem.eql(u8, request.method, "session/new")) {
             try self.handleNewSession(request);
         } else if (std.mem.eql(u8, request.method, "session/prompt")) {
@@ -171,6 +188,14 @@ pub const Agent = struct {
         try self.writer.writeTypedResponse(request.id, response);
     }
 
+    fn handleAuthenticate(self: *Agent, request: jsonrpc.Request) !void {
+        // For now, we don't require authentication - Claude CLI handles it
+        // Just return success with empty result
+        var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
+        defer result.object.deinit();
+        try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
+    }
+
     fn handleNewSession(self: *Agent, request: jsonrpc.Request) !void {
         // Generate session ID
         var uuid_bytes: [16]u8 = undefined;
@@ -226,7 +251,9 @@ pub const Agent = struct {
         };
         defer parsed.deinit();
         const session_id = parsed.value.sessionId;
-        const prompt_text = parsed.value.prompt;
+
+        // Extract text from content blocks array
+        const prompt_text = extractTextFromPrompt(parsed.value.prompt);
 
         const session = self.sessions.get(session_id) orelse {
             try self.writer.writeResponse(jsonrpc.Response.err(
@@ -238,7 +265,7 @@ pub const Agent = struct {
         };
 
         session.cancelled = false;
-        log.info("Prompt received for session {s}", .{session_id});
+        log.info("Prompt received for session {s}: {s}", .{ session_id, prompt_text orelse "(empty)" });
 
         // Start bridge if not running
         if (session.bridge == null) {
@@ -287,7 +314,7 @@ pub const Agent = struct {
                             // Note: CLI will continue, we're just notifying user
                         } else {
                             try self.sendSessionUpdate(session_id, .{
-                                .kind = .tool_call,
+                                .kind = .tool_use,
                                 .title = tool_name,
                             });
                         }

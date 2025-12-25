@@ -4,3 +4,4 @@ zig-out/
 *.a
 SESSION.md
 dist/
+extension/banjo

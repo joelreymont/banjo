@@ -151,10 +151,11 @@ pub const SessionUpdate = struct {
 
     pub const UpdateKind = enum {
         text,
-        tool_call,
-        tool_call_update,
-        plan,
+        tool_use,
+        tool_result,
         thinking,
+        plan,
+        @"error",
     };
 
     pub const ToolKind = enum {
