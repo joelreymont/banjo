@@ -1,8 +1,6 @@
 # Banjo
 
-<p align="center">
-  <img src="assets/logo.jpg" alt="Banjo" width="200">
-</p>
+![Banjo](assets/logo.jpg)
 
 Claude Code ACP Agent in Zig — run [Claude Code](https://docs.anthropic.com/en/docs/claude-code) inside [Zed](https://zed.dev)'s Agent Panel.
 
