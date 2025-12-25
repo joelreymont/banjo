@@ -12,7 +12,7 @@ jobs:
           - os: macos-latest
             target: aarch64-macos
             artifact: banjo-darwin-arm64.tar.gz
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-macos
             artifact: banjo-darwin-x64.tar.gz
           - os: ubuntu-latest
@@ -24,9 +24,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: goto-bus-stop/setup-zig@v2
+      - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.0
+          version: master
 
       - name: Build
         run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
