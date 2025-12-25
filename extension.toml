@@ -1,6 +1,6 @@
 id = "banjo"
 name = "Banjo"
-version = "0.2.0"
+version = "0.2.1"
 schema_version = 1
 description = "Claude Code ACP Agent in Zig"
 authors = ["Joel Reymont <joelr@well.com>"]
@@ -11,16 +11,16 @@ license = "MIT"
 name = "Claude Code (Banjo)"
 
 [agent_servers.banjo.targets.darwin-aarch64]
-archive = "https://github.com/joelreymont/banjo/releases/download/v0.2.0/banjo-darwin-arm64.tar.gz"
+archive = "https://github.com/joelreymont/banjo/releases/download/v0.2.1/banjo-darwin-arm64.tar.gz"
 sha256 = "02bddced6d29d090a279d375eb6c3aeed875034dc190499d0f5ec582e40f9e1d"
 cmd = "./banjo"
 
 [agent_servers.banjo.targets.darwin-x86_64]
-archive = "https://github.com/joelreymont/banjo/releases/download/v0.2.0/banjo-darwin-x64.tar.gz"
+archive = "https://github.com/joelreymont/banjo/releases/download/v0.2.1/banjo-darwin-x64.tar.gz"
 sha256 = "5ba713c3b1d6d133fce181a71646ebaef5234545350c11fc72b01b0270f15134"
 cmd = "./banjo"
 
 [agent_servers.banjo.targets.linux-x86_64]
-archive = "https://github.com/joelreymont/banjo/releases/download/v0.2.0/banjo-linux-x64.tar.gz"
+archive = "https://github.com/joelreymont/banjo/releases/download/v0.2.1/banjo-linux-x64.tar.gz"
 sha256 = "b7ab67241ac92c199dc8097bdaf70faec46f42eb285553ef90747e011fb92b1d"
 cmd = "./banjo"
