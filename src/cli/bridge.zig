@@ -121,12 +121,33 @@ pub const Bridge = struct {
         }
     }
 
+    /// Find claude binary - check env var and common locations
+    fn findClaudeBinary() []const u8 {
+        // Check CLAUDE_CODE_EXECUTABLE env var first
+        if (std.posix.getenv("CLAUDE_CODE_EXECUTABLE")) |path| {
+            return path;
+        }
+        // Common installation locations
+        const paths = [_][]const u8{
+            "/usr/local/bin/claude",
+            "/opt/homebrew/bin/claude",
+        };
+        for (paths) |path| {
+            std.fs.accessAbsolute(path, .{}) catch continue;
+            return path;
+        }
+        // Fall back to PATH lookup
+        return "claude";
+    }
+
     /// Start Claude CLI process
     pub fn start(self: *Bridge, opts: StartOptions) !void {
         var args: std.ArrayList([]const u8) = .empty;
         defer args.deinit(self.allocator);
 
-        try args.append(self.allocator, "claude");
+        const claude_path = findClaudeBinary();
+        log.info("Using claude binary: {s}", .{claude_path});
+        try args.append(self.allocator, claude_path);
         try args.append(self.allocator, "-p");
         try args.append(self.allocator, "--input-format");
         try args.append(self.allocator, "stream-json");
