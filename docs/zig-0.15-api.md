@@ -183,6 +183,67 @@ list.deinit(allocator);
 
 Same API as new ArrayList - they're now equivalent.
 
+## ArrayList.writer() and AnyWriter Lifetime
+
+**CRITICAL**: `ArrayList.writer(allocator)` returns a `GenericWriter` whose context is a struct stored by value. Converting to `AnyWriter` stores a pointer to this context. If the GenericWriter is a temporary, the pointer is dangling.
+
+```zig
+// WRONG - dangling pointer:
+fn makeWriter(allocator: Allocator) std.io.AnyWriter {
+    var list: std.ArrayList(u8) = .empty;
+    return list.writer(allocator).any();  // GenericWriter is temporary, context pointer dangles
+}
+
+// WRONG - still dangling:
+fn makeTestWriter(allocator: Allocator) struct { writer: jsonrpc.Writer, output: *std.ArrayList(u8) } {
+    const output = allocator.create(std.ArrayList(u8)) catch unreachable;
+    output.* = .empty;
+    return .{
+        // output.writer(allocator) returns temporary GenericWriter
+        // .any() stores pointer to its context - dangles after return
+        .writer = jsonrpc.Writer.init(allocator, output.writer(allocator).any()),
+        .output = output,
+    };
+}
+
+// CORRECT - heap-allocate the GenericWriter:
+const TestWriter = struct {
+    output: *std.ArrayList(u8),
+    list_writer: *std.ArrayList(u8).Writer,  // heap-allocated GenericWriter
+    writer: jsonrpc.Writer,
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator) !TestWriter {
+        const output = try allocator.create(std.ArrayList(u8));
+        errdefer allocator.destroy(output);
+        output.* = .empty;
+
+        const list_writer = try allocator.create(std.ArrayList(u8).Writer);
+        errdefer allocator.destroy(list_writer);
+        list_writer.* = output.writer(allocator);
+
+        return .{
+            .output = output,
+            .list_writer = list_writer,
+            .writer = jsonrpc.Writer.init(allocator, list_writer.any()),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *TestWriter) void {
+        self.output.deinit(self.allocator);
+        self.allocator.destroy(self.output);
+        self.allocator.destroy(self.list_writer);
+    }
+
+    pub fn getOutput(self: *TestWriter) []const u8 {
+        return self.output.items;
+    }
+};
+```
+
+**Key insight**: `AnyWriter` stores `context: *const anyopaque` - a pointer. The `GenericWriter.context` is stored by value. When you call `.any()`, it takes a pointer to that value. If the GenericWriter is on the stack or is temporary, the pointer becomes invalid.
+
 ## File Reading
 
 ```zig

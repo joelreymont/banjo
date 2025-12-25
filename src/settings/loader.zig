@@ -71,7 +71,8 @@ pub fn loadSettings(allocator: Allocator, cwd: []const u8) !Settings {
     const settings_path = try std.fs.path.join(allocator, &.{ cwd, ".claude", "settings.json" });
     defer allocator.free(settings_path);
 
-    const file = std.fs.openFileAbsolute(settings_path, .{}) catch |err| switch (err) {
+    // Use cwd().openFile to handle both absolute and relative paths
+    const file = std.fs.cwd().openFile(settings_path, .{}) catch |err| switch (err) {
         error.FileNotFound => {
             log.debug("No settings file at {s}", .{settings_path});
             return settings;

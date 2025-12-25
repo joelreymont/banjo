@@ -9,8 +9,11 @@ const Settings = settings_loader.Settings;
 const log = std.log.scoped(.agent);
 
 // JSON-RPC method parameter schemas
+// See docs/acp-protocol.md for full specification
+
 const NewSessionParams = struct {
     cwd: []const u8 = ".",
+    mcpServers: ?std.json.Value = null, // Array of MCP server configs (we store raw for now)
 };
 
 const PromptParams = struct {
@@ -138,8 +141,8 @@ pub const Agent = struct {
         // Build response struct and serialize directly
         const response = protocol.InitializeResponse{
             .agentInfo = .{
-                .name = "banjo",
-                .title = "Banjo (Claude Code)",
+                .name = "Claude Code (Banjo)",
+                .title = "Claude Code (Banjo)",
                 .version = "0.1.0",
             },
             .agentCapabilities = .{
@@ -176,7 +179,9 @@ pub const Agent = struct {
         const session_id = try self.allocator.dupe(u8, &hex);
 
         // Parse params using typed struct
-        const parsed = try std.json.parseFromValue(NewSessionParams, self.allocator, request.params orelse .null, .{});
+        const parsed = try std.json.parseFromValue(NewSessionParams, self.allocator, request.params orelse .null, .{
+            .ignore_unknown_fields = true,
+        });
         defer parsed.deinit();
         const cwd = parsed.value.cwd;
 
@@ -201,6 +206,7 @@ pub const Agent = struct {
 
         // Build response
         var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
+        defer result.object.deinit();
         try result.object.put("sessionId", .{ .string = session_id });
 
         try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
@@ -208,7 +214,9 @@ pub const Agent = struct {
 
     fn handlePrompt(self: *Agent, request: jsonrpc.Request) !void {
         // Parse params using typed struct
-        const parsed = std.json.parseFromValue(PromptParams, self.allocator, request.params orelse .null, .{}) catch {
+        const parsed = std.json.parseFromValue(PromptParams, self.allocator, request.params orelse .null, .{
+            .ignore_unknown_fields = true,
+        }) catch {
             try self.writer.writeResponse(jsonrpc.Response.err(
                 request.id,
                 jsonrpc.Error.InvalidParams,
@@ -325,13 +333,16 @@ pub const Agent = struct {
 
         // Return result
         var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
+        defer result.object.deinit();
         try result.object.put("stopReason", .{ .string = stop_reason });
 
         try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
     }
 
     fn handleCancel(self: *Agent, request: jsonrpc.Request) !void {
-        const parsed = std.json.parseFromValue(CancelParams, self.allocator, request.params orelse .null, .{}) catch return;
+        const parsed = std.json.parseFromValue(CancelParams, self.allocator, request.params orelse .null, .{
+            .ignore_unknown_fields = true,
+        }) catch return;
         defer parsed.deinit();
 
         if (self.sessions.get(parsed.value.sessionId)) |session| {
@@ -345,7 +356,9 @@ pub const Agent = struct {
     }
 
     fn handleSetMode(self: *Agent, request: jsonrpc.Request) !void {
-        const parsed = std.json.parseFromValue(SetModeParams, self.allocator, request.params orelse .null, .{}) catch {
+        const parsed = std.json.parseFromValue(SetModeParams, self.allocator, request.params orelse .null, .{
+            .ignore_unknown_fields = true,
+        }) catch {
             try self.writer.writeResponse(jsonrpc.Response.err(
                 request.id,
                 jsonrpc.Error.InvalidParams,
@@ -368,12 +381,15 @@ pub const Agent = struct {
         session.permission_mode = std.meta.stringToEnum(protocol.PermissionMode, params.mode) orelse .default;
         log.info("Set mode for session {s} to {s}", .{ params.sessionId, params.mode });
 
-        const result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
+        var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
+        defer result.object.deinit();
         try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
     }
 
     fn handleResumeSession(self: *Agent, request: jsonrpc.Request) !void {
-        const parsed = std.json.parseFromValue(ResumeSessionParams, self.allocator, request.params orelse .null, .{}) catch {
+        const parsed = std.json.parseFromValue(ResumeSessionParams, self.allocator, request.params orelse .null, .{
+            .ignore_unknown_fields = true,
+        }) catch {
             try self.writer.writeResponse(jsonrpc.Response.err(
                 request.id,
                 jsonrpc.Error.InvalidParams,
@@ -387,6 +403,7 @@ pub const Agent = struct {
         // Check if session already exists
         if (self.sessions.get(params.sessionId)) |_| {
             var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
+            defer result.object.deinit();
             try result.object.put("sessionId", .{ .string = params.sessionId });
             try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
             return;
@@ -404,6 +421,7 @@ pub const Agent = struct {
         log.info("Resumed session {s}", .{sid_copy});
 
         var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
+        defer result.object.deinit();
         try result.object.put("sessionId", .{ .string = sid_copy });
         try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
     }
@@ -411,9 +429,11 @@ pub const Agent = struct {
     /// Send a session update notification
     pub fn sendSessionUpdate(self: *Agent, session_id: []const u8, update: protocol.SessionUpdate.Update) !void {
         var params = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
+        defer params.object.deinit();
         try params.object.put("sessionId", .{ .string = session_id });
 
         var update_obj = std.json.ObjectMap.init(self.allocator);
+        defer update_obj.deinit();
         try update_obj.put("kind", .{ .string = @tagName(update.kind) });
         if (update.content) |content| {
             try update_obj.put("content", .{ .string = content });
@@ -429,3 +449,314 @@ pub const Agent = struct {
         });
     }
 };
+
+// Tests
+const testing = std.testing;
+
+/// Test helper for capturing JSON-RPC output.
+/// Heap-allocates the GenericWriter to ensure AnyWriter context pointer remains valid.
+const TestWriter = struct {
+    output: *std.ArrayList(u8),
+    list_writer: *std.ArrayList(u8).Writer,
+    writer: jsonrpc.Writer,
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator) !TestWriter {
+        const output = try allocator.create(std.ArrayList(u8));
+        errdefer allocator.destroy(output);
+        output.* = .empty;
+
+        const list_writer = try allocator.create(std.ArrayList(u8).Writer);
+        errdefer allocator.destroy(list_writer);
+        list_writer.* = output.writer(allocator);
+
+        return .{
+            .output = output,
+            .list_writer = list_writer,
+            .writer = jsonrpc.Writer.init(allocator, list_writer.any()),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *TestWriter) void {
+        self.output.deinit(self.allocator);
+        self.allocator.destroy(self.output);
+        self.allocator.destroy(self.list_writer);
+    }
+
+    pub fn getOutput(self: *TestWriter) []const u8 {
+        return self.output.items;
+    }
+};
+
+test "Agent init/deinit" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    defer agent.deinit();
+}
+
+test "Agent handleRequest - initialize" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    defer agent.deinit();
+
+    const request = jsonrpc.Request{
+        .method = "initialize",
+        .id = .{ .number = 1 },
+    };
+
+    try agent.handleRequest(request);
+
+    // Check that a response was written
+    try testing.expect(tw.getOutput().len > 0);
+
+    // Parse the response
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getOutput(), .{});
+    defer parsed.deinit();
+
+    // Verify it's a success response
+    try testing.expectEqualStrings("2.0", parsed.value.object.get("jsonrpc").?.string);
+    try testing.expect(parsed.value.object.get("result") != null);
+    try testing.expectEqual(@as(i64, 1), parsed.value.object.get("id").?.integer);
+}
+
+test "Agent handleRequest - newSession" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    defer agent.deinit();
+
+    const request = jsonrpc.Request{
+        .method = "session/new",
+        .id = .{ .number = 2 },
+        .params = .{ .object = std.json.ObjectMap.init(testing.allocator) },
+    };
+
+    try agent.handleRequest(request);
+
+    // Check response
+    try testing.expect(tw.getOutput().len > 0);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getOutput(), .{});
+    defer parsed.deinit();
+
+    // Should have a sessionId in result
+    const result = parsed.value.object.get("result").?.object;
+    try testing.expect(result.get("sessionId") != null);
+}
+
+test "Agent handleRequest - methodNotFound" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    defer agent.deinit();
+
+    const request = jsonrpc.Request{
+        .method = "nonexistent/method",
+        .id = .{ .number = 99 },
+    };
+
+    try agent.handleRequest(request);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getOutput(), .{});
+    defer parsed.deinit();
+
+    // Should be an error response
+    const err = parsed.value.object.get("error").?.object;
+    try testing.expectEqual(@as(i64, jsonrpc.Error.MethodNotFound), err.get("code").?.integer);
+}
+
+test "Agent handleRequest - setMode" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    defer agent.deinit();
+
+    // First create a session
+    var new_session_params = std.json.ObjectMap.init(testing.allocator);
+    defer new_session_params.deinit();
+
+    const create_request = jsonrpc.Request{
+        .method = "session/new",
+        .id = .{ .number = 1 },
+        .params = .{ .object = new_session_params },
+    };
+    try agent.handleRequest(create_request);
+
+    // Parse the session ID from response
+    const create_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getOutput(), .{});
+    defer create_parsed.deinit();
+    const session_id = create_parsed.value.object.get("result").?.object.get("sessionId").?.string;
+
+    // Clear output for next request
+    tw.output.clearRetainingCapacity();
+
+    // Set mode to plan
+    var set_mode_params = std.json.ObjectMap.init(testing.allocator);
+    defer set_mode_params.deinit();
+    try set_mode_params.put("sessionId", .{ .string = session_id });
+    try set_mode_params.put("mode", .{ .string = "plan" });
+
+    const set_mode_request = jsonrpc.Request{
+        .method = "session/set_mode",
+        .id = .{ .number = 2 },
+        .params = .{ .object = set_mode_params },
+    };
+    try agent.handleRequest(set_mode_request);
+
+    // Should succeed with empty result
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getOutput(), .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.object.get("result") != null);
+    try testing.expectEqual(@as(i64, 2), parsed.value.object.get("id").?.integer);
+}
+
+test "Agent handleRequest - setMode session not found" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    defer agent.deinit();
+
+    var params = std.json.ObjectMap.init(testing.allocator);
+    defer params.deinit();
+    try params.put("sessionId", .{ .string = "nonexistent" });
+    try params.put("mode", .{ .string = "plan" });
+
+    const request = jsonrpc.Request{
+        .method = "session/set_mode",
+        .id = .{ .number = 1 },
+        .params = .{ .object = params },
+    };
+    try agent.handleRequest(request);
+
+    // Should return error - session not found
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getOutput(), .{});
+    defer parsed.deinit();
+    const err = parsed.value.object.get("error").?.object;
+    try testing.expectEqual(@as(i64, jsonrpc.Error.InvalidParams), err.get("code").?.integer);
+}
+
+test "Agent handleRequest - resumeSession" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    defer agent.deinit();
+
+    var params = std.json.ObjectMap.init(testing.allocator);
+    defer params.deinit();
+    try params.put("sessionId", .{ .string = "test-session-123" });
+    try params.put("cwd", .{ .string = "." });
+
+    const request = jsonrpc.Request{
+        .method = "unstable_resumeSession",
+        .id = .{ .number = 1 },
+        .params = .{ .object = params },
+    };
+    try agent.handleRequest(request);
+
+    // Should succeed and return sessionId
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getOutput(), .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result").?.object;
+    try testing.expectEqualStrings("test-session-123", result.get("sessionId").?.string);
+}
+
+test "Agent handleRequest - resumeSession existing" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    defer agent.deinit();
+
+    // First create a session
+    var new_session_params = std.json.ObjectMap.init(testing.allocator);
+    defer new_session_params.deinit();
+
+    const create_request = jsonrpc.Request{
+        .method = "session/new",
+        .id = .{ .number = 1 },
+        .params = .{ .object = new_session_params },
+    };
+    try agent.handleRequest(create_request);
+
+    // Get the session ID
+    const create_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getOutput(), .{});
+    defer create_parsed.deinit();
+    const session_id = create_parsed.value.object.get("result").?.object.get("sessionId").?.string;
+
+    // Clear output
+    tw.output.clearRetainingCapacity();
+
+    // Resume the same session
+    var resume_params = std.json.ObjectMap.init(testing.allocator);
+    defer resume_params.deinit();
+    try resume_params.put("sessionId", .{ .string = session_id });
+
+    const resume_request = jsonrpc.Request{
+        .method = "unstable_resumeSession",
+        .id = .{ .number = 2 },
+        .params = .{ .object = resume_params },
+    };
+    try agent.handleRequest(resume_request);
+
+    // Should return the same sessionId (session already exists)
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getOutput(), .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result").?.object;
+    try testing.expectEqualStrings(session_id, result.get("sessionId").?.string);
+}
+
+test "Agent handleRequest - cancel" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    defer agent.deinit();
+
+    // First create a session
+    var new_session_params = std.json.ObjectMap.init(testing.allocator);
+    defer new_session_params.deinit();
+
+    const create_request = jsonrpc.Request{
+        .method = "session/new",
+        .id = .{ .number = 1 },
+        .params = .{ .object = new_session_params },
+    };
+    try agent.handleRequest(create_request);
+
+    // Get the session ID
+    const create_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getOutput(), .{});
+    defer create_parsed.deinit();
+    const session_id = create_parsed.value.object.get("result").?.object.get("sessionId").?.string;
+
+    // Clear output
+    tw.output.clearRetainingCapacity();
+
+    // Cancel the session (notification - no id)
+    var cancel_params = std.json.ObjectMap.init(testing.allocator);
+    defer cancel_params.deinit();
+    try cancel_params.put("sessionId", .{ .string = session_id });
+
+    const cancel_request = jsonrpc.Request{
+        .method = "session/cancel",
+        .id = null, // notification
+        .params = .{ .object = cancel_params },
+    };
+    try agent.handleRequest(cancel_request);
+
+    // Cancel is a notification, no response expected
+    try testing.expectEqual(@as(usize, 0), tw.getOutput().len);
+
+    // Verify session was marked as cancelled
+    const session = agent.sessions.get(session_id).?;
+    try testing.expect(session.cancelled);
+}

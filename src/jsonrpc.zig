@@ -280,7 +280,7 @@ pub const Writer = struct {
         try jw.objectField("jsonrpc");
         try jw.write("2.0");
         try jw.objectField("result");
-        try std.json.stringify(result, .{}, &out.writer);
+        try jw.write(result);
         try jw.objectField("id");
         if (id) |i| {
             switch (i) {
@@ -326,7 +326,7 @@ pub const Writer = struct {
         try jw.objectField("method");
         try jw.write(method);
         try jw.objectField("params");
-        try std.json.stringify(params, .{}, &out.writer);
+        try jw.write(params);
         try jw.objectField("id");
         switch (id) {
             .string => |s| try jw.write(s),
@@ -387,4 +387,83 @@ test "serialize error response" {
     const json = try serializeResponse(testing.allocator, response);
     defer testing.allocator.free(json);
     try testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32601,\"message\":\"Method not found\"},\"id\":1}", json);
+}
+
+// Property tests
+const quickcheck = @import("util/quickcheck.zig");
+
+test "property: response with numeric id roundtrips through JSON" {
+    try quickcheck.check(struct {
+        fn prop(args: struct { id: i64, result_bool: bool }) bool {
+            const response = Response.success(
+                .{ .number = args.id },
+                .{ .bool = args.result_bool },
+            );
+
+            const json = serializeResponse(testing.allocator, response) catch return false;
+            defer testing.allocator.free(json);
+
+            // Parse it back
+            const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{}) catch return false;
+            defer parsed.deinit();
+
+            const obj = parsed.value.object;
+
+            // Verify structure
+            const jsonrpc = obj.get("jsonrpc") orelse return false;
+            if (jsonrpc != .string or !std.mem.eql(u8, jsonrpc.string, "2.0")) return false;
+
+            const id_val = obj.get("id") orelse return false;
+            if (id_val != .integer or id_val.integer != args.id) return false;
+
+            const result = obj.get("result") orelse return false;
+            if (result != .bool or result.bool != args.result_bool) return false;
+
+            return true;
+        }
+    }.prop, .{});
+}
+
+test "property: error response preserves error code" {
+    try quickcheck.check(struct {
+        fn prop(args: struct { id: i64, code: i32 }) bool {
+            const response = Response.err(.{ .number = args.id }, args.code, "test error");
+
+            const json = serializeResponse(testing.allocator, response) catch return false;
+            defer testing.allocator.free(json);
+
+            const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{}) catch return false;
+            defer parsed.deinit();
+
+            const obj = parsed.value.object;
+            const err_obj = (obj.get("error") orelse return false).object;
+            const code = (err_obj.get("code") orelse return false).integer;
+
+            return code == args.code;
+        }
+    }.prop, .{});
+}
+
+test "property: request id types are preserved" {
+    try quickcheck.check(struct {
+        fn prop(args: struct { id: i64 }) bool {
+            // Test numeric ID roundtrip through request serialization
+            const request = Request{
+                .method = "test",
+                .id = .{ .number = args.id },
+            };
+
+            const json = serializeRequest(testing.allocator, request) catch return false;
+            defer testing.allocator.free(json);
+
+            var parsed_req = parseRequest(testing.allocator, json) catch return false;
+            defer parsed_req.deinit();
+
+            const parsed_id = parsed_req.request.id orelse return false;
+            return switch (parsed_id) {
+                .number => |n| n == args.id,
+                else => false,
+            };
+        }
+    }.prop, .{});
 }
