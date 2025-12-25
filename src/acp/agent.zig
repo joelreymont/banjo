@@ -311,61 +311,11 @@ pub const Agent = struct {
         try result.object.put("sessionId", .{ .string = session_id });
         try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
 
-        // Try to read CLI init with timeout to get slash commands
-        var cli_commands: ?[]const []const u8 = null;
-        var init_msg: ?bridge.StreamMessage = null;
-        defer if (init_msg) |*m| m.deinit();
-
-        if (session.bridge) |*cli_bridge| {
-            if (cli_bridge.process) |proc| {
-                if (proc.stdout) |stdout| {
-                    // Poll stdout for up to 5 seconds
-                    var fds = [_]std.posix.pollfd{.{
-                        .fd = stdout.handle,
-                        .events = std.posix.POLL.IN,
-                        .revents = 0,
-                    }};
-
-                    const poll_timeout_ms = 5000;
-                    const ready = std.posix.poll(&fds, poll_timeout_ms) catch |err| blk: {
-                        log.warn("Poll failed: {}", .{err});
-                        break :blk 0;
-                    };
-                    log.info("Poll result: ready={d}, revents=0x{x}", .{ ready, fds[0].revents });
-
-                    if (ready > 0 and (fds[0].revents & std.posix.POLL.IN) != 0) {
-                        // Data available, try to read messages until init
-                        var attempts: u32 = 0;
-                        while (attempts < 10) : (attempts += 1) {
-                            var msg = cli_bridge.readMessage() catch break orelse break;
-
-                            if (msg.type == .system) {
-                                if (msg.getInitInfo()) |info| {
-                                    init_msg = msg;
-                                    cli_commands = info.slash_commands;
-                                    break;
-                                }
-                            }
-                            if (init_msg == null) {
-                                msg.deinit();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Send available commands (banjo + CLI if available)
-        if (cli_commands) |cmds| {
-            log.info("Got {d} CLI slash commands at session start", .{cmds.len});
-            try self.sendAvailableCommands(session_id, cmds);
-        } else {
-            // Fallback to banjo + common CLI commands (CLI provides full list on first prompt)
-            try self.sendSessionUpdate(session_id, .{
-                .sessionUpdate = .available_commands_update,
-                .availableCommands = &initial_commands,
-            });
-        }
+        // Send initial commands (CLI provides full list on first prompt after we send it input)
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .available_commands_update,
+            .availableCommands = &initial_commands,
+        });
     }
 
     fn handlePrompt(self: *Agent, request: jsonrpc.Request) !void {
