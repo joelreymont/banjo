@@ -3,6 +3,7 @@ name = "Banjo"
 version = "0.1.0"
 description = "Claude Code ACP agent (small and fast!)"
 authors = ["Joel Reymont"]
+license = "MIT"
 repository = "https://github.com/joelreymont/banjo"
 
 [agent_servers.banjo]
