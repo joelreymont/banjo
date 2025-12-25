@@ -1,6 +1,6 @@
 id = "banjo"
 name = "Banjo"
-version = "0.1.0"
+version = "0.2.0"
 schema_version = 1
 description = "Claude Code ACP Agent in Zig"
 authors = ["Joel Reymont <joelr@well.com>"]
@@ -11,13 +11,13 @@ license = "MIT"
 name = "Claude Code (Banjo)"
 
 [agent_servers.banjo.targets.darwin-aarch64]
-archive = "https://github.com/joelreymont/banjo/releases/download/v0.1.0/banjo-darwin-arm64.tar.gz"
+archive = "https://github.com/joelreymont/banjo/releases/download/v0.2.0/banjo-darwin-arm64.tar.gz"
 cmd = "./banjo"
 
 [agent_servers.banjo.targets.darwin-x86_64]
-archive = "https://github.com/joelreymont/banjo/releases/download/v0.1.0/banjo-darwin-x64.tar.gz"
+archive = "https://github.com/joelreymont/banjo/releases/download/v0.2.0/banjo-darwin-x64.tar.gz"
 cmd = "./banjo"
 
 [agent_servers.banjo.targets.linux-x86_64]
-archive = "https://github.com/joelreymont/banjo/releases/download/v0.1.0/banjo-linux-x64.tar.gz"
+archive = "https://github.com/joelreymont/banjo/releases/download/v0.2.0/banjo-linux-x64.tar.gz"
 cmd = "./banjo"

@@ -13,7 +13,7 @@ const config = @import("config");
 const log = std.log.scoped(.agent);
 
 /// Banjo version with git hash
-pub const version = "0.1.0 (" ++ config.git_hash ++ ")";
+pub const version = "0.2.0 (" ++ config.git_hash ++ ")";
 
 /// Check if auto-resume is enabled (default: true)
 fn isAutoResumeEnabled() bool {
@@ -249,6 +249,7 @@ pub const Agent = struct {
         std.crypto.random.bytes(&uuid_bytes);
         const hex = std.fmt.bytesToHex(uuid_bytes, .lower);
         const session_id = try self.allocator.dupe(u8, &hex);
+        errdefer self.allocator.free(session_id);
 
         // Parse params using typed struct
         const parsed = try std.json.parseFromValue(NewSessionParams, self.allocator, request.params orelse .null, .{
@@ -267,10 +268,16 @@ pub const Agent = struct {
 
         // Create session
         const session = try self.allocator.create(Session);
+        errdefer self.allocator.destroy(session);
+        const cwd_copy = try self.allocator.dupe(u8, cwd);
+        errdefer self.allocator.free(cwd_copy);
+        const model_copy = if (parsed.value.model) |m| try self.allocator.dupe(u8, m) else null;
+        errdefer if (model_copy) |m| self.allocator.free(m);
+
         session.* = .{
             .id = session_id,
-            .cwd = try self.allocator.dupe(u8, cwd),
-            .model = if (parsed.value.model) |m| try self.allocator.dupe(u8, m) else null,
+            .cwd = cwd_copy,
+            .model = model_copy,
             .settings = settings,
         };
         try self.sessions.put(session_id, session);
@@ -647,10 +654,15 @@ pub const Agent = struct {
 
         // Create new session
         const session = try self.allocator.create(Session);
+        errdefer self.allocator.destroy(session);
         const sid_copy = try self.allocator.dupe(u8, params.sessionId);
+        errdefer self.allocator.free(sid_copy);
+        const cwd_copy = try self.allocator.dupe(u8, params.cwd);
+        errdefer self.allocator.free(cwd_copy);
+
         session.* = .{
             .id = sid_copy,
-            .cwd = try self.allocator.dupe(u8, params.cwd),
+            .cwd = cwd_copy,
         };
         try self.sessions.put(sid_copy, session);
 
