@@ -29,7 +29,10 @@ jobs:
           version: 0.15.2
 
       - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+        run: zig build -Doptimize=ReleaseSmall -Dtarget=${{ matrix.target }}
+
+      - name: Strip
+        run: strip zig-out/bin/banjo || true
 
       - name: Package
         run: tar -czf ${{ matrix.artifact }} -C zig-out/bin banjo
