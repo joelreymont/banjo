@@ -2,14 +2,35 @@
 
 ## Zig 0.15 API Changes
 
-**MUST READ**: `docs/zig-0.15-io-api.md` for ArrayList, I/O, and JSON API changes.
+**MUST READ**: `docs/zig-0.15-api.md` for ArrayList, I/O, and JSON API changes.
 
 Key changes:
 - `ArrayList.init(allocator)` → `.empty`, methods take allocator
-- `std.json.encodeJsonString` → `std.json.Stringify.encodeJsonString(str, .{}, writer)`
-- `value.jsonStringify(writer)` expects `*std.json.Stringify`, NOT raw writer!
+- **JSON parsing**: Use `std.json.parseFromValue(T, allocator, value, .{})` to parse into typed structs
+- **JSON writing**: Use `std.json.Stringify` with `beginObject/objectField/write/endObject`
 - Use `std.io.Writer.Allocating` for building JSON strings
-- Use `std.io.AnyReader`/`AnyWriter` for type-erased streams
+
+## JSON Pattern (REQUIRED)
+
+**ALWAYS** define typed structs for JSON params and use `parseFromValue`:
+
+```zig
+// Define schema as struct
+const PromptParams = struct {
+    sessionId: []const u8,
+    prompt: ?[]const u8 = null,
+};
+
+// Parse in handler
+const parsed = std.json.parseFromValue(PromptParams, allocator, json_value, .{}) catch {
+    // handle error
+};
+defer parsed.deinit();
+const params = parsed.value;
+// Use params.sessionId, params.prompt
+```
+
+**NEVER** manually extract fields with `params.object.get("field")` chains.
 
 ## Architecture
 

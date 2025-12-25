@@ -229,40 +229,66 @@ const idx = work_index.fetchAdd(1, .monotonic);
 
 ## JSON Parsing
 
+### Parse JSON string into typed struct (PREFERRED)
+
 ```zig
-const parsed = try std.json.parseFromSlice(
-    std.json.Value,
-    allocator,
-    json_string,
-    .{}
-);
+const MyParams = struct {
+    name: []const u8,
+    count: i32 = 0,
+    optional_field: ?[]const u8 = null,
+};
+
+const parsed = try std.json.parseFromSlice(MyParams, allocator, json_string, .{});
+defer parsed.deinit();
+const params = parsed.value;
+// Use params.name, params.count, params.optional_field
+```
+
+### Parse json.Value into typed struct
+
+When you already have a `std.json.Value` (e.g., from JSON-RPC params):
+
+```zig
+const parsed = try std.json.parseFromValue(MyParams, allocator, json_value, .{});
+defer parsed.deinit();
+const params = parsed.value;
+```
+
+### Parse into dynamic Value (avoid if possible)
+
+```zig
+const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_string, .{});
 defer parsed.deinit();
 const obj = parsed.value.object;
 ```
 
 ## JSON Stringify
 
-Use `std.io.Writer.Allocating` with `std.json.Stringify`:
+Use `std.json.Stringify` for writing JSON:
 
 ```zig
-// Create allocating writer
 var out: std.io.Writer.Allocating = .init(allocator);
 defer out.deinit();
-const w = &out.writer;
+var jw: std.json.Stringify = .{ .writer = &out.writer };
 
-// For raw output
-try w.writeAll("prefix");
-try w.print("{d}", .{123});
+try jw.beginObject();
+try jw.objectField("name");
+try jw.write("value");
+try jw.objectField("count");
+try jw.write(42);
+try jw.objectField("nested");
+try jw.beginObject();
+try jw.objectField("inner");
+try jw.write(true);
+try jw.endObject();
+try jw.endObject();
 
-// For JSON values - use Stringify
-var jw: std.json.Stringify = .{ .writer = w };
-try my_json_value.jsonStringify(&jw);
+const result = try out.toOwnedSlice();  // {"name":"value","count":42,"nested":{"inner":true}}
+```
 
-// For encoding strings with escapes
-try std.json.Stringify.encodeJsonString(my_string, .{}, w);
-
-// Get result
-const result = try out.toOwnedSlice();  // caller owns memory
+For encoding strings with escapes:
+```zig
+try std.json.Stringify.encodeJsonString(my_string, .{}, &out.writer);
 ```
 
 **WRONG**: `value.jsonStringify(array_list.writer())` - ArrayList.Writer is NOT a Stringify!

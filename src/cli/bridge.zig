@@ -123,37 +123,37 @@ pub const Bridge = struct {
 
     /// Start Claude CLI process
     pub fn start(self: *Bridge, opts: StartOptions) !void {
-        var args = std.ArrayList([]const u8).init(self.allocator);
-        defer args.deinit();
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(self.allocator);
 
-        try args.append("claude");
-        try args.append("-p");
-        try args.append("--input-format");
-        try args.append("stream-json");
-        try args.append("--output-format");
-        try args.append("stream-json");
-        try args.append("--include-partial-messages");
+        try args.append(self.allocator, "claude");
+        try args.append(self.allocator, "-p");
+        try args.append(self.allocator, "--input-format");
+        try args.append(self.allocator, "stream-json");
+        try args.append(self.allocator, "--output-format");
+        try args.append(self.allocator, "stream-json");
+        try args.append(self.allocator, "--include-partial-messages");
 
         if (opts.resume_session_id) |sid| {
-            try args.append("--resume");
-            try args.append(sid);
+            try args.append(self.allocator, "--resume");
+            try args.append(self.allocator, sid);
         }
 
         if (opts.permission_mode) |mode| {
-            try args.append("--permission-mode");
-            try args.append(mode);
+            try args.append(self.allocator, "--permission-mode");
+            try args.append(self.allocator, mode);
         }
 
         if (opts.mcp_config) |config| {
-            try args.append("--mcp-config");
-            try args.append(config);
+            try args.append(self.allocator, "--mcp-config");
+            try args.append(self.allocator, config);
         }
 
         var child = std.process.Child.init(args.items, self.allocator);
         child.cwd = self.cwd;
-        child.stdin_behavior = .pipe;
-        child.stdout_behavior = .pipe;
-        child.stderr_behavior = .inherit;
+        child.stdin_behavior = .Pipe;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Inherit;
 
         try child.spawn();
         self.process = child;
@@ -202,11 +202,14 @@ pub const Bridge = struct {
         const proc = self.process orelse return error.NotStarted;
         const stdout = proc.stdout orelse return error.NoStdout;
 
-        var line_buf: [64 * 1024]u8 = undefined;
-        const line = stdout.reader().readUntilDelimiter(&line_buf, '\n') catch |e| switch (e) {
-            error.EndOfStream => return null,
-            else => return e,
-        };
+        var read_buf: [64 * 1024]u8 = undefined;
+        var file_reader = stdout.reader(&read_buf);
+        const reader = &file_reader.interface;
+
+        const line = reader.takeDelimiter('\n') catch |e| switch (e) {
+            error.ReadFailed => return null,
+            error.StreamTooLong => return error.LineTooLong,
+        } orelse return null;
 
         if (line.len == 0) return null;
 
@@ -231,19 +234,6 @@ pub const Bridge = struct {
             .raw = parsed.value,
             .arena = arena,
         };
-    }
-
-    /// Check if process is still running
-    pub fn isRunning(self: *Bridge) bool {
-        if (self.process) |*proc| {
-            const result = proc.wait() catch return false;
-            if (result.Exited != null or result.Signal != null) {
-                self.process = null;
-                return false;
-            }
-            return true;
-        }
-        return false;
     }
 };
 

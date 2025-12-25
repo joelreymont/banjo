@@ -113,68 +113,68 @@ fn parseRequestFromValue(value: std.json.Value) !Request {
     };
 }
 
-/// Serialize a response to JSON
+/// Serialize a response to JSON using std.json.Stringify
 pub fn serializeResponse(allocator: Allocator, response: Response) ![]u8 {
     var out: std.io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    const w = &out.writer;
+    var jw: std.json.Stringify = .{ .writer = &out.writer };
 
-    try w.writeAll("{\"jsonrpc\":\"2.0\"");
+    try jw.beginObject();
+    try jw.objectField("jsonrpc");
+    try jw.write("2.0");
 
     if (response.result) |result| {
-        try w.writeAll(",\"result\":");
-        try stringifyValue(result, w);
+        try jw.objectField("result");
+        try result.jsonStringify(&jw);
     }
 
     if (response.@"error") |err_val| {
-        try w.writeAll(",\"error\":{\"code\":");
-        try w.print("{d}", .{err_val.code});
-        try w.writeAll(",\"message\":");
-        try std.json.Stringify.encodeJsonString(err_val.message, .{}, w);
+        try jw.objectField("error");
+        try jw.beginObject();
+        try jw.objectField("code");
+        try jw.write(err_val.code);
+        try jw.objectField("message");
+        try jw.write(err_val.message);
         if (err_val.data) |data| {
-            try w.writeAll(",\"data\":");
-            try stringifyValue(data, w);
+            try jw.objectField("data");
+            try data.jsonStringify(&jw);
         }
-        try w.writeByte('}');
+        try jw.endObject();
     }
 
-    // Serialize id
-    try w.writeAll(",\"id\":");
+    try jw.objectField("id");
     if (response.id) |id| {
         switch (id) {
-            .string => |s| try std.json.Stringify.encodeJsonString(s, .{}, w),
-            .number => |n| try w.print("{d}", .{n}),
-            .null => try w.writeAll("null"),
+            .string => |s| try jw.write(s),
+            .number => |n| try jw.write(n),
+            .null => try jw.write(null),
         }
     } else {
-        try w.writeAll("null");
+        try jw.write(null);
     }
 
-    try w.writeByte('}');
+    try jw.endObject();
     return out.toOwnedSlice();
 }
 
-/// Stringify a JSON value using std.json.Stringify
-fn stringifyValue(value: std.json.Value, w: *std.io.Writer) !void {
-    var jw: std.json.Stringify = .{ .writer = w };
-    try value.jsonStringify(&jw);
-}
-
-/// Serialize a notification to JSON
+/// Serialize a notification to JSON using std.json.Stringify
 pub fn serializeNotification(allocator: Allocator, notification: Notification) ![]u8 {
     var out: std.io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    const w = &out.writer;
+    var jw: std.json.Stringify = .{ .writer = &out.writer };
 
-    try w.writeAll("{\"jsonrpc\":\"2.0\",\"method\":");
-    try std.json.Stringify.encodeJsonString(notification.method, .{}, w);
+    try jw.beginObject();
+    try jw.objectField("jsonrpc");
+    try jw.write("2.0");
+    try jw.objectField("method");
+    try jw.write(notification.method);
 
     if (notification.params) |params| {
-        try w.writeAll(",\"params\":");
-        try stringifyValue(params, w);
+        try jw.objectField("params");
+        try params.jsonStringify(&jw);
     }
 
-    try w.writeByte('}');
+    try jw.endObject();
     return out.toOwnedSlice();
 }
 
@@ -216,7 +216,8 @@ pub const Reader = struct {
 
         if (self.buffer.items.len == 0) return null;
 
-        return parseRequest(self.allocator, self.buffer.items);
+        const parsed = try parseRequest(self.allocator, self.buffer.items);
+        return parsed;
     }
 };
 

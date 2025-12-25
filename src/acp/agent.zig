@@ -8,6 +8,30 @@ const Settings = settings_loader.Settings;
 
 const log = std.log.scoped(.agent);
 
+// JSON-RPC method parameter schemas
+const NewSessionParams = struct {
+    cwd: []const u8 = ".",
+};
+
+const PromptParams = struct {
+    sessionId: []const u8,
+    prompt: ?[]const u8 = null,
+};
+
+const CancelParams = struct {
+    sessionId: []const u8,
+};
+
+const SetModeParams = struct {
+    sessionId: []const u8,
+    mode: []const u8,
+};
+
+const ResumeSessionParams = struct {
+    sessionId: []const u8,
+    cwd: []const u8 = ".",
+};
+
 pub const Agent = struct {
     allocator: Allocator,
     writer: jsonrpc.Writer,
@@ -172,23 +196,19 @@ pub const Agent = struct {
         // Generate session ID
         var uuid_bytes: [16]u8 = undefined;
         std.crypto.random.bytes(&uuid_bytes);
-        const session_id = try std.fmt.allocPrint(self.allocator, "{x:0>32}", .{std.fmt.fmtSliceHexLower(&uuid_bytes)});
+        const hex = std.fmt.bytesToHex(uuid_bytes, .lower);
+        const session_id = try self.allocator.dupe(u8, &hex);
 
-        // Parse cwd from params
-        var cwd: []const u8 = ".";
-        if (request.params) |params| {
-            if (params == .object) {
-                if (params.object.get("cwd")) |cwd_val| {
-                    if (cwd_val == .string) {
-                        cwd = cwd_val.string;
-                    }
-                }
-            }
-        }
+        // Parse params using typed struct
+        const parsed = try std.json.parseFromValue(NewSessionParams, self.allocator, request.params orelse .null, .{});
+        defer parsed.deinit();
+        const cwd = parsed.value.cwd;
 
         // Load settings from project directory
+        // Note: FileNotFound is handled internally by loader (returns empty settings)
+        // Other errors (parse failure, permission denied) mean settings file exists but is broken
         const settings = settings_loader.loadSettings(self.allocator, cwd) catch |err| blk: {
-            log.warn("Failed to load settings: {}", .{err});
+            log.err("Settings parse failed in {s}: {} - tool permissions disabled (all tools allowed)", .{ cwd, err });
             break :blk null;
         };
 
@@ -211,31 +231,20 @@ pub const Agent = struct {
     }
 
     fn handlePrompt(self: *Agent, request: jsonrpc.Request) !void {
-        // Parse params
-        var session_id: ?[]const u8 = null;
-        var prompt_text: ?[]const u8 = null;
-
-        if (request.params) |params| {
-            if (params == .object) {
-                if (params.object.get("sessionId")) |sid| {
-                    if (sid == .string) session_id = sid.string;
-                }
-                if (params.object.get("prompt")) |p| {
-                    if (p == .string) prompt_text = p.string;
-                }
-            }
-        }
-
-        if (session_id == null) {
+        // Parse params using typed struct
+        const parsed = std.json.parseFromValue(PromptParams, self.allocator, request.params orelse .null, .{}) catch {
             try self.writer.writeResponse(jsonrpc.Response.err(
                 request.id,
                 jsonrpc.Error.InvalidParams,
-                "Missing sessionId",
+                "Missing or invalid sessionId",
             ));
             return;
-        }
+        };
+        defer parsed.deinit();
+        const session_id = parsed.value.sessionId;
+        const prompt_text = parsed.value.prompt;
 
-        const session = self.sessions.get(session_id.?) orelse {
+        const session = self.sessions.get(session_id) orelse {
             try self.writer.writeResponse(jsonrpc.Response.err(
                 request.id,
                 jsonrpc.Error.InvalidParams,
@@ -245,7 +254,7 @@ pub const Agent = struct {
         };
 
         session.cancelled = false;
-        log.info("Prompt received for session {s}", .{session_id.?});
+        log.info("Prompt received for session {s}", .{session_id});
 
         // Start bridge if not running
         if (session.bridge == null) {
@@ -262,6 +271,8 @@ pub const Agent = struct {
 
         // Read and process CLI messages
         var stop_reason: []const u8 = "end_turn";
+        var stop_reason_owned: ?[]u8 = null;
+        defer if (stop_reason_owned) |s| self.allocator.free(s);
         const bridge = &session.bridge.?;
 
         while (!session.cancelled) {
@@ -275,7 +286,7 @@ pub const Agent = struct {
                 .assistant => {
                     // Forward text content as session update
                     if (msg.getContent()) |content| {
-                        try self.sendSessionUpdate(session_id.?, .{
+                        try self.sendSessionUpdate(session_id, .{
                             .kind = .text,
                             .content = content,
                         });
@@ -285,13 +296,13 @@ pub const Agent = struct {
                     if (msg.getToolName()) |tool_name| {
                         if (!session.isToolAllowed(tool_name)) {
                             log.warn("Tool {s} denied by settings", .{tool_name});
-                            try self.sendSessionUpdate(session_id.?, .{
+                            try self.sendSessionUpdate(session_id, .{
                                 .kind = .text,
                                 .content = "Tool execution blocked by settings.",
                             });
                             // Note: CLI will continue, we're just notifying user
                         } else {
-                            try self.sendSessionUpdate(session_id.?, .{
+                            try self.sendSessionUpdate(session_id, .{
                                 .kind = .tool_call,
                                 .title = tool_name,
                             });
@@ -300,7 +311,8 @@ pub const Agent = struct {
                 },
                 .result => {
                     if (msg.getStopReason()) |reason| {
-                        stop_reason = reason;
+                        stop_reason_owned = self.allocator.dupe(u8, reason) catch null;
+                        if (stop_reason_owned) |s| stop_reason = s;
                     }
                     break;
                 },
@@ -315,9 +327,9 @@ pub const Agent = struct {
                                 if (std.mem.indexOf(u8, content, "/login") != null or
                                     std.mem.indexOf(u8, content, "authenticate") != null)
                                 {
-                                    log.warn("Auth required for session {s}", .{session_id.?});
+                                    log.warn("Auth required for session {s}", .{session_id});
                                     // Send friendly message to user instead of error
-                                    try self.sendSessionUpdate(session_id.?, .{
+                                    try self.sendSessionUpdate(session_id, .{
                                         .kind = .text,
                                         .content = "Authentication required. Please run `claude /login` in your terminal, then try again.",
                                     });
@@ -343,56 +355,32 @@ pub const Agent = struct {
     }
 
     fn handleCancel(self: *Agent, request: jsonrpc.Request) !void {
-        var session_id: ?[]const u8 = null;
-        if (request.params) |params| {
-            if (params == .object) {
-                if (params.object.get("sessionId")) |sid| {
-                    if (sid == .string) {
-                        session_id = sid.string;
-                    }
-                }
-            }
-        }
+        const parsed = std.json.parseFromValue(CancelParams, self.allocator, request.params orelse .null, .{}) catch return;
+        defer parsed.deinit();
 
-        if (session_id) |sid| {
-            if (self.sessions.get(sid)) |session| {
-                session.cancelled = true;
-                // Stop the CLI bridge
-                if (session.bridge) |*bridge| {
-                    bridge.stop();
-                }
-                log.info("Cancelled session {s}", .{sid});
+        if (self.sessions.get(parsed.value.sessionId)) |session| {
+            session.cancelled = true;
+            if (session.bridge) |*bridge| {
+                bridge.stop();
             }
+            log.info("Cancelled session {s}", .{parsed.value.sessionId});
         }
         // Cancel is a notification, no response needed
     }
 
     fn handleSetMode(self: *Agent, request: jsonrpc.Request) !void {
-        // Parse session ID and mode
-        var session_id: ?[]const u8 = null;
-        var mode_str: ?[]const u8 = null;
-
-        if (request.params) |params| {
-            if (params == .object) {
-                if (params.object.get("sessionId")) |sid| {
-                    if (sid == .string) session_id = sid.string;
-                }
-                if (params.object.get("mode")) |m| {
-                    if (m == .string) mode_str = m.string;
-                }
-            }
-        }
-
-        if (session_id == null or mode_str == null) {
+        const parsed = std.json.parseFromValue(SetModeParams, self.allocator, request.params orelse .null, .{}) catch {
             try self.writer.writeResponse(jsonrpc.Response.err(
                 request.id,
                 jsonrpc.Error.InvalidParams,
                 "Missing sessionId or mode",
             ));
             return;
-        }
+        };
+        defer parsed.deinit();
+        const params = parsed.value;
 
-        const session = self.sessions.get(session_id.?) orelse {
+        const session = self.sessions.get(params.sessionId) orelse {
             try self.writer.writeResponse(jsonrpc.Response.err(
                 request.id,
                 jsonrpc.Error.InvalidParams,
@@ -401,53 +389,46 @@ pub const Agent = struct {
             return;
         };
 
-        // Parse mode
-        session.permission_mode = std.meta.stringToEnum(protocol.PermissionMode, mode_str.?) orelse .default;
-
-        log.info("Set mode for session {s} to {s}", .{ session_id.?, mode_str.? });
+        session.permission_mode = std.meta.stringToEnum(protocol.PermissionMode, params.mode) orelse .default;
+        log.info("Set mode for session {s} to {s}", .{ params.sessionId, params.mode });
 
         const result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
         try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
     }
 
     fn handleResumeSession(self: *Agent, request: jsonrpc.Request) !void {
-        var session_id: ?[]const u8 = null;
-        var cwd: []const u8 = ".";
-
-        if (request.params) |params| {
-            if (params == .object) {
-                if (params.object.get("sessionId")) |sid| {
-                    if (sid == .string) session_id = sid.string;
-                }
-                if (params.object.get("cwd")) |c| {
-                    if (c == .string) cwd = c.string;
-                }
-            }
-        }
-
-        if (session_id == null) {
+        const parsed = std.json.parseFromValue(ResumeSessionParams, self.allocator, request.params orelse .null, .{}) catch {
             try self.writer.writeResponse(jsonrpc.Response.err(
                 request.id,
                 jsonrpc.Error.InvalidParams,
                 "Missing sessionId",
             ));
             return;
+        };
+        defer parsed.deinit();
+        const params = parsed.value;
+
+        // Check if session already exists
+        if (self.sessions.get(params.sessionId)) |_| {
+            var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
+            try result.object.put("sessionId", .{ .string = params.sessionId });
+            try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
+            return;
         }
 
-        // Create or resume session
+        // Create new session
         const session = try self.allocator.create(Session);
-        const sid_copy = try self.allocator.dupe(u8, session_id.?);
+        const sid_copy = try self.allocator.dupe(u8, params.sessionId);
         session.* = .{
             .id = sid_copy,
-            .cwd = try self.allocator.dupe(u8, cwd),
+            .cwd = try self.allocator.dupe(u8, params.cwd),
         };
         try self.sessions.put(sid_copy, session);
 
-        log.info("Resumed session {s}", .{session_id.?});
+        log.info("Resumed session {s}", .{sid_copy});
 
-        const result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
-        try result.object.put("sessionId", .{ .string = session_id.? });
-
+        var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
+        try result.object.put("sessionId", .{ .string = sid_copy });
         try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
     }
 

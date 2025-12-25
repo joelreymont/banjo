@@ -9,14 +9,10 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Redirect stderr for logging (stdout is for ACP protocol)
-    const stderr = std.io.getStdErr().writer();
-    _ = stderr;
-
     log.info("Banjo ACP agent starting...", .{});
 
-    const stdin = std.io.getStdIn().reader().any();
-    const stdout = std.io.getStdOut().writer().any();
+    const stdin = std.fs.File.stdin().deprecatedReader().any();
+    const stdout = std.fs.File.stdout().deprecatedWriter().any();
 
     var reader = jsonrpc.Reader.init(allocator, stdin);
     defer reader.deinit();
@@ -52,5 +48,6 @@ test {
     _ = @import("acp/protocol.zig");
     _ = @import("cli/bridge.zig");
     _ = @import("settings/loader.zig");
+    _ = @import("tools/proxy.zig");
     _ = @import("util/quickcheck.zig");
 }
