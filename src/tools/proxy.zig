@@ -4,6 +4,21 @@ const jsonrpc = @import("../jsonrpc.zig");
 
 const log = std.log.scoped(.tool_proxy);
 
+// Request parameter schemas for Zed ACP
+const ReadFileParams = struct {
+    path: []const u8,
+};
+
+const WriteFileParams = struct {
+    path: []const u8,
+    content: []const u8,
+};
+
+const CreateTerminalParams = struct {
+    command: []const u8,
+    cwd: ?[]const u8 = null,
+};
+
 /// Tool proxy for delegating operations to Zed via ACP
 ///
 /// When Claude CLI wants to read/write files or execute commands,
@@ -19,7 +34,6 @@ pub const ToolProxy = struct {
 
     const PendingRequest = struct {
         method: []const u8,
-        callback: ?*const fn (result: std.json.Value) void = null,
     };
 
     pub fn init(allocator: Allocator, writer: *jsonrpc.Writer) ToolProxy {
@@ -39,18 +53,14 @@ pub const ToolProxy = struct {
         const request_id = self.next_request_id;
         self.next_request_id += 1;
 
-        var params = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
-        try params.object.put("path", .{ .string = path });
+        try self.writer.writeTypedRequest(
+            .{ .number = request_id },
+            "fs/readTextFile",
+            ReadFileParams{ .path = path },
+        );
 
-        // Send request to Zed
-        // Note: This requires bidirectional communication - agent sends request to client
-        log.debug("Requesting file read: {s}", .{path});
-
-        try self.pending_requests.put(request_id, .{ .method = "fs/read_text_file" });
-
-        // TODO: Actually send the request
-        // The current jsonrpc.Writer only supports Response and Notification,
-        // we'd need to add Request support for bidirectional communication
+        try self.pending_requests.put(request_id, .{ .method = "fs/readTextFile" });
+        log.debug("Sent readTextFile request {d}: {s}", .{ request_id, path });
 
         return request_id;
     }
@@ -60,13 +70,14 @@ pub const ToolProxy = struct {
         const request_id = self.next_request_id;
         self.next_request_id += 1;
 
-        var params = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
-        try params.object.put("path", .{ .string = path });
-        try params.object.put("content", .{ .string = content });
+        try self.writer.writeTypedRequest(
+            .{ .number = request_id },
+            "fs/writeTextFile",
+            WriteFileParams{ .path = path, .content = content },
+        );
 
-        log.debug("Requesting file write: {s}", .{path});
-
-        try self.pending_requests.put(request_id, .{ .method = "fs/write_text_file" });
+        try self.pending_requests.put(request_id, .{ .method = "fs/writeTextFile" });
+        log.debug("Sent writeTextFile request {d}: {s}", .{ request_id, path });
 
         return request_id;
     }
@@ -76,26 +87,37 @@ pub const ToolProxy = struct {
         const request_id = self.next_request_id;
         self.next_request_id += 1;
 
-        var params = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
-        try params.object.put("command", .{ .string = command });
-        if (cwd) |c| {
-            try params.object.put("cwd", .{ .string = c });
-        }
-
-        log.debug("Requesting terminal: {s}", .{command});
+        try self.writer.writeTypedRequest(
+            .{ .number = request_id },
+            "terminal/create",
+            CreateTerminalParams{ .command = command, .cwd = cwd },
+        );
 
         try self.pending_requests.put(request_id, .{ .method = "terminal/create" });
+        log.debug("Sent terminal/create request {d}: {s}", .{ request_id, command });
 
         return request_id;
     }
 
+    /// Check if a request is pending
+    pub fn isPending(self: *ToolProxy, request_id: i64) bool {
+        return self.pending_requests.contains(request_id);
+    }
+
     /// Handle a response from Zed
-    pub fn handleResponse(self: *ToolProxy, request_id: i64, result: std.json.Value) void {
+    pub fn handleResponse(self: *ToolProxy, request_id: i64, result: std.json.Value) ?[]const u8 {
         if (self.pending_requests.fetchRemove(request_id)) |entry| {
-            log.debug("Received response for {s}", .{entry.value.method});
-            if (entry.value.callback) |cb| {
-                cb(result);
-            }
+            log.debug("Received response for {s} (id={d})", .{ entry.value.method, request_id });
+            _ = result; // Caller should process result based on method
+            return entry.value.method;
+        }
+        return null;
+    }
+
+    /// Handle an error response from Zed
+    pub fn handleError(self: *ToolProxy, request_id: i64, err: jsonrpc.Error) void {
+        if (self.pending_requests.fetchRemove(request_id)) |entry| {
+            log.err("Request {s} (id={d}) failed: {s}", .{ entry.value.method, request_id, err.message });
         }
     }
 };
@@ -104,7 +126,22 @@ pub const ToolProxy = struct {
 const testing = std.testing;
 
 test "ToolProxy init/deinit" {
-    var writer: jsonrpc.Writer = undefined; // Not used in this test
+    var writer: jsonrpc.Writer = undefined;
     var proxy = ToolProxy.init(testing.allocator, &writer);
     defer proxy.deinit();
+}
+
+test "ToolProxy request tracking" {
+    var writer: jsonrpc.Writer = undefined;
+    var proxy = ToolProxy.init(testing.allocator, &writer);
+    defer proxy.deinit();
+
+    // Can't actually send requests without a real writer, but we can test tracking
+    try proxy.pending_requests.put(1, .{ .method = "test" });
+    try testing.expect(proxy.isPending(1));
+    try testing.expect(!proxy.isPending(2));
+
+    const method = proxy.handleResponse(1, .null);
+    try testing.expectEqualStrings("test", method.?);
+    try testing.expect(!proxy.isPending(1));
 }

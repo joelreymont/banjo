@@ -178,6 +178,36 @@ pub fn serializeNotification(allocator: Allocator, notification: Notification) !
     return out.toOwnedSlice();
 }
 
+/// Serialize a request to JSON using std.json.Stringify
+pub fn serializeRequest(allocator: Allocator, request: Request) ![]u8 {
+    var out: std.io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var jw: std.json.Stringify = .{ .writer = &out.writer };
+
+    try jw.beginObject();
+    try jw.objectField("jsonrpc");
+    try jw.write("2.0");
+    try jw.objectField("method");
+    try jw.write(request.method);
+
+    if (request.params) |params| {
+        try jw.objectField("params");
+        try params.jsonStringify(&jw);
+    }
+
+    if (request.id) |id| {
+        try jw.objectField("id");
+        switch (id) {
+            .string => |s| try jw.write(s),
+            .number => |n| try jw.write(n),
+            .null => try jw.write(null),
+        }
+    }
+
+    try jw.endObject();
+    return out.toOwnedSlice();
+}
+
 /// JSON-RPC message reader - reads newline-delimited JSON from a stream
 pub const Reader = struct {
     stream: std.io.AnyReader,
@@ -271,6 +301,41 @@ pub const Writer = struct {
 
     pub fn writeNotification(self: *Writer, notification: Notification) !void {
         const json = try serializeNotification(self.allocator, notification);
+        defer self.allocator.free(json);
+        try self.stream.writeAll(json);
+        try self.stream.writeByte('\n');
+    }
+
+    /// Write a request (for bidirectional communication)
+    pub fn writeRequest(self: *Writer, request: Request) !void {
+        const json = try serializeRequest(self.allocator, request);
+        defer self.allocator.free(json);
+        try self.stream.writeAll(json);
+        try self.stream.writeByte('\n');
+    }
+
+    /// Write a request with typed params (avoids Value intermediary)
+    pub fn writeTypedRequest(self: *Writer, id: Request.Id, method: []const u8, params: anytype) !void {
+        var out: std.io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        var jw: std.json.Stringify = .{ .writer = &out.writer };
+
+        try jw.beginObject();
+        try jw.objectField("jsonrpc");
+        try jw.write("2.0");
+        try jw.objectField("method");
+        try jw.write(method);
+        try jw.objectField("params");
+        try std.json.stringify(params, .{}, &out.writer);
+        try jw.objectField("id");
+        switch (id) {
+            .string => |s| try jw.write(s),
+            .number => |n| try jw.write(n),
+            .null => try jw.write(null),
+        }
+        try jw.endObject();
+
+        const json = try out.toOwnedSlice();
         defer self.allocator.free(json);
         try self.stream.writeAll(json);
         try self.stream.writeByte('\n');
