@@ -4,12 +4,20 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Get git commit hash
+    const git_hash = b.run(&.{ "git", "rev-parse", "--short", "HEAD" });
+
+    // Build options for version info
+    const options = b.addOptions();
+    options.addOption([]const u8, "git_hash", std.mem.trim(u8, git_hash, "\n\r "));
+
     // Main module
     const main_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    main_mod.addOptions("config", options);
 
     // Main executable
     const exe = b.addExecutable(.{
@@ -35,6 +43,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    test_mod.addOptions("config", options);
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,

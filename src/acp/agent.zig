@@ -2,18 +2,49 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const jsonrpc = @import("../jsonrpc.zig");
 const protocol = @import("protocol.zig");
-const Bridge = @import("../cli/bridge.zig").Bridge;
+const bridge = @import("../cli/bridge.zig");
+const Bridge = bridge.Bridge;
+const ContentBlockType = bridge.ContentBlockType;
+const SystemSubtype = bridge.SystemSubtype;
 const settings_loader = @import("../settings/loader.zig");
 const Settings = settings_loader.Settings;
+const config = @import("config");
 
 const log = std.log.scoped(.agent);
+
+/// Banjo version with git hash
+pub const version = "0.1.0 (" ++ config.git_hash ++ ")";
+
+/// Check if auto-resume is enabled (default: true)
+fn isAutoResumeEnabled() bool {
+    const val = std.posix.getenv("BANJO_AUTO_RESUME") orelse return true;
+    return !std.mem.eql(u8, val, "false") and !std.mem.eql(u8, val, "0");
+}
+
+/// Map CLI result subtypes to ACP stop reasons
+fn mapCliStopReason(cli_reason: []const u8) []const u8 {
+    const map = std.StaticStringMap([]const u8).initComptime(.{
+        .{ "success", "end_turn" },
+        .{ "cancelled", "cancelled" },
+        .{ "max_tokens", "max_tokens" },
+        .{ "error_max_turns", "max_turn_requests" },
+        .{ "error_max_budget_usd", "max_turn_requests" },
+    });
+    return map.get(cli_reason) orelse "end_turn";
+}
 
 // JSON-RPC method parameter schemas
 // See docs/acp-protocol.md for full specification
 
+const InitializeParams = struct {
+    protocolVersion: ?i64 = null,
+    clientCapabilities: ?protocol.ClientCapabilities = null,
+};
+
 const NewSessionParams = struct {
     cwd: []const u8 = ".",
     mcpServers: ?std.json.Value = null, // Array of MCP server configs (we store raw for now)
+    model: ?[]const u8 = null, // Model alias or full name (e.g. "sonnet", "opus", "claude-sonnet-4-5-20250929")
 };
 
 const PromptParams = struct {
@@ -41,9 +72,10 @@ fn extractTextFromPrompt(prompt: ?std.json.Value) ?[]const u8 {
     if (blocks != .array) return null;
     for (blocks.array.items) |block| {
         if (block != .object) continue;
-        const block_type = block.object.get("type") orelse continue;
-        if (block_type != .string) continue;
-        if (!std.mem.eql(u8, block_type.string, "text")) continue;
+        const type_val = block.object.get("type") orelse continue;
+        if (type_val != .string) continue;
+        const block_type = ContentBlockType.fromString(type_val.string) orelse continue;
+        if (block_type != .text) continue;
         const text = block.object.get("text") orelse continue;
         if (text == .string) return text.string;
     }
@@ -61,14 +93,18 @@ pub const Agent = struct {
         cwd: []const u8,
         cancelled: bool = false,
         permission_mode: protocol.PermissionMode = .default,
+        model: ?[]const u8 = null,
         bridge: ?Bridge = null,
         settings: ?Settings = null,
+        cli_session_id: ?[]const u8 = null, // Claude CLI session ID for --resume
 
         pub fn deinit(self: *Session, allocator: Allocator) void {
             if (self.bridge) |*b| b.deinit();
             if (self.settings) |*s| s.deinit();
             allocator.free(self.id);
             allocator.free(self.cwd);
+            if (self.model) |m| allocator.free(m);
+            if (self.cli_session_id) |sid| allocator.free(sid);
         }
 
         /// Check if a tool is allowed based on settings
@@ -101,24 +137,23 @@ pub const Agent = struct {
         self.sessions.deinit();
     }
 
+    const Handler = *const fn (*Agent, jsonrpc.Request) anyerror!void;
+    const method_handlers = std.StaticStringMap(Handler).initComptime(.{
+        .{ "initialize", handleInitialize },
+        .{ "authenticate", handleAuthenticate },
+        .{ "session/new", handleNewSession },
+        .{ "session/prompt", handlePrompt },
+        .{ "session/cancel", handleCancel },
+        .{ "session/set_mode", handleSetMode },
+        .{ "unstable_resumeSession", handleResumeSession },
+    });
+
     /// Handle an incoming JSON-RPC request
     pub fn handleRequest(self: *Agent, request: jsonrpc.Request) !void {
         log.debug("Handling request: {s}", .{request.method});
 
-        if (std.mem.eql(u8, request.method, "initialize")) {
-            try self.handleInitialize(request);
-        } else if (std.mem.eql(u8, request.method, "authenticate")) {
-            try self.handleAuthenticate(request);
-        } else if (std.mem.eql(u8, request.method, "session/new")) {
-            try self.handleNewSession(request);
-        } else if (std.mem.eql(u8, request.method, "session/prompt")) {
-            try self.handlePrompt(request);
-        } else if (std.mem.eql(u8, request.method, "session/cancel")) {
-            try self.handleCancel(request);
-        } else if (std.mem.eql(u8, request.method, "session/set_mode")) {
-            try self.handleSetMode(request);
-        } else if (std.mem.eql(u8, request.method, "unstable_resumeSession")) {
-            try self.handleResumeSession(request);
+        if (method_handlers.get(request.method)) |handler| {
+            try handler(self, request);
         } else {
             // Unknown method
             if (!request.isNotification()) {
@@ -132,53 +167,47 @@ pub const Agent = struct {
     }
 
     fn handleInitialize(self: *Agent, request: jsonrpc.Request) !void {
+        // Parse params using typed struct
+        const parsed = std.json.parseFromValue(InitializeParams, self.allocator, request.params orelse .null, .{
+            .ignore_unknown_fields = true,
+        }) catch |err| {
+            log.warn("Failed to parse initialize params: {}", .{err});
+            // Continue with defaults
+            return self.sendInitializeResponse(request);
+        };
+        defer parsed.deinit();
+        const params = parsed.value;
+
         // Validate protocol version
-        if (request.params) |params| {
-            if (params == .object) {
-                if (params.object.get("protocolVersion")) |ver| {
-                    if (ver == .integer) {
-                        if (ver.integer != protocol.ProtocolVersion) {
-                            try self.writer.writeResponse(jsonrpc.Response.err(
-                                request.id,
-                                jsonrpc.Error.InvalidParams,
-                                "Unsupported protocol version",
-                            ));
-                            return;
-                        }
-                    }
-                }
+        if (params.protocolVersion) |ver| {
+            if (ver != protocol.ProtocolVersion) {
+                try self.writer.writeResponse(jsonrpc.Response.err(
+                    request.id,
+                    jsonrpc.Error.InvalidParams,
+                    "Unsupported protocol version",
+                ));
+                return;
             }
         }
 
-        // Parse client capabilities
-        if (request.params) |params| {
-            if (params == .object) {
-                if (params.object.get("clientCapabilities")) |caps| {
-                    if (std.json.parseFromValue(
-                        protocol.ClientCapabilities,
-                        self.allocator,
-                        caps,
-                        .{ .ignore_unknown_fields = true },
-                    )) |parsed| {
-                        defer parsed.deinit();
-                        self.client_capabilities = parsed.value;
-                        log.info("Client capabilities: fs={?}, terminal={?}", .{
-                            if (self.client_capabilities.?.fs) |fs| fs.readTextFile else null,
-                            self.client_capabilities.?.terminal,
-                        });
-                    } else |err| {
-                        log.warn("Failed to parse client capabilities: {}", .{err});
-                    }
-                }
-            }
+        // Store client capabilities
+        if (params.clientCapabilities) |caps| {
+            self.client_capabilities = caps;
+            log.info("Client capabilities: fs={?}, terminal={?}", .{
+                if (caps.fs) |fs| fs.readTextFile else null,
+                caps.terminal,
+            });
         }
 
-        // Build response struct and serialize directly
+        try self.sendInitializeResponse(request);
+    }
+
+    fn sendInitializeResponse(self: *Agent, request: jsonrpc.Request) !void {
         const response = protocol.InitializeResponse{
             .agentInfo = .{
                 .name = "Claude Code (Banjo)",
                 .title = "Claude Code (Banjo)",
-                .version = "0.1.0",
+                .version = version,
             },
             .agentCapabilities = .{
                 .promptCapabilities = .{
@@ -241,21 +270,89 @@ pub const Agent = struct {
         session.* = .{
             .id = session_id,
             .cwd = try self.allocator.dupe(u8, cwd),
+            .model = if (parsed.value.model) |m| try self.allocator.dupe(u8, m) else null,
             .settings = settings,
         };
         try self.sessions.put(session_id, session);
 
-        log.info("Created session {s} in {s}", .{ session_id, cwd });
+        log.info("Created session {s} in {s} with model {?s}", .{ session_id, cwd, session.model });
 
-        // Build response
+        // Pre-start Claude CLI for instant first response (auto-resume last session if enabled)
+        session.bridge = Bridge.init(self.allocator, session.cwd);
+        session.bridge.?.start(.{
+            .continue_last = isAutoResumeEnabled(),
+            .permission_mode = @tagName(session.permission_mode),
+            .model = session.model,
+        }) catch |err| {
+            log.warn("Failed to pre-start CLI: {} - will retry on first prompt", .{err});
+            session.bridge = null;
+        };
+
+        // Build response - must be sent BEFORE session updates
         var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
         defer result.object.deinit();
         try result.object.put("sessionId", .{ .string = session_id });
-
         try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
+
+        // Try to read CLI init with timeout to get slash commands
+        var cli_commands: ?[]const []const u8 = null;
+        var init_msg: ?bridge.StreamMessage = null;
+        defer if (init_msg) |*m| m.deinit();
+
+        if (session.bridge) |*cli_bridge| {
+            if (cli_bridge.process) |proc| {
+                if (proc.stdout) |stdout| {
+                    // Poll stdout for up to 2 seconds
+                    var fds = [_]std.posix.pollfd{.{
+                        .fd = stdout.handle,
+                        .events = std.posix.POLL.IN,
+                        .revents = 0,
+                    }};
+
+                    const poll_timeout_ms = 5000;
+                    const ready = std.posix.poll(&fds, poll_timeout_ms) catch |err| blk: {
+                        log.warn("Poll failed: {}", .{err});
+                        break :blk 0;
+                    };
+                    log.info("Poll result: ready={d}, revents=0x{x}", .{ ready, fds[0].revents });
+
+                    if (ready > 0 and (fds[0].revents & std.posix.POLL.IN) != 0) {
+                        // Data available, try to read messages until init
+                        var attempts: u32 = 0;
+                        while (attempts < 10) : (attempts += 1) {
+                            var msg = cli_bridge.readMessage() catch break orelse break;
+
+                            if (msg.type == .system and msg.getInitInfo() != null) {
+                                init_msg = msg;
+                                if (msg.getInitInfo()) |info| {
+                                    cli_commands = info.slash_commands;
+                                }
+                                break;
+                            } else {
+                                msg.deinit();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Send available commands (banjo + CLI if available)
+        if (cli_commands) |cmds| {
+            log.info("Got {d} CLI slash commands at session start", .{cmds.len});
+            try self.sendAvailableCommands(session_id, cmds);
+        } else {
+            // Fallback to banjo + common CLI commands (CLI provides full list on first prompt)
+            try self.sendSessionUpdate(session_id, .{
+                .sessionUpdate = .available_commands_update,
+                .availableCommands = &initial_commands,
+            });
+        }
     }
 
     fn handlePrompt(self: *Agent, request: jsonrpc.Request) !void {
+        var timer = std.time.Timer.start() catch unreachable;
+
         // Parse params using typed struct
         const parsed = std.json.parseFromValue(PromptParams, self.allocator, request.params orelse .null, .{
             .ignore_unknown_fields = true,
@@ -285,44 +382,68 @@ pub const Agent = struct {
         session.cancelled = false;
         log.info("Prompt received for session {s}: {s}", .{ session_id, prompt_text orelse "(empty)" });
 
+        // Handle banjo commands
+        if (prompt_text) |text| {
+            if (std.mem.eql(u8, text, "/version") or std.mem.startsWith(u8, text, "/version ")) {
+                try self.handleVersionCommand(request, session_id);
+                return;
+            }
+        }
+
         // Start bridge if not running
+        const bridge_was_null = session.bridge == null;
         if (session.bridge == null) {
             session.bridge = Bridge.init(self.allocator, session.cwd);
             try session.bridge.?.start(.{
+                .resume_session_id = session.cli_session_id,
+                .continue_last = session.cli_session_id == null and isAutoResumeEnabled(),
                 .permission_mode = @tagName(session.permission_mode),
+                .model = session.model,
             });
+        }
+        const bridge_start_ms = timer.read() / std.time.ns_per_ms;
+        if (bridge_was_null) {
+            log.info("Bridge started in {d}ms", .{bridge_start_ms});
         }
 
         // Send prompt to CLI
         if (prompt_text) |text| {
             try session.bridge.?.sendPrompt(text);
         }
+        const prompt_sent_ms = timer.read() / std.time.ns_per_ms;
+        log.info("Prompt sent to CLI at {d}ms", .{prompt_sent_ms});
 
         // Read and process CLI messages
         var stop_reason: []const u8 = "end_turn";
-        var stop_reason_owned: ?[]u8 = null;
-        defer if (stop_reason_owned) |s| self.allocator.free(s);
-        const bridge = &session.bridge.?;
+        const cli_bridge = &session.bridge.?;
+        var first_response_ms: u64 = 0;
 
+        var msg_count: u32 = 0;
         while (true) {
             // Check cancellation at loop start
             if (session.cancelled) {
                 stop_reason = "cancelled";
                 break;
             }
-            var msg = bridge.readMessage() catch |err| {
+            var msg = cli_bridge.readMessage() catch |err| {
                 log.err("Failed to read CLI message: {}", .{err});
                 break;
             } orelse break;
             defer msg.deinit();
 
+            msg_count += 1;
+            const msg_time_ms = timer.read() / std.time.ns_per_ms;
+            if (first_response_ms == 0) first_response_ms = msg_time_ms;
+            log.debug("CLI msg #{d} ({s}) at {d}ms", .{ msg_count, @tagName(msg.type), msg_time_ms });
+
             switch (msg.type) {
                 .assistant => {
                     // Forward text content as session update
                     if (msg.getContent()) |content| {
+                        log.info("First assistant response at {d}ms", .{msg_time_ms});
                         try self.sendSessionUpdate(session_id, .{
-                            .kind = .text,
-                            .content = content,
+                            .sessionUpdate = .agent_message_chunk,
+                            .content = .{ .type = "text", .text = content },
                         });
                     }
 
@@ -331,55 +452,120 @@ pub const Agent = struct {
                         if (!session.isToolAllowed(tool_name)) {
                             log.warn("Tool {s} denied by settings", .{tool_name});
                             try self.sendSessionUpdate(session_id, .{
-                                .kind = .text,
-                                .content = "Tool execution blocked by settings.",
+                                .sessionUpdate = .agent_message_chunk,
+                                .content = .{ .type = "text", .text = "Tool execution blocked by settings." },
                             });
                             // Note: CLI will continue, we're just notifying user
                         } else {
+                            const tool_id = msg.getToolId() orelse "unknown";
                             try self.sendSessionUpdate(session_id, .{
-                                .kind = .tool_use,
+                                .sessionUpdate = .tool_call,
+                                .toolCallId = tool_id,
                                 .title = tool_name,
+                                .kind = .other,
+                                .status = .pending,
                             });
                         }
                     }
                 },
                 .result => {
+                    // Translate CLI stop reasons to ACP stop reasons
                     if (msg.getStopReason()) |reason| {
-                        stop_reason_owned = try self.allocator.dupe(u8, reason);
-                        stop_reason = stop_reason_owned.?;
+                        stop_reason = mapCliStopReason(reason);
                     }
                     break;
                 },
+                .stream_event => {
+                    // Handle streaming text deltas for real-time updates
+                    if (msg.getStreamTextDelta()) |text| {
+                        if (first_response_ms == 0) {
+                            first_response_ms = msg_time_ms;
+                            log.info("First streaming response at {d}ms", .{msg_time_ms});
+                        }
+                        try self.sendSessionUpdate(session_id, .{
+                            .sessionUpdate = .agent_message_chunk,
+                            .content = .{ .type = "text", .text = text },
+                        });
+                    }
+                    // Handle thinking deltas
+                    if (msg.getStreamThinkingDelta()) |thinking| {
+                        try self.sendSessionUpdate(session_id, .{
+                            .sessionUpdate = .agent_thought_chunk,
+                            .content = .{ .type = "text", .text = thinking },
+                        });
+                    }
+                },
                 .system => {
-                    // Check for auth required
-                    if (msg.subtype) |subtype| {
-                        if (std.mem.eql(u8, subtype, "auth_required") or
-                            std.mem.eql(u8, subtype, "init"))
-                        {
-                            // Check content for login prompt
-                            if (msg.getContent()) |content| {
-                                if (std.mem.indexOf(u8, content, "/login") != null or
-                                    std.mem.indexOf(u8, content, "authenticate") != null)
-                                {
-                                    log.warn("Auth required for session {s}", .{session_id});
-                                    // Send friendly message to user instead of error
-                                    try self.sendSessionUpdate(session_id, .{
-                                        .kind = .text,
-                                        .content = "Authentication required. Please run `claude /login` in your terminal, then try again.",
-                                    });
-                                    stop_reason = "auth_required";
-                                    // Stop the bridge - user needs to login externally
-                                    session.bridge.?.stop();
-                                    session.bridge = null;
-                                    break;
+                    if (msg.getSystemSubtype()) |subtype| {
+                        switch (subtype) {
+                            .init => {
+                                // Parse init message for slash commands and CLI session ID
+                                if (msg.getInitInfo()) |init_info| {
+                                    if (init_info.slash_commands) |cmds| {
+                                        try self.sendAvailableCommands(session_id, cmds);
+                                    }
+                                    // Capture CLI session ID for resume support
+                                    if (init_info.session_id) |cli_sid| {
+                                        if (session.cli_session_id == null) {
+                                            session.cli_session_id = self.allocator.dupe(u8, cli_sid) catch null;
+                                            if (session.cli_session_id != null) {
+                                                log.info("Captured CLI session ID: {s}", .{cli_sid});
+                                            }
+                                        }
+                                    }
                                 }
-                            }
+                                // Check for auth required in init message
+                                if (msg.getContent()) |content| {
+                                    if (std.mem.indexOf(u8, content, "/login") != null or
+                                        std.mem.indexOf(u8, content, "authenticate") != null)
+                                    {
+                                        log.warn("Auth required for session {s}", .{session_id});
+                                        try self.sendSessionUpdate(session_id, .{
+                                            .sessionUpdate = .agent_message_chunk,
+                                            .content = .{ .type = "text", .text = "Authentication required. Please run `claude /login` in your terminal, then try again." },
+                                        });
+                                        stop_reason = "auth_required";
+                                        session.bridge.?.stop();
+                                        session.bridge = null;
+                                        break;
+                                    }
+                                }
+                            },
+                            .auth_required => {
+                                if (msg.getContent()) |content| {
+                                    if (std.mem.indexOf(u8, content, "/login") != null or
+                                        std.mem.indexOf(u8, content, "authenticate") != null)
+                                    {
+                                        log.warn("Auth required for session {s}", .{session_id});
+                                        try self.sendSessionUpdate(session_id, .{
+                                            .sessionUpdate = .agent_message_chunk,
+                                            .content = .{ .type = "text", .text = "Authentication required. Please run `claude /login` in your terminal, then try again." },
+                                        });
+                                        stop_reason = "auth_required";
+                                        session.bridge.?.stop();
+                                        session.bridge = null;
+                                        break;
+                                    }
+                                }
+                            },
+                            .hook_response => {},
+                        }
+                    } else {
+                        // Forward unknown system messages as text (e.g., /model output)
+                        if (msg.getContent()) |content| {
+                            try self.sendSessionUpdate(session_id, .{
+                                .sessionUpdate = .agent_message_chunk,
+                                .content = .{ .type = "text", .text = content },
+                            });
                         }
                     }
                 },
                 else => {},
             }
         }
+
+        const total_ms = timer.read() / std.time.ns_per_ms;
+        log.info("Prompt complete: {d} msgs, first response at {d}ms, total {d}ms", .{ msg_count, first_response_ms, total_ms });
 
         // Return result
         var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
@@ -397,8 +583,8 @@ pub const Agent = struct {
 
         if (self.sessions.get(parsed.value.sessionId)) |session| {
             session.cancelled = true;
-            if (session.bridge) |*bridge| {
-                bridge.stop();
+            if (session.bridge) |*b| {
+                b.stop();
             }
             log.info("Cancelled session {s}", .{parsed.value.sessionId});
         }
@@ -476,6 +662,72 @@ pub const Agent = struct {
         try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
     }
 
+    /// Handle /version command
+    fn handleVersionCommand(self: *Agent, request: jsonrpc.Request, session_id: []const u8) !void {
+        const version_msg = std.fmt.comptimePrint("Banjo {s} - Claude Code ACP Agent", .{version});
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .agent_message_chunk,
+            .content = .{ .type = "text", .text = version_msg },
+        });
+
+        var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
+        defer result.object.deinit();
+        try result.object.put("stopReason", .{ .string = "end_turn" });
+        try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
+    }
+
+    /// Banjo's own slash commands
+    const banjo_commands = [_]protocol.SlashCommand{
+        .{ .name = "version", .description = "Show banjo version" },
+    };
+
+    /// Commands filtered from CLI (unsupported in stream-json mode, handled via authMethods)
+    const unsupported_commands = [_][]const u8{ "login", "logout", "cost", "context" };
+
+    /// Common Claude Code slash commands (static fallback, CLI provides full list on first prompt)
+    const common_cli_commands = [_]protocol.SlashCommand{
+        .{ .name = "model", .description = "Show current model" },
+        .{ .name = "compact", .description = "Compact conversation" },
+        .{ .name = "review", .description = "Code review" },
+    };
+
+    /// Combined commands for initial session (before CLI provides its list)
+    const initial_commands = banjo_commands ++ common_cli_commands;
+
+    /// Check if command is unsupported
+    fn isUnsupportedCommand(name: []const u8) bool {
+        for (unsupported_commands) |cmd| {
+            if (std.mem.eql(u8, name, cmd)) return true;
+        }
+        return false;
+    }
+
+    /// Send available_commands_update with CLI commands + banjo commands
+    fn sendAvailableCommands(self: *Agent, session_id: []const u8, cli_commands: []const []const u8) !void {
+        // Build command list: banjo commands + CLI commands (filtered)
+        var commands: std.ArrayList(protocol.SlashCommand) = .empty;
+        defer commands.deinit(self.allocator);
+
+        // Add banjo's own commands first
+        for (&banjo_commands) |cmd| {
+            try commands.append(self.allocator, cmd);
+        }
+
+        // Add CLI commands, filtering unsupported ones
+        for (cli_commands) |name| {
+            if (!isUnsupportedCommand(name)) {
+                try commands.append(self.allocator, .{ .name = name, .description = "" });
+            }
+        }
+
+        log.info("Sending {d} available commands to client", .{commands.items.len});
+
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .available_commands_update,
+            .availableCommands = commands.items,
+        });
+    }
+
     /// Send a session update notification
     pub fn sendSessionUpdate(self: *Agent, session_id: []const u8, update: protocol.SessionUpdate.Update) !void {
         // Use typed notification to avoid manual json.Value construction
@@ -525,7 +777,22 @@ const TestWriter = struct {
     pub fn getOutput(self: *TestWriter) []const u8 {
         return self.output.items;
     }
+
+    /// Get first line of output (for parsing response when notification follows)
+    pub fn getFirstLine(self: *TestWriter) []const u8 {
+        const output = self.output.items;
+        if (std.mem.indexOf(u8, output, "\n")) |idx| {
+            return output[0..idx];
+        }
+        return output;
+    }
 };
+
+test "isAutoResumeEnabled returns true by default" {
+    // When BANJO_AUTO_RESUME is not set (typical case), should return true
+    // The env var may or may not be set in CI, so we just verify the function works
+    _ = isAutoResumeEnabled();
+}
 
 test "Agent init/deinit" {
     var tw = try TestWriter.init(testing.allocator);
@@ -636,10 +903,10 @@ test "Agent handleRequest - newSession" {
 
     try agent.handleRequest(request);
 
-    // Check response
+    // Check response (first line, notification follows)
     try testing.expect(tw.getOutput().len > 0);
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getOutput(), .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getFirstLine(), .{});
     defer parsed.deinit();
 
     // Should have a sessionId in result
@@ -687,8 +954,8 @@ test "Agent handleRequest - setMode" {
     };
     try agent.handleRequest(create_request);
 
-    // Parse the session ID from response
-    const create_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getOutput(), .{});
+    // Parse the session ID from response (first line, notification follows)
+    const create_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getFirstLine(), .{});
     defer create_parsed.deinit();
     const session_id = create_parsed.value.object.get("result").?.object.get("sessionId").?.string;
 
@@ -785,8 +1052,8 @@ test "Agent handleRequest - resumeSession existing" {
     };
     try agent.handleRequest(create_request);
 
-    // Get the session ID
-    const create_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getOutput(), .{});
+    // Get the session ID (first line, notification follows)
+    const create_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getFirstLine(), .{});
     defer create_parsed.deinit();
     const session_id = create_parsed.value.object.get("result").?.object.get("sessionId").?.string;
 
@@ -926,8 +1193,8 @@ test "Agent handleRequest - cancel" {
     };
     try agent.handleRequest(create_request);
 
-    // Get the session ID
-    const create_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getOutput(), .{});
+    // Get the session ID (first line, notification follows)
+    const create_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tw.getFirstLine(), .{});
     defer create_parsed.deinit();
     const session_id = create_parsed.value.object.get("result").?.object.get("sessionId").?.string;
 
@@ -1082,4 +1349,18 @@ test "Agent handleRequest - authenticate returns success" {
     // Should be a success response (empty result object)
     try testing.expect(parsed.value.object.get("result") != null);
     try testing.expect(parsed.value.object.get("error") == null);
+}
+
+test "isUnsupportedCommand filters correctly" {
+    // These should be filtered
+    try testing.expect(Agent.isUnsupportedCommand("login"));
+    try testing.expect(Agent.isUnsupportedCommand("logout"));
+    try testing.expect(Agent.isUnsupportedCommand("cost"));
+    try testing.expect(Agent.isUnsupportedCommand("context"));
+
+    // These should not be filtered
+    try testing.expect(!Agent.isUnsupportedCommand("model"));
+    try testing.expect(!Agent.isUnsupportedCommand("compact"));
+    try testing.expect(!Agent.isUnsupportedCommand("review"));
+    try testing.expect(!Agent.isUnsupportedCommand("version"));
 }

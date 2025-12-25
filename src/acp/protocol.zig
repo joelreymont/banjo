@@ -136,42 +136,67 @@ pub const StopReason = enum {
 // Session Update (Notification)
 // =============================================================================
 
+/// Wire format: { "sessionId": "...", "update": { "sessionUpdate": "...", ... } }
 pub const SessionUpdate = struct {
     sessionId: []const u8,
     update: Update,
 
+    /// The update payload with sessionUpdate discriminator
     pub const Update = struct {
-        kind: UpdateKind,
-        content: ?[]const u8 = null,
-        title: ?[]const u8 = null,
+        sessionUpdate: UpdateType,
+        // Content for message chunks
+        content: ?ContentChunk = null,
+        // Tool call fields
         toolCallId: ?[]const u8 = null,
-        toolKind: ?ToolKind = null,
+        title: ?[]const u8 = null,
+        kind: ?ToolKind = null,
+        status: ?ToolCallStatus = null,
+        rawInput: ?std.json.Value = null,
+        // Plan fields
         entries: ?[]const PlanEntry = null,
+        // Mode update
+        currentModeId: ?[]const u8 = null,
+        // Available commands update
+        availableCommands: ?[]const SlashCommand = null,
     };
 
-    pub const UpdateKind = enum {
-        text,
-        tool_use,
-        tool_result,
-        thinking,
+    pub const UpdateType = enum {
+        agent_message_chunk,
+        user_message_chunk,
+        agent_thought_chunk,
+        tool_call,
+        tool_call_update,
         plan,
-        @"error",
+        available_commands_update,
+        current_mode_update,
+    };
+
+    pub const ContentChunk = struct {
+        type: []const u8 = "text",
+        text: ?[]const u8 = null,
+        data: ?[]const u8 = null,
+        mediaType: ?[]const u8 = null,
     };
 
     pub const ToolKind = enum {
         read,
         write,
         edit,
-        execute,
-        think,
-        search,
-        fetch,
+        command,
+        other,
+    };
+
+    pub const ToolCallStatus = enum {
+        pending,
+        in_progress,
+        completed,
+        failed,
     };
 
     pub const PlanEntry = struct {
+        id: []const u8,
         content: []const u8,
         status: PlanStatus,
-        priority: []const u8 = "medium",
     };
 
     pub const PlanStatus = enum {
@@ -179,6 +204,30 @@ pub const SessionUpdate = struct {
         in_progress,
         completed,
     };
+
+    // Convenience constructors
+    pub fn textChunk(session_id: []const u8, text: []const u8) SessionUpdate {
+        return .{
+            .sessionId = session_id,
+            .update = .{
+                .sessionUpdate = .agent_message_chunk,
+                .content = .{ .type = "text", .text = text },
+            },
+        };
+    }
+
+    pub fn toolCall(session_id: []const u8, tool_call_id: []const u8, title: []const u8, kind: ToolKind) SessionUpdate {
+        return .{
+            .sessionId = session_id,
+            .update = .{
+                .sessionUpdate = .tool_call,
+                .toolCallId = tool_call_id,
+                .title = title,
+                .kind = kind,
+                .status = .pending,
+            },
+        };
+    }
 };
 
 // =============================================================================

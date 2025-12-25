@@ -310,7 +310,10 @@ pub const Writer = struct {
     pub fn writeTypedNotification(self: *Writer, method: []const u8, params: anytype) !void {
         var out: std.io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
-        var jw: std.json.Stringify = .{ .writer = &out.writer };
+        var jw: std.json.Stringify = .{
+            .writer = &out.writer,
+            .options = .{ .emit_null_optional_fields = false },
+        };
 
         try jw.beginObject();
         try jw.objectField("jsonrpc");

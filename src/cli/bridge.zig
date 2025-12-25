@@ -24,6 +24,58 @@ pub const MessageType = enum {
     }
 };
 
+/// Content block types in assistant messages
+pub const ContentBlockType = enum {
+    text,
+    tool_use,
+    tool_result,
+    image,
+
+    pub fn fromString(s: []const u8) ?ContentBlockType {
+        const map = std.StaticStringMap(ContentBlockType).initComptime(.{
+            .{ "text", .text },
+            .{ "tool_use", .tool_use },
+            .{ "tool_result", .tool_result },
+            .{ "image", .image },
+        });
+        return map.get(s);
+    }
+};
+
+/// System message subtypes
+pub const SystemSubtype = enum {
+    init,
+    auth_required,
+    hook_response,
+
+    pub fn fromString(s: []const u8) ?SystemSubtype {
+        const map = std.StaticStringMap(SystemSubtype).initComptime(.{
+            .{ "init", .init },
+            .{ "auth_required", .auth_required },
+            .{ "hook_response", .hook_response },
+        });
+        return map.get(s);
+    }
+};
+
+/// Stream JSON input format for sending messages to Claude CLI
+pub const StreamInput = struct {
+    type: []const u8,
+    message: Message,
+
+    pub const Message = struct {
+        role: []const u8,
+        content: []const u8,
+    };
+
+    pub fn userPrompt(content: []const u8) StreamInput {
+        return .{
+            .type = "user",
+            .message = .{ .role = "user", .content = content },
+        };
+    }
+};
+
 /// Parsed stream message
 pub const StreamMessage = struct {
     type: MessageType,
@@ -36,6 +88,7 @@ pub const StreamMessage = struct {
     }
 
     /// Get content from message (works for assistant and system messages)
+    /// Uses manual traversal to avoid allocations (no parseFromValue)
     pub fn getContent(self: *const StreamMessage) ?[]const u8 {
         // For system messages, content may be a direct string
         if (self.type == .system) {
@@ -47,7 +100,7 @@ pub const StreamMessage = struct {
             }
         }
 
-        // For assistant messages, content is nested
+        // For assistant messages, content is nested in message.content[]
         if (self.type == .assistant) {
             const message = self.raw.object.get("message") orelse return null;
             if (message != .object) return null;
@@ -58,7 +111,8 @@ pub const StreamMessage = struct {
                 if (item != .object) continue;
                 const item_type = item.object.get("type") orelse continue;
                 if (item_type != .string) continue;
-                if (!std.mem.eql(u8, item_type.string, "text")) continue;
+                const block_type = ContentBlockType.fromString(item_type.string) orelse continue;
+                if (block_type != .text) continue;
                 const text = item.object.get("text") orelse continue;
                 if (text == .string) return text.string;
             }
@@ -73,6 +127,7 @@ pub const StreamMessage = struct {
     }
 
     /// Get the tool name from a tool_use message
+    /// Uses manual traversal to avoid allocations
     pub fn getToolName(self: *const StreamMessage) ?[]const u8 {
         if (self.type != .assistant) return null;
         const message = self.raw.object.get("message") orelse return null;
@@ -83,7 +138,8 @@ pub const StreamMessage = struct {
             if (item != .object) continue;
             const item_type = item.object.get("type") orelse continue;
             if (item_type != .string) continue;
-            if (!std.mem.eql(u8, item_type.string, "tool_use")) continue;
+            const block_type = ContentBlockType.fromString(item_type.string) orelse continue;
+            if (block_type != .tool_use) continue;
             // Found tool_use, get the name
             const name = item.object.get("name") orelse continue;
             if (name == .string) return name.string;
@@ -91,12 +147,122 @@ pub const StreamMessage = struct {
         return null;
     }
 
+    /// Get the tool use ID from a tool_use message
+    pub fn getToolId(self: *const StreamMessage) ?[]const u8 {
+        if (self.type != .assistant) return null;
+        const message = self.raw.object.get("message") orelse return null;
+        if (message != .object) return null;
+        const content = message.object.get("content") orelse return null;
+        if (content != .array) return null;
+        for (content.array.items) |item| {
+            if (item != .object) continue;
+            const item_type = item.object.get("type") orelse continue;
+            if (item_type != .string) continue;
+            const block_type = ContentBlockType.fromString(item_type.string) orelse continue;
+            if (block_type != .tool_use) continue;
+            // Found tool_use, get the id
+            const id = item.object.get("id") orelse continue;
+            if (id == .string) return id.string;
+        }
+        return null;
+    }
+
     /// Get stop reason from result message
     pub fn getStopReason(self: *const StreamMessage) ?[]const u8 {
         if (self.type != .result) return null;
-        const subtype = self.raw.object.get("subtype") orelse return null;
-        if (subtype == .string) return subtype.string;
+        const subtype_val = self.raw.object.get("subtype") orelse return null;
+        if (subtype_val == .string) return subtype_val.string;
         return null;
+    }
+
+    /// Get system subtype as enum
+    pub fn getSystemSubtype(self: *const StreamMessage) ?SystemSubtype {
+        if (self.type != .system) return null;
+        const subtype_str = self.subtype orelse return null;
+        return SystemSubtype.fromString(subtype_str);
+    }
+
+    /// Get text delta from stream event
+    pub fn getStreamTextDelta(self: *const StreamMessage) ?[]const u8 {
+        const delta = self.getStreamDelta() orelse return null;
+        return delta.text;
+    }
+
+    /// Get thinking delta from stream event
+    pub fn getStreamThinkingDelta(self: *const StreamMessage) ?[]const u8 {
+        const delta = self.getStreamDelta() orelse return null;
+        return delta.thinking;
+    }
+
+    /// CLI init message structure
+    pub const InitMessage = struct {
+        session_id: ?[]const u8 = null,
+        model: ?[]const u8 = null,
+        slash_commands: ?[]const []const u8 = null,
+        tools: ?[]const []const u8 = null,
+    };
+
+    /// Parse system/init message
+    pub fn getInitInfo(self: *const StreamMessage) ?InitMessage {
+        if (self.type != .system) return null;
+        if (self.getSystemSubtype()) |subtype| {
+            if (subtype != .init) return null;
+        } else return null;
+
+        const parsed = std.json.parseFromValue(InitMessage, self.arena.child_allocator, self.raw, .{
+            .ignore_unknown_fields = true,
+        }) catch return null;
+
+        return parsed.value;
+    }
+
+    /// Stream event structure from Claude CLI
+    pub const StreamEvent = struct {
+        event: Event,
+
+        pub const Event = struct {
+            type: EventType,
+            delta: ?Delta = null,
+
+            pub const EventType = enum {
+                content_block_delta,
+                content_block_start,
+                content_block_stop,
+                message_start,
+                message_delta,
+                message_stop,
+            };
+
+            pub const Delta = struct {
+                type: DeltaType,
+                text: ?[]const u8 = null,
+                thinking: ?[]const u8 = null,
+
+                pub const DeltaType = enum {
+                    text_delta,
+                    thinking_delta,
+                    input_json_delta,
+                };
+            };
+        };
+    };
+
+    /// Get stream event data (text or thinking delta)
+    pub fn getStreamDelta(self: *const StreamMessage) ?struct { text: ?[]const u8, thinking: ?[]const u8 } {
+        if (self.type != .stream_event) return null;
+
+        const parsed = std.json.parseFromValue(StreamEvent, self.arena.child_allocator, self.raw, .{
+            .ignore_unknown_fields = true,
+        }) catch return null;
+
+        if (parsed.value.event.type != .content_block_delta) return null;
+
+        const delta = parsed.value.event.delta orelse return null;
+        return switch (delta.type) {
+            .text_delta => .{ .text = delta.text, .thinking = null },
+            .thinking_delta => .{ .text = null, .thinking = delta.thinking },
+            .input_json_delta => null,
+        };
     }
 };
 
@@ -149,15 +315,17 @@ pub const Bridge = struct {
         log.info("Using claude binary: {s}", .{claude_path});
         try args.append(self.allocator, claude_path);
         try args.append(self.allocator, "-p");
+        try args.append(self.allocator, "--verbose"); // Required with -p and stream-json
         try args.append(self.allocator, "--input-format");
         try args.append(self.allocator, "stream-json");
         try args.append(self.allocator, "--output-format");
         try args.append(self.allocator, "stream-json");
-        try args.append(self.allocator, "--include-partial-messages");
 
         if (opts.resume_session_id) |sid| {
             try args.append(self.allocator, "--resume");
             try args.append(self.allocator, sid);
+        } else if (opts.continue_last) {
+            try args.append(self.allocator, "--continue");
         }
 
         if (opts.permission_mode) |mode| {
@@ -168,6 +336,11 @@ pub const Bridge = struct {
         if (opts.mcp_config) |config| {
             try args.append(self.allocator, "--mcp-config");
             try args.append(self.allocator, config);
+        }
+
+        if (opts.model) |model| {
+            try args.append(self.allocator, "--model");
+            try args.append(self.allocator, model);
         }
 
         var child = std.process.Child.init(args.items, self.allocator);
@@ -184,8 +357,10 @@ pub const Bridge = struct {
 
     pub const StartOptions = struct {
         resume_session_id: ?[]const u8 = null,
+        continue_last: bool = false, // Use --continue to resume last session
         permission_mode: ?[]const u8 = null,
         mcp_config: ?[]const u8 = null,
+        model: ?[]const u8 = null,
     };
 
     /// Stop the CLI process
@@ -203,18 +378,21 @@ pub const Bridge = struct {
         const proc = self.process orelse return error.NotStarted;
         const stdin = proc.stdin orelse return error.NoStdin;
 
-        // Stream-json input format: {"type": "user", "content": "..."}
+        const input = StreamInput.userPrompt(prompt);
+
         var out: std.io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
-        const w = &out.writer;
-
-        try w.writeAll("{\"type\":\"user\",\"content\":");
-        try std.json.Stringify.encodeJsonString(prompt, .{}, w);
-        try w.writeAll("}\n");
+        var jw: std.json.Stringify = .{ .writer = &out.writer };
+        jw.write(input) catch |err| {
+            log.err("Failed to serialize prompt: {}", .{err});
+            return error.SerializationFailed;
+        };
+        try out.writer.writeByte('\n');
 
         const data = try out.toOwnedSlice();
         defer self.allocator.free(data);
 
+        log.debug("Sending to CLI stdin: {s}", .{data});
         try stdin.writeAll(data);
     }
 
@@ -227,12 +405,24 @@ pub const Bridge = struct {
         var file_reader = stdout.reader(&read_buf);
         const reader = &file_reader.interface;
 
+        log.debug("Waiting for CLI stdout...", .{});
         const line = reader.takeDelimiter('\n') catch |e| switch (e) {
-            error.ReadFailed => return null,
+            error.ReadFailed => {
+                log.debug("CLI read failed", .{});
+                return null;
+            },
             error.StreamTooLong => return error.LineTooLong,
-        } orelse return null;
+        } orelse {
+            log.debug("CLI returned null (EOF or empty)", .{});
+            return null;
+        };
 
-        if (line.len == 0) return null;
+        if (line.len == 0) {
+            log.debug("CLI returned empty line", .{});
+            return null;
+        }
+
+        log.debug("CLI stdout: {s}", .{line});
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
@@ -278,11 +468,11 @@ test "StreamMessage parsing" {
 
     const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json, .{});
 
-    var msg = StreamMessage{
+    const msg = StreamMessage{
         .type = .assistant,
         .subtype = null,
         .raw = parsed.value,
-        .arena = undefined, // Not used in this test
+        .arena = arena,
     };
 
     try testing.expectEqualStrings("Hello", msg.getContent().?);
@@ -332,7 +522,8 @@ fn buildTestMessage(
             var tool_block = std.json.ObjectMap.init(allocator);
             errdefer tool_block.deinit();
             try tool_block.put("type", .{ .string = "tool_use" });
-            try tool_block.put("name", .{ .string = "test_tool" });
+            try tool_block.put("name", .{ .string = "default_tool" });
+            try tool_block.put("id", .{ .string = "toolu_default" });
             try content_array.append(.{ .object = tool_block });
         } else if (content_type == .image) {
             var img_block = std.json.ObjectMap.init(allocator);
@@ -399,68 +590,86 @@ test "property: MessageType.fromString covers all variants" {
     }.prop, .{});
 }
 
-test "property: getContent returns text for assistant messages with text blocks" {
+test "property: getToolName/getToolId extraction preserves input values" {
+    // Property: for any tool name and id, extraction returns the original values
     try quickcheck.check(struct {
-        fn prop(args: struct { has_text: bool, num_other_blocks: u2 }) bool {
+        fn prop(args: struct { name_seed: u32, id_seed: u32 }) bool {
+            // Generate deterministic "random" names from seeds
+            var name_buf: [16]u8 = undefined;
+            var id_buf: [20]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "Tool_{x}", .{args.name_seed}) catch return false;
+            const id = std.fmt.bufPrint(&id_buf, "toolu_{x}", .{args.id_seed}) catch return false;
+
+            // Build JSON with these values
+            var json_buf: [256]u8 = undefined;
+            const json = std.fmt.bufPrint(&json_buf,
+                \\{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"{s}","id":"{s}"}}]}}}}
+            , .{ name, id }) catch return false;
+
+            // Parse and extract
+            const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{}) catch return false;
+            defer parsed.deinit();
+
             var arena = std.heap.ArenaAllocator.init(testing.allocator);
             defer arena.deinit();
-            const alloc = arena.allocator();
+            const msg = StreamMessage{ .type = .assistant, .subtype = null, .raw = parsed.value, .arena = arena };
 
-            var json_val = buildTestMessage(
-                alloc,
-                .assistant,
-                if (args.has_text) .text else .image,
-                false,
-            ) catch return false;
-            _ = &json_val;
-
-            const msg = StreamMessage{
-                .type = .assistant,
-                .subtype = null,
-                .raw = json_val,
-                .arena = undefined,
-            };
-
-            const content = msg.getContent();
-            if (args.has_text) {
-                return content != null and std.mem.eql(u8, content.?, "assistant_text");
-            } else {
-                return content == null;
-            }
+            // Property: extracted values equal input values
+            const extracted_name = msg.getToolName() orelse return false;
+            const extracted_id = msg.getToolId() orelse return false;
+            return std.mem.eql(u8, extracted_name, name) and std.mem.eql(u8, extracted_id, id);
         }
     }.prop, .{});
 }
 
-test "property: getToolName returns name for tool_use blocks" {
+test "property: getContent extraction preserves input text" {
     try quickcheck.check(struct {
-        fn prop(args: struct { is_tool_use: bool }) bool {
+        fn prop(args: struct { text_seed: u32 }) bool {
+            // Generate deterministic text from seed (avoid special chars that break JSON)
+            var text_buf: [32]u8 = undefined;
+            const text = std.fmt.bufPrint(&text_buf, "Message_{x}", .{args.text_seed}) catch return false;
+
+            // Build JSON
+            var json_buf: [256]u8 = undefined;
+            const json = std.fmt.bufPrint(&json_buf,
+                \\{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{s}"}}]}}}}
+            , .{text}) catch return false;
+
+            // Parse and extract
+            const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{}) catch return false;
+            defer parsed.deinit();
+
             var arena = std.heap.ArenaAllocator.init(testing.allocator);
             defer arena.deinit();
-            const alloc = arena.allocator();
+            const msg = StreamMessage{ .type = .assistant, .subtype = null, .raw = parsed.value, .arena = arena };
 
-            var json_val = buildTestMessage(
-                alloc,
-                .assistant,
-                if (args.is_tool_use) .tool_use else .text,
-                false,
-            ) catch return false;
-            _ = &json_val;
-
-            const msg = StreamMessage{
-                .type = .assistant,
-                .subtype = null,
-                .raw = json_val,
-                .arena = undefined,
-            };
-
-            const tool_name = msg.getToolName();
-            if (args.is_tool_use) {
-                return tool_name != null and std.mem.eql(u8, tool_name.?, "test_tool");
-            } else {
-                return tool_name == null;
-            }
+            // Property: extracted text equals input text
+            const extracted = msg.getContent() orelse return false;
+            return std.mem.eql(u8, extracted, text);
         }
     }.prop, .{});
+}
+
+test "getToolName/getToolId return null for non-tool messages" {
+    // This is exhaustive, not property-based - just test the specific cases
+    const cases = [_][]const u8{
+        \\{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}
+        ,
+        \\{"type":"system","content":"hello"}
+        ,
+        \\{"type":"result","subtype":"success"}
+    };
+    const types = [_]MessageType{ .assistant, .system, .result };
+
+    for (cases, types) |json, msg_type| {
+        const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{}) catch continue;
+        defer parsed.deinit();
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const msg = StreamMessage{ .type = msg_type, .subtype = null, .raw = parsed.value, .arena = arena };
+        try testing.expect(msg.getToolName() == null);
+        try testing.expect(msg.getToolId() == null);
+    }
 }
 
 test "property: getStopReason only works for result type" {
@@ -478,7 +687,7 @@ test "property: getStopReason only works for result type" {
             .type = msg_type,
             .subtype = "end_turn",
             .raw = json_val,
-            .arena = undefined,
+            .arena = arena,
         };
 
         const reason = msg.getStopReason();
@@ -502,7 +711,7 @@ test "property: system messages extract content from content or message field" {
         .type = .system,
         .subtype = null,
         .raw = json1,
-        .arena = undefined,
+        .arena = arena,
     };
     try testing.expectEqualStrings("system_content", msg1.getContent().?);
 
@@ -516,7 +725,7 @@ test "property: system messages extract content from content or message field" {
         .type = .system,
         .subtype = null,
         .raw = json2,
-        .arena = undefined,
+        .arena = arena,
     };
     try testing.expectEqualStrings("fallback_message", msg2.getContent().?);
 }
