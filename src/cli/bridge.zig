@@ -350,6 +350,10 @@ pub const Bridge = struct {
         child.stderr_behavior = .Inherit;
 
         try child.spawn();
+        errdefer {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+        }
         self.process = child;
 
         log.info("Started Claude CLI in {s}", .{self.cwd});

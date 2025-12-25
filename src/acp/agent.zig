@@ -21,6 +21,12 @@ fn isAutoResumeEnabled() bool {
     return !std.mem.eql(u8, val, "false") and !std.mem.eql(u8, val, "0");
 }
 
+/// Check if content indicates authentication is required
+fn isAuthRequiredContent(content: []const u8) bool {
+    return std.mem.indexOf(u8, content, "/login") != null or
+        std.mem.indexOf(u8, content, "authenticate") != null;
+}
+
 /// Map CLI result subtypes to ACP stop reasons
 fn mapCliStopReason(cli_reason: []const u8) []const u8 {
     const map = std.StaticStringMap([]const u8).initComptime(.{
@@ -265,6 +271,10 @@ pub const Agent = struct {
             log.err("Settings parse failed in {s}: {} - tool permissions disabled (all tools allowed)", .{ cwd, err });
             break :blk null;
         };
+        errdefer if (settings) |s| {
+            var mutable_settings = s;
+            mutable_settings.deinit();
+        };
 
         // Create session
         const session = try self.allocator.create(Session);
@@ -309,7 +319,7 @@ pub const Agent = struct {
         if (session.bridge) |*cli_bridge| {
             if (cli_bridge.process) |proc| {
                 if (proc.stdout) |stdout| {
-                    // Poll stdout for up to 2 seconds
+                    // Poll stdout for up to 5 seconds
                     var fds = [_]std.posix.pollfd{.{
                         .fd = stdout.handle,
                         .events = std.posix.POLL.IN,
@@ -329,13 +339,14 @@ pub const Agent = struct {
                         while (attempts < 10) : (attempts += 1) {
                             var msg = cli_bridge.readMessage() catch break orelse break;
 
-                            if (msg.type == .system and msg.getInitInfo() != null) {
-                                init_msg = msg;
+                            if (msg.type == .system) {
                                 if (msg.getInitInfo()) |info| {
+                                    init_msg = msg;
                                     cli_commands = info.slash_commands;
+                                    break;
                                 }
-                                break;
-                            } else {
+                            }
+                            if (init_msg == null) {
                                 msg.deinit();
                             }
                         }
@@ -401,12 +412,24 @@ pub const Agent = struct {
         const bridge_was_null = session.bridge == null;
         if (session.bridge == null) {
             session.bridge = Bridge.init(self.allocator, session.cwd);
-            try session.bridge.?.start(.{
+            session.bridge.?.start(.{
                 .resume_session_id = session.cli_session_id,
                 .continue_last = session.cli_session_id == null and isAutoResumeEnabled(),
                 .permission_mode = @tagName(session.permission_mode),
                 .model = session.model,
-            });
+            }) catch |err| {
+                log.err("Failed to start bridge: {}", .{err});
+                session.bridge = null;
+                try self.sendSessionUpdate(session_id, .{
+                    .sessionUpdate = .agent_message_chunk,
+                    .content = .{ .type = "text", .text = "Failed to start Claude CLI. Please ensure it is installed and in PATH." },
+                });
+                var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
+                defer result.object.deinit();
+                try result.object.put("stopReason", .{ .string = "error" });
+                try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
+                return;
+            };
         }
         const bridge_start_ms = timer.read() / std.time.ns_per_ms;
         if (bridge_was_null) {
@@ -523,34 +546,16 @@ pub const Agent = struct {
                                 }
                                 // Check for auth required in init message
                                 if (msg.getContent()) |content| {
-                                    if (std.mem.indexOf(u8, content, "/login") != null or
-                                        std.mem.indexOf(u8, content, "authenticate") != null)
-                                    {
-                                        log.warn("Auth required for session {s}", .{session_id});
-                                        try self.sendSessionUpdate(session_id, .{
-                                            .sessionUpdate = .agent_message_chunk,
-                                            .content = .{ .type = "text", .text = "Authentication required. Please run `claude /login` in your terminal, then try again." },
-                                        });
-                                        stop_reason = "auth_required";
-                                        session.bridge.?.stop();
-                                        session.bridge = null;
+                                    if (isAuthRequiredContent(content)) {
+                                        stop_reason = try self.handleAuthRequired(session_id, session);
                                         break;
                                     }
                                 }
                             },
                             .auth_required => {
                                 if (msg.getContent()) |content| {
-                                    if (std.mem.indexOf(u8, content, "/login") != null or
-                                        std.mem.indexOf(u8, content, "authenticate") != null)
-                                    {
-                                        log.warn("Auth required for session {s}", .{session_id});
-                                        try self.sendSessionUpdate(session_id, .{
-                                            .sessionUpdate = .agent_message_chunk,
-                                            .content = .{ .type = "text", .text = "Authentication required. Please run `claude /login` in your terminal, then try again." },
-                                        });
-                                        stop_reason = "auth_required";
-                                        session.bridge.?.stop();
-                                        session.bridge = null;
+                                    if (isAuthRequiredContent(content)) {
+                                        stop_reason = try self.handleAuthRequired(session_id, session);
                                         break;
                                     }
                                 }
@@ -585,7 +590,10 @@ pub const Agent = struct {
     fn handleCancel(self: *Agent, request: jsonrpc.Request) !void {
         const parsed = std.json.parseFromValue(CancelParams, self.allocator, request.params orelse .null, .{
             .ignore_unknown_fields = true,
-        }) catch return;
+        }) catch |err| {
+            log.warn("Failed to parse cancel params: {}", .{err});
+            return;
+        };
         defer parsed.deinit();
 
         if (self.sessions.get(parsed.value.sessionId)) |session| {
@@ -672,6 +680,20 @@ pub const Agent = struct {
         defer result.object.deinit();
         try result.object.put("sessionId", .{ .string = sid_copy });
         try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
+    }
+
+    /// Handle authentication required - notify user and stop bridge
+    fn handleAuthRequired(self: *Agent, session_id: []const u8, session: *Session) ![]const u8 {
+        log.warn("Auth required for session {s}", .{session_id});
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .agent_message_chunk,
+            .content = .{ .type = "text", .text = "Authentication required. Please run `claude /login` in your terminal, then try again." },
+        });
+        if (session.bridge) |*b| {
+            b.stop();
+        }
+        session.bridge = null;
+        return "auth_required";
     }
 
     /// Handle /version command
