@@ -188,28 +188,36 @@ const SetModeParams = struct {
 
 ## Session Update Notification (Agent→Client)
 
-```zig
-const SessionUpdate = struct {
-    sessionId: []const u8,
-    update: Update,
-};
+Wire format uses `sessionUpdate` as discriminator inside `update` object:
 
-const Update = struct {
-    kind: UpdateKind,
-    content: ?[]const u8 = null,
-    title: ?[]const u8 = null,
-    // ... other fields based on kind
-};
-
-const UpdateKind = enum {
-    text,
-    tool_use,
-    tool_result,
-    thinking,
-    plan,
-    error,
-};
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "session/update",
+  "params": {
+    "sessionId": "...",
+    "update": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": { "type": "text", "text": "Hello!" }
+    }
+  }
+}
 ```
+
+### Update Types
+
+| sessionUpdate | Description | Key Fields |
+|---------------|-------------|------------|
+| `agent_message_chunk` | Agent response text | `content: {type, text}` |
+| `user_message_chunk` | User message echo | `content: {type, text}` |
+| `agent_thought_chunk` | Agent thinking | `content: {type, text}` |
+| `tool_call` | Tool invocation | `toolCallId, title, kind, status` |
+| `tool_call_update` | Tool progress/result | `toolCallId, status, content` |
+| `plan` | Todo list | `entries: [{id, content, status}]` |
+| `available_commands_update` | Slash commands | `availableCommands` |
+| `current_mode_update` | Mode change | `currentModeId` |
+
+See `docs/wire-formats.md` for complete schema.
 
 ## Permission Modes
 

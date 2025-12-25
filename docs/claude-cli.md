@@ -28,16 +28,45 @@ claude -p \
 | `-c, --continue` | Continue last session |
 | `-r, --resume <id>` | Resume by session ID |
 
-## Stream JSON Message Types
+## Stream JSON Input Format
+
+When using `--input-format stream-json`, send messages as:
+
+```json
+{"type":"user","message":{"role":"user","content":"your prompt here"}}
+```
+
+**IMPORTANT**:
+- Requires `--verbose` flag when using `-p` with `stream-json`
+- `type` must be "user" or "control" at top level
+- `message.role` must be "user"
+- `message.content` is the prompt text
+
+Example command:
+```bash
+echo '{"type":"user","message":{"role":"user","content":"hello"}}' | \
+  claude -p --verbose --input-format stream-json --output-format stream-json
+```
+
+## Stream JSON Output Format
 
 Output stream contains JSON objects per line:
 
 ```json
 {"type": "system", "subtype": "init", ...}
-{"type": "assistant", "message": {"content": [...]}}
-{"type": "stream_event", ...}
-{"type": "result", "subtype": "success"}
+{"type": "system", "subtype": "hook_response", ...}
+{"type": "assistant", "message": {"role":"assistant","content": [{"type":"text","text":"..."}]}}
+{"type": "result", "subtype": "success", "result": "...", "duration_ms": 123}
 ```
+
+### Output Message Types
+
+| type | subtype | Description |
+|------|---------|-------------|
+| system | init | Session initialization with tools, model info |
+| system | hook_response | Hook stdout/stderr from SessionStart etc |
+| assistant | - | Model response with content blocks |
+| result | success/error | Final result with stats |
 
 ## Tool Use Events in Stream
 
