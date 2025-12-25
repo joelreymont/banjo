@@ -1,8 +1,9 @@
 id = "banjo"
 name = "Banjo"
 version = "0.1.0"
+schema_version = 1
 description = "Claude Code ACP agent (small and fast!)"
-authors = ["Joel Reymont"]
+authors = ["Joel Reymont <joel@reymont.com>"]
 license = "MIT"
 repository = "https://github.com/joelreymont/banjo"
 
