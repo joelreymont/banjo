@@ -12,15 +12,15 @@ name = "Claude Code (Banjo)"
 
 [agent_servers.banjo.targets.darwin-aarch64]
 archive = "https://github.com/joelreymont/banjo/releases/download/v0.2.1/banjo-darwin-arm64.tar.gz"
-sha256 = "02bddced6d29d090a279d375eb6c3aeed875034dc190499d0f5ec582e40f9e1d"
+sha256 = "a3c56f08a38fbfa9f76677ed74ac9ef0ef4c150f17d3123716905f508eddbae6"
 cmd = "./banjo"
 
 [agent_servers.banjo.targets.darwin-x86_64]
 archive = "https://github.com/joelreymont/banjo/releases/download/v0.2.1/banjo-darwin-x64.tar.gz"
-sha256 = "5ba713c3b1d6d133fce181a71646ebaef5234545350c11fc72b01b0270f15134"
+sha256 = "c830e20905c96c45882a77bd7ed3e6164f41276ce9d9634874aec7b870d45433"
 cmd = "./banjo"
 
 [agent_servers.banjo.targets.linux-x86_64]
 archive = "https://github.com/joelreymont/banjo/releases/download/v0.2.1/banjo-linux-x64.tar.gz"
-sha256 = "b7ab67241ac92c199dc8097bdaf70faec46f42eb285553ef90747e011fb92b1d"
+sha256 = "4f8357c5ebd77c6bd812a22b41704c34ffb77eac93640df7b8acbbaa8a69dd5a"
 cmd = "./banjo"
