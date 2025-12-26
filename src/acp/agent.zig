@@ -356,10 +356,6 @@ pub const Agent = struct {
                 try self.handleVersionCommand(request, session_id);
                 return;
             }
-            if (std.mem.eql(u8, text, "/test-links") or std.mem.startsWith(u8, text, "/test-links ")) {
-                try self.handleTestLinksCommand(request, session_id);
-                return;
-            }
         }
 
         // Start bridge if not running
@@ -664,31 +660,9 @@ pub const Agent = struct {
         try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
     }
 
-    /// Handle /test-links command - test which link formats Zed renders as clickable
-    fn handleTestLinksCommand(self: *Agent, request: jsonrpc.Request, session_id: []const u8) !void {
-        const test_msg =
-            \\Testing link formats:
-            \\
-            \\1. Zed exact: [@partitioned.zig (24:25)](file:///Users/joel/Work/dixie/src/compiler/ir/partitioned.zig#L24:25)
-            \\2. Banjo file: [@main.zig (1:10)](file:///Users/joel/Work/banjo/src/main.zig#L1:10)
-            \\
-            \\Click each to test if Zed navigates.
-        ;
-        try self.sendSessionUpdate(session_id, .{
-            .sessionUpdate = .agent_message_chunk,
-            .content = .{ .type = "text", .text = test_msg },
-        });
-
-        var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
-        defer result.object.deinit();
-        try result.object.put("stopReason", .{ .string = "end_turn" });
-        try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
-    }
-
     /// Banjo's own slash commands
     const banjo_commands = [_]protocol.SlashCommand{
         .{ .name = "version", .description = "Show banjo version" },
-        .{ .name = "test-links", .description = "Test clickable link formats" },
     };
 
     /// Commands filtered from CLI (unsupported in stream-json mode, handled via authMethods)

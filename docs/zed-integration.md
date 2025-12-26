@@ -49,7 +49,6 @@ Users can add context via @mentions:
 
 Banjo commands:
 - `/version` - show banjo version
-- `/test-links` - test clickable link formats (debugging)
 
 CLI commands forwarded to Claude Code (filtered: login, logout, cost, context).
 
