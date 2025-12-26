@@ -206,6 +206,17 @@ Combines LSP markers with agent panel display:
 
 **Concurrent updates:** Banjo can push updates while Claude is streaming (stop button shown). GPUI queues updates on foreground executor - they interleave freely. No locks, no rejection. Consider queuing hemi updates until `status == Idle` for cleaner UX.
 
+**Multiple LSPs:** Banjo LSP can run alongside rust-analyzer/zls. Zed supports multiple LSPs per language via settings:
+```json
+"language_servers": ["rust-analyzer", "banjo"]
+```
+Diagnostics merge by server ID - both servers' markers displayed together.
+
+Extensions register LSPs via `register_language_server()` in `extension_lsp_adapter.rs`. Key files:
+- `zed/crates/project/src/lsp_store.rs` - multi-server iteration
+- `zed/crates/language/src/language_settings.rs` - `language_servers` config
+- `zed/crates/language_extension/src/extension_lsp_adapter.rs` - extension registration
+
 ## Related Documentation
 
 - [ACP Protocol](acp-protocol.md) - Agent Client Protocol specification
