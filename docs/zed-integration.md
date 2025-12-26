@@ -162,6 +162,48 @@ Use clickable markdown links in agent output:
 
 No inline markers, but notes can link to code locations.
 
+### Option 4: LSP + Agent Panel (Recommended)
+
+Combines LSP markers with agent panel display:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Editor Buffer                                               │
+│  ├─ LSP diagnostics (info-level) show hemi markers          │
+│  └─ Click marker → LSP code action → IPC to banjo           │
+└─────────────────────┬───────────────────────────────────────┘
+                      │ IPC (unix socket)
+                      ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Banjo (ACP Agent)                                           │
+│  ├─ Receives hemi click from LSP                            │
+│  ├─ Pushes session/update WITHOUT user prompt               │
+│  └─ Streams note content with clickable file links          │
+└─────────────────────┬───────────────────────────────────────┘
+                      │ session/update notification
+                      ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Agent Panel                                                 │
+│  ├─ Displays note content                                   │
+│  ├─ Clickable: [@file.zig (42:50)](file:///...#L42:50)      │
+│  └─ User can ask Claude to edit/expand note                 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key insight:** Banjo can push `session/update` at any time after session creation - no user prompt required. Zed's `handle_session_update()` processes updates independently.
+
+**Benefits:**
+- Gutter markers visible in editor (via LSP diagnostics)
+- Rich note display in agent panel with clickable links
+- Claude can help edit/expand notes
+- No Zed fork required
+
+**Implementation:**
+1. Banjo listens on unix socket for LSP commands
+2. LSP server (could be built into banjo) publishes hemi diagnostics
+3. Code action click → socket message → banjo pushes to panel
+4. SQLite database for note persistence (hemis)
+
 ## Related Documentation
 
 - [ACP Protocol](acp-protocol.md) - Agent Client Protocol specification
