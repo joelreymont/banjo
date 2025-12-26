@@ -496,9 +496,8 @@ test "property: request id types are preserved" {
 // Snapshot Tests for JSON-RPC Responses
 // =============================================================================
 
-const ohsnap = @import("ohsnap");
-
 test "snapshot: success response with object result" {
+    const ohsnap = @import("ohsnap");
     var result_obj = std.json.ObjectMap.init(testing.allocator);
     defer result_obj.deinit();
     try result_obj.put("sessionId", .{ .string = "abc123" });
@@ -514,6 +513,7 @@ test "snapshot: success response with object result" {
 }
 
 test "snapshot: error response with code and message" {
+    const ohsnap = @import("ohsnap");
     const response = Response.err(.{ .string = "req-42" }, Error.MethodNotFound, "Unknown method");
     const json = try serializeResponse(testing.allocator, response);
     defer testing.allocator.free(json);
@@ -524,6 +524,7 @@ test "snapshot: error response with code and message" {
 }
 
 test "snapshot: notification without id" {
+    const ohsnap = @import("ohsnap");
     var params = std.json.ObjectMap.init(testing.allocator);
     defer params.deinit();
     try params.put("event", .{ .string = "connected" });
@@ -541,8 +542,10 @@ test "snapshot: notification without id" {
 }
 
 test "snapshot: request with null id" {
+    const ohsnap = @import("ohsnap");
     const request = Request{
         .method = "initialize",
+        .params = null,
         .id = .null,
     };
     const json = try serializeRequest(testing.allocator, request);
