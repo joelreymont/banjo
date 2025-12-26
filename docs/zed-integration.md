@@ -217,6 +217,30 @@ Extensions register LSPs via `register_language_server()` in `extension_lsp_adap
 - `zed/crates/language/src/language_settings.rs` - `language_servers` config
 - `zed/crates/language_extension/src/extension_lsp_adapter.rs` - extension registration
 
+## Agent Panel Input
+
+### Triggers
+
+Only two triggers are supported (hardcoded):
+- `@` - mentions (files, symbols, threads, etc.)
+- `/` - slash commands
+
+**No extensible trigger system** - cannot add `[[` for wiki-links.
+
+### Note Link Insertion
+
+Best approach: `/note` slash command with autocomplete:
+```
+/note search-term → autocomplete list → select → inserts clickable link
+```
+
+Slash commands can provide dynamic argument completions via `complete_argument()` hook.
+
+Key files:
+- `zed/crates/agent_ui/src/completion_provider.rs` - mention parsing, completions
+- `zed/crates/agent_ui/src/acp/message_editor.rs` - editor setup
+- `zed/crates/agent_ui/src/slash_command.rs` - slash command completions
+
 ## Related Documentation
 
 - [ACP Protocol](acp-protocol.md) - Agent Client Protocol specification
