@@ -174,16 +174,19 @@ pub const Agent = struct {
 
     fn handleInitialize(self: *Agent, request: jsonrpc.Request) !void {
         // Parse params using typed struct
-        const parsed = std.json.parseFromValue(InitializeParams, self.allocator, request.params orelse .null, .{
-            .ignore_unknown_fields = true,
-        }) catch |err| {
-            log.warn("Failed to parse initialize params: {}", .{err});
-            // Continue with defaults
-            return self.sendInitializeResponse(request);
-        };
-        defer parsed.deinit();
-        const params = parsed.value;
+        const parsed = if (request.params) |p|
+            std.json.parseFromValue(InitializeParams, self.allocator, p, .{
+                .ignore_unknown_fields = true,
+            }) catch |err| {
+                log.warn("Failed to parse initialize params: {}", .{err});
+                // Continue with defaults
+                return self.sendInitializeResponse(request);
+            }
+        else
+            null;
+        defer if (parsed) |*p| p.deinit();
 
+        const params = if (parsed) |p| p.value else InitializeParams{};
         // Validate protocol version
         if (params.protocolVersion) |ver| {
             if (ver != protocol.ProtocolVersion) {
@@ -808,6 +811,7 @@ test "Agent handleRequest - initialize" {
 
     const request = jsonrpc.Request{
         .method = "initialize",
+        .params = null,
         .id = .{ .number = 1 },
     };
 
