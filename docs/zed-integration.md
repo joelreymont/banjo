@@ -204,6 +204,8 @@ Combines LSP markers with agent panel display:
 3. Code action click → socket message → banjo pushes to panel
 4. SQLite database for note persistence (hemis)
 
+**Concurrent updates:** Banjo can push updates while Claude is streaming (stop button shown). GPUI queues updates on foreground executor - they interleave freely. No locks, no rejection. Consider queuing hemi updates until `status == Idle` for cleaner UX.
+
 ## Related Documentation
 
 - [ACP Protocol](acp-protocol.md) - Agent Client Protocol specification
