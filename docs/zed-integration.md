@@ -52,6 +52,116 @@ Banjo commands:
 
 CLI commands forwarded to Claude Code (filtered: login, logout, cost, context).
 
+## LSP Inline Annotations
+
+### Inlay Hints
+
+Zed supports LSP inlay hints with partial interactivity:
+
+- **Hover**: Tooltips shown via `hover_at_inlay()`
+- **Ctrl+Click**: Navigation via `location` field in label parts
+- **No direct click handlers**: Would need Zed modification
+
+Structure (`zed/crates/project/src/project.rs`):
+```rust
+pub struct InlayHintLabelPart {
+    pub value: String,
+    pub tooltip: Option<InlayHintLabelPartTooltip>,
+    pub location: Option<(LanguageServerId, lsp::Location)>,  // Ctrl+Click navigation
+}
+```
+
+### Code Lenses
+
+**Not implemented in Zed.** Use code actions instead.
+
+### Diagnostics
+
+Rendered as inline blocks with code action support. Could potentially trigger agent communication.
+
+### Agent Panel Communication
+
+**No direct LSP→Agent pipeline exists.** Would require:
+1. Extend `InlayHintLabelPart` with `command` field
+2. Hook click handler to dispatch actions
+3. Add action receiver in agent panel
+
+Key files:
+- `zed/crates/project/src/project.rs` - InlayHint structures
+- `zed/crates/editor/src/inlays/inlay_hints.rs` - Click handling (lines 684-700)
+- `zed/crates/agent_ui/src/agent_panel.rs` - Would receive actions
+
+### Alternative: Banjo as LSP Server
+
+Banjo could implement LSP protocol to provide:
+- Inlay hints for note markers
+- Hover popups with note content
+- Ctrl+Click to navigate (but not to agent panel)
+
+Limitation: No way to send data TO agent panel from LSP without Zed modifications.
+
+## WASM Extension Capabilities
+
+Zed WASM extensions are sandboxed with limited capabilities:
+
+**Can do:**
+- LSP server configuration
+- Slash commands (text output in assistant panel)
+- Context servers for AI
+- Completion/symbol labels
+- Debug adapter setup
+- File operations, settings, key-value storage
+
+**Cannot do:**
+- Editor buffer decorations/markers
+- Click interception on decorations
+- Direct tree-sitter access
+- Custom UI panels
+- Agent panel communication
+- SQLite or structured persistence
+
+## Hemis Integration Options
+
+### Option 1: LSP Server + WASM Extension (Recommended)
+
+**Effort:** 3-4 weeks, no fork needed
+
+```
+LSP Server (external process)
+  ├─ Tree-sitter parsing + SQLite database
+  ├─ Publish diagnostics: "HEMI: {note}" at node positions
+  ├─ Code actions to add/edit/delete notes
+  └─ Sync on file changes
+
+WASM Extension
+  ├─ Register LSP server
+  ├─ Slash command for bulk operations
+  └─ Settings/config management
+```
+
+Notes appear as info-level diagnostics (gutter icons). Click → code action → edit.
+
+### Option 2: Modify Zed Source (Best UX)
+
+**Effort:** 2-3 weeks + fork maintenance
+
+- Add `InlayId::Hemi(uuid)` variant
+- Custom gutter icons with click handlers
+- Native tree-sitter tracking
+- SQLite in project directory
+- Full visual control
+
+Requires maintaining Zed fork.
+
+### Option 3: Agent Panel Only (Current Capability)
+
+Use clickable markdown links in agent output:
+```markdown
+[@file.zig (42:50)](file:///path#L42:50)
+```
+
+No inline markers, but notes can link to code locations.
+
 ## Related Documentation
 
 - [ACP Protocol](acp-protocol.md) - Agent Client Protocol specification
