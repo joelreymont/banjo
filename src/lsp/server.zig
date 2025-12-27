@@ -477,8 +477,10 @@ pub const Server = struct {
         // Look up the target note
         if (self.note_index.getNote(target_id)) |note| {
             const target_line: u32 = if (note.line > 0) note.line - 1 else 0;
+            const target_uri = try pathToUri(self.allocator, note.file_path);
+            defer self.allocator.free(target_uri);
             const location = protocol.Location{
-                .uri = try pathToUri(self.allocator, note.file_path),
+                .uri = target_uri,
                 .range = .{
                     .start = .{ .line = target_line, .character = 0 },
                     .end = .{ .line = target_line, .character = 0 },
@@ -537,6 +539,13 @@ pub const Server = struct {
         var items: std.ArrayListUnmanaged(protocol.CompletionItem) = .empty;
         defer items.deinit(self.allocator);
 
+        // Track allocated strings for cleanup
+        var allocated_strings: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (allocated_strings.items) |s| self.allocator.free(s);
+            allocated_strings.deinit(self.allocator);
+        }
+
         // Get current file path from URI
         const current_path = uriToPath(uri) orelse uri;
 
@@ -548,12 +557,18 @@ pub const Server = struct {
 
             if (mem.eql(u8, note_info.file_path, current_path)) {
                 const summary = getSummary(note_info.content);
+                const detail = try std.fmt.allocPrint(self.allocator, "line {d}", .{note_info.line});
+                try allocated_strings.append(self.allocator, detail);
+                const insertText = try std.fmt.allocPrint(self.allocator, "{s}]({s})", .{ summary, note_id });
+                try allocated_strings.append(self.allocator, insertText);
+                const sortText = try std.fmt.allocPrint(self.allocator, "0{s}", .{note_id});
+                try allocated_strings.append(self.allocator, sortText);
                 try items.append(self.allocator, .{
-                    .label = summary, // Show content, not ID
+                    .label = summary,
                     .kind = 6, // Variable
-                    .detail = try std.fmt.allocPrint(self.allocator, "line {d}", .{note_info.line}),
-                    .insertText = try std.fmt.allocPrint(self.allocator, "{s}]({s})", .{ summary, note_id }),
-                    .sortText = try std.fmt.allocPrint(self.allocator, "0{s}", .{note_id}),
+                    .detail = detail,
+                    .insertText = insertText,
+                    .sortText = sortText,
                 });
             }
         }
@@ -567,12 +582,18 @@ pub const Server = struct {
             if (!mem.eql(u8, note_info.file_path, current_path)) {
                 const filename = std.fs.path.basename(note_info.file_path);
                 const summary = getSummary(note_info.content);
+                const detail = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ filename, note_info.line });
+                try allocated_strings.append(self.allocator, detail);
+                const insertText = try std.fmt.allocPrint(self.allocator, "{s}]({s})", .{ summary, note_id });
+                try allocated_strings.append(self.allocator, insertText);
+                const sortText = try std.fmt.allocPrint(self.allocator, "1{s}", .{note_id});
+                try allocated_strings.append(self.allocator, sortText);
                 try items.append(self.allocator, .{
-                    .label = summary, // Show content, not ID
+                    .label = summary,
                     .kind = 6, // Variable
-                    .detail = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ filename, note_info.line }),
-                    .insertText = try std.fmt.allocPrint(self.allocator, "{s}]({s})", .{ summary, note_id }),
-                    .sortText = try std.fmt.allocPrint(self.allocator, "1{s}", .{note_id}),
+                    .detail = detail,
+                    .insertText = insertText,
+                    .sortText = sortText,
                 });
             }
         }
