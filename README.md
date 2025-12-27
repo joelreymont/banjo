@@ -53,10 +53,10 @@ Banjo lets you attach notes to code as `@banjo[id]` comments. Notes appear as LS
 
 Notes are stored as comments in your code:
 ```
-// @banjo[abc123def456]: This function handles authentication
+// @banjo[abc123def456] This function handles authentication
 ```
 
-Notes can link to each other using `[[display text][target-id]]` syntax.
+Notes can link to each other using `@[display](target-id)` syntax. Type `@[` to trigger autocomplete.
 
 ## Configuration
 

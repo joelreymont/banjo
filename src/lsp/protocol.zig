@@ -168,7 +168,23 @@ pub const ServerCapabilities = struct {
     executeCommandProvider: ?ExecuteCommandOptions = null,
     diagnosticProvider: ?DiagnosticOptions = null,
     hoverProvider: ?bool = null,
+    definitionProvider: ?bool = null,
     completionProvider: ?CompletionOptions = null,
+    semanticTokensProvider: ?SemanticTokensOptions = null,
+};
+
+pub const SemanticTokensOptions = struct {
+    legend: SemanticTokensLegend,
+    full: bool = true,
+};
+
+pub const SemanticTokensLegend = struct {
+    tokenTypes: []const []const u8,
+    tokenModifiers: []const []const u8,
+};
+
+pub const SemanticTokens = struct {
+    data: []const u32,
 };
 
 pub const CompletionOptions = struct {
@@ -260,10 +276,12 @@ pub const ExecuteCommandParams = struct {
 // Hover
 // =============================================================================
 
-pub const HoverParams = struct {
+pub const TextDocumentPositionParams = struct {
     textDocument: TextDocumentIdentifier,
     position: Position,
 };
+
+pub const HoverParams = TextDocumentPositionParams;
 
 pub const Hover = struct {
     contents: MarkupContent,

@@ -885,7 +885,7 @@ pub const Agent = struct {
             formatted[i] = if (c == '\n') ' ' else c;
         }
 
-        const note_comment = try std.fmt.allocPrint(self.allocator, "{s} @banjo[{s}]: {s}\n", .{
+        const note_comment = try std.fmt.allocPrint(self.allocator, "{s} @banjo[{s}] {s}\n", .{
             comment_prefix, &note_id, formatted,
         });
         defer self.allocator.free(note_comment);

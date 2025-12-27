@@ -7,7 +7,7 @@ pub const ParsedNote = struct {
     id: []const u8,
     line: u32,
     content: []const u8,
-    /// Links found in content: [[summary][target-id]]
+    /// Links found in content: @[summary](target-id)
     links: []const []const u8,
 
     pub fn deinit(self: *ParsedNote, allocator: Allocator) void {
@@ -51,17 +51,10 @@ pub fn parseNoteLine(allocator: Allocator, line: []const u8, line_number: u32) !
     const id = try allocator.dupe(u8, line[id_start..id_end]);
     errdefer allocator.free(id);
 
-    // Content is after "]: "
-    const content_start = id_end + 1;
-    var content: []const u8 = "";
-
-    if (content_start < line.len) {
-        var cs = content_start;
-        // Skip ": " if present
-        if (line[cs] == ':') cs += 1;
-        if (cs < line.len and line[cs] == ' ') cs += 1;
-        content = line[cs..];
-    }
+    // Content is after "]" - skip whitespace
+    var cs = id_end + 1;
+    while (cs < line.len and (line[cs] == ' ' or line[cs] == '\t')) cs += 1;
+    const content = line[cs..];
 
     const duped_content = try allocator.dupe(u8, content);
     errdefer allocator.free(duped_content);
@@ -77,7 +70,7 @@ pub fn parseNoteLine(allocator: Allocator, line: []const u8, line_number: u32) !
     };
 }
 
-/// Parse [[summary][target-id]] links from content
+/// Parse @[display](target-id) links from content
 fn parseLinks(allocator: Allocator, content: []const u8) ![]const []const u8 {
     var links: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer {
@@ -87,24 +80,24 @@ fn parseLinks(allocator: Allocator, content: []const u8) ![]const []const u8 {
 
     var pos: usize = 0;
     while (pos < content.len) {
-        // Find [[
-        const link_start = mem.indexOfPos(u8, content, pos, "[[") orelse break;
-        // Find ][
-        const mid = mem.indexOfPos(u8, content, link_start + 2, "][") orelse {
+        // Find @[
+        const link_start = mem.indexOfPos(u8, content, pos, "@[") orelse break;
+        // Find ](
+        const mid = mem.indexOfPos(u8, content, link_start + 2, "](") orelse {
             pos = link_start + 2;
             continue;
         };
-        // Find ]]
-        const link_end = mem.indexOfPos(u8, content, mid + 2, "]]") orelse {
+        // Find )
+        const link_end = mem.indexOfPos(u8, content, mid + 2, ")") orelse {
             pos = mid + 2;
             continue;
         };
 
-        // Extract target ID (between ][ and ]])
+        // Extract target ID (between ]( and ))
         const target_id = content[mid + 2 .. link_end];
         try links.append(allocator, try allocator.dupe(u8, target_id));
 
-        pos = link_end + 2;
+        pos = link_end + 1;
     }
 
     return try links.toOwnedSlice(allocator);
@@ -165,7 +158,7 @@ pub fn formatNoteComment(
     content: []const u8,
     comment_prefix: []const u8,
 ) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s} @banjo[{s}]: {s}", .{
+    return std.fmt.allocPrint(allocator, "{s} @banjo[{s}] {s}", .{
         comment_prefix,
         id,
         content,
@@ -277,7 +270,7 @@ const testing = std.testing;
 
 test "parseNoteLine extracts note ID and content" {
     const alloc = testing.allocator;
-    var note = (try parseNoteLine(alloc, "// @banjo[note-123]: TODO fix this", 5)).?;
+    var note = (try parseNoteLine(alloc, "// @banjo[note-123] TODO fix this", 5)).?;
     defer note.deinit(alloc);
 
     try testing.expectEqualStrings("note-123", note.id);
@@ -295,18 +288,18 @@ test "parseNoteLine returns null for non-note lines" {
 test "parseNoteLine handles different comment styles" {
     const alloc = testing.allocator;
 
-    var note1 = (try parseNoteLine(alloc, "# @banjo[py-note]: Python note", 1)).?;
+    var note1 = (try parseNoteLine(alloc, "# @banjo[py-note] Python note", 1)).?;
     defer note1.deinit(alloc);
     try testing.expectEqualStrings("py-note", note1.id);
 
-    var note2 = (try parseNoteLine(alloc, "-- @banjo[sql-note]: SQL note", 1)).?;
+    var note2 = (try parseNoteLine(alloc, "-- @banjo[sql-note] SQL note", 1)).?;
     defer note2.deinit(alloc);
     try testing.expectEqualStrings("sql-note", note2.id);
 }
 
 test "parseNoteLine extracts links" {
     const alloc = testing.allocator;
-    var note = (try parseNoteLine(alloc, "// @banjo[note-1]: See [[other note][note-2]] and [[third][note-3]]", 1)).?;
+    var note = (try parseNoteLine(alloc, "// @banjo[note-1] See @[other note](note-2) and @[third](note-3)", 1)).?;
     defer note.deinit(alloc);
 
     try testing.expectEqual(@as(usize, 2), note.links.len);
@@ -318,9 +311,9 @@ test "scanFileForNotes finds all notes" {
     const alloc = testing.allocator;
     const content =
         \\const std = @import("std");
-        \\// @banjo[note-1]: First note
+        \\// @banjo[note-1] First note
         \\pub fn main() void {
-        \\    // @banjo[note-2]: Second note
+        \\    // @banjo[note-2] Second note
         \\}
     ;
 
@@ -350,7 +343,7 @@ test "formatNoteComment creates correct format" {
     const comment = try formatNoteComment(alloc, "note-123", "TODO fix this", "//");
     defer alloc.free(comment);
 
-    try testing.expectEqualStrings("// @banjo[note-123]: TODO fix this", comment);
+    try testing.expectEqualStrings("// @banjo[note-123] TODO fix this", comment);
 }
 
 test "generateNoteId returns 12 char hex string" {

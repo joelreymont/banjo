@@ -23,22 +23,24 @@ pub const OwnedDiagnostic = struct {
 
 /// Index of all notes for backlink lookup
 pub const NoteIndex = struct {
-    /// Map from note ID to note info
-    notes: std.StringHashMap(NoteInfo),
-    /// Map from note ID to list of backlink IDs
-    backlinks: std.StringHashMap(std.ArrayListUnmanaged([]const u8)),
-    allocator: Allocator,
-
     pub const NoteInfo = struct {
         file_path: []const u8,
         line: u32,
         content: []const u8,
     };
 
+    const BacklinkList = std.ArrayListUnmanaged([]const u8);
+    const NotesMap = std.StringHashMap(NoteInfo);
+    const BacklinksMap = std.StringHashMap(BacklinkList);
+
+    notes: NotesMap,
+    backlinks: BacklinksMap,
+    allocator: Allocator,
+
     pub fn init(allocator: Allocator) NoteIndex {
         return .{
-            .notes = std.StringHashMap(NoteInfo).init(allocator),
-            .backlinks = std.StringHashMap(std.ArrayList([]const u8)).init(allocator),
+            .notes = NotesMap.init(allocator),
+            .backlinks = BacklinksMap.init(allocator),
             .allocator = allocator,
         };
     }
@@ -67,6 +69,13 @@ pub const NoteIndex = struct {
 
     /// Add a note to the index
     pub fn addNote(self: *NoteIndex, note: comments.ParsedNote, file_path: []const u8) !void {
+        // Check for existing note with same ID and free it
+        if (self.notes.fetchRemove(note.id)) |old| {
+            self.allocator.free(old.key);
+            self.allocator.free(old.value.file_path);
+            self.allocator.free(old.value.content);
+        }
+
         const id = try self.allocator.dupe(u8, note.id);
         errdefer self.allocator.free(id);
 

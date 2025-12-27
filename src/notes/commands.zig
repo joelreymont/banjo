@@ -4,6 +4,9 @@ const fs = std.fs;
 const Allocator = mem.Allocator;
 const comments = @import("comments.zig");
 
+const NoteList = std.ArrayListUnmanaged(comments.ParsedNote);
+const NotesByFile = std.StringHashMap(NoteList);
+
 /// Result of a notes command
 pub const CommandResult = struct {
     success: bool,
@@ -91,7 +94,7 @@ fn handleNotes(allocator: Allocator, project_root: []const u8, _: []const u8) !C
 }
 
 const note_subcommands = std.StaticStringMap([]const u8).initComptime(.{
-    .{ "create", "To create a note:\n1. Write a comment in your code: // TODO: fix this\n2. Place cursor on that line\n3. Press Cmd+. and select 'Create Banjo Note'\n\nThe comment will be converted to: // @banjo[id]: TODO: fix this" },
+    .{ "create", "To create a note:\n1. Write a comment in your code: // TODO: fix this\n2. Place cursor on that line\n3. Press Cmd+. and select 'Create Banjo Note'\n\nThe comment will be converted to: // @banjo[id] TODO: fix this" },
 });
 
 fn handleNote(_: Allocator, _: []const u8, args: []const u8) !CommandResult {
@@ -104,7 +107,7 @@ fn handleNote(_: Allocator, _: []const u8, args: []const u8) !CommandResult {
 
 /// List all notes in project grouped by file
 fn listNotes(allocator: Allocator, project_root: []const u8) !CommandResult {
-    var notes_by_file = std.StringHashMap(std.ArrayListUnmanaged(comments.ParsedNote)).init(allocator);
+    var notes_by_file = NotesByFile.init(allocator);
     defer {
         var it = notes_by_file.iterator();
         while (it.next()) |entry| {
@@ -164,7 +167,7 @@ fn listNotes(allocator: Allocator, project_root: []const u8) !CommandResult {
 }
 
 /// Scan project recursively for note comments
-fn scanProjectForNotes(allocator: Allocator, dir_path: []const u8, notes_by_file: *std.StringHashMap(std.ArrayListUnmanaged(comments.ParsedNote))) !void {
+fn scanProjectForNotes(allocator: Allocator, dir_path: []const u8, notes_by_file: *NotesByFile) !void {
     var dir = fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
     defer dir.close();
 

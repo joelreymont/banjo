@@ -124,6 +124,8 @@ pub const Server = struct {
         .{ "textDocument/codeAction", handleCodeAction },
         .{ "textDocument/hover", handleHover },
         .{ "textDocument/completion", handleCompletion },
+        .{ "textDocument/semanticTokens/full", handleSemanticTokens },
+        .{ "textDocument/definition", handleDefinition },
         .{ "workspace/executeCommand", handleExecuteCommand },
     });
 
@@ -189,6 +191,7 @@ pub const Server = struct {
                 },
                 .codeActionProvider = true,
                 .hoverProvider = true,
+                .definitionProvider = true,
                 .completionProvider = .{
                     .triggerCharacters = &[_][]const u8{"["},
                 },
@@ -197,6 +200,13 @@ pub const Server = struct {
                         "banjo.createNote",
                         "banjo.showBacklinks",
                     },
+                },
+                .semanticTokensProvider = .{
+                    .legend = .{
+                        .tokenTypes = &[_][]const u8{ "macro", "string" },
+                        .tokenModifiers = &[_][]const u8{},
+                    },
+                    .full = true,
                 },
             },
         };
@@ -426,7 +436,62 @@ pub const Server = struct {
         try self.transport.writeTypedResponse(request.id, hover);
     }
 
+    fn handleDefinition(self: *Server, request: jsonrpc.Request) !void {
+        const params = if (request.params) |p| blk: {
+            const parsed = std.json.parseFromValue(
+                protocol.TextDocumentPositionParams,
+                self.allocator,
+                p,
+                .{ .ignore_unknown_fields = true },
+            ) catch {
+                try self.transport.writeTypedResponse(request.id, @as(?protocol.Location, null));
+                return;
+            };
+            break :blk parsed;
+        } else {
+            try self.transport.writeTypedResponse(request.id, @as(?protocol.Location, null));
+            return;
+        };
+        defer params.deinit();
+
+        const uri = params.value.textDocument.uri;
+        const line = params.value.position.line;
+        const char = params.value.position.character;
+
+        const content = self.documents.get(uri) orelse {
+            try self.transport.writeTypedResponse(request.id, @as(?protocol.Location, null));
+            return;
+        };
+
+        const line_content = getLineContent(content, line) orelse {
+            try self.transport.writeTypedResponse(request.id, @as(?protocol.Location, null));
+            return;
+        };
+
+        // Check if cursor is on a note ID pattern: @banjo[id] or @[text](id)
+        const target_id = findNoteIdAtPosition(line_content, char) orelse {
+            try self.transport.writeTypedResponse(request.id, @as(?protocol.Location, null));
+            return;
+        };
+
+        // Look up the target note
+        if (self.note_index.getNote(target_id)) |note| {
+            const target_line: u32 = if (note.line > 0) note.line - 1 else 0;
+            const location = protocol.Location{
+                .uri = try pathToUri(self.allocator, note.file_path),
+                .range = .{
+                    .start = .{ .line = target_line, .character = 0 },
+                    .end = .{ .line = target_line, .character = 0 },
+                },
+            };
+            try self.transport.writeTypedResponse(request.id, location);
+        } else {
+            try self.transport.writeTypedResponse(request.id, @as(?protocol.Location, null));
+        }
+    }
+
     fn handleCompletion(self: *Server, request: jsonrpc.Request) !void {
+        log.info("handleCompletion called", .{});
         const params = if (request.params) |p| blk: {
             const parsed = std.json.parseFromValue(
                 protocol.CompletionParams,
@@ -459,10 +524,14 @@ pub const Server = struct {
             return;
         };
 
-        if (char < 2 or !mem.eql(u8, line_content[char - 2 .. char], "[[")) {
+        // Trigger on @[ for note links
+        const prefix = if (char >= 2 and char <= line_content.len) line_content[char - 2 .. char] else "";
+        log.info("completion check: char={d}, prefix='{s}'", .{ char, prefix });
+        if (!mem.eql(u8, prefix, "@[")) {
             try self.transport.writeTypedResponse(request.id, protocol.CompletionList{ .items = &.{} });
             return;
         }
+        log.info("@[ matched, building completions", .{});
 
         // Build completion items - current file first, then other files
         var items: std.ArrayListUnmanaged(protocol.CompletionItem) = .empty;
@@ -478,14 +547,12 @@ pub const Server = struct {
             const note_info = entry.value_ptr.*;
 
             if (mem.eql(u8, note_info.file_path, current_path)) {
+                const summary = getSummary(note_info.content);
                 try items.append(self.allocator, .{
-                    .label = note_id,
+                    .label = summary, // Show content, not ID
                     .kind = 6, // Variable
-                    .detail = try std.fmt.allocPrint(self.allocator, "(this file) {s}", .{getSummary(note_info.content)}),
-                    .insertText = try std.fmt.allocPrint(self.allocator, "[{s}][{s}]]", .{
-                        getSummary(note_info.content),
-                        note_id,
-                    }),
+                    .detail = try std.fmt.allocPrint(self.allocator, "line {d}", .{note_info.line}),
+                    .insertText = try std.fmt.allocPrint(self.allocator, "{s}]({s})", .{ summary, note_id }),
                     .sortText = try std.fmt.allocPrint(self.allocator, "0{s}", .{note_id}),
                 });
             }
@@ -499,14 +566,12 @@ pub const Server = struct {
 
             if (!mem.eql(u8, note_info.file_path, current_path)) {
                 const filename = std.fs.path.basename(note_info.file_path);
+                const summary = getSummary(note_info.content);
                 try items.append(self.allocator, .{
-                    .label = note_id,
+                    .label = summary, // Show content, not ID
                     .kind = 6, // Variable
-                    .detail = try std.fmt.allocPrint(self.allocator, "{s}: {s}", .{ filename, getSummary(note_info.content) }),
-                    .insertText = try std.fmt.allocPrint(self.allocator, "[{s}][{s}]]", .{
-                        getSummary(note_info.content),
-                        note_id,
-                    }),
+                    .detail = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ filename, note_info.line }),
+                    .insertText = try std.fmt.allocPrint(self.allocator, "{s}]({s})", .{ summary, note_id }),
                     .sortText = try std.fmt.allocPrint(self.allocator, "1{s}", .{note_id}),
                 });
             }
@@ -514,6 +579,104 @@ pub const Server = struct {
 
         try self.transport.writeTypedResponse(request.id, protocol.CompletionList{
             .items = items.items,
+        });
+    }
+
+    fn handleSemanticTokens(self: *Server, request: jsonrpc.Request) !void {
+        const params = if (request.params) |p| blk: {
+            const parsed = std.json.parseFromValue(
+                struct { textDocument: protocol.TextDocumentIdentifier },
+                self.allocator,
+                p,
+                .{ .ignore_unknown_fields = true },
+            ) catch {
+                try self.transport.writeTypedResponse(request.id, protocol.SemanticTokens{ .data = &.{} });
+                return;
+            };
+            break :blk parsed;
+        } else {
+            try self.transport.writeTypedResponse(request.id, protocol.SemanticTokens{ .data = &.{} });
+            return;
+        };
+        defer params.deinit();
+
+        const uri = params.value.textDocument.uri;
+        const content = self.documents.get(uri) orelse {
+            try self.transport.writeTypedResponse(request.id, protocol.SemanticTokens{ .data = &.{} });
+            return;
+        };
+
+        // Token data: [deltaLine, deltaStart, length, tokenType, tokenModifiers]
+        var tokens: std.ArrayListUnmanaged(u32) = .empty;
+        defer tokens.deinit(self.allocator);
+
+        var prev_line: u32 = 0;
+        var prev_char: u32 = 0;
+
+        // Scan all lines for @banjo[id] and @[text](id) patterns
+        var line_num: u32 = 0;
+        var line_start: usize = 0;
+        for (content, 0..) |c, i| {
+            if (c == '\n' or i == content.len - 1) {
+                const line_end = if (c == '\n') i else i + 1;
+                const line_content = content[line_start..line_end];
+
+                // Find @banjo[id] pattern
+                if (mem.indexOf(u8, line_content, "@banjo[")) |marker_start| {
+                    if (mem.indexOfPos(u8, line_content, marker_start + 7, "]")) |id_end| {
+                        const delta_line = line_num - prev_line;
+                        const start_char: u32 = @intCast(marker_start);
+                        const delta_char = if (delta_line == 0) start_char - prev_char else start_char;
+                        const length: u32 = @intCast(id_end + 1 - marker_start);
+
+                        try tokens.appendSlice(self.allocator, &[_]u32{
+                            delta_line, delta_char, length, 0, 0,
+                        });
+
+                        prev_line = line_num;
+                        prev_char = start_char;
+                    }
+                }
+
+                // Find all @[text](id) patterns
+                var search_pos: usize = 0;
+                while (search_pos < line_content.len) {
+                    const link_start = mem.indexOfPos(u8, line_content, search_pos, "@[") orelse break;
+                    // Skip if this is @banjo[
+                    if (link_start + 6 <= line_content.len and mem.eql(u8, line_content[link_start .. link_start + 6], "@banjo")) {
+                        search_pos = link_start + 6;
+                        continue;
+                    }
+                    const mid = mem.indexOfPos(u8, line_content, link_start + 2, "](") orelse {
+                        search_pos = link_start + 2;
+                        continue;
+                    };
+                    const link_end = mem.indexOfPos(u8, line_content, mid + 2, ")") orelse {
+                        search_pos = mid + 2;
+                        continue;
+                    };
+
+                    const delta_line = line_num - prev_line;
+                    const start_char: u32 = @intCast(link_start);
+                    const delta_char = if (delta_line == 0) start_char - prev_char else start_char;
+                    const length: u32 = @intCast(link_end + 1 - link_start);
+
+                    try tokens.appendSlice(self.allocator, &[_]u32{
+                        delta_line, delta_char, length, 1, 0,
+                    });
+
+                    prev_line = line_num;
+                    prev_char = start_char;
+                    search_pos = link_end + 1;
+                }
+
+                line_num += 1;
+                line_start = i + 1;
+            }
+        }
+
+        try self.transport.writeTypedResponse(request.id, protocol.SemanticTokens{
+            .data = tokens.items,
         });
     }
 
@@ -542,6 +705,7 @@ pub const Server = struct {
 
         const uri = params.value.textDocument.uri;
         const line = params.value.range.start.line; // 0-indexed for edits
+        const char = params.value.range.start.character;
         const file_path = uriToPath(uri) orelse {
             try self.transport.writeTypedResponse(request.id, &[_]protocol.CodeAction{});
             return;
@@ -566,23 +730,9 @@ pub const Server = struct {
             self.allocator.free(note.links);
             // Could add "Delete Note" action here in the future
         } else if (is_comment) {
-            // Comment line: convert to banjo note (replace line)
-            const prefix = comments.getCommentPrefix(file_path);
+            // Comment line: insert @banjo[id] at cursor position
             const note_id = comments.generateNoteId();
-
-            // Extract comment text (strip comment prefix)
-            var comment_text = mem.trim(u8, line_text, " \t");
-            for ([_][]const u8{ "//", "#", "--", ";" }) |p| {
-                if (mem.startsWith(u8, comment_text, p)) {
-                    comment_text = mem.trimLeft(u8, comment_text[p.len..], " ");
-                    break;
-                }
-            }
-
-            const new_line = comments.formatNoteComment(self.allocator, &note_id, comment_text, prefix) catch {
-                try self.transport.writeTypedResponse(request.id, &[_]protocol.CodeAction{});
-                return;
-            };
+            const insert_text = try std.fmt.allocPrint(self.allocator, "@banjo[{s}] ", .{&note_id});
 
             const title = if (hasTodoPattern(line_text)) |pattern|
                 try std.fmt.allocPrint(self.allocator, "Convert {s} to Banjo Note", .{pattern})
@@ -597,10 +747,10 @@ pub const Server = struct {
                         .textDocument = .{ .uri = uri },
                         .edits = try self.allocator.dupe(protocol.TextEdit, &[_]protocol.TextEdit{.{
                             .range = .{
-                                .start = .{ .line = line, .character = 0 },
-                                .end = .{ .line = line, .character = @intCast(line_text.len) },
+                                .start = .{ .line = line, .character = char },
+                                .end = .{ .line = line, .character = char },
                             },
-                            .newText = new_line,
+                            .newText = insert_text,
                         }}),
                     }}),
                 },
@@ -613,7 +763,7 @@ pub const Server = struct {
 
             const new_line = try std.fmt.allocPrint(
                 self.allocator,
-                "{s}{s} [banjo:{s}] NOTE:\n",
+                "{s}{s} @banjo[{s}] NOTE:\n",
                 .{ indent, prefix, &note_id },
             );
 
@@ -697,17 +847,31 @@ pub const Server = struct {
         const note_id = comments.generateNoteId();
 
         if (is_comment) {
-            // Comment line: extract text and replace with banjo marker
-            var comment_text = line_content;
-            for ([_][]const u8{ "//", "#", "--", ";" }) |p| {
-                if (mem.startsWith(u8, mem.trimLeft(u8, line_content, " \t"), p)) {
-                    const start = mem.indexOf(u8, line_content, p).? + p.len;
-                    comment_text = mem.trimLeft(u8, line_content[start..], " ");
-                    break;
-                }
+            // Comment line: find prefix end, skip whitespace, insert note ID
+            const trimmed = mem.trimLeft(u8, line_content, " \t");
+            const leading_spaces = mem.indexOf(u8, line_content, trimmed) orelse 0;
+
+            // Skip comment prefix chars (/, #, -, ;)
+            var prefix_end: usize = 0;
+            while (prefix_end < trimmed.len) : (prefix_end += 1) {
+                const c = trimmed[prefix_end];
+                if (c != '/' and c != '#' and c != '-' and c != ';') break;
+            }
+            // Skip whitespace after prefix
+            var content_start = prefix_end;
+            while (content_start < trimmed.len and (trimmed[content_start] == ' ' or trimmed[content_start] == '\t')) {
+                content_start += 1;
             }
 
-            const new_line = try comments.formatNoteComment(self.allocator, &note_id, comment_text, prefix);
+            const original_prefix = trimmed[0..prefix_end];
+            const comment_text = trimmed[content_start..];
+
+            // Build: <indent><original_prefix> @banjo[id] <content>
+            const new_line = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}{s} @banjo[{s}] {s}",
+                .{ line_content[0..leading_spaces], original_prefix, &note_id, comment_text },
+            );
             defer self.allocator.free(new_line);
             try self.applyLineEdit(uri, line - 1, new_line);
         } else {
@@ -715,7 +879,7 @@ pub const Server = struct {
             const indent = getIndent(line_content);
             const new_line = try std.fmt.allocPrint(
                 self.allocator,
-                "{s}{s} [banjo:{s}] NOTE:\n",
+                "{s}{s} @banjo[{s}] NOTE:\n",
                 .{ indent, prefix, &note_id },
             );
             defer self.allocator.free(new_line);
@@ -884,16 +1048,70 @@ fn isCommentLine(content: []const u8, line: u32) bool {
 }
 
 fn getSummary(text: []const u8) []const u8 {
-    var end: usize = 0;
+    // Find first line
+    var end: usize = text.len;
     for (text, 0..) |c, i| {
         if (c == '\n') {
             end = i;
             break;
         }
-    } else {
-        end = text.len;
     }
-    return if (end > 40) text[0..40] else text[0..end];
+
+    // If short enough, return as-is
+    if (end <= 40) return text[0..end];
+
+    // Find last space before position 40 to avoid splitting words
+    var split: usize = 40;
+    while (split > 0 and text[split] != ' ') : (split -= 1) {}
+    return if (split > 0) text[0..split] else text[0..40];
+}
+
+/// Find note ID at cursor position. Handles:
+/// - @banjo[id] - returns id
+/// - @[text](id) - returns id
+fn findNoteIdAtPosition(line: []const u8, char: u32) ?[]const u8 {
+    const pos: usize = @intCast(char);
+
+    // Check for @banjo[id] patterns - find all of them
+    var banjo_pos: usize = 0;
+    while (mem.indexOfPos(u8, line, banjo_pos, "@banjo[")) |start| {
+        const id_start = start + 7; // "@banjo[".len
+        if (mem.indexOfPos(u8, line, id_start, "]")) |id_end| {
+            if (pos >= start and pos <= id_end) {
+                return line[id_start..id_end];
+            }
+            banjo_pos = id_end + 1;
+        } else {
+            banjo_pos = id_start;
+        }
+    }
+
+    // Check for @[text](id) link patterns - find all of them
+    var search_pos: usize = 0;
+    while (search_pos < line.len) {
+        const link_start = mem.indexOfPos(u8, line, search_pos, "@[") orelse break;
+        // Skip @banjo[ patterns
+        if (link_start + 6 <= line.len and mem.eql(u8, line[link_start .. link_start + 6], "@banjo")) {
+            search_pos = link_start + 6;
+            continue;
+        }
+        const mid = mem.indexOfPos(u8, line, link_start + 2, "](") orelse {
+            search_pos = link_start + 2;
+            continue;
+        };
+        const link_end = mem.indexOfPos(u8, line, mid + 2, ")") orelse {
+            search_pos = mid + 2;
+            continue;
+        };
+
+        if (pos >= link_start and pos <= link_end) {
+            return line[mid + 2 .. link_end];
+        }
+
+        search_pos = link_end + 1;
+    }
+
+    return null;
 }
 
 fn uriToPath(uri: []const u8) ?[]const u8 {
@@ -1006,7 +1224,7 @@ test "isCommentLine detects comments" {
 }
 
 test "isCommentLine excludes banjo notes" {
-    const content = "// @banjo[abc]: note\n// regular comment";
+    const content = "// @banjo[abc] note\n// regular comment";
     try testing.expect(!isCommentLine(content, 1)); // already a note
     try testing.expect(isCommentLine(content, 2)); // can be converted
 }
