@@ -1,26 +1,32 @@
 id = "banjo"
 name = "Banjo"
-version = "0.2.0"
+version = "0.3.0"
 schema_version = 1
-description = "Claude Code ACP Agent in Zig"
+description = "A second brain for your code - Claude Code agent with notes and backlinks"
 authors = ["Joel Reymont <joelr@well.com>"]
 repository = "https://github.com/joelreymont/banjo"
 license = "MIT"
 
+# ACP Agent Server (Claude Code)
 [agent_servers.banjo]
 name = "Claude Code (Banjo)"
 
 [agent_servers.banjo.targets.darwin-aarch64]
-archive = "https://github.com/joelreymont/banjo/releases/download/v0.2.0/banjo-darwin-arm64.tar.gz"
-sha256 = "27a686c93ddcbcda4bed08d47b43c16c3b3ae9fb4f2c8755355663ef0cb000ec"
+archive = "https://github.com/joelreymont/banjo/releases/download/v0.3.0/banjo-darwin-arm64.tar.gz"
 cmd = "./banjo"
+args = ["--agent"]
 
 [agent_servers.banjo.targets.darwin-x86_64]
-archive = "https://github.com/joelreymont/banjo/releases/download/v0.2.0/banjo-darwin-x64.tar.gz"
-sha256 = "a14624bc33f800284fdd30dac0ea3123a53223cd3bc56e7011197d8db9a3c515"
+archive = "https://github.com/joelreymont/banjo/releases/download/v0.3.0/banjo-darwin-x64.tar.gz"
 cmd = "./banjo"
+args = ["--agent"]
 
 [agent_servers.banjo.targets.linux-x86_64]
-archive = "https://github.com/joelreymont/banjo/releases/download/v0.2.0/banjo-linux-x64.tar.gz"
-sha256 = "32931c1022ec83a6308dedee87b51af05214af3027c2db25c8a20c6b8fdbd0a9"
+archive = "https://github.com/joelreymont/banjo/releases/download/v0.3.0/banjo-linux-x64.tar.gz"
 cmd = "./banjo"
+args = ["--agent"]
+
+# LSP Server for notes
+[language_servers.banjo-notes]
+name = "Banjo Notes"
+languages = ["Zig", "Rust", "Python", "JavaScript", "TypeScript", "Go", "C", "C++", "Ruby", "Elixir", "Markdown"]

@@ -1,11 +1,20 @@
 const std = @import("std");
 const jsonrpc = @import("jsonrpc.zig");
 const Agent = @import("acp/agent.zig").Agent;
+const LspServer = @import("lsp/server.zig").Server;
+const config = @import("config");
 
 const log = std.log.scoped(.banjo);
 
+/// Run mode
+const Mode = enum {
+    agent, // ACP agent mode (default)
+    lsp, // LSP server mode
+};
+
 /// CLI options matching Claude Code interface
 const CliOptions = struct {
+    mode: Mode = .agent,
     output_format: Format = .stream_json,
     input_format: Format = .stream_json,
     verbose: bool = false,
@@ -21,6 +30,8 @@ const CliOptions = struct {
 };
 
 const ArgAction = enum {
+    mode_agent,
+    mode_lsp,
     output_format,
     input_format,
     verbose,
@@ -38,6 +49,8 @@ const ArgAction = enum {
 };
 
 const arg_map = std.StaticStringMap(ArgAction).initComptime(.{
+    .{ "--agent", .mode_agent },
+    .{ "--lsp", .mode_lsp },
     .{ "--output-format", .output_format },
     .{ "--input-format", .input_format },
     .{ "--verbose", .verbose },
@@ -72,6 +85,8 @@ fn parseArgs(allocator: std.mem.Allocator) !CliOptions {
     while (args.next()) |arg| {
         const action = arg_map.get(arg) orelse continue;
         switch (action) {
+            .mode_agent => opts.mode = .agent,
+            .mode_lsp => opts.mode = .lsp,
             .output_format => opts.output_format = parseFormat(args.next()),
             .input_format => opts.input_format = parseFormat(args.next()),
             .verbose => opts.verbose = true,
@@ -103,9 +118,13 @@ fn printHelp() void {
     var file_writer = stdout_file.writer(&buf);
     const w = &file_writer.interface;
     w.writeAll(
-        \\Banjo - Claude Code ACP Agent
+        \\Banjo - A second brain for your code
         \\
-        \\Usage: banjo [OPTIONS]
+        \\Usage: banjo [MODE] [OPTIONS]
+        \\
+        \\Modes:
+        \\  --agent                     ACP agent mode (default)
+        \\  --lsp                       LSP server mode for note stickies
         \\
         \\Options:
         \\  --output-format <format>    Output format: stream-json, text
@@ -129,38 +148,48 @@ pub fn main() !void {
 
     const opts = try parseArgs(allocator);
 
-    if (opts.verbose) {
-        log.info("Banjo ACP agent starting...", .{});
-        if (opts.session_id) |sid| {
-            log.info("Session ID: {s}", .{sid});
-        }
-    }
-
     const stdin = std.fs.File.stdin().deprecatedReader().any();
     const stdout = std.fs.File.stdout().deprecatedWriter().any();
 
-    var reader = jsonrpc.Reader.init(allocator, stdin);
-    defer reader.deinit();
-
-    var acp_agent = Agent.init(allocator, stdout);
-    defer acp_agent.deinit();
-
-    // Main event loop
-    while (true) {
-        var parsed = reader.next() catch |err| {
-            log.err("Failed to parse request: {}", .{err});
-            continue;
-        } orelse {
+    switch (opts.mode) {
+        .lsp => {
+            log.info("Banjo LSP v{s} ({s}) starting", .{ config.version, config.git_hash });
+            var server = LspServer.init(allocator, stdin, stdout);
+            defer server.deinit();
+            try server.run();
+        },
+        .agent => {
+            log.info("Banjo Agent v{s} ({s}) starting", .{ config.version, config.git_hash });
             if (opts.verbose) {
-                log.info("EOF received, shutting down", .{});
+                if (opts.session_id) |sid| {
+                    log.info("Session ID: {s}", .{sid});
+                }
             }
-            break;
-        };
-        defer parsed.deinit();
 
-        acp_agent.handleRequest(parsed.request) catch |err| {
-            log.err("Failed to handle request: {}", .{err});
-        };
+            var reader = jsonrpc.Reader.init(allocator, stdin);
+            defer reader.deinit();
+
+            var acp_agent = Agent.init(allocator, stdout);
+            defer acp_agent.deinit();
+
+            // Main event loop
+            while (true) {
+                var parsed = reader.next() catch |err| {
+                    log.err("Failed to parse request: {}", .{err});
+                    continue;
+                } orelse {
+                    if (opts.verbose) {
+                        log.info("EOF received, shutting down", .{});
+                    }
+                    break;
+                };
+                defer parsed.deinit();
+
+                acp_agent.handleRequest(parsed.request) catch |err| {
+                    log.err("Failed to handle request: {}", .{err});
+                };
+            }
+        },
     }
 }
 
@@ -177,4 +206,13 @@ test {
     _ = @import("settings/loader.zig");
     _ = @import("tools/proxy.zig");
     _ = @import("util/quickcheck.zig");
+
+    // Notes (comment-based)
+    _ = @import("notes/comments.zig");
+    _ = @import("notes/commands.zig");
+
+    // LSP server
+    _ = @import("lsp/protocol.zig");
+    _ = @import("lsp/diagnostics.zig");
+    _ = @import("lsp/server.zig");
 }

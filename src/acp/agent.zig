@@ -8,12 +8,13 @@ const ContentBlockType = bridge.ContentBlockType;
 const SystemSubtype = bridge.SystemSubtype;
 const settings_loader = @import("../settings/loader.zig");
 const Settings = settings_loader.Settings;
+const notes_commands = @import("../notes/commands.zig");
 const config = @import("config");
 
 const log = std.log.scoped(.agent);
 
 /// Banjo version with git hash
-pub const version = "0.2.0 (" ++ config.git_hash ++ ")";
+pub const version = "0.3.0 (" ++ config.git_hash ++ ")";
 
 /// Check if auto-resume is enabled (default: true)
 fn isAutoResumeEnabled() bool {
@@ -84,6 +85,31 @@ fn extractTextFromPrompt(prompt: ?std.json.Value) ?[]const u8 {
         if (block_type != .text) continue;
         const text = block.object.get("text") orelse continue;
         if (text == .string) return text.string;
+    }
+    return null;
+}
+
+/// Resource block data extracted from prompt
+const ResourceData = struct {
+    uri: []const u8,
+    text: ?[]const u8,
+};
+
+/// Extract resource data from prompt content blocks (Zed sends file references as resources)
+fn extractResource(prompt: ?std.json.Value) ?ResourceData {
+    const blocks = prompt orelse return null;
+    if (blocks != .array) return null;
+    for (blocks.array.items) |block| {
+        if (block != .object) continue;
+        const type_val = block.object.get("type") orelse continue;
+        if (type_val != .string or !std.mem.eql(u8, type_val.string, "resource")) continue;
+        // Resource block: { type: "resource", resource: { uri, text } }
+        const resource = block.object.get("resource") orelse continue;
+        if (resource != .object) continue;
+        const uri = resource.object.get("uri") orelse continue;
+        if (uri != .string) continue;
+        const text = if (resource.object.get("text")) |t| (if (t == .string) t.string else null) else null;
+        return .{ .uri = uri.string, .text = text };
     }
     return null;
 }
@@ -294,6 +320,9 @@ pub const Agent = struct {
 
         log.info("Created session {s} in {s} with model {?s}", .{ session_id, cwd, session.model });
 
+        // Auto-setup: create .zed/settings.json if missing (enables banjo LSP)
+        const did_setup = self.autoSetupLspIfNeeded(cwd) catch false;
+
         // Pre-start Claude CLI for instant first response (auto-resume last session if enabled)
         session.bridge = Bridge.init(self.allocator, session.cwd);
         session.bridge.?.start(.{
@@ -311,59 +340,20 @@ pub const Agent = struct {
         try result.object.put("sessionId", .{ .string = session_id });
         try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
 
-        // Try to read CLI init with timeout to get slash commands
-        var cli_commands: ?[]const []const u8 = null;
-        var init_msg: ?bridge.StreamMessage = null;
-        defer if (init_msg) |*m| m.deinit();
+        // Send initial commands (CLI provides full list on first prompt after we send it input)
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .available_commands_update,
+            .availableCommands = &initial_commands,
+        });
 
-        if (session.bridge) |*cli_bridge| {
-            if (cli_bridge.process) |proc| {
-                if (proc.stdout) |stdout| {
-                    // Poll stdout for up to 5 seconds
-                    var fds = [_]std.posix.pollfd{.{
-                        .fd = stdout.handle,
-                        .events = std.posix.POLL.IN,
-                        .revents = 0,
-                    }};
-
-                    const poll_timeout_ms = 5000;
-                    const ready = std.posix.poll(&fds, poll_timeout_ms) catch |err| blk: {
-                        log.warn("Poll failed: {}", .{err});
-                        break :blk 0;
-                    };
-                    log.info("Poll result: ready={d}, revents=0x{x}", .{ ready, fds[0].revents });
-
-                    if (ready > 0 and (fds[0].revents & std.posix.POLL.IN) != 0) {
-                        // Data available, try to read messages until init
-                        var attempts: u32 = 0;
-                        while (attempts < 10) : (attempts += 1) {
-                            var msg = cli_bridge.readMessage() catch break orelse break;
-
-                            if (msg.type == .system) {
-                                if (msg.getInitInfo()) |info| {
-                                    init_msg = msg;
-                                    cli_commands = info.slash_commands;
-                                    break;
-                                }
-                            }
-                            if (init_msg == null) {
-                                msg.deinit();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Send available commands (banjo + CLI if available)
-        if (cli_commands) |cmds| {
-            log.info("Got {d} CLI slash commands at session start", .{cmds.len});
-            try self.sendAvailableCommands(session_id, cmds);
-        } else {
-            // Fallback to banjo + common CLI commands (CLI provides full list on first prompt)
+        // Notify user if auto-setup ran
+        if (did_setup) {
             try self.sendSessionUpdate(session_id, .{
-                .sessionUpdate = .available_commands_update,
-                .availableCommands = &initial_commands,
+                .sessionUpdate = .agent_message_chunk,
+                .content = .{
+                    .type = "text",
+                    .text = "✨ Created `.zed/settings.json` to enable banjo-notes LSP.\n\n**Reload workspace** (Cmd+Shift+P → \"workspace: reload\") to activate note features.",
+                },
             });
         }
     }
@@ -400,11 +390,16 @@ pub const Agent = struct {
         session.cancelled = false;
         log.info("Prompt received for session {s}: {s}", .{ session_id, prompt_text orelse "(empty)" });
 
-        // Handle banjo commands
+        // Handle slash commands
+        var effective_prompt = prompt_text;
         if (prompt_text) |text| {
-            if (std.mem.eql(u8, text, "/version") or std.mem.startsWith(u8, text, "/version ")) {
-                try self.handleVersionCommand(request, session_id);
-                return;
+            if (text.len > 0 and text[0] == '/') {
+                const resource = extractResource(parsed.value.prompt);
+                if (self.dispatchCommand(request, session, session_id, text, resource)) |transformed| {
+                    effective_prompt = transformed;
+                } else {
+                    return; // Command fully handled
+                }
             }
         }
 
@@ -437,7 +432,7 @@ pub const Agent = struct {
         }
 
         // Send prompt to CLI
-        if (prompt_text) |text| {
+        if (effective_prompt) |text| {
             try session.bridge.?.sendPrompt(text);
         }
         const prompt_sent_ms = timer.read() / std.time.ns_per_ms;
@@ -710,9 +705,277 @@ pub const Agent = struct {
         try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
     }
 
-    /// Banjo's own slash commands
-    const banjo_commands = [_]protocol.SlashCommand{
+    const Command = enum { version, note, notes, setup, explain };
+    const command_map = std.StaticStringMap(Command).initComptime(.{
+        .{ "version", .version },
+        .{ "note", .note },
+        .{ "notes", .notes },
+        .{ "setup", .setup },
+        .{ "explain", .explain },
+    });
+
+    /// Dispatch slash commands. Returns modified prompt to pass to CLI, or null if fully handled.
+    fn dispatchCommand(self: *Agent, request: jsonrpc.Request, session: *Session, session_id: []const u8, text: []const u8, resource: ?ResourceData) ?[]const u8 {
+        // Extract command name: "/cmd arg" -> "cmd"
+        const after_slash = text[1..];
+        const space_idx = std.mem.indexOfScalar(u8, after_slash, ' ') orelse after_slash.len;
+        const cmd_name = after_slash[0..space_idx];
+
+        const command = command_map.get(cmd_name) orelse return text; // Not our command, pass through to CLI
+
+        switch (command) {
+            .version => {
+                self.handleVersionCommand(request, session_id) catch return null;
+                return null; // Fully handled
+            },
+            .note, .notes, .setup => {
+                self.handleNotesCommand(request, session_id, session.cwd, text) catch return null;
+                return null; // Fully handled
+            },
+            .explain => {
+                // Get summary from Claude and insert as note comment
+                if (resource) |r| {
+                    self.handleExplainCommand(request, session, session_id, r) catch |err| {
+                        log.err("Explain command failed: {}", .{err});
+                    };
+                    return null;
+                }
+                // No valid resource found - show usage
+                self.sendSessionUpdate(session_id, .{
+                    .sessionUpdate = .agent_message_chunk,
+                    .content = .{ .type = "text", .text = "Usage: `/explain` with a code reference\n\n1. Select code in editor\n2. Press **Cmd+>** to add reference\n3. Type `/explain` and send" },
+                }) catch {};
+                self.sendEndTurn(request) catch {};
+                return null;
+            },
+        }
+    }
+
+    /// Decoded file URI result (path may be allocated)
+    const FileUri = struct {
+        path: []const u8,
+        line: u32,
+        allocated: bool = false,
+
+        fn deinit(self: *const FileUri, allocator: Allocator) void {
+            if (self.allocated) allocator.free(self.path);
+        }
+    };
+
+    /// Parse file:// URI into path and line number, with URL decoding
+    fn parseFileUri(allocator: Allocator, uri: []const u8) ?FileUri {
+        if (!std.mem.startsWith(u8, uri, "file:///")) return null;
+        const path_start = 7; // skip "file://"
+        const hash_idx = std.mem.indexOfScalar(u8, uri, '#') orelse uri.len;
+        const raw_path = uri[path_start..hash_idx];
+        if (raw_path.len == 0) return null;
+
+        // URL decode path (handle %XX sequences)
+        const path = if (std.mem.indexOf(u8, raw_path, "%")) |_| blk: {
+            var decoded: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer decoded.deinit(allocator);
+            var i: usize = 0;
+            while (i < raw_path.len) {
+                if (raw_path[i] == '%' and i + 2 < raw_path.len) {
+                    const hex = raw_path[i + 1 .. i + 3];
+                    if (std.fmt.parseInt(u8, hex, 16)) |byte| {
+                        decoded.append(allocator, byte) catch return null;
+                        i += 3;
+                        continue;
+                    } else |_| {}
+                }
+                decoded.append(allocator, raw_path[i]) catch return null;
+                i += 1;
+            }
+            break :blk decoded.toOwnedSlice(allocator) catch return null;
+        } else raw_path;
+
+        var line: u32 = 1;
+        if (hash_idx + 2 < uri.len and uri[hash_idx + 1] == 'L') {
+            const line_part = uri[hash_idx + 2 ..];
+            const colon_idx = std.mem.indexOfScalar(u8, line_part, ':') orelse line_part.len;
+            line = std.fmt.parseInt(u32, line_part[0..colon_idx], 10) catch 1;
+        }
+        return .{ .path = path, .line = line, .allocated = std.mem.indexOf(u8, raw_path, "%") != null };
+    }
+
+    /// Handle /explain command: get summary from Claude and insert as note comment
+    fn handleExplainCommand(self: *Agent, request: jsonrpc.Request, session: *Session, session_id: []const u8, resource: ResourceData) !void {
+        const comments = @import("../notes/comments.zig");
+
+        // Parse URI
+        const uri_info = parseFileUri(self.allocator, resource.uri) orelse {
+            return self.sendErrorAndEnd(request, session_id, "Invalid file URI");
+        };
+        defer uri_info.deinit(self.allocator);
+
+        // Security: validate path is within project directory (resolve symlinks)
+        const real_path = std.fs.cwd().realpathAlloc(self.allocator, uri_info.path) catch {
+            return self.sendErrorAndEnd(request, session_id, "Invalid file path");
+        };
+        defer self.allocator.free(real_path);
+
+        const real_cwd = std.fs.cwd().realpathAlloc(self.allocator, session.cwd) catch session.cwd;
+        defer if (real_cwd.ptr != session.cwd.ptr) self.allocator.free(real_cwd);
+
+        const in_project = std.mem.startsWith(u8, real_path, real_cwd) and
+            (real_path.len == real_cwd.len or real_path[real_cwd.len] == '/');
+        if (!in_project) {
+            log.warn("Path traversal attempt: {s} not in {s}", .{ real_path, real_cwd });
+            return self.sendErrorAndEnd(request, session_id, "File must be within project directory");
+        }
+
+        // Get code content from resource
+        const code = resource.text orelse {
+            return self.sendErrorAndEnd(request, session_id, "No code content in reference");
+        };
+
+        // Build prompt asking for paragraph summary
+        const ext = std.fs.path.extension(uri_info.path);
+        const lang = if (ext.len > 1) ext[1..] else "code";
+        const prompt = try std.fmt.allocPrint(self.allocator,
+            \\Write a brief paragraph explaining what this {s} code does. Be concise but thorough.
+            \\Respond with ONLY the explanation paragraph, no code blocks or formatting.
+            \\
+            \\```{s}
+            \\{s}
+            \\```
+        , .{ lang, lang, code });
+        defer self.allocator.free(prompt);
+
+        // Send prompt and collect response
+        const cli_bridge = try self.ensureBridge(session);
+        try cli_bridge.sendPrompt(prompt);
+
+        var summary: std.ArrayListUnmanaged(u8) = .empty;
+        defer summary.deinit(self.allocator);
+
+        const max_summary_size = 64 * 1024; // 64KB limit for summary
+        while (true) {
+            var msg = cli_bridge.readMessage() catch break orelse break;
+            defer msg.deinit();
+
+            switch (msg.type) {
+                .assistant => if (msg.getContent()) |content| {
+                    if (summary.items.len + content.len > max_summary_size) break;
+                    try summary.appendSlice(self.allocator, content);
+                },
+                .stream_event => if (msg.getStreamTextDelta()) |text| {
+                    if (summary.items.len + text.len > max_summary_size) break;
+                    try summary.appendSlice(self.allocator, text);
+                },
+                .result => break,
+                else => {},
+            }
+        }
+
+        if (summary.items.len == 0) {
+            return self.sendErrorAndEnd(request, session_id, "Could not get explanation from Claude");
+        }
+
+        // Generate note comment
+        const note_id = comments.generateNoteId();
+        const comment_prefix = comments.getCommentPrefix(uri_info.path);
+
+        // Format summary (replace newlines with spaces)
+        const trimmed = std.mem.trim(u8, summary.items, " \t\n\r");
+        var formatted = try self.allocator.alloc(u8, trimmed.len);
+        defer self.allocator.free(formatted);
+        for (trimmed, 0..) |c, i| {
+            formatted[i] = if (c == '\n') ' ' else c;
+        }
+
+        const note_comment = try std.fmt.allocPrint(self.allocator, "{s} @banjo[{s}]: {s}\n", .{
+            comment_prefix, &note_id, formatted,
+        });
+        defer self.allocator.free(note_comment);
+
+        // Insert comment at line (use real_path, not uri_info.path, to prevent symlink bypass)
+        comments.insertAtLine(self.allocator, real_path, uri_info.line, note_comment) catch |err| {
+            log.err("insertAtLine failed: {}", .{err});
+            return self.sendErrorAndEnd(request, session_id, "Could not write to file");
+        };
+
+        // Send success message
+        const success_msg = try std.fmt.allocPrint(self.allocator, "Added note `{s}` at {s}:{d}", .{
+            &note_id, std.fs.path.basename(uri_info.path), uri_info.line,
+        });
+        defer self.allocator.free(success_msg);
+
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .agent_message_chunk,
+            .content = .{ .type = "text", .text = success_msg },
+        });
+        try self.sendEndTurn(request);
+    }
+
+    /// Handle /note, /notes, and /setup commands
+    fn handleNotesCommand(self: *Agent, request: jsonrpc.Request, session_id: []const u8, cwd: []const u8, command: []const u8) !void {
+        // Execute command with project root
+        var cmd_result = notes_commands.executeCommand(self.allocator, cwd, command) catch {
+            try self.sendSessionUpdate(session_id, .{
+                .sessionUpdate = .agent_message_chunk,
+                .content = .{ .type = "text", .text = "Failed to execute notes command" },
+            });
+            var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
+            defer result.object.deinit();
+            try result.object.put("stopReason", .{ .string = "error" });
+            try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
+            return;
+        };
+        defer cmd_result.deinit(self.allocator);
+
+        // Send response
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .agent_message_chunk,
+            .content = .{ .type = "text", .text = cmd_result.message },
+        });
+
+        var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
+        defer result.object.deinit();
+        try result.object.put("stopReason", .{ .string = if (cmd_result.success) "end_turn" else "error" });
+        try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
+    }
+
+    /// Auto-setup LSP if .zed/settings.json doesn't exist. Returns true if setup was performed.
+    fn autoSetupLspIfNeeded(self: *Agent, cwd: []const u8) !bool {
+        // Only run for absolute paths (skip "." or relative paths in tests)
+        if (cwd.len == 0 or cwd[0] != '/') {
+            log.debug("Auto-setup: skipping for non-absolute path: {s}", .{cwd});
+            return false;
+        }
+
+        // Check if .zed/settings.json already exists
+        const settings_path = try std.fs.path.join(self.allocator, &.{ cwd, ".zed", "settings.json" });
+        defer self.allocator.free(settings_path);
+
+        std.fs.accessAbsolute(settings_path, .{}) catch {
+            // Doesn't exist - run setup
+            log.info("Auto-setup: creating .zed/settings.json for {s}", .{cwd});
+            var result = try notes_commands.executeCommand(self.allocator, cwd, "/setup");
+            defer result.deinit(self.allocator);
+
+            if (result.success) {
+                log.info("Auto-setup: LSP enabled for project", .{});
+                return true;
+            } else {
+                log.warn("Auto-setup: {s}", .{result.message});
+                return false;
+            }
+        };
+
+        // Already exists - nothing to do
+        log.debug("Auto-setup: .zed/settings.json already exists", .{});
+        return false;
+    }
+
+    /// Agent slash commands (handled locally, not forwarded to CLI)
+    const slash_commands = [_]protocol.SlashCommand{
         .{ .name = "version", .description = "Show banjo version" },
+        .{ .name = "setup", .description = "Enable banjo LSP for this project" },
+        .{ .name = "notes", .description = "List project notes" },
+        .{ .name = "note", .description = "Show or create a note" },
+        .{ .name = "explain", .description = "Explain code (paste Zed URL)" },
     };
 
     /// Commands filtered from CLI (unsupported in stream-json mode, handled via authMethods)
@@ -726,7 +989,7 @@ pub const Agent = struct {
     };
 
     /// Combined commands for initial session (before CLI provides its list)
-    const initial_commands = banjo_commands ++ common_cli_commands;
+    const initial_commands = slash_commands ++ common_cli_commands;
 
     /// Check if command is unsupported
     fn isUnsupportedCommand(name: []const u8) bool {
@@ -736,20 +999,33 @@ pub const Agent = struct {
         return false;
     }
 
-    /// Send available_commands_update with CLI commands + banjo commands
+    /// Check if command is ours (to avoid duplicates with CLI)
+    fn isOurCommand(name: []const u8) bool {
+        for (slash_commands) |cmd| {
+            if (std.mem.eql(u8, name, cmd.name)) return true;
+        }
+        return false;
+    }
+
+    /// Send available_commands_update with CLI commands + agent commands
     fn sendAvailableCommands(self: *Agent, session_id: []const u8, cli_commands: []const []const u8) !void {
-        // Build command list: banjo commands + CLI commands (filtered)
+        // Build command list: agent commands + CLI commands (filtered)
         var commands: std.ArrayList(protocol.SlashCommand) = .empty;
         defer commands.deinit(self.allocator);
 
-        // Add banjo's own commands first
-        for (&banjo_commands) |cmd| {
+        // Add agent commands first
+        for (&slash_commands) |cmd| {
             try commands.append(self.allocator, cmd);
         }
 
-        // Add CLI commands, filtering unsupported ones
+        // Add CLI commands, filtering unsupported and duplicates
         for (cli_commands) |name| {
-            if (!isUnsupportedCommand(name)) {
+            if (isUnsupportedCommand(name) or isOurCommand(name)) continue;
+            // Check if already added (CLI might send duplicates)
+            const already_added = for (commands.items) |cmd| {
+                if (std.mem.eql(u8, cmd.name, name)) break true;
+            } else false;
+            if (!already_added) {
                 try commands.append(self.allocator, .{ .name = name, .description = "" });
             }
         }
@@ -760,6 +1036,36 @@ pub const Agent = struct {
             .sessionUpdate = .available_commands_update,
             .availableCommands = commands.items,
         });
+    }
+
+    /// Send end_turn response for a request
+    fn sendEndTurn(self: *Agent, request: jsonrpc.Request) !void {
+        var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
+        defer result.object.deinit();
+        try result.object.put("stopReason", .{ .string = "end_turn" });
+        try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
+    }
+
+    /// Send error message and end turn (common pattern)
+    fn sendErrorAndEnd(self: *Agent, request: jsonrpc.Request, session_id: []const u8, msg: []const u8) !void {
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .agent_message_chunk,
+            .content = .{ .type = "text", .text = msg },
+        });
+        try self.sendEndTurn(request);
+    }
+
+    /// Ensure bridge is started, return it
+    fn ensureBridge(self: *Agent, session: *Session) !*Bridge {
+        if (session.bridge == null) {
+            session.bridge = Bridge.init(self.allocator, session.cwd);
+            try session.bridge.?.start(.{
+                .resume_session_id = session.cli_session_id,
+                .permission_mode = @tagName(session.permission_mode),
+                .model = session.model,
+            });
+        }
+        return &session.bridge.?;
     }
 
     /// Send a session update notification

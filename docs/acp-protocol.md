@@ -143,12 +143,33 @@ const PromptParams = struct {
 const ContentBlock = union(enum) {
     text: TextContent,
     image: ImageContent,
+    resource: ResourceContent,
+    resource_link: ResourceLinkContent,
     context: EmbeddedContext,
 };
 
 const TextContent = struct {
     type: []const u8 = "text",
     text: []const u8,
+};
+
+// Embedded resource with contents (from Cmd+> / "Add to Agent")
+const ResourceContent = struct {
+    type: []const u8 = "resource",
+    resource: TextResourceContents,
+};
+
+const TextResourceContents = struct {
+    type: []const u8 = "text_resource_contents",
+    uri: []const u8,  // e.g. "file:///path/to/file.zig#L42:50"
+    text: []const u8, // file contents
+};
+
+// Resource link without contents (agent must fetch)
+const ResourceLinkContent = struct {
+    type: []const u8 = "resource_link",
+    uri: []const u8,
+    name: []const u8,
 };
 ```
 

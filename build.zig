@@ -4,11 +4,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Get git commit hash
+    // Version and git info
+    const version = "0.3.1";
     const git_hash = b.run(&.{ "git", "rev-parse", "--short", "HEAD" });
 
     // Build options for version info
     const options = b.addOptions();
+    options.addOption([]const u8, "version", version);
     options.addOption([]const u8, "git_hash", std.mem.trim(u8, git_hash, "\n\r "));
 
     // Main module
