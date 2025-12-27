@@ -98,19 +98,28 @@ pub const NoteIndex = struct {
 
         // Index backlinks BEFORE adding note to map (so errdefers work correctly)
         for (note.links) |target_id| {
-            const target = try self.allocator.dupe(u8, target_id);
-            errdefer self.allocator.free(target);
-
             const source_id = try self.allocator.dupe(u8, note.id);
             errdefer self.allocator.free(source_id);
 
-            const result = try self.backlinks.getOrPut(target);
-            if (result.found_existing) {
-                self.allocator.free(target); // Key exists, don't need this copy
+            // Check if target already exists before allocating
+            if (self.backlinks.getPtr(target_id)) |list| {
+                // Target exists, just append source
+                try list.append(self.allocator, source_id);
             } else {
+                // New target, need to allocate key
+                const target = try self.allocator.dupe(u8, target_id);
+                const result = self.backlinks.getOrPut(target) catch |e| {
+                    self.allocator.free(target);
+                    return e;
+                };
                 result.value_ptr.* = .empty;
+                result.value_ptr.append(self.allocator, source_id) catch |e| {
+                    // Remove and free the entry we just added
+                    _ = self.backlinks.remove(target);
+                    self.allocator.free(target);
+                    return e;
+                };
             }
-            try result.value_ptr.append(self.allocator, source_id);
         }
 
         // Add note to map last (after backlinks processed successfully)
@@ -158,15 +167,24 @@ pub fn noteToDiagnostic(
     if (index) |idx| {
         if (idx.getBacklinks(note.id)) |backlink_ids| {
             var related = try allocator.alloc(protocol.DiagnosticRelatedInformation, backlink_ids.len);
-            errdefer allocator.free(related);
             var uris = try allocator.alloc([]const u8, backlink_ids.len);
-            errdefer allocator.free(uris);
-
             var valid_count: usize = 0;
+
+            errdefer {
+                // Clean up partial allocations on error
+                for (0..valid_count) |i| {
+                    allocator.free(related[i].message);
+                    allocator.free(uris[i]);
+                }
+                allocator.free(related);
+                allocator.free(uris);
+            }
+
             for (backlink_ids) |bl_id| {
                 if (idx.getNote(bl_id)) |bl_note| {
                     const bl_line: u32 = if (bl_note.line > 0) bl_note.line - 1 else 0;
                     const bl_msg = try std.fmt.allocPrint(allocator, "Linked from: {s}", .{getSummary(bl_note.content)});
+                    errdefer allocator.free(bl_msg);
                     const bl_uri = try pathToUri(allocator, bl_note.file_path);
 
                     uris[valid_count] = bl_uri;
@@ -222,10 +240,16 @@ pub fn notesToDiagnostics(
     if (notes.len == 0) return try allocator.alloc(OwnedDiagnostic, 0);
 
     var result = try allocator.alloc(OwnedDiagnostic, notes.len);
-    errdefer freeOwnedDiagnostics(allocator, result);
+    var initialized: usize = 0;
+    errdefer {
+        // Only free initialized elements
+        for (result[0..initialized]) |*d| d.deinit(allocator);
+        allocator.free(result);
+    }
 
     for (notes, 0..) |note, i| {
         result[i] = try noteToDiagnostic(allocator, note, file_uri, index);
+        initialized += 1;
     }
 
     return result;
