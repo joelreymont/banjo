@@ -740,6 +740,21 @@ pub const Server = struct {
         var actions: std.ArrayListUnmanaged(protocol.CodeAction) = .empty;
         defer actions.deinit(self.allocator);
 
+        // Track allocations for cleanup after response
+        var allocs: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (allocs.items) |s| self.allocator.free(s);
+            allocs.deinit(self.allocator);
+        }
+        var edit_allocs: std.ArrayListUnmanaged([]protocol.TextDocumentEdit) = .empty;
+        defer {
+            for (edit_allocs.items) |slice| {
+                for (slice) |edit| self.allocator.free(edit.edits);
+                self.allocator.free(slice);
+            }
+            edit_allocs.deinit(self.allocator);
+        }
+
         const line_text = getLineContent(content, line) orelse "";
         const is_comment = isCommentLine(content, line + 1); // isCommentLine uses 1-indexed
 
@@ -754,27 +769,31 @@ pub const Server = struct {
             // Comment line: insert @banjo[id] at cursor position
             const note_id = comments.generateNoteId();
             const insert_text = try std.fmt.allocPrint(self.allocator, "@banjo[{s}] ", .{&note_id});
+            try allocs.append(self.allocator, insert_text);
 
             const title = if (hasTodoPattern(line_text)) |pattern|
                 try std.fmt.allocPrint(self.allocator, "Convert {s} to Banjo Note", .{pattern})
             else
                 try self.allocator.dupe(u8, "Create Banjo Note");
+            try allocs.append(self.allocator, title);
+
+            const edits = try self.allocator.dupe(protocol.TextEdit, &[_]protocol.TextEdit{.{
+                .range = .{
+                    .start = .{ .line = line, .character = char },
+                    .end = .{ .line = line, .character = char },
+                },
+                .newText = insert_text,
+            }});
+            const doc_changes = try self.allocator.dupe(protocol.TextDocumentEdit, &[_]protocol.TextDocumentEdit{.{
+                .textDocument = .{ .uri = uri },
+                .edits = edits,
+            }});
+            try edit_allocs.append(self.allocator, doc_changes);
 
             try actions.append(self.allocator, .{
                 .title = title,
                 .kind = protocol.CodeActionKind.QuickFix,
-                .edit = .{
-                    .documentChanges = try self.allocator.dupe(protocol.TextDocumentEdit, &[_]protocol.TextDocumentEdit{.{
-                        .textDocument = .{ .uri = uri },
-                        .edits = try self.allocator.dupe(protocol.TextEdit, &[_]protocol.TextEdit{.{
-                            .range = .{
-                                .start = .{ .line = line, .character = char },
-                                .end = .{ .line = line, .character = char },
-                            },
-                            .newText = insert_text,
-                        }}),
-                    }}),
-                },
+                .edit = .{ .documentChanges = doc_changes },
             });
         } else if (mem.trim(u8, line_text, " \t").len > 0) {
             // Code line: insert note comment above
@@ -787,22 +806,25 @@ pub const Server = struct {
                 "{s}{s} @banjo[{s}] NOTE:\n",
                 .{ indent, prefix, &note_id },
             );
+            try allocs.append(self.allocator, new_line);
+
+            const edits = try self.allocator.dupe(protocol.TextEdit, &[_]protocol.TextEdit{.{
+                .range = .{
+                    .start = .{ .line = line, .character = 0 },
+                    .end = .{ .line = line, .character = 0 },
+                },
+                .newText = new_line,
+            }});
+            const doc_changes = try self.allocator.dupe(protocol.TextDocumentEdit, &[_]protocol.TextDocumentEdit{.{
+                .textDocument = .{ .uri = uri },
+                .edits = edits,
+            }});
+            try edit_allocs.append(self.allocator, doc_changes);
 
             try actions.append(self.allocator, .{
                 .title = "Add Banjo Note",
                 .kind = protocol.CodeActionKind.Refactor,
-                .edit = .{
-                    .documentChanges = try self.allocator.dupe(protocol.TextDocumentEdit, &[_]protocol.TextDocumentEdit{.{
-                        .textDocument = .{ .uri = uri },
-                        .edits = try self.allocator.dupe(protocol.TextEdit, &[_]protocol.TextEdit{.{
-                            .range = .{
-                                .start = .{ .line = line, .character = 0 },
-                                .end = .{ .line = line, .character = 0 },
-                            },
-                            .newText = new_line,
-                        }}),
-                    }}),
-                },
+                .edit = .{ .documentChanges = doc_changes },
             });
         }
 
@@ -930,11 +952,20 @@ pub const Server = struct {
         var locations: std.ArrayListUnmanaged(protocol.Location) = .empty;
         defer locations.deinit(self.allocator);
 
+        // Track URI allocations for cleanup
+        var uris: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (uris.items) |u| self.allocator.free(u);
+            uris.deinit(self.allocator);
+        }
+
         for (backlink_ids) |bl_id| {
             if (self.note_index.getNote(bl_id)) |bl_note| {
                 const bl_line: u32 = if (bl_note.line > 0) bl_note.line - 1 else 0;
+                const bl_uri = try pathToUri(self.allocator, bl_note.file_path);
+                try uris.append(self.allocator, bl_uri);
                 try locations.append(self.allocator, .{
-                    .uri = try pathToUri(self.allocator, bl_note.file_path),
+                    .uri = bl_uri,
                     .range = .{
                         .start = .{ .line = bl_line, .character = 0 },
                         .end = .{ .line = bl_line, .character = 1 },

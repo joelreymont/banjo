@@ -9,6 +9,7 @@ pub const OwnedDiagnostic = struct {
     diagnostic: protocol.Diagnostic,
     owned_message: []const u8,
     owned_related: ?[]protocol.DiagnosticRelatedInformation,
+    owned_uris: ?[]const []const u8, // URIs in related info
 
     pub fn deinit(self: *OwnedDiagnostic, allocator: Allocator) void {
         allocator.free(self.owned_message);
@@ -18,8 +19,18 @@ pub const OwnedDiagnostic = struct {
             }
             allocator.free(related);
         }
+        if (self.owned_uris) |uris| {
+            for (uris) |u| {
+                allocator.free(u);
+            }
+            allocator.free(uris);
+        }
     }
 };
+
+fn pathToUri(allocator: Allocator, path: []const u8) ![]const u8 {
+    return try std.fmt.allocPrint(allocator, "file://{s}", .{path});
+}
 
 /// Index of all notes for backlink lookup
 pub const NoteIndex = struct {
@@ -100,7 +111,9 @@ pub const NoteIndex = struct {
             errdefer self.allocator.free(source_id);
 
             const result = try self.backlinks.getOrPut(target);
-            if (!result.found_existing) {
+            if (result.found_existing) {
+                self.allocator.free(target); // Key exists, don't need this copy
+            } else {
                 result.value_ptr.* = .empty;
             }
             try result.value_ptr.append(self.allocator, source_id);
@@ -140,20 +153,25 @@ pub fn noteToDiagnostic(
 
     // Build related information for backlinks
     var owned_related: ?[]protocol.DiagnosticRelatedInformation = null;
+    var owned_uris: ?[]const []const u8 = null;
     if (index) |idx| {
         if (idx.getBacklinks(note.id)) |backlink_ids| {
             var related = try allocator.alloc(protocol.DiagnosticRelatedInformation, backlink_ids.len);
             errdefer allocator.free(related);
+            var uris = try allocator.alloc([]const u8, backlink_ids.len);
+            errdefer allocator.free(uris);
 
             var valid_count: usize = 0;
             for (backlink_ids) |bl_id| {
                 if (idx.getNote(bl_id)) |bl_note| {
                     const bl_line: u32 = if (bl_note.line > 0) bl_note.line - 1 else 0;
                     const bl_msg = try std.fmt.allocPrint(allocator, "Linked from: {s}", .{getSummary(bl_note.content)});
+                    const bl_uri = try pathToUri(allocator, bl_note.file_path);
 
+                    uris[valid_count] = bl_uri;
                     related[valid_count] = .{
                         .location = .{
-                            .uri = bl_note.file_path, // TODO: convert to URI
+                            .uri = bl_uri,
                             .range = .{
                                 .start = .{ .line = bl_line, .character = 0 },
                                 .end = .{ .line = bl_line, .character = 1 },
@@ -167,8 +185,10 @@ pub fn noteToDiagnostic(
 
             if (valid_count > 0) {
                 owned_related = related[0..valid_count];
+                owned_uris = uris[0..valid_count];
             } else {
                 allocator.free(related);
+                allocator.free(uris);
             }
         }
     }
@@ -187,6 +207,7 @@ pub fn noteToDiagnostic(
         },
         .owned_message = message,
         .owned_related = owned_related,
+        .owned_uris = owned_uris,
     };
 }
 
@@ -333,6 +354,6 @@ test "snapshot: note diagnostic JSON" {
     try (ohsnap{}).snap(
         @src(),
         \\{"range":{"start":{"line":41,"character":0},"end":{"line":41,"character":1}},"severity":3,"code":"abc12345","source":"banjo","message":"Note: TODO: refactor this function"}
-    ,
+        ,
     ).diff(json, true);
 }
