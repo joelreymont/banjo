@@ -96,13 +96,7 @@ pub const NoteIndex = struct {
         const content = try self.allocator.dupe(u8, note.content);
         errdefer self.allocator.free(content);
 
-        try self.notes.put(id, .{
-            .file_path = path,
-            .line = note.line,
-            .content = content,
-        });
-
-        // Index backlinks (this note links TO these targets)
+        // Index backlinks BEFORE adding note to map (so errdefers work correctly)
         for (note.links) |target_id| {
             const target = try self.allocator.dupe(u8, target_id);
             errdefer self.allocator.free(target);
@@ -118,6 +112,13 @@ pub const NoteIndex = struct {
             }
             try result.value_ptr.append(self.allocator, source_id);
         }
+
+        // Add note to map last (after backlinks processed successfully)
+        try self.notes.put(id, .{
+            .file_path = path,
+            .line = note.line,
+            .content = content,
+        });
     }
 
     /// Get backlinks to a note (notes that link TO this note)
@@ -218,7 +219,7 @@ pub fn notesToDiagnostics(
     file_uri: []const u8,
     index: ?*NoteIndex,
 ) ![]OwnedDiagnostic {
-    if (notes.len == 0) return &[_]OwnedDiagnostic{};
+    if (notes.len == 0) return try allocator.alloc(OwnedDiagnostic, 0);
 
     var result = try allocator.alloc(OwnedDiagnostic, notes.len);
     errdefer freeOwnedDiagnostics(allocator, result);

@@ -663,11 +663,6 @@ pub const Server = struct {
                 var search_pos: usize = 0;
                 while (search_pos < line_content.len) {
                     const link_start = mem.indexOfPos(u8, line_content, search_pos, "@[") orelse break;
-                    // Skip if this is @banjo[
-                    if (link_start + 6 <= line_content.len and mem.eql(u8, line_content[link_start .. link_start + 6], "@banjo")) {
-                        search_pos = link_start + 6;
-                        continue;
-                    }
                     const mid = mem.indexOfPos(u8, line_content, link_start + 2, "](") orelse {
                         search_pos = link_start + 2;
                         continue;
@@ -1142,11 +1137,6 @@ fn findNoteIdAtPosition(line: []const u8, char: u32) ?[]const u8 {
     var search_pos: usize = 0;
     while (search_pos < line.len) {
         const link_start = mem.indexOfPos(u8, line, search_pos, "@[") orelse break;
-        // Skip @banjo[ patterns
-        if (link_start + 6 <= line.len and mem.eql(u8, line[link_start .. link_start + 6], "@banjo")) {
-            search_pos = link_start + 6;
-            continue;
-        }
         const mid = mem.indexOfPos(u8, line, link_start + 2, "](") orelse {
             search_pos = link_start + 2;
             continue;
