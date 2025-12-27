@@ -973,13 +973,40 @@ pub const Server = struct {
     }
 
     fn applyLineEdit(self: *Server, uri: []const u8, line: u32, new_text: []const u8) !void {
-        // Build workspace/applyEdit request
+        // Build workspace/applyEdit request with proper JSON escaping
         var edit_writer: std.io.Writer.Allocating = .init(self.allocator);
         defer edit_writer.deinit();
+        var jw: std.json.Stringify = .{ .writer = &edit_writer.writer };
 
-        try edit_writer.writer.print(
-            \\{{"jsonrpc":"2.0","method":"workspace/applyEdit","params":{{"edit":{{"changes":{{"{s}":[{{"range":{{"start":{{"line":{d},"character":0}},"end":{{"line":{d},"character":999}}}},"newText":"{s}"}}]}}}}}}}}
-        , .{ uri, line, line, new_text });
+        try jw.beginObject();
+        try jw.objectField("jsonrpc");
+        try jw.write("2.0");
+        try jw.objectField("method");
+        try jw.write("workspace/applyEdit");
+        try jw.objectField("params");
+        try jw.beginObject();
+        try jw.objectField("edit");
+        try jw.beginObject();
+        try jw.objectField("changes");
+        try jw.beginObject();
+        try jw.objectField(uri);
+        try jw.beginArray();
+        try jw.beginObject();
+        try jw.objectField("range");
+        try jw.beginObject();
+        try jw.objectField("start");
+        try jw.write(.{ .line = line, .character = @as(u32, 0) });
+        try jw.objectField("end");
+        try jw.write(.{ .line = line, .character = @as(u32, 999) });
+        try jw.endObject();
+        try jw.objectField("newText");
+        try jw.write(new_text);
+        try jw.endObject();
+        try jw.endArray();
+        try jw.endObject();
+        try jw.endObject();
+        try jw.endObject();
+        try jw.endObject();
 
         const edit_json = try edit_writer.toOwnedSlice();
         defer self.allocator.free(edit_json);
@@ -990,10 +1017,37 @@ pub const Server = struct {
         // Insert a new line at the given position (before existing line)
         var edit_writer: std.io.Writer.Allocating = .init(self.allocator);
         defer edit_writer.deinit();
+        var jw: std.json.Stringify = .{ .writer = &edit_writer.writer };
 
-        try edit_writer.writer.print(
-            \\{{"jsonrpc":"2.0","method":"workspace/applyEdit","params":{{"edit":{{"changes":{{"{s}":[{{"range":{{"start":{{"line":{d},"character":0}},"end":{{"line":{d},"character":0}}}},"newText":"{s}"}}]}}}}}}}}
-        , .{ uri, line, line, new_text });
+        try jw.beginObject();
+        try jw.objectField("jsonrpc");
+        try jw.write("2.0");
+        try jw.objectField("method");
+        try jw.write("workspace/applyEdit");
+        try jw.objectField("params");
+        try jw.beginObject();
+        try jw.objectField("edit");
+        try jw.beginObject();
+        try jw.objectField("changes");
+        try jw.beginObject();
+        try jw.objectField(uri);
+        try jw.beginArray();
+        try jw.beginObject();
+        try jw.objectField("range");
+        try jw.beginObject();
+        try jw.objectField("start");
+        try jw.write(.{ .line = line, .character = @as(u32, 0) });
+        try jw.objectField("end");
+        try jw.write(.{ .line = line, .character = @as(u32, 0) });
+        try jw.endObject();
+        try jw.objectField("newText");
+        try jw.write(new_text);
+        try jw.endObject();
+        try jw.endArray();
+        try jw.endObject();
+        try jw.endObject();
+        try jw.endObject();
+        try jw.endObject();
 
         const edit_json = try edit_writer.toOwnedSlice();
         defer self.allocator.free(edit_json);
