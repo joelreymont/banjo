@@ -120,14 +120,6 @@ pub const Agent = struct {
     sessions: std.StringHashMap(*Session),
     client_capabilities: ?protocol.ClientCapabilities = null,
     next_tool_call_id: u64 = 0,
-    next_request_id: i64 = 1,
-    pending_requests: std.AutoHashMap(i64, *PendingRequest),
-
-    const PendingRequest = struct {
-        completed: bool = false,
-        result: ?std.json.Value = null,
-        err: ?jsonrpc.Error = null,
-    };
 
     const Session = struct {
         id: []const u8,
@@ -166,7 +158,6 @@ pub const Agent = struct {
             .allocator = allocator,
             .writer = jsonrpc.Writer.init(allocator, writer),
             .sessions = std.StringHashMap(*Session).init(allocator),
-            .pending_requests = std.AutoHashMap(i64, *PendingRequest).init(allocator),
         };
     }
 
@@ -177,12 +168,6 @@ pub const Agent = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.sessions.deinit();
-
-        var req_it = self.pending_requests.iterator();
-        while (req_it.next()) |entry| {
-            self.allocator.destroy(entry.value_ptr.*);
-        }
-        self.pending_requests.deinit();
     }
 
     const Handler = *const fn (*Agent, jsonrpc.Request) anyerror!void;
@@ -196,22 +181,8 @@ pub const Agent = struct {
         .{ "unstable_resumeSession", handleResumeSession },
     });
 
-    /// Handle an incoming JSON-RPC request or response
+    /// Handle an incoming JSON-RPC request
     pub fn handleRequest(self: *Agent, request: jsonrpc.Request) !void {
-        // Check if this is a response to our request (has id, empty method = response)
-        if (request.method.len == 0) {
-            if (request.id) |id| {
-                const num_id = switch (id) {
-                    .number => |n| n,
-                    else => return, // Ignore non-numeric IDs
-                };
-                // This is a response - extract result/error from params (raw JSON)
-                const result = if (request.params) |p| p else null;
-                self.handleClientResponse(num_id, result, null);
-                return;
-            }
-        }
-
         log.debug("Handling request: {s}", .{request.method});
 
         if (method_handlers.get(request.method)) |handler| {
@@ -226,42 +197,6 @@ pub const Agent = struct {
                 ));
             }
         }
-    }
-
-    //
-    // Bidirectional RPC Infrastructure
-    //
-
-    fn sendClientRequest(self: *Agent, method: []const u8, params: anytype) !i64 {
-        const id = self.next_request_id;
-        self.next_request_id += 1;
-        try self.writer.writeTypedRequest(.{ .number = id }, method, params);
-        return id;
-    }
-
-    fn registerPendingRequest(self: *Agent, id: i64) !*PendingRequest {
-        const req = try self.allocator.create(PendingRequest);
-        errdefer self.allocator.destroy(req);
-        req.* = .{};
-        try self.pending_requests.put(id, req);
-        return req;
-    }
-
-    fn handleClientResponse(self: *Agent, id: i64, result: ?std.json.Value, err: ?jsonrpc.Error) void {
-        // Remove and free the pending request - we're done with it
-        if (self.pending_requests.fetchRemove(id)) |kv| {
-            // For now, just log completion. Future: store result for async consumption.
-            _ = result;
-            _ = err;
-            self.allocator.destroy(kv.value);
-        }
-    }
-
-    fn clientSupportsTerminal(self: *Agent) bool {
-        if (self.client_capabilities) |caps| {
-            return caps.terminal orelse false;
-        }
-        return false;
     }
 
     fn handleInitialize(self: *Agent, request: jsonrpc.Request) !void {
@@ -598,7 +533,10 @@ pub const Agent = struct {
                                     // Capture CLI session ID for resume support
                                     if (init_info.session_id) |cli_sid| {
                                         if (session.cli_session_id == null) {
-                                            session.cli_session_id = self.allocator.dupe(u8, cli_sid) catch null;
+                                            session.cli_session_id = self.allocator.dupe(u8, cli_sid) catch |err| blk: {
+                                                log.warn("Failed to capture CLI session ID: {}", .{err});
+                                                break :blk null;
+                                            };
                                             if (session.cli_session_id != null) {
                                                 log.info("Captured CLI session ID: {s}", .{cli_sid});
                                             }
