@@ -52,7 +52,7 @@ Banjo commands:
 - `/explain` - summarize selected code and insert as note comment
 - `/notes` - list all notes in project
 
-CLI commands (`/version`, `/model`, `/compact`, `/review`, `/clear`) forwarded to Claude Code.
+Claude Code commands (`/version`, `/model`, `/compact`, `/review`, `/clear`) forwarded to Claude Code.
 
 ## Note Creation Workflow
 
@@ -203,7 +203,7 @@ LSP Server (banjo --lsp)
 Agent (banjo --agent)
   ├─ /explain command for Claude-generated summaries
   ├─ /setup lsp for per-project configuration
-  └─ Forwards other commands to Claude CLI
+  └─ Forwards other commands to Claude Code
 ```
 
 Notes appear as info-level diagnostics. `F8` jumps between notes, `Cmd+.` shows actions.
@@ -326,4 +326,4 @@ Key files:
 - [ACP Protocol](acp-protocol.md) - Agent Client Protocol specification
 - [Wire Formats](wire-formats.md) - JSON-RPC message schemas
 - [Zed Extension](zed-extension.md) - Extension packaging and publishing
-- [Claude CLI](claude-cli.md) - CLI streaming JSON format
+- [Claude Code](claude-code.md) - streaming JSON format

@@ -328,7 +328,7 @@ banjo-zed/
 id = "banjo"
 name = "Banjo"
 version = "0.1.0"
-description = "Claude Code ACP agent in Zig"
+description = "ACP agent for Claude Code + Codex in Zig"
 authors = ["Your Name"]
 repository = "https://github.com/user/banjo"
 

@@ -1,4 +1,4 @@
-# Banjo - Claude Code ACP Agent in Zig
+# Banjo - ACP Agent for Claude Code + Codex in Zig
 
 ## Zig 0.15 API Changes
 
@@ -39,7 +39,7 @@ Zed (ACP Client)
     ↓ JSON-RPC 2.0 over stdio
 banjo
     ↓ spawn + stream-json
-Claude Code CLI
+Claude Code
 ```
 
 ## State Machine Pattern

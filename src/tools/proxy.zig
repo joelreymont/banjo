@@ -21,7 +21,7 @@ const CreateTerminalParams = struct {
 
 /// Tool proxy for delegating operations to Zed via ACP
 ///
-/// When Claude CLI wants to read/write files or execute commands,
+/// When Claude Code wants to read/write files or execute commands,
 /// we can intercept and delegate to Zed instead. This allows:
 /// - File operations through Zed's file system
 /// - Terminal execution through Zed's terminal API

@@ -6,12 +6,23 @@ const bridge = @import("../cli/bridge.zig");
 const Bridge = bridge.Bridge;
 const ContentBlockType = bridge.ContentBlockType;
 const SystemSubtype = bridge.SystemSubtype;
+const CodexBridge = @import("../cli/codex_bridge.zig").CodexBridge;
 const settings_loader = @import("../settings/loader.zig");
 const Settings = settings_loader.Settings;
 const notes_commands = @import("../notes/commands.zig");
 const config = @import("config");
 
 const log = std.log.scoped(.agent);
+
+const Engine = enum { claude, codex };
+
+const Route = enum { claude, codex, both };
+
+const RoutingResult = struct {
+    route: Route,
+    prompt: []const u8,
+    consumed: bool,
+};
 
 /// Banjo version with git hash
 pub const version = "0.3.0 (" ++ config.git_hash ++ ")";
@@ -38,6 +49,96 @@ fn mapCliStopReason(cli_reason: []const u8) []const u8 {
         .{ "error_max_budget_usd", "max_turn_requests" },
     });
     return map.get(cli_reason) orelse "end_turn";
+}
+
+fn getDuetDefaultRoute() Route {
+    const val = std.posix.getenv("BANJO_DUET_DEFAULT") orelse return .both;
+    if (std.mem.eql(u8, val, "claude")) return .claude;
+    if (std.mem.eql(u8, val, "codex")) return .codex;
+    if (std.mem.eql(u8, val, "both")) return .both;
+    return .both;
+}
+
+fn getDuetPrimary() Engine {
+    const val = std.posix.getenv("BANJO_DUET_PRIMARY") orelse return .claude;
+    if (std.mem.eql(u8, val, "codex")) return .codex;
+    return .claude;
+}
+
+const EngineAvailability = struct {
+    claude: bool,
+    codex: bool,
+};
+
+fn detectEngines() EngineAvailability {
+    return .{
+        .claude = Bridge.isAvailable(),
+        .codex = CodexBridge.isAvailable(),
+    };
+}
+
+fn engineLabel(engine: Engine) []const u8 {
+    return switch (engine) {
+        .claude => "Claude",
+        .codex => "Codex",
+    };
+}
+
+fn enginePrefix(engine: Engine) []const u8 {
+    return switch (engine) {
+        .claude => "[Claude] ",
+        .codex => "[Codex] ",
+    };
+}
+
+fn mapToolKind(tool_name: []const u8) protocol.SessionUpdate.ToolKind {
+    const map = std.StaticStringMap(protocol.SessionUpdate.ToolKind).initComptime(.{
+        .{ "Read", .read },
+        .{ "Write", .write },
+        .{ "Edit", .edit },
+        .{ "Bash", .command },
+        .{ "Command", .command },
+    });
+    return map.get(tool_name) orelse .other;
+}
+
+fn parseRoutePrefix(text: []const u8, default_route: Route) RoutingResult {
+    if (text.len == 0 or text[0] != '/') {
+        return .{ .route = default_route, .prompt = text, .consumed = false };
+    }
+
+    const routing = matchRoute(text) orelse {
+        return .{ .route = default_route, .prompt = text, .consumed = false };
+    };
+
+    var idx = routing.prefix_len;
+    while (idx < text.len and (text[idx] == ' ' or text[idx] == '\t')) idx += 1;
+    return .{ .route = routing.route, .prompt = text[idx..], .consumed = true };
+}
+
+const RouteMatch = struct {
+    route: Route,
+    prefix_len: usize,
+};
+
+fn matchRoute(text: []const u8) ?RouteMatch {
+    const routes = [_]struct { prefix: []const u8, route: Route }{
+        .{ .prefix = "/claude", .route = .claude },
+        .{ .prefix = "/codex", .route = .codex },
+        .{ .prefix = "/both", .route = .both },
+    };
+
+    for (routes) |entry| {
+        if (!std.mem.startsWith(u8, text, entry.prefix)) continue;
+        if (text.len == entry.prefix.len) {
+            return .{ .route = entry.route, .prefix_len = entry.prefix.len };
+        }
+        const next = text[entry.prefix.len];
+        if (next == ' ' or next == '\t' or next == '\n' or next == '\r') {
+            return .{ .route = entry.route, .prefix_len = entry.prefix.len };
+        }
+    }
+    return null;
 }
 
 // JSON-RPC method parameter schemas
@@ -129,7 +230,8 @@ pub const Agent = struct {
         model: ?[]const u8 = null,
         bridge: ?Bridge = null,
         settings: ?Settings = null,
-        cli_session_id: ?[]const u8 = null, // Claude CLI session ID for --resume
+        cli_session_id: ?[]const u8 = null, // Claude Code session ID for --resume
+        codex_session_id: ?[]const u8 = null,
 
         pub fn deinit(self: *Session, allocator: Allocator) void {
             if (self.bridge) |*b| b.deinit();
@@ -138,6 +240,7 @@ pub const Agent = struct {
             allocator.free(self.cwd);
             if (self.model) |m| allocator.free(m);
             if (self.cli_session_id) |sid| allocator.free(sid);
+            if (self.codex_session_id) |sid| allocator.free(sid);
         }
 
         /// Check if a tool is allowed based on settings
@@ -201,7 +304,11 @@ pub const Agent = struct {
 
     fn handleInitialize(self: *Agent, request: jsonrpc.Request) !void {
         // Parse params using typed struct
-        const parsed = std.json.parseFromValue(InitializeParams, self.allocator, request.params orelse .null, .{
+        if (request.params == null) {
+            return self.sendInitializeResponse(request);
+        }
+
+        const parsed = std.json.parseFromValue(InitializeParams, self.allocator, request.params.?, .{
             .ignore_unknown_fields = true,
         }) catch |err| {
             log.warn("Failed to parse initialize params: {}", .{err});
@@ -238,8 +345,8 @@ pub const Agent = struct {
     fn sendInitializeResponse(self: *Agent, request: jsonrpc.Request) !void {
         const response = protocol.InitializeResponse{
             .agentInfo = .{
-                .name = "Claude Code (Banjo)",
-                .title = "Claude Code (Banjo)",
+                .name = "Banjo (Claude Code + Codex)",
+                .title = "Banjo (Claude Code + Codex)",
                 .version = version,
             },
             .agentCapabilities = .{
@@ -269,7 +376,7 @@ pub const Agent = struct {
     }
 
     fn handleAuthenticate(self: *Agent, request: jsonrpc.Request) !void {
-        // For now, we don't require authentication - Claude CLI handles it
+        // For now, we don't require authentication - Claude Code handles it
         // Just return success with empty result
         var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
         defer result.object.deinit();
@@ -324,16 +431,20 @@ pub const Agent = struct {
         // Auto-setup: create .zed/settings.json if missing (enables banjo LSP)
         const did_setup = self.autoSetupLspIfNeeded(cwd) catch false;
 
-        // Pre-start Claude CLI for instant first response (auto-resume last session if enabled)
-        session.bridge = Bridge.init(self.allocator, session.cwd);
-        session.bridge.?.start(.{
-            .continue_last = isAutoResumeEnabled(),
-            .permission_mode = @tagName(session.permission_mode),
-            .model = session.model,
-        }) catch |err| {
-            log.warn("Failed to pre-start CLI: {} - will retry on first prompt", .{err});
-            session.bridge = null;
-        };
+        const availability = detectEngines();
+
+        // Pre-start Claude Code for instant first response (auto-resume last session if enabled)
+        if (availability.claude) {
+            session.bridge = Bridge.init(self.allocator, session.cwd);
+            session.bridge.?.start(.{
+                .continue_last = isAutoResumeEnabled(),
+                .permission_mode = @tagName(session.permission_mode),
+                .model = session.model,
+            }) catch |err| {
+                log.warn("Failed to pre-start Claude Code: {} - will retry on first prompt", .{err});
+                session.bridge = null;
+            };
+        }
 
         // Build response - must be sent BEFORE session updates
         var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
@@ -346,6 +457,16 @@ pub const Agent = struct {
             .sessionUpdate = .available_commands_update,
             .availableCommands = &initial_commands,
         });
+
+        if (!availability.claude and !availability.codex) {
+            try self.sendSessionUpdate(session_id, .{
+                .sessionUpdate = .agent_message_chunk,
+                .content = .{
+                    .type = "text",
+                    .text = "Banjo could not find Claude Code or Codex. Install one (or set CLAUDE_CODE_EXECUTABLE/CODEX_EXECUTABLE) and restart the agent.",
+                },
+            });
+        }
 
         // Notify user if auto-setup ran
         if (did_setup) {
@@ -360,8 +481,6 @@ pub const Agent = struct {
     }
 
     fn handlePrompt(self: *Agent, request: jsonrpc.Request) !void {
-        var timer = std.time.Timer.start() catch unreachable;
-
         // Parse params using typed struct
         const parsed = std.json.parseFromValue(PromptParams, self.allocator, request.params orelse .null, .{
             .ignore_unknown_fields = true,
@@ -391,20 +510,108 @@ pub const Agent = struct {
         session.cancelled = false;
         log.info("Prompt received for session {s}: {s}", .{ session_id, prompt_text orelse "(empty)" });
 
-        // Handle slash commands
+        var route = getDuetDefaultRoute();
         var effective_prompt = prompt_text;
+
         if (prompt_text) |text| {
-            if (text.len > 0 and text[0] == '/') {
+            const routing = parseRoutePrefix(text, route);
+            route = routing.route;
+            effective_prompt = routing.prompt;
+
+            if (routing.consumed and effective_prompt.?.len == 0) {
+                try self.sendSessionUpdate(session_id, .{
+                    .sessionUpdate = .agent_message_chunk,
+                    .content = .{ .type = "text", .text = "Usage: /claude <prompt> | /codex <prompt> | /both <prompt>" },
+                });
+                try self.sendEndTurn(request);
+                return;
+            }
+
+            const prompt_value = effective_prompt.?;
+            if (prompt_value.len > 0 and prompt_value[0] == '/') {
                 const resource = extractResource(parsed.value.prompt);
-                if (self.dispatchCommand(request, session, session_id, text, resource)) |transformed| {
+                if (self.dispatchCommand(request, session, session_id, prompt_value, resource)) |transformed| {
                     effective_prompt = transformed;
                 } else {
-                    return; // Command fully handled
+                    return;
                 }
             }
         }
 
-        // Start bridge if not running
+        var stop_reason: []const u8 = "end_turn";
+        if (effective_prompt) |text| {
+            stop_reason = try self.runDuetPrompt(session, session_id, text, route);
+        }
+
+        var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
+        defer result.object.deinit();
+        try result.object.put("stopReason", .{ .string = stop_reason });
+        try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
+    }
+
+    const DuetState = enum { start, next_engine, run_engine };
+
+    fn runDuetPrompt(self: *Agent, session: *Session, session_id: []const u8, prompt: []const u8, route: Route) ![]const u8 {
+        var stop_reason: []const u8 = "end_turn";
+        const primary = getDuetPrimary();
+
+        var engines: [2]Engine = .{ .claude, .codex };
+        var count: usize = 0;
+        switch (route) {
+            .claude => {
+                engines[0] = .claude;
+                count = 1;
+            },
+            .codex => {
+                engines[0] = .codex;
+                count = 1;
+            },
+            .both => {
+                if (primary == .claude) {
+                    engines[0] = .claude;
+                    engines[1] = .codex;
+                } else {
+                    engines[0] = .codex;
+                    engines[1] = .claude;
+                }
+                count = 2;
+            },
+        }
+
+        var idx: usize = 0;
+        var current: Engine = .claude;
+
+        state: switch (DuetState.start) {
+            .start => continue :state .next_engine,
+            .next_engine => {
+                if (idx >= count) return stop_reason;
+                current = engines[idx];
+                idx += 1;
+                continue :state .run_engine;
+            },
+            .run_engine => {
+                const reason = switch (current) {
+                    .claude => try self.runClaudePrompt(session, session_id, prompt),
+                    .codex => try self.runCodexPrompt(session, session_id, prompt),
+                };
+                stop_reason = mergeStopReason(stop_reason, reason);
+                if (session.cancelled) return "cancelled";
+                continue :state .next_engine;
+            },
+        }
+    }
+
+    fn mergeStopReason(current: []const u8, next: []const u8) []const u8 {
+        if (std.mem.eql(u8, next, "cancelled")) return "cancelled";
+        if (std.mem.eql(u8, current, "end_turn")) return next;
+        return current;
+    }
+
+    fn runClaudePrompt(self: *Agent, session: *Session, session_id: []const u8, prompt: []const u8) ![]const u8 {
+        var timer = std.time.Timer.start() catch unreachable;
+        const engine = Engine.claude;
+        var stream_prefix_pending = true;
+
         const bridge_was_null = session.bridge == null;
         if (session.bridge == null) {
             session.bridge = Bridge.init(self.allocator, session.cwd);
@@ -414,45 +621,35 @@ pub const Agent = struct {
                 .permission_mode = @tagName(session.permission_mode),
                 .model = session.model,
             }) catch |err| {
-                log.err("Failed to start bridge: {}", .{err});
+                log.err("Failed to start Claude bridge: {}", .{err});
                 session.bridge = null;
-                try self.sendSessionUpdate(session_id, .{
-                    .sessionUpdate = .agent_message_chunk,
-                    .content = .{ .type = "text", .text = "Failed to start Claude CLI. Please ensure it is installed and in PATH." },
-                });
-                var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
-                defer result.object.deinit();
-                try result.object.put("stopReason", .{ .string = "error" });
-                try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
-                return;
+                try self.sendEngineText(session_id, engine, "Failed to start Claude Code. Please ensure it is installed and in PATH.");
+                return "error";
             };
         }
-        const bridge_start_ms = timer.read() / std.time.ns_per_ms;
+
         if (bridge_was_null) {
-            log.info("Bridge started in {d}ms", .{bridge_start_ms});
+            const bridge_start_ms = timer.read() / std.time.ns_per_ms;
+            log.info("Claude bridge started in {d}ms", .{bridge_start_ms});
         }
 
-        // Send prompt to CLI
-        if (effective_prompt) |text| {
-            try session.bridge.?.sendPrompt(text);
-        }
+        try session.bridge.?.sendPrompt(prompt);
         const prompt_sent_ms = timer.read() / std.time.ns_per_ms;
-        log.info("Prompt sent to CLI at {d}ms", .{prompt_sent_ms});
+        log.info("Claude prompt sent at {d}ms", .{prompt_sent_ms});
 
-        // Read and process CLI messages
         var stop_reason: []const u8 = "end_turn";
         const cli_bridge = &session.bridge.?;
         var first_response_ms: u64 = 0;
-
         var msg_count: u32 = 0;
+
         while (true) {
-            // Check cancellation at loop start
             if (session.cancelled) {
                 stop_reason = "cancelled";
                 break;
             }
+
             var msg = cli_bridge.readMessage() catch |err| {
-                log.err("Failed to read CLI message: {}", .{err});
+                log.err("Failed to read Claude Code message: {}", .{err});
                 break;
             } orelse break;
             defer msg.deinit();
@@ -460,93 +657,93 @@ pub const Agent = struct {
             msg_count += 1;
             const msg_time_ms = timer.read() / std.time.ns_per_ms;
             if (first_response_ms == 0) first_response_ms = msg_time_ms;
-            log.debug("CLI msg #{d} ({s}) at {d}ms", .{ msg_count, @tagName(msg.type), msg_time_ms });
+            log.debug("Claude msg #{d} ({s}) at {d}ms", .{ msg_count, @tagName(msg.type), msg_time_ms });
 
             switch (msg.type) {
                 .assistant => {
-                    // Forward text content as session update
                     if (msg.getContent()) |content| {
-                        log.info("First assistant response at {d}ms", .{msg_time_ms});
-                        try self.sendSessionUpdate(session_id, .{
-                            .sessionUpdate = .agent_message_chunk,
-                            .content = .{ .type = "text", .text = content },
-                        });
+                        if (first_response_ms == 0) {
+                            first_response_ms = msg_time_ms;
+                        }
+                        try self.sendEngineText(session_id, engine, content);
                     }
 
-                    // Check for tool use - apply permission hooks
-                    if (msg.getToolName()) |tool_name| {
-                        if (!session.isToolAllowed(tool_name)) {
-                            log.warn("Tool {s} denied by settings", .{tool_name});
-                            try self.sendSessionUpdate(session_id, .{
-                                .sessionUpdate = .agent_message_chunk,
-                                .content = .{ .type = "text", .text = "Tool execution blocked by settings." },
-                            });
-                            // Note: CLI will continue, we're just notifying user
-                        } else {
-                            const tool_id = msg.getToolId() orelse "unknown";
-                            try self.sendSessionUpdate(session_id, .{
-                                .sessionUpdate = .tool_call,
-                                .toolCallId = tool_id,
-                                .title = tool_name,
-                                .kind = .other,
-                                .status = .pending,
-                            });
-                        }
+                    if (msg.getToolUse()) |tool| {
+                        try self.handleEngineToolCall(
+                            session,
+                            session_id,
+                            engine,
+                            tool.name,
+                            tool.name,
+                            tool.id,
+                            mapToolKind(tool.name),
+                            tool.input,
+                        );
+                    }
+
+                    if (msg.getToolResult()) |tool_result| {
+                        const status: protocol.SessionUpdate.ToolCallStatus = if (tool_result.is_error) .failed else .completed;
+                        try self.handleEngineToolResult(session_id, engine, tool_result.id, tool_result.content, status);
+                    }
+                },
+                .user => {
+                    if (msg.getToolResult()) |tool_result| {
+                        const status: protocol.SessionUpdate.ToolCallStatus = if (tool_result.is_error) .failed else .completed;
+                        try self.handleEngineToolResult(session_id, engine, tool_result.id, tool_result.content, status);
                     }
                 },
                 .result => {
-                    // Translate CLI stop reasons to ACP stop reasons
                     if (msg.getStopReason()) |reason| {
                         stop_reason = mapCliStopReason(reason);
                     }
                     break;
                 },
                 .stream_event => {
-                    // Handle streaming text deltas for real-time updates
+                    if (msg.getStreamEventType()) |event_type| {
+                        switch (event_type) {
+                            .message_start => stream_prefix_pending = true,
+                            .message_stop => stream_prefix_pending = false,
+                            else => {},
+                        }
+                    }
                     if (msg.getStreamTextDelta()) |text| {
                         if (first_response_ms == 0) {
                             first_response_ms = msg_time_ms;
-                            log.info("First streaming response at {d}ms", .{msg_time_ms});
+                            log.info("First Claude stream response at {d}ms", .{msg_time_ms});
                         }
-                        try self.sendSessionUpdate(session_id, .{
-                            .sessionUpdate = .agent_message_chunk,
-                            .content = .{ .type = "text", .text = text },
-                        });
+                        if (stream_prefix_pending) {
+                            try self.sendEngineTextPrefix(session_id, engine);
+                            stream_prefix_pending = false;
+                        }
+                        try self.sendEngineTextRaw(session_id, text);
                     }
-                    // Handle thinking deltas
                     if (msg.getStreamThinkingDelta()) |thinking| {
-                        try self.sendSessionUpdate(session_id, .{
-                            .sessionUpdate = .agent_thought_chunk,
-                            .content = .{ .type = "text", .text = thinking },
-                        });
+                        try self.sendEngineThought(session_id, engine, thinking);
                     }
                 },
                 .system => {
                     if (msg.getSystemSubtype()) |subtype| {
                         switch (subtype) {
                             .init => {
-                                // Parse init message for slash commands and CLI session ID
                                 if (msg.getInitInfo()) |init_info| {
                                     if (init_info.slash_commands) |cmds| {
                                         try self.sendAvailableCommands(session_id, cmds);
                                     }
-                                    // Capture CLI session ID for resume support
                                     if (init_info.session_id) |cli_sid| {
                                         if (session.cli_session_id == null) {
                                             session.cli_session_id = self.allocator.dupe(u8, cli_sid) catch |err| blk: {
-                                                log.warn("Failed to capture CLI session ID: {}", .{err});
+                                                log.warn("Failed to capture Claude session ID: {}", .{err});
                                                 break :blk null;
                                             };
                                             if (session.cli_session_id != null) {
-                                                log.info("Captured CLI session ID: {s}", .{cli_sid});
+                                                log.info("Captured Claude session ID: {s}", .{cli_sid});
                                             }
                                         }
                                     }
                                 }
-                                // Check for auth required in init message
                                 if (msg.getContent()) |content| {
                                     if (isAuthRequiredContent(content)) {
-                                        stop_reason = try self.handleAuthRequired(session_id, session);
+                                        stop_reason = try self.handleAuthRequired(session_id, session, engine);
                                         break;
                                     }
                                 }
@@ -554,7 +751,7 @@ pub const Agent = struct {
                             .auth_required => {
                                 if (msg.getContent()) |content| {
                                     if (isAuthRequiredContent(content)) {
-                                        stop_reason = try self.handleAuthRequired(session_id, session);
+                                        stop_reason = try self.handleAuthRequired(session_id, session, engine);
                                         break;
                                     }
                                 }
@@ -562,12 +759,8 @@ pub const Agent = struct {
                             .hook_response => {},
                         }
                     } else {
-                        // Forward unknown system messages as text (e.g., /model output)
                         if (msg.getContent()) |content| {
-                            try self.sendSessionUpdate(session_id, .{
-                                .sessionUpdate = .agent_message_chunk,
-                                .content = .{ .type = "text", .text = content },
-                            });
+                            try self.sendEngineText(session_id, engine, content);
                         }
                     }
                 },
@@ -576,14 +769,222 @@ pub const Agent = struct {
         }
 
         const total_ms = timer.read() / std.time.ns_per_ms;
-        log.info("Prompt complete: {d} msgs, first response at {d}ms, total {d}ms", .{ msg_count, first_response_ms, total_ms });
+        log.info("Claude prompt complete: {d} msgs, first response at {d}ms, total {d}ms", .{ msg_count, first_response_ms, total_ms });
 
-        // Return result
-        var result = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
-        defer result.object.deinit();
-        try result.object.put("stopReason", .{ .string = stop_reason });
+        return stop_reason;
+    }
 
-        try self.writer.writeResponse(jsonrpc.Response.success(request.id, result));
+    fn runCodexPrompt(self: *Agent, session: *Session, session_id: []const u8, prompt: []const u8) ![]const u8 {
+        var timer = std.time.Timer.start() catch unreachable;
+        const engine = Engine.codex;
+
+        var codex_bridge = CodexBridge.init(self.allocator, session.cwd);
+        defer codex_bridge.deinit();
+
+        codex_bridge.start(.{
+            .resume_session_id = session.codex_session_id,
+            .model = null,
+        }) catch |err| {
+            log.err("Failed to start Codex: {}", .{err});
+            try self.sendEngineText(session_id, engine, "Failed to start Codex. Please ensure it is installed and in PATH.");
+            return "error";
+        };
+
+        const start_ms = timer.read() / std.time.ns_per_ms;
+        log.info("Codex bridge started in {d}ms", .{start_ms});
+
+        try codex_bridge.sendPrompt(prompt);
+        const prompt_sent_ms = timer.read() / std.time.ns_per_ms;
+        log.info("Codex prompt sent at {d}ms", .{prompt_sent_ms});
+
+        var first_response_ms: u64 = 0;
+        var msg_count: u32 = 0;
+
+        while (true) {
+            if (session.cancelled) return "cancelled";
+
+            var msg = codex_bridge.readMessage() catch |err| {
+                log.err("Failed to read Codex message: {}", .{err});
+                break;
+            } orelse break;
+            defer msg.deinit();
+
+            msg_count += 1;
+            const msg_time_ms = timer.read() / std.time.ns_per_ms;
+            if (first_response_ms == 0) first_response_ms = msg_time_ms;
+
+            if (msg.getSessionId()) |sid| {
+                if (session.codex_session_id == null) {
+                    session.codex_session_id = self.allocator.dupe(u8, sid) catch |err| blk: {
+                        log.warn("Failed to capture Codex session ID: {}", .{err});
+                        break :blk null;
+                    };
+                    if (session.codex_session_id != null) {
+                        log.info("Captured Codex session ID: {s}", .{sid});
+                    }
+                }
+            }
+
+            if (msg.getToolCall()) |tool| {
+                try self.handleEngineToolCall(
+                    session,
+                    session_id,
+                    engine,
+                    "Bash",
+                    tool.command,
+                    tool.id,
+                    .command,
+                    null,
+                );
+                continue;
+            }
+
+            if (msg.getToolResult()) |tool_result| {
+                const status: protocol.SessionUpdate.ToolCallStatus = if (tool_result.exit_code) |code|
+                    (if (code == 0) .completed else .failed)
+                else
+                    .completed;
+                try self.handleEngineToolResult(session_id, engine, tool_result.id, tool_result.content, status);
+                continue;
+            }
+
+            if (msg.getThought()) |text| {
+                if (first_response_ms == 0) first_response_ms = msg_time_ms;
+                try self.sendEngineThought(session_id, engine, text);
+                continue;
+            }
+
+            if (msg.getText()) |text| {
+                if (first_response_ms == 0) first_response_ms = msg_time_ms;
+                try self.sendEngineText(session_id, engine, text);
+                continue;
+            }
+
+            if (msg.isTurnCompleted()) break;
+        }
+
+        const total_ms = timer.read() / std.time.ns_per_ms;
+        log.info("Codex prompt complete: {d} msgs, first response at {d}ms, total {d}ms", .{ msg_count, first_response_ms, total_ms });
+        return "end_turn";
+    }
+
+    fn sendEngineText(self: *Agent, session_id: []const u8, engine: Engine, text: []const u8) !void {
+        const tagged = try self.tagText(engine, text);
+        defer self.allocator.free(tagged);
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .agent_message_chunk,
+            .content = .{ .type = "text", .text = tagged },
+        });
+    }
+
+    fn sendEngineTextRaw(self: *Agent, session_id: []const u8, text: []const u8) !void {
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .agent_message_chunk,
+            .content = .{ .type = "text", .text = text },
+        });
+    }
+
+    fn sendEngineTextPrefix(self: *Agent, session_id: []const u8, engine: Engine) !void {
+        const prefix = enginePrefix(engine);
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .agent_message_chunk,
+            .content = .{ .type = "text", .text = prefix },
+        });
+    }
+
+    fn sendEngineThought(self: *Agent, session_id: []const u8, engine: Engine, text: []const u8) !void {
+        const tagged = try self.tagText(engine, text);
+        defer self.allocator.free(tagged);
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .agent_thought_chunk,
+            .content = .{ .type = "text", .text = tagged },
+        });
+    }
+
+    fn sendEngineToolCall(
+        self: *Agent,
+        session_id: []const u8,
+        engine: Engine,
+        tool_id: []const u8,
+        tool_name: []const u8,
+        kind: protocol.SessionUpdate.ToolKind,
+        raw_input: ?std.json.Value,
+    ) !void {
+        const tagged_title = try self.tagText(engine, tool_name);
+        defer self.allocator.free(tagged_title);
+        const tagged_id = try self.tagToolId(engine, tool_id);
+        defer self.allocator.free(tagged_id);
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .tool_call,
+            .toolCallId = tagged_id,
+            .title = tagged_title,
+            .kind = kind,
+            .status = .pending,
+            .rawInput = raw_input,
+        });
+    }
+
+    fn sendEngineToolResult(
+        self: *Agent,
+        session_id: []const u8,
+        engine: Engine,
+        tool_id: []const u8,
+        content: ?[]const u8,
+        status: protocol.SessionUpdate.ToolCallStatus,
+    ) !void {
+        const tagged_id = try self.tagToolId(engine, tool_id);
+        defer self.allocator.free(tagged_id);
+
+        var tagged_content: ?[]const u8 = null;
+        if (content) |text| {
+            tagged_content = try self.tagText(engine, text);
+        }
+        defer if (tagged_content) |text| self.allocator.free(text);
+
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .tool_call_update,
+            .toolCallId = tagged_id,
+            .status = status,
+            .content = if (tagged_content) |text| .{ .type = "text", .text = text } else null,
+        });
+    }
+
+    fn handleEngineToolCall(
+        self: *Agent,
+        session: *Session,
+        session_id: []const u8,
+        engine: Engine,
+        permission_name: []const u8,
+        display_name: []const u8,
+        tool_id: []const u8,
+        kind: protocol.SessionUpdate.ToolKind,
+        raw_input: ?std.json.Value,
+    ) !void {
+        if (!session.isToolAllowed(permission_name)) {
+            log.warn("Tool {s} denied by settings", .{permission_name});
+            try self.sendEngineText(session_id, engine, "Tool execution blocked by settings.");
+            return;
+        }
+        try self.sendEngineToolCall(session_id, engine, tool_id, display_name, kind, raw_input);
+    }
+
+    fn handleEngineToolResult(
+        self: *Agent,
+        session_id: []const u8,
+        engine: Engine,
+        tool_id: []const u8,
+        content: ?[]const u8,
+        status: protocol.SessionUpdate.ToolCallStatus,
+    ) !void {
+        try self.sendEngineToolResult(session_id, engine, tool_id, content, status);
+    }
+
+    fn tagText(self: *Agent, engine: Engine, text: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(self.allocator, "[{s}] {s}", .{ engineLabel(engine), text });
+    }
+
+    fn tagToolId(self: *Agent, engine: Engine, tool_id: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ engineLabel(engine), tool_id });
     }
 
     fn handleCancel(self: *Agent, request: jsonrpc.Request) !void {
@@ -682,12 +1083,9 @@ pub const Agent = struct {
     }
 
     /// Handle authentication required - notify user and stop bridge
-    fn handleAuthRequired(self: *Agent, session_id: []const u8, session: *Session) ![]const u8 {
+    fn handleAuthRequired(self: *Agent, session_id: []const u8, session: *Session, engine: Engine) ![]const u8 {
         log.warn("Auth required for session {s}", .{session_id});
-        try self.sendSessionUpdate(session_id, .{
-            .sessionUpdate = .agent_message_chunk,
-            .content = .{ .type = "text", .text = "Authentication required. Please run `claude /login` in your terminal, then try again." },
-        });
+        try self.sendEngineText(session_id, engine, "Authentication required. Please run `claude /login` in your terminal, then try again.");
         if (session.bridge) |*b| {
             b.stop();
         }
@@ -697,7 +1095,7 @@ pub const Agent = struct {
 
     /// Handle /version command
     fn handleVersionCommand(self: *Agent, request: jsonrpc.Request, session_id: []const u8) !void {
-        const version_msg = std.fmt.comptimePrint("Banjo {s} - Claude Code ACP Agent", .{version});
+        const version_msg = std.fmt.comptimePrint("Banjo {s} - ACP Agent for Claude Code + Codex", .{version});
         try self.sendSessionUpdate(session_id, .{
             .sessionUpdate = .agent_message_chunk,
             .content = .{ .type = "text", .text = version_msg },
@@ -1046,6 +1444,9 @@ pub const Agent = struct {
         .{ .name = "notes", .description = "List all notes in the project" },
         .{ .name = "note", .description = "Note management commands" },
         .{ .name = "version", .description = "Show banjo version" },
+        .{ .name = "claude", .description = "Route prompt to Claude only" },
+        .{ .name = "codex", .description = "Route prompt to Codex only" },
+        .{ .name = "both", .description = "Route prompt to Claude then Codex" },
     };
 
     /// Commands filtered from CLI (unsupported in stream-json mode, handled via authMethods)
@@ -1624,6 +2025,49 @@ test "property: extractTextFromPrompt null/non-array always returns null" {
             return true;
         }
     }.prop, .{});
+}
+
+test "property: parseRoutePrefix strips routing command and preserves payload" {
+    try quickcheck.check(struct {
+        fn prop(args: struct { prefix: u2, payload: [32]u8, len: u5 }) bool {
+            const prefix_str = switch (args.prefix) {
+                0 => "/claude",
+                1 => "/codex",
+                else => "/both",
+            };
+            const route = switch (args.prefix) {
+                0 => Route.claude,
+                1 => Route.codex,
+                else => Route.both,
+            };
+
+            const payload_len = @as(usize, args.len) % args.payload.len;
+            var buf: [64]u8 = undefined;
+            var idx: usize = 0;
+            std.mem.copyForwards(u8, buf[idx..][0..prefix_str.len], prefix_str);
+            idx += prefix_str.len;
+            buf[idx] = ' ';
+            idx += 1;
+            std.mem.copyForwards(u8, buf[idx..][0..payload_len], args.payload[0..payload_len]);
+            idx += payload_len;
+
+            const input = buf[0..idx];
+            const result = parseRoutePrefix(input, .both);
+            var expected_start: usize = 0;
+            while (expected_start < payload_len and (args.payload[expected_start] == ' ' or args.payload[expected_start] == '\t')) {
+                expected_start += 1;
+            }
+            return result.consumed and result.route == route and std.mem.eql(u8, result.prompt, args.payload[expected_start..payload_len]);
+        }
+    }.prop, .{});
+}
+
+test "parseRoutePrefix ignores non-command prefixes" {
+    const input = "/claudeX hello";
+    const result = parseRoutePrefix(input, .both);
+    try testing.expect(!result.consumed);
+    try testing.expectEqual(Route.both, result.route);
+    try testing.expectEqualStrings(input, result.prompt);
 }
 
 test "Agent handleRequest - cancel" {

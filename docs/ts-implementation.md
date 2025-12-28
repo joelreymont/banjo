@@ -9,7 +9,7 @@ Zed (ACP Client)
     ↓ JSON-RPC over stdio
 claude-code-acp (Node.js)
     ↓ Claude Agent SDK
-Claude Code CLI (subprocess)
+Claude Code (subprocess)
     ↓ API calls
 Anthropic API
 ```
@@ -64,7 +64,7 @@ Async queue bridging push-based input to async iteration.
 
 ## Hook Implementation
 
-The "hooks" are **NOT** Claude Code CLI hooks. They're SDK-level JS callbacks:
+The "hooks" are **NOT** Claude Code hooks. They're SDK-level JS callbacks:
 
 ```typescript
 hooks: {

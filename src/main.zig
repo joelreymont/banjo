@@ -118,7 +118,7 @@ fn printHelp() void {
     var file_writer = stdout_file.writer(&buf);
     const w = &file_writer.interface;
     w.writeAll(
-        \\Banjo - A second brain for your code
+        \\Banjo - A Second Brain for your code
         \\
         \\Usage: banjo [MODE] [OPTIONS]
         \\
@@ -203,6 +203,7 @@ test {
     _ = @import("acp/agent.zig");
     _ = @import("acp/protocol.zig");
     _ = @import("cli/bridge.zig");
+    _ = @import("cli/codex_bridge.zig");
     _ = @import("settings/loader.zig");
     _ = @import("tools/proxy.zig");
     _ = @import("util/quickcheck.zig");

@@ -2,23 +2,24 @@
 
 ![Banjo](assets/logo.jpg)
 
-Claude Code ACP Agent in Zig — run [Claude Code](https://docs.anthropic.com/en/docs/claude-code) inside [Zed](https://zed.dev)'s Agent Panel.
+Banjo is a Second Brain for your code — an ACP agent in Zig that runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and Codex inside [Zed](https://zed.dev)'s Agent Panel.
 
-> **Requires [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated.**
+> **Requires Claude Code or Codex installed.**
 > Run `claude /login` if you haven't already.
 
 ## Installation
 
 1. Open Zed → Extensions → Search "Banjo" → Install
-2. Open Agent Panel (`Cmd+?`) → Select "Claude Code (Banjo)"
+2. Open Agent Panel (`Cmd+?`) → Select "Banjo (Claude Code + Codex)"
 
 ## Features
 
 - **Auto-resume sessions** — automatically continues your last conversation
 - **Code notes** — attach notes to code as comments with `/explain`
 - **Auto-setup** — `/setup lsp` configures Zed settings automatically
-- Claude CLI commands: `/version`, `/model`, `/compact`, `/review`, `/clear`
-- MCP server passthrough
+- Claude Code commands: `/version`, `/model`, `/compact`, `/review`, `/clear`
+- **Duet routing** — `/claude`, `/codex`, `/both` (default: `/both`, Claude responds first)
+- **Codex support** — run Codex prompts side-by-side with Claude Code
 
 ## Notes
 
@@ -29,6 +30,7 @@ Banjo lets you attach notes to code as `@banjo[id]` comments. Notes appear as LS
 1. Run `/setup lsp` in the agent panel — automatically configures Zed settings
 2. Write a comment, press `Cmd+.`, select "Create Banjo Note"
 3. Or select code, press `Cmd+>`, type `/explain` to have Claude summarize it
+4. Use `/claude`, `/codex`, or `/both` to route prompts
 
 ### Creating Notes
 
@@ -67,6 +69,21 @@ To start fresh sessions instead of auto-resuming:
   "agent_servers": {
     "banjo": {
       "env": { "BANJO_AUTO_RESUME": "false" }
+    }
+  }
+}
+```
+
+Duet defaults (optional):
+
+```json
+{
+  "agent_servers": {
+    "banjo": {
+      "env": {
+        "BANJO_DUET_DEFAULT": "both",
+        "BANJO_DUET_PRIMARY": "claude"
+      }
     }
   }
 }

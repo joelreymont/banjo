@@ -157,9 +157,9 @@ Response to `session/prompt`:
 | `error_max_turns` | `max_turn_requests` |
 | `error_max_budget_usd` | `max_turn_requests` |
 
-## Claude CLI Stream JSON
+## Claude Code Stream JSON
 
-Communication between banjo and Claude Code CLI.
+Communication between banjo and Claude Code.
 
 ### Input Format
 
@@ -184,6 +184,15 @@ Newline-delimited JSON objects:
   "session_id": "uuid",
   "tools": ["Read", "Edit", "Bash", ...],
   "model": "claude-opus-4-5-20251101"
+}
+```
+
+#### system/auth_required
+```json
+{
+  "type": "system",
+  "subtype": "auth_required",
+  "content": "Please run /login to authenticate"
 }
 ```
 
@@ -214,6 +223,44 @@ Newline-delimited JSON objects:
 }
 ```
 
+#### assistant (tool_result content block)
+```json
+{
+  "type": "assistant",
+  "message": {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "tool_result",
+        "tool_use_id": "tool_1",
+        "content": [
+          { "type": "text", "text": "file contents..." }
+        ],
+        "is_error": false
+      }
+    ]
+  }
+}
+```
+
+#### user (tool_result content block)
+```json
+{
+  "type": "user",
+  "message": {
+    "role": "user",
+    "content": [
+      {
+        "type": "tool_result",
+        "tool_use_id": "tool_1",
+        "content": "error output",
+        "is_error": true
+      }
+    ]
+  }
+}
+```
+
 #### result
 ```json
 {
@@ -225,6 +272,42 @@ Newline-delimited JSON objects:
 }
 ```
 
+#### stream_event (message_start/stop)
+```json
+{
+  "type": "stream_event",
+  "event": { "type": "message_start" }
+}
+```
+
+```json
+{
+  "type": "stream_event",
+  "event": { "type": "message_stop" }
+}
+```
+
+#### stream_event (content_block_delta)
+```json
+{
+  "type": "stream_event",
+  "event": {
+    "type": "content_block_delta",
+    "delta": { "type": "text_delta", "text": "Hello" }
+  }
+}
+```
+
+```json
+{
+  "type": "stream_event",
+  "event": {
+    "type": "content_block_delta",
+    "delta": { "type": "thinking_delta", "thinking": "..." }
+  }
+}
+```
+
 ### CLI Flags
 
 Required for stream-json mode:
@@ -233,6 +316,109 @@ claude -p --verbose \
   --input-format stream-json \
   --output-format stream-json
 ```
+
+## Codex JSONL
+
+Communication between banjo and `codex exec --json`.
+
+### Input Format
+
+Codex takes raw prompt text (not JSON) on stdin:
+
+```bash
+codex exec --json -
+```
+
+Optional resume:
+
+```bash
+codex exec --json resume <thread_id> -
+```
+
+### Output Format
+
+Newline-delimited JSON objects with a `type` field:
+
+#### thread.started
+```json
+{ "type": "thread.started", "thread_id": "uuid" }
+```
+
+#### turn.started
+```json
+{ "type": "turn.started" }
+```
+
+#### item.started (tool execution begins)
+```json
+{
+  "type": "item.started",
+  "item": {
+    "id": "item_1",
+    "type": "command_execution",
+    "command": "/bin/zsh -lc ls",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+  }
+}
+```
+
+#### item.completed (reasoning)
+```json
+{
+  "type": "item.completed",
+  "item": {
+    "id": "item_0",
+    "type": "reasoning",
+    "text": "**Listing files**"
+  }
+}
+```
+
+#### item.completed (agent message)
+```json
+{
+  "type": "item.completed",
+  "item": {
+    "id": "item_2",
+    "type": "agent_message",
+    "text": "Hello"
+  }
+}
+```
+
+#### item.completed (tool execution ends)
+```json
+{
+  "type": "item.completed",
+  "item": {
+    "id": "item_1",
+    "type": "command_execution",
+    "command": "/bin/zsh -lc ls",
+    "aggregated_output": "file1\nfile2\n",
+    "exit_code": 0,
+    "status": "completed"
+  }
+}
+```
+
+#### turn.completed
+```json
+{
+  "type": "turn.completed",
+  "usage": {
+    "input_tokens": 123,
+    "cached_input_tokens": 0,
+    "output_tokens": 45
+  }
+}
+```
+
+Notes:
+- `item.type` values observed: `reasoning`, `agent_message`, `command_execution`
+- `aggregated_output` may be empty on `item.started`
+- `exit_code` is null until completion
 
 ## Sources
 

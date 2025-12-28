@@ -2,14 +2,14 @@ id = "banjo"
 name = "Banjo"
 version = "0.3.0"
 schema_version = 1
-description = "A second brain for your code - Claude Code agent with notes and backlinks"
+description = "A Second Brain for your code - Claude Code + Codex agent with notes and backlinks"
 authors = ["Joel Reymont <joelr@well.com>"]
 repository = "https://github.com/joelreymont/banjo"
 license = "MIT"
 
-# ACP Agent Server (Claude Code)
+# ACP Agent Server (Claude Code + Codex)
 [agent_servers.banjo]
-name = "Claude Code (Banjo)"
+name = "Banjo (Claude Code + Codex)"
 
 [agent_servers.banjo.targets.darwin-aarch64]
 archive = "https://github.com/joelreymont/banjo/releases/download/v0.3.0/banjo-darwin-arm64.tar.gz"

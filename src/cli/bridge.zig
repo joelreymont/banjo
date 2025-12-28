@@ -2,8 +2,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.cli_bridge);
+const executable = @import("executable.zig");
 
-/// Stream JSON message types from Claude CLI
+/// Stream JSON message types from Claude Code
 pub const MessageType = enum {
     system,
     assistant,
@@ -58,7 +59,7 @@ pub const SystemSubtype = enum {
     }
 };
 
-/// Stream JSON input format for sending messages to Claude CLI
+/// Stream JSON input format for sending messages to Claude Code
 pub const StreamInput = struct {
     type: []const u8,
     message: Message,
@@ -121,50 +122,111 @@ pub const StreamMessage = struct {
         return null;
     }
 
+    pub const ToolUse = struct {
+        id: []const u8,
+        name: []const u8,
+        input: ?std.json.Value = null,
+    };
+
+    pub const ToolResult = struct {
+        id: []const u8,
+        content: ?[]const u8 = null,
+        is_error: bool = false,
+    };
+
     /// Check if this is a tool use event
     pub fn isToolUse(self: *const StreamMessage) bool {
-        return self.getToolName() != null;
+        return self.getToolUse() != null;
+    }
+
+    /// Get tool use details from assistant message
+    pub fn getToolUse(self: *const StreamMessage) ?ToolUse {
+        if (self.type != .assistant) return null;
+        const message = self.raw.object.get("message") orelse return null;
+        if (message != .object) return null;
+        const content = message.object.get("content") orelse return null;
+        if (content != .array) return null;
+        for (content.array.items) |item| {
+            if (item != .object) continue;
+            const item_type = item.object.get("type") orelse continue;
+            if (item_type != .string) continue;
+            const block_type = ContentBlockType.fromString(item_type.string) orelse continue;
+            if (block_type != .tool_use) continue;
+            const name = item.object.get("name") orelse continue;
+            const id = item.object.get("id") orelse continue;
+            if (name != .string or id != .string) continue;
+            const input = item.object.get("input");
+            return .{ .id = id.string, .name = name.string, .input = input };
+        }
+        return null;
+    }
+
+    /// Get tool result details from assistant message
+    pub fn getToolResult(self: *const StreamMessage) ?ToolResult {
+        if (self.type != .assistant and self.type != .user) return null;
+        const message = self.raw.object.get("message") orelse return null;
+        if (message != .object) return null;
+        const content = message.object.get("content") orelse return null;
+        if (content != .array) return null;
+        for (content.array.items) |item| {
+            if (item != .object) continue;
+            const item_type = item.object.get("type") orelse continue;
+            if (item_type != .string) continue;
+            const block_type = ContentBlockType.fromString(item_type.string) orelse continue;
+            if (block_type != .tool_result) continue;
+            const id = item.object.get("tool_use_id") orelse item.object.get("id") orelse continue;
+            if (id != .string) continue;
+            var is_error = false;
+            if (item.object.get("is_error")) |flag| {
+                if (flag == .bool) is_error = flag.bool;
+            } else if (item.object.get("error")) |err| {
+                if (err == .string and err.string.len > 0) is_error = true;
+            }
+            const content_val = item.object.get("content");
+            return .{
+                .id = id.string,
+                .content = if (content_val) |val| extractToolResultText(val) else null,
+                .is_error = is_error,
+            };
+        }
+        return null;
+    }
+
+    fn extractToolResultText(val: std.json.Value) ?[]const u8 {
+        return switch (val) {
+            .string => val.string,
+            .array => |arr| blk: {
+                for (arr.items) |item| {
+                    if (item != .object) continue;
+                    const item_type = item.object.get("type") orelse continue;
+                    if (item_type != .string) continue;
+                    if (!std.mem.eql(u8, item_type.string, "text")) continue;
+                    const text = item.object.get("text") orelse continue;
+                    if (text == .string) break :blk text.string;
+                }
+                break :blk null;
+            },
+            .object => |obj| blk: {
+                if (obj.get("text")) |text| {
+                    if (text == .string) break :blk text.string;
+                }
+                break :blk null;
+            },
+            else => null,
+        };
     }
 
     /// Get the tool name from a tool_use message
     /// Uses manual traversal to avoid allocations
     pub fn getToolName(self: *const StreamMessage) ?[]const u8 {
-        if (self.type != .assistant) return null;
-        const message = self.raw.object.get("message") orelse return null;
-        if (message != .object) return null;
-        const content = message.object.get("content") orelse return null;
-        if (content != .array) return null;
-        for (content.array.items) |item| {
-            if (item != .object) continue;
-            const item_type = item.object.get("type") orelse continue;
-            if (item_type != .string) continue;
-            const block_type = ContentBlockType.fromString(item_type.string) orelse continue;
-            if (block_type != .tool_use) continue;
-            // Found tool_use, get the name
-            const name = item.object.get("name") orelse continue;
-            if (name == .string) return name.string;
-        }
-        return null;
+        const tool = self.getToolUse() orelse return null;
+        return tool.name;
     }
 
     /// Get the tool use ID from a tool_use message
     pub fn getToolId(self: *const StreamMessage) ?[]const u8 {
-        if (self.type != .assistant) return null;
-        const message = self.raw.object.get("message") orelse return null;
-        if (message != .object) return null;
-        const content = message.object.get("content") orelse return null;
-        if (content != .array) return null;
-        for (content.array.items) |item| {
-            if (item != .object) continue;
-            const item_type = item.object.get("type") orelse continue;
-            if (item_type != .string) continue;
-            const block_type = ContentBlockType.fromString(item_type.string) orelse continue;
-            if (block_type != .tool_use) continue;
-            // Found tool_use, get the id
-            const id = item.object.get("id") orelse continue;
-            if (id == .string) return id.string;
-        }
-        return null;
+        const tool = self.getToolUse() orelse return null;
+        return tool.id;
     }
 
     /// Get stop reason from result message
@@ -216,7 +278,7 @@ pub const StreamMessage = struct {
         return parsed.value;
     }
 
-    /// Stream event structure from Claude CLI
+    /// Stream event structure from Claude Code
     pub const StreamEvent = struct {
         event: Event,
 
@@ -264,14 +326,25 @@ pub const StreamMessage = struct {
             .input_json_delta => null,
         };
     }
+
+    /// Get stream event type (message start/stop, content block, etc.)
+    pub fn getStreamEventType(self: *const StreamMessage) ?StreamEvent.Event.EventType {
+        if (self.type != .stream_event) return null;
+        const parsed = std.json.parseFromValue(StreamEvent, self.arena.child_allocator, self.raw, .{
+            .ignore_unknown_fields = true,
+        }) catch return null;
+        return parsed.value.event.type;
+    }
 };
 
-/// Claude CLI Bridge - spawns and communicates with Claude CLI
+/// Claude Code Bridge - spawns and communicates with Claude Code
 pub const Bridge = struct {
     allocator: Allocator,
     process: ?std.process.Child = null,
     cwd: []const u8,
     session_id: ?[]const u8 = null,
+    stdout_reader: ?std.fs.File.Reader = null,
+    stdout_buf: [64 * 1024]u8 = undefined,
 
     pub fn init(allocator: Allocator, cwd: []const u8) Bridge {
         return .{
@@ -287,26 +360,21 @@ pub const Bridge = struct {
         }
     }
 
-    /// Find claude binary - check env var and common locations
+    /// Find Claude Code binary - check env var and common locations
     fn findClaudeBinary() []const u8 {
-        // Check CLAUDE_CODE_EXECUTABLE env var first
-        if (std.posix.getenv("CLAUDE_CODE_EXECUTABLE")) |path| {
-            return path;
-        }
-        // Common installation locations
-        const paths = [_][]const u8{
-            "/usr/local/bin/claude",
-            "/opt/homebrew/bin/claude",
-        };
-        for (paths) |path| {
-            std.fs.accessAbsolute(path, .{}) catch continue;
-            return path;
-        }
-        // Fall back to PATH lookup
-        return "claude";
+        return executable.choose("CLAUDE_CODE_EXECUTABLE", "claude", claude_paths[0..]);
     }
 
-    /// Start Claude CLI process
+    const claude_paths = [_][]const u8{
+        "/usr/local/bin/claude",
+        "/opt/homebrew/bin/claude",
+    };
+
+    pub fn isAvailable() bool {
+        return executable.isAvailable("CLAUDE_CODE_EXECUTABLE", "claude", claude_paths[0..]);
+    }
+
+    /// Start Claude Code process
     pub fn start(self: *Bridge, opts: StartOptions) !void {
         var args: std.ArrayList([]const u8) = .empty;
         defer args.deinit(self.allocator);
@@ -355,8 +423,13 @@ pub const Bridge = struct {
             _ = child.wait() catch {};
         }
         self.process = child;
+        if (self.process.?.stdout) |stdout| {
+            self.stdout_reader = stdout.reader(&self.stdout_buf);
+        } else {
+            self.stdout_reader = null;
+        }
 
-        log.info("Started Claude CLI in {s}", .{self.cwd});
+        log.info("Started Claude Code in {s}", .{self.cwd});
     }
 
     pub const StartOptions = struct {
@@ -373,7 +446,8 @@ pub const Bridge = struct {
             _ = proc.kill() catch {};
             _ = proc.wait() catch {};
             self.process = null;
-            log.info("Stopped Claude CLI", .{});
+            self.stdout_reader = null;
+            log.info("Stopped Claude Code", .{});
         }
     }
 
@@ -402,12 +476,8 @@ pub const Bridge = struct {
 
     /// Read next message from CLI stdout
     pub fn readMessage(self: *Bridge) !?StreamMessage {
-        const proc = self.process orelse return error.NotStarted;
-        const stdout = proc.stdout orelse return error.NoStdout;
-
-        var read_buf: [64 * 1024]u8 = undefined;
-        var file_reader = stdout.reader(&read_buf);
-        const reader = &file_reader.interface;
+        _ = self.process orelse return error.NotStarted;
+        const reader = if (self.stdout_reader) |*stdout_reader| &stdout_reader.interface else return error.NoStdout;
 
         log.debug("Waiting for CLI stdout...", .{});
         const line = reader.takeDelimiter('\n') catch |e| switch (e) {
@@ -481,6 +551,71 @@ test "StreamMessage parsing" {
 
     try testing.expectEqualStrings("Hello", msg.getContent().?);
     try testing.expect(!msg.isToolUse());
+}
+
+test "StreamMessage tool use parsing" {
+    const json =
+        \\{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool_1","name":"Read","input":{"file_path":"foo"}}]}}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json, .{});
+    const msg = StreamMessage{
+        .type = .assistant,
+        .subtype = null,
+        .raw = parsed.value,
+        .arena = arena,
+    };
+
+    const tool = msg.getToolUse().?;
+    try testing.expectEqualStrings("tool_1", tool.id);
+    try testing.expectEqualStrings("Read", tool.name);
+}
+
+test "StreamMessage tool result parsing" {
+    const json =
+        \\{"type":"assistant","message":{"content":[{"type":"tool_result","tool_use_id":"tool_2","content":[{"type":"text","text":"ok"}],"is_error":false}]}}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json, .{});
+    const msg = StreamMessage{
+        .type = .assistant,
+        .subtype = null,
+        .raw = parsed.value,
+        .arena = arena,
+    };
+
+    const result = msg.getToolResult().?;
+    try testing.expectEqualStrings("tool_2", result.id);
+    try testing.expectEqualStrings("ok", result.content.?);
+    try testing.expect(!result.is_error);
+}
+
+test "StreamMessage tool result parsing from user message" {
+    const json =
+        \\{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool_3","content":"fail","is_error":true}]}}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json, .{});
+    const msg = StreamMessage{
+        .type = .user,
+        .subtype = null,
+        .raw = parsed.value,
+        .arena = arena,
+    };
+
+    const result = msg.getToolResult().?;
+    try testing.expectEqualStrings("tool_3", result.id);
+    try testing.expectEqualStrings("fail", result.content.?);
+    try testing.expect(result.is_error);
 }
 
 // =============================================================================

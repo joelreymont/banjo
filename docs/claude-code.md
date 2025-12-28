@@ -1,8 +1,8 @@
-# Claude Code CLI Direct Communication
+# Claude Code Direct Communication
 
 ## Streaming JSON Mode
 
-Bypass SDK, talk directly to CLI:
+Bypass SDK, talk directly to Claude Code:
 
 ```bash
 claude -p \
@@ -78,7 +78,7 @@ When Claude uses a tool, stream contains:
 
 ## Hooks Architecture
 
-### CLI Hooks (shell commands)
+### Claude Code Hooks (shell commands)
 Defined in `.claude/settings.json`:
 ```json
 {
