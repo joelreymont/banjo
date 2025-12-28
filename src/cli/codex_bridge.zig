@@ -198,8 +198,6 @@ pub const CodexBridge = struct {
 
         try stdin.writeAll(prompt);
         try stdin.writeAll("\n");
-        // Codex expects EOF for non-interactive exec prompts.
-        stdin.close();
     }
 
     pub fn readMessage(self: *CodexBridge) !?CodexMessage {

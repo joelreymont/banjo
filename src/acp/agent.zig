@@ -241,12 +241,14 @@ pub const Agent = struct {
         permission_mode: protocol.PermissionMode = .default,
         model: ?[]const u8 = null,
         bridge: ?Bridge = null,
+        codex_bridge: ?CodexBridge = null,
         settings: ?Settings = null,
         cli_session_id: ?[]const u8 = null, // Claude Code session ID for --resume
         codex_session_id: ?[]const u8 = null,
 
         pub fn deinit(self: *Session, allocator: Allocator) void {
             if (self.bridge) |*b| b.deinit();
+            if (self.codex_bridge) |*b| b.deinit();
             if (self.settings) |*s| s.deinit();
             allocator.free(self.id);
             allocator.free(self.cwd);
@@ -790,22 +792,23 @@ pub const Agent = struct {
         var timer = std.time.Timer.start() catch unreachable;
         const engine = Engine.codex;
 
-        // Codex is executed per prompt; resume uses thread_id across runs.
-        var codex_bridge = CodexBridge.init(self.allocator, session.cwd);
-        defer codex_bridge.deinit();
-
-        codex_bridge.start(.{
-            .resume_session_id = session.codex_session_id,
-            .model = null,
-        }) catch |err| {
-            log.err("Failed to start Codex: {}", .{err});
-            try self.sendEngineText(session_id, engine, "Failed to start Codex. Please ensure it is installed and in PATH.");
-            return "error";
-        };
+        if (session.codex_bridge == null) {
+            session.codex_bridge = CodexBridge.init(self.allocator, session.cwd);
+            session.codex_bridge.?.start(.{
+                .resume_session_id = session.codex_session_id,
+                .model = null,
+            }) catch |err| {
+                log.err("Failed to start Codex: {}", .{err});
+                session.codex_bridge = null;
+                try self.sendEngineText(session_id, engine, "Failed to start Codex. Please ensure it is installed and in PATH.");
+                return "error";
+            };
+        }
 
         const start_ms = timer.read() / std.time.ns_per_ms;
         log.info("Codex bridge started in {d}ms", .{start_ms});
 
+        const codex_bridge = &session.codex_bridge.?;
         try codex_bridge.sendPrompt(prompt);
         const prompt_sent_ms = timer.read() / std.time.ns_per_ms;
         log.info("Codex prompt sent at {d}ms", .{prompt_sent_ms});
@@ -819,7 +822,11 @@ pub const Agent = struct {
             var msg = codex_bridge.readMessage() catch |err| {
                 log.err("Failed to read Codex message: {}", .{err});
                 break;
-            } orelse break;
+            } orelse {
+                codex_bridge.stop();
+                session.codex_bridge = null;
+                break;
+            };
             defer msg.deinit();
 
             msg_count += 1;
@@ -1012,6 +1019,9 @@ pub const Agent = struct {
         if (self.sessions.get(parsed.value.sessionId)) |session| {
             session.cancelled = true;
             if (session.bridge) |*b| {
+                b.stop();
+            }
+            if (session.codex_bridge) |*b| {
                 b.stop();
             }
             log.info("Cancelled session {s}", .{parsed.value.sessionId});
