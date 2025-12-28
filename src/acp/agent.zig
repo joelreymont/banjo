@@ -993,11 +993,11 @@ pub const Agent = struct {
 
     /// Agent slash commands (handled locally, not forwarded to CLI)
     const slash_commands = [_]protocol.SlashCommand{
+        .{ .name = "explain", .description = "Summarize selected code as a note comment" },
+        .{ .name = "setup", .description = "Configure Zed for banjo LSP integration" },
+        .{ .name = "notes", .description = "List all notes in the project" },
+        .{ .name = "note", .description = "Note management commands" },
         .{ .name = "version", .description = "Show banjo version" },
-        .{ .name = "setup", .description = "Enable banjo LSP for this project" },
-        .{ .name = "notes", .description = "List project notes" },
-        .{ .name = "note", .description = "Show or create a note" },
-        .{ .name = "explain", .description = "Explain code (paste Zed URL)" },
     };
 
     /// Commands filtered from CLI (unsupported in stream-json mode, handled via authMethods)
