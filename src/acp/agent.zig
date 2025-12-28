@@ -626,23 +626,26 @@ pub const Agent = struct {
         const engine = Engine.claude;
         var stream_prefix_pending = true;
 
-        const bridge_was_null = session.bridge == null;
+        var bridge_started = false;
         if (session.bridge == null) {
             session.bridge = Bridge.init(self.allocator, session.cwd);
+        }
+        if (session.bridge.?.process == null) {
             session.bridge.?.start(.{
                 .resume_session_id = session.cli_session_id,
                 .continue_last = session.cli_session_id == null and isAutoResumeEnabled(),
                 .permission_mode = @tagName(session.permission_mode),
                 .model = session.model,
             }) catch |err| {
-                log.err("Failed to start Claude bridge: {}", .{err});
+                log.err("Failed to start Claude Code: {}", .{err});
                 session.bridge = null;
                 try self.sendEngineText(session_id, engine, "Failed to start Claude Code. Please ensure it is installed and in PATH.");
                 return "error";
             };
+            bridge_started = true;
         }
 
-        if (bridge_was_null) {
+        if (bridge_started) {
             const bridge_start_ms = timer.read() / std.time.ns_per_ms;
             log.info("Claude bridge started in {d}ms", .{bridge_start_ms});
         }
@@ -794,6 +797,9 @@ pub const Agent = struct {
 
         if (session.codex_bridge == null) {
             session.codex_bridge = CodexBridge.init(self.allocator, session.cwd);
+        }
+
+        if (session.codex_bridge.?.process == null) {
             session.codex_bridge.?.start(.{
                 .resume_session_id = session.codex_session_id,
                 .model = null,
@@ -803,13 +809,26 @@ pub const Agent = struct {
                 try self.sendEngineText(session_id, engine, "Failed to start Codex. Please ensure it is installed and in PATH.");
                 return "error";
             };
+            const start_ms = timer.read() / std.time.ns_per_ms;
+            log.info("Codex bridge started in {d}ms", .{start_ms});
         }
 
-        const start_ms = timer.read() / std.time.ns_per_ms;
-        log.info("Codex bridge started in {d}ms", .{start_ms});
-
         const codex_bridge = &session.codex_bridge.?;
-        try codex_bridge.sendPrompt(prompt);
+        codex_bridge.sendPrompt(prompt) catch |err| {
+            log.warn("Codex sendPrompt failed ({}), restarting", .{err});
+            codex_bridge.stop();
+            session.codex_bridge = CodexBridge.init(self.allocator, session.cwd);
+            session.codex_bridge.?.start(.{
+                .resume_session_id = session.codex_session_id,
+                .model = null,
+            }) catch |start_err| {
+                log.err("Failed to restart Codex: {}", .{start_err});
+                session.codex_bridge = null;
+                try self.sendEngineText(session_id, engine, "Failed to start Codex. Please ensure it is installed and in PATH.");
+                return "error";
+            };
+            try session.codex_bridge.?.sendPrompt(prompt);
+        };
         const prompt_sent_ms = timer.read() / std.time.ns_per_ms;
         log.info("Codex prompt sent at {d}ms", .{prompt_sent_ms});
 
