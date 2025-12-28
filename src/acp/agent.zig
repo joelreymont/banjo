@@ -119,6 +119,7 @@ pub const Agent = struct {
     writer: jsonrpc.Writer,
     sessions: std.StringHashMap(*Session),
     client_capabilities: ?protocol.ClientCapabilities = null,
+    next_tool_call_id: u64 = 0,
 
     const Session = struct {
         id: []const u8,
@@ -838,6 +839,14 @@ pub const Agent = struct {
             return self.sendErrorAndEnd(request, session_id, "No code content in reference");
         };
 
+        // Report reading file
+        const filename = std.fs.path.basename(uri_info.path);
+        const read_title = std.fmt.allocPrint(self.allocator, "Reading {s}", .{filename}) catch "Reading file";
+        defer if (read_title.ptr != "Reading file".ptr) self.allocator.free(read_title);
+        const read_tool_id = try self.reportToolStart(session_id, read_title, .read);
+        defer self.allocator.free(read_tool_id);
+        try self.reportToolComplete(session_id, read_tool_id, true);
+
         // Step 1 complete: code read from resource
         plan_entries[0].status = .completed;
         plan_entries[1].status = .in_progress;
@@ -855,6 +864,10 @@ pub const Agent = struct {
             \\```
         , .{ lang, lang, code });
         defer self.allocator.free(prompt);
+
+        // Report generating explanation
+        const explain_tool_id = try self.reportToolStart(session_id, "Generating explanation", .other);
+        defer self.allocator.free(explain_tool_id);
 
         // Send prompt and collect response
         const cli_bridge = try self.ensureBridge(session);
@@ -883,8 +896,10 @@ pub const Agent = struct {
         }
 
         if (summary.items.len == 0) {
+            try self.reportToolComplete(session_id, explain_tool_id, false);
             return self.sendErrorAndEnd(request, session_id, "Could not get explanation from Claude");
         }
+        try self.reportToolComplete(session_id, explain_tool_id, true);
 
         // Step 2 complete: explanation generated
         plan_entries[1].status = .completed;
@@ -908,11 +923,17 @@ pub const Agent = struct {
         });
         defer self.allocator.free(note_comment);
 
+        // Report inserting note
+        const insert_tool_id = try self.reportToolStart(session_id, "Inserting note", .write);
+        defer self.allocator.free(insert_tool_id);
+
         // Insert comment at line (use real_path, not uri_info.path, to prevent symlink bypass)
         comments.insertAtLine(self.allocator, real_path, uri_info.line, note_comment) catch |err| {
             log.err("insertAtLine failed: {}", .{err});
+            try self.reportToolComplete(session_id, insert_tool_id, false);
             return self.sendErrorAndEnd(request, session_id, "Could not write to file");
         };
+        try self.reportToolComplete(session_id, insert_tool_id, true);
 
         // Step 3 complete: note inserted
         plan_entries[2].status = .completed;
@@ -933,8 +954,18 @@ pub const Agent = struct {
 
     /// Handle /note, /notes, and /setup commands
     fn handleNotesCommand(self: *Agent, request: jsonrpc.Request, session_id: []const u8, cwd: []const u8, command: []const u8) !void {
+        // Determine tool title and kind based on command
+        const is_setup = std.mem.startsWith(u8, command, "/setup");
+        const title: []const u8 = if (is_setup) "Configuring Zed settings" else "Scanning project for notes";
+        const kind: protocol.SessionUpdate.ToolKind = if (is_setup) .write else .read;
+
+        // Report tool start
+        const tool_id = try self.reportToolStart(session_id, title, kind);
+        defer self.allocator.free(tool_id);
+
         // Execute command with project root
         var cmd_result = notes_commands.executeCommand(self.allocator, cwd, command) catch {
+            try self.reportToolComplete(session_id, tool_id, false);
             try self.sendSessionUpdate(session_id, .{
                 .sessionUpdate = .agent_message_chunk,
                 .content = .{ .type = "text", .text = "Failed to execute notes command" },
@@ -946,6 +977,9 @@ pub const Agent = struct {
             return;
         };
         defer cmd_result.deinit(self.allocator);
+
+        // Report tool completion
+        try self.reportToolComplete(session_id, tool_id, cmd_result.success);
 
         // Send response
         try self.sendSessionUpdate(session_id, .{
@@ -1107,6 +1141,39 @@ pub const Agent = struct {
             .update = update,
         };
         try self.writer.writeTypedNotification("session/update", session_update);
+    }
+
+    //
+    // Tool Call Reporting
+    //
+
+    /// Generate a unique tool call ID like "banjo_tc_1"
+    fn generateToolCallId(self: *Agent) []const u8 {
+        const id = self.next_tool_call_id;
+        self.next_tool_call_id += 1;
+        return std.fmt.allocPrint(self.allocator, "banjo_tc_{d}", .{id}) catch "banjo_tc_0";
+    }
+
+    /// Report tool start with in_progress status, returns the tool call ID
+    fn reportToolStart(self: *Agent, session_id: []const u8, title: []const u8, kind: protocol.SessionUpdate.ToolKind) ![]const u8 {
+        const tool_id = self.generateToolCallId();
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .tool_call,
+            .toolCallId = tool_id,
+            .title = title,
+            .kind = kind,
+            .status = .in_progress,
+        });
+        return tool_id;
+    }
+
+    /// Report tool completion with success or failure status
+    fn reportToolComplete(self: *Agent, session_id: []const u8, tool_id: []const u8, success: bool) !void {
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .tool_call_update,
+            .toolCallId = tool_id,
+            .status = if (success) .completed else .failed,
+        });
     }
 };
 
