@@ -317,107 +317,106 @@ claude -p --verbose \
   --output-format stream-json
 ```
 
-## Codex JSONL
+## Codex App Server (JSON-RPC JSONL)
 
-Communication between banjo and `codex exec --json`.
+Communication between banjo and `codex app-server`.
 
 ### Input Format
 
-Codex takes raw prompt text (not JSON) on stdin:
+Codex app-server speaks JSON-RPC over JSONL (one JSON object per line):
 
 ```bash
-codex exec --json -
+codex app-server
 ```
 
-Optional resume:
+Initialize the session, then send an `initialized` notification:
 
-```bash
-codex exec --json resume <thread_id> -
+```json
+{ "id": 1, "method": "initialize", "params": { "clientInfo": { "name": "banjo", "title": "Banjo ACP Agent", "version": "0.3.1" } } }
+{ "method": "initialized" }
+```
+
+Start a thread, then start a turn with user input:
+
+```json
+{ "id": 2, "method": "thread/start", "params": { "model": null, "cwd": "/path/to/repo", "approvalPolicy": "never", "experimentalRawEvents": false } }
+{ "id": 3, "method": "turn/start", "params": { "threadId": "thr_123", "input": [ { "type": "text", "text": "Say hello" } ], "approvalPolicy": "never" } }
 ```
 
 ### Output Format
 
-Newline-delimited JSON objects with a `type` field:
+JSON-RPC responses and notifications. Key notifications:
 
-#### thread.started
+#### thread/started
 ```json
-{ "type": "thread.started", "thread_id": "uuid" }
+{ "method": "thread/started", "params": { "thread": { "id": "thr_123" } } }
 ```
 
-#### turn.started
+#### turn/started
 ```json
-{ "type": "turn.started" }
+{ "method": "turn/started", "params": { "threadId": "thr_123", "turn": { "id": "turn_1", "status": "inProgress", "items": [], "error": null } } }
 ```
 
-#### item.started (tool execution begins)
+#### item/agentMessage/delta
+```json
+{ "method": "item/agentMessage/delta", "params": { "threadId": "thr_123", "turnId": "turn_1", "itemId": "item_1", "delta": "Hello" } }
+```
+
+#### item/started (command execution begins)
 ```json
 {
-  "type": "item.started",
-  "item": {
-    "id": "item_1",
-    "type": "command_execution",
-    "command": "/bin/zsh -lc ls",
-    "aggregated_output": "",
-    "exit_code": null,
-    "status": "in_progress"
+  "method": "item/started",
+  "params": {
+    "threadId": "thr_123",
+    "turnId": "turn_1",
+    "item": { "type": "commandExecution", "id": "item_2", "command": "/bin/zsh -lc ls", "cwd": "/path/to/repo", "processId": null, "status": "inProgress", "commandActions": [], "aggregatedOutput": null, "exitCode": null, "durationMs": null }
   }
 }
 ```
 
-#### item.completed (reasoning)
+#### item/completed (command execution ends)
 ```json
 {
-  "type": "item.completed",
-  "item": {
-    "id": "item_0",
-    "type": "reasoning",
-    "text": "**Listing files**"
+  "method": "item/completed",
+  "params": {
+    "threadId": "thr_123",
+    "turnId": "turn_1",
+    "item": { "type": "commandExecution", "id": "item_2", "command": "/bin/zsh -lc ls", "cwd": "/path/to/repo", "processId": null, "status": "completed", "commandActions": [], "aggregatedOutput": "file1\nfile2\n", "exitCode": 0, "durationMs": 12 }
   }
 }
 ```
 
-#### item.completed (agent message)
+#### turn/completed
 ```json
-{
-  "type": "item.completed",
-  "item": {
-    "id": "item_2",
-    "type": "agent_message",
-    "text": "Hello"
-  }
-}
+{ "method": "turn/completed", "params": { "threadId": "thr_123", "turn": { "id": "turn_1", "status": "completed", "items": [], "error": null } } }
 ```
 
-#### item.completed (tool execution ends)
+### Ordering and approvals
+
+Ordering (v2):
+- `turn/start` sends a JSON-RPC response first, then emits `turn/started`.
+- Item notifications (`item/*`, deltas) stream after `turn/started`.
+
+Approval requests (v2):
+- `item/commandExecution/requestApproval`
+- `item/fileChange/requestApproval`
+
+Respond with a JSON-RPC response whose `result` is:
+
 ```json
-{
-  "type": "item.completed",
-  "item": {
-    "id": "item_1",
-    "type": "command_execution",
-    "command": "/bin/zsh -lc ls",
-    "aggregated_output": "file1\nfile2\n",
-    "exit_code": 0,
-    "status": "completed"
-  }
-}
+{ "decision": "accept" }
 ```
 
-#### turn.completed
-```json
-{
-  "type": "turn.completed",
-  "usage": {
-    "input_tokens": 123,
-    "cached_input_tokens": 0,
-    "output_tokens": 45
-  }
-}
-```
+Allowed decisions: `accept`, `acceptForSession`, `acceptWithExecpolicyAmendment`, `decline`, `cancel`.
+
+Legacy approvals (v1) use `applyPatchApproval` and `execCommandApproval` and expect a `decision`
+value from `ReviewDecision` (snake_case), e.g. `approved`, `approved_for_session`,
+`approved_execpolicy_amendment`, `denied`, `abort`.
 
 Notes:
-- `item.type` values observed: `reasoning`, `agent_message`, `command_execution`
-- `aggregated_output` may be empty on `item.started`
+- JSON-RPC responses echo the request `id` and return a `result` object.
+- Codex app-server omits the `"jsonrpc":"2.0"` header.
+- Item types are camelCase (e.g., `agentMessage`, `commandExecution`).
 - `exit_code` is null until completion
 
 ## Sources
