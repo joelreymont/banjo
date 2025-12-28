@@ -729,11 +729,17 @@ pub const Agent = struct {
 
         switch (command) {
             .version => {
-                self.handleVersionCommand(request, session_id) catch return null;
+                self.handleVersionCommand(request, session_id) catch |err| {
+                    log.err("Version command failed: {}", .{err});
+                    self.sendErrorAndEnd(request, session_id, "Version command failed") catch {};
+                };
                 return null; // Fully handled
             },
             .note, .notes, .setup => {
-                self.handleNotesCommand(request, session_id, session.cwd, text) catch return null;
+                self.handleNotesCommand(request, session_id, session.cwd, text) catch |err| {
+                    log.err("Notes command failed: {}", .{err});
+                    self.sendErrorAndEnd(request, session_id, "Notes command failed") catch {};
+                };
                 return null; // Fully handled
             },
             .explain => {
@@ -741,6 +747,7 @@ pub const Agent = struct {
                 if (resource) |r| {
                     self.handleExplainCommand(request, session, session_id, r) catch |err| {
                         log.err("Explain command failed: {}", .{err});
+                        self.sendErrorAndEnd(request, session_id, "Explain command failed") catch {};
                     };
                     return null;
                 }
@@ -748,8 +755,12 @@ pub const Agent = struct {
                 self.sendSessionUpdate(session_id, .{
                     .sessionUpdate = .agent_message_chunk,
                     .content = .{ .type = "text", .text = "Usage: `/explain` with a code reference\n\n1. Select code in editor\n2. Press **Cmd+>** to add reference\n3. Type `/explain` and send" },
-                }) catch {};
-                self.sendEndTurn(request) catch {};
+                }) catch |err| {
+                    log.err("Failed to send usage message: {}", .{err});
+                };
+                self.sendEndTurn(request) catch |err| {
+                    log.err("Failed to send end turn: {}", .{err});
+                };
                 return null;
             },
         }
