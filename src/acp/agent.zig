@@ -826,6 +826,7 @@ pub const Agent = struct {
             };
             const start_ms = timer.read() / std.time.ns_per_ms;
             log.info("Codex bridge started in {d}ms", .{start_ms});
+            self.captureCodexSessionId(session);
         }
 
         session.codex_bridge.?.sendPrompt(prompt) catch |err| {
@@ -841,6 +842,7 @@ pub const Agent = struct {
                 try self.sendEngineText(session_id, engine, "Failed to start Codex. Please ensure it is installed and in PATH.");
                 return "error";
             };
+            self.captureCodexSessionId(session);
             try session.codex_bridge.?.sendPrompt(prompt);
         };
         const codex_bridge = &session.codex_bridge.?;
@@ -857,6 +859,7 @@ pub const Agent = struct {
                 log.err("Failed to read Codex message: {}", .{err});
                 break;
             } orelse {
+                codex_bridge.stop();
                 break;
             };
             defer msg.deinit();
@@ -915,12 +918,24 @@ pub const Agent = struct {
             if (msg.isTurnCompleted()) break;
         }
 
-        codex_bridge.stop();
-        session.codex_bridge = null;
-
         const total_ms = timer.read() / std.time.ns_per_ms;
         log.info("Codex prompt complete: {d} msgs, first response at {d}ms, total {d}ms", .{ msg_count, first_response_ms, total_ms });
         return "end_turn";
+    }
+
+    fn captureCodexSessionId(self: *Agent, session: *Session) void {
+        if (session.codex_session_id != null) return;
+        if (session.codex_bridge) |*codex_bridge| {
+            if (codex_bridge.getThreadId()) |thread_id| {
+                session.codex_session_id = self.allocator.dupe(u8, thread_id) catch |err| blk: {
+                    log.warn("Failed to capture Codex thread ID: {}", .{err});
+                    break :blk null;
+                };
+                if (session.codex_session_id != null) {
+                    log.info("Captured Codex thread ID: {s}", .{thread_id});
+                }
+            }
+        }
     }
 
     fn sendEngineText(self: *Agent, session_id: []const u8, engine: Engine, text: []const u8) !void {
