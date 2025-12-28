@@ -813,10 +813,9 @@ pub const Agent = struct {
             log.info("Codex bridge started in {d}ms", .{start_ms});
         }
 
-        const codex_bridge = &session.codex_bridge.?;
-        codex_bridge.sendPrompt(prompt) catch |err| {
+        session.codex_bridge.?.sendPrompt(prompt) catch |err| {
             log.warn("Codex sendPrompt failed ({}), restarting", .{err});
-            codex_bridge.stop();
+            session.codex_bridge.?.stop();
             session.codex_bridge = CodexBridge.init(self.allocator, session.cwd);
             session.codex_bridge.?.start(.{
                 .resume_session_id = session.codex_session_id,
@@ -829,6 +828,7 @@ pub const Agent = struct {
             };
             try session.codex_bridge.?.sendPrompt(prompt);
         };
+        const codex_bridge = &session.codex_bridge.?;
         const prompt_sent_ms = timer.read() / std.time.ns_per_ms;
         log.info("Codex prompt sent at {d}ms", .{prompt_sent_ms});
 
