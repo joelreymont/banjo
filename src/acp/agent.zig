@@ -30,7 +30,7 @@ pub const version = "0.3.0 (" ++ config.git_hash ++ ")";
 /// Check if auto-resume is enabled (default: true)
 fn isAutoResumeEnabled() bool {
     const val = std.posix.getenv("BANJO_AUTO_RESUME") orelse return true;
-    return !std.mem.eql(u8, val, "false") and !std.mem.eql(u8, val, "0");
+    return falsey_env_values.get(val) == null;
 }
 
 /// Check if content indicates authentication is required
@@ -53,17 +53,29 @@ fn mapCliStopReason(cli_reason: []const u8) []const u8 {
 
 fn getDuetDefaultRoute() Route {
     const val = std.posix.getenv("BANJO_DUET_DEFAULT") orelse return .both;
-    if (std.mem.eql(u8, val, "claude")) return .claude;
-    if (std.mem.eql(u8, val, "codex")) return .codex;
-    if (std.mem.eql(u8, val, "both")) return .both;
-    return .both;
+    return route_map.get(val) orelse .both;
 }
 
 fn getDuetPrimary() Engine {
     const val = std.posix.getenv("BANJO_DUET_PRIMARY") orelse return .claude;
-    if (std.mem.eql(u8, val, "codex")) return .codex;
-    return .claude;
+    return engine_map.get(val) orelse .claude;
 }
+
+const falsey_env_values = std.StaticStringMap(void).initComptime(.{
+    .{ "false", {} },
+    .{ "0", {} },
+});
+
+const route_map = std.StaticStringMap(Route).initComptime(.{
+    .{ "claude", .claude },
+    .{ "codex", .codex },
+    .{ "both", .both },
+});
+
+const engine_map = std.StaticStringMap(Engine).initComptime(.{
+    .{ "claude", .claude },
+    .{ "codex", .codex },
+});
 
 const EngineAvailability = struct {
     claude: bool,
@@ -778,6 +790,7 @@ pub const Agent = struct {
         var timer = std.time.Timer.start() catch unreachable;
         const engine = Engine.codex;
 
+        // Codex is executed per prompt; resume uses thread_id across runs.
         var codex_bridge = CodexBridge.init(self.allocator, session.cwd);
         defer codex_bridge.deinit();
 

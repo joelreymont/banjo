@@ -92,13 +92,16 @@ const Envelope = struct {
     item: ?CodexMessage.Item = null,
 };
 
+const event_type_map = std.StaticStringMap(CodexMessage.EventType).initComptime(.{
+    .{ "thread.started", .thread_started },
+    .{ "turn.started", .turn_started },
+    .{ "item.started", .item_started },
+    .{ "item.completed", .item_completed },
+    .{ "turn.completed", .turn_completed },
+});
+
 fn mapEventType(event_type: []const u8) CodexMessage.EventType {
-    if (std.mem.eql(u8, event_type, "thread.started")) return .thread_started;
-    if (std.mem.eql(u8, event_type, "turn.started")) return .turn_started;
-    if (std.mem.eql(u8, event_type, "item.started")) return .item_started;
-    if (std.mem.eql(u8, event_type, "item.completed")) return .item_completed;
-    if (std.mem.eql(u8, event_type, "turn.completed")) return .turn_completed;
-    return .unknown;
+    return event_type_map.get(event_type) orelse .unknown;
 }
 
 pub const CodexBridge = struct {
@@ -195,6 +198,7 @@ pub const CodexBridge = struct {
 
         try stdin.writeAll(prompt);
         try stdin.writeAll("\n");
+        // Codex expects EOF for non-interactive exec prompts.
         stdin.close();
     }
 
