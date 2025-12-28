@@ -650,7 +650,22 @@ pub const Agent = struct {
             log.info("Claude bridge started in {d}ms", .{bridge_start_ms});
         }
 
-        try session.bridge.?.sendPrompt(prompt);
+        session.bridge.?.sendPrompt(prompt) catch |err| {
+            log.warn("Claude Code sendPrompt failed ({}), restarting", .{err});
+            session.bridge.?.stop();
+            session.bridge.?.start(.{
+                .resume_session_id = session.cli_session_id,
+                .continue_last = session.cli_session_id == null and isAutoResumeEnabled(),
+                .permission_mode = @tagName(session.permission_mode),
+                .model = session.model,
+            }) catch |start_err| {
+                log.err("Failed to restart Claude Code: {}", .{start_err});
+                session.bridge = null;
+                try self.sendEngineText(session_id, engine, "Failed to start Claude Code. Please ensure it is installed and in PATH.");
+                return "error";
+            };
+            try session.bridge.?.sendPrompt(prompt);
+        };
         const prompt_sent_ms = timer.read() / std.time.ns_per_ms;
         log.info("Claude prompt sent at {d}ms", .{prompt_sent_ms});
 
