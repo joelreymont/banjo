@@ -223,12 +223,65 @@ const ItemEventParams = struct {
     item: ItemData,
 };
 
+const ReasoningLines = struct {
+    lines: []const []const u8,
+
+    pub fn jsonParse(
+        allocator: Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) std.json.ParseError(@TypeOf(source.*))!ReasoningLines {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(
+        allocator: Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) std.json.ParseFromValueError!ReasoningLines {
+        _ = options;
+        switch (source) {
+            .string => |text| {
+                const lines = try allocator.alloc([]const u8, 1);
+                lines[0] = text;
+                return .{ .lines = lines };
+            },
+            .null => {
+                const lines = try allocator.alloc([]const u8, 0);
+                return .{ .lines = lines };
+            },
+            .array => |arr| {
+                var list: std.ArrayList([]const u8) = .empty;
+                defer list.deinit(allocator);
+
+                for (arr.items) |item| {
+                    switch (item) {
+                        .string => |text| try list.append(allocator, text),
+                        .object => |obj| {
+                            if (obj.get("text")) |text_val| {
+                                if (text_val == .string) {
+                                    try list.append(allocator, text_val.string);
+                                }
+                            }
+                        },
+                        else => {},
+                    }
+                }
+
+                return .{ .lines = try list.toOwnedSlice(allocator) };
+            },
+            else => return error.UnexpectedToken,
+        }
+    }
+};
+
 const ItemData = struct {
     id: []const u8,
     @"type": []const u8,
     text: ?[]const u8 = null,
-    summary: ?std.json.Value = null,
-    content: ?std.json.Value = null,
+    summary: ?ReasoningLines = null,
+    content: ?ReasoningLines = null,
     command: ?[]const u8 = null,
     aggregatedOutput: ?[]const u8 = null,
     aggregated_output: ?[]const u8 = null,
@@ -824,19 +877,17 @@ fn parseRequestId(value: std.json.Value) ?i64 {
 }
 
 fn extractThreadId(allocator: Allocator, value: std.json.Value) ?[]const u8 {
-    const parsed = std.json.parseFromValue(ThreadStartResponse, allocator, value, .{
+    const parsed = std.json.parseFromValueLeaky(ThreadStartResponse, allocator, value, .{
         .ignore_unknown_fields = true,
     }) catch return null;
-    defer parsed.deinit();
-    return parsed.value.thread.id;
+    return parsed.thread.id;
 }
 
 fn extractTurnId(allocator: Allocator, value: std.json.Value) ?[]const u8 {
-    const parsed = std.json.parseFromValue(TurnStartResponse, allocator, value, .{
+    const parsed = std.json.parseFromValueLeaky(TurnStartResponse, allocator, value, .{
         .ignore_unknown_fields = true,
     }) catch return null;
-    defer parsed.deinit();
-    return parsed.value.turn.id;
+    return parsed.turn.id;
 }
 
 fn parseItem(allocator: Allocator, item: ItemData) ?CodexMessage.Item {
@@ -854,11 +905,11 @@ fn parseItem(allocator: Allocator, item: ItemData) ?CodexMessage.Item {
 
     if (kind == .reasoning) {
         if (item.summary) |summary_val| {
-            parsed.text = joinStringArray(allocator, summary_val, "\n");
+            parsed.text = joinStringLines(allocator, summary_val.lines, "\n");
         }
         if (parsed.text == null) {
             if (item.content) |content_val| {
-                parsed.text = joinStringArray(allocator, content_val, "\n");
+                parsed.text = joinStringLines(allocator, content_val.lines, "\n");
             }
         }
         return parsed;
@@ -970,33 +1021,24 @@ const ServerRequestKind = enum {
     }
 };
 
-fn joinStringArray(allocator: Allocator, value: std.json.Value, sep: []const u8) ?[]const u8 {
-    if (value != .array) return null;
-    if (value.array.items.len == 0) return null;
+fn joinStringLines(allocator: Allocator, lines: []const []const u8, sep: []const u8) ?[]const u8 {
+    if (lines.len == 0) return null;
 
     var total_len: usize = 0;
-    var count: usize = 0;
-    for (value.array.items) |item| {
-        if (item == .string) {
-            total_len += item.string.len;
-            count += 1;
-        }
+    for (lines) |line| {
+        total_len += line.len;
     }
-    if (count == 0) return null;
-    total_len += sep.len * (count - 1);
+    total_len += sep.len * (lines.len - 1);
 
     const buf = allocator.alloc(u8, total_len) catch return null;
     var offset: usize = 0;
-    var first = true;
-    for (value.array.items) |item| {
-        if (item != .string) continue;
-        if (!first) {
+    for (lines, 0..) |line, idx| {
+        if (idx != 0) {
             std.mem.copyForwards(u8, buf[offset..][0..sep.len], sep);
             offset += sep.len;
         }
-        first = false;
-        std.mem.copyForwards(u8, buf[offset..][0..item.string.len], item.string);
-        offset += item.string.len;
+        std.mem.copyForwards(u8, buf[offset..][0..line.len], line);
+        offset += line.len;
     }
     return buf;
 }

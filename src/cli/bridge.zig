@@ -59,6 +59,66 @@ pub const SystemSubtype = enum {
     }
 };
 
+const ContentBlock = struct {
+    type: ?[]const u8 = null,
+    text: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    id: ?[]const u8 = null,
+    tool_use_id: ?[]const u8 = null,
+    input: ?std.json.Value = null,
+    content: ?std.json.Value = null,
+    is_error: ?bool = null,
+    @"error": ?[]const u8 = null,
+};
+
+const MessageObject = struct {
+    content: ?[]ContentBlock = null,
+};
+
+const MessageField = struct {
+    text: ?[]const u8 = null,
+    content: ?[]ContentBlock = null,
+
+    pub fn jsonParse(
+        allocator: Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) std.json.ParseError(@TypeOf(source.*))!MessageField {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(
+        allocator: Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) std.json.ParseFromValueError!MessageField {
+        _ = options;
+        return switch (source) {
+            .string => |text| .{ .text = text },
+            .object => {
+                const parsed = try std.json.parseFromValueLeaky(MessageObject, allocator, source, .{
+                    .ignore_unknown_fields = true,
+                });
+                return .{ .content = parsed.content };
+            },
+            else => error.UnexpectedToken,
+        };
+    }
+};
+
+const StreamEnvelope = struct {
+    type: []const u8,
+    subtype: ?[]const u8 = null,
+    message: ?MessageField = null,
+    content: ?[]const u8 = null,
+    event: ?std.json.Value = null,
+    session_id: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    slash_commands: ?[]const []const u8 = null,
+    tools: ?[]const []const u8 = null,
+};
+
 /// Stream JSON input format for sending messages to Claude Code
 pub const StreamInput = struct {
     type: []const u8,
@@ -81,6 +141,7 @@ pub const StreamInput = struct {
 pub const StreamMessage = struct {
     type: MessageType,
     subtype: ?[]const u8 = null,
+    envelope: ?StreamEnvelope = null,
     raw: std.json.Value,
     arena: std.heap.ArenaAllocator,
 
@@ -88,34 +149,39 @@ pub const StreamMessage = struct {
         self.arena.deinit();
     }
 
+    fn arenaAllocator(self: *const StreamMessage) Allocator {
+        return @constCast(&self.arena).allocator();
+    }
+
+    fn getEnvelope(self: *const StreamMessage) ?StreamEnvelope {
+        if (self.envelope) |env| return env;
+        return std.json.parseFromValueLeaky(StreamEnvelope, self.arenaAllocator(), self.raw, .{
+            .ignore_unknown_fields = true,
+        }) catch null;
+    }
+
     /// Get content from message (works for assistant and system messages)
-    /// Uses manual traversal to avoid allocations (no parseFromValue)
     pub fn getContent(self: *const StreamMessage) ?[]const u8 {
+        const env = self.getEnvelope() orelse return null;
+
         // For system messages, content may be a direct string
         if (self.type == .system) {
-            if (self.raw.object.get("content")) |content| {
-                if (content == .string) return content.string;
-            }
-            if (self.raw.object.get("message")) |message| {
-                if (message == .string) return message.string;
+            if (env.content) |content| return content;
+            if (env.message) |message| {
+                if (message.text) |text| return text;
             }
         }
 
         // For assistant messages, content is nested in message.content[]
         if (self.type == .assistant) {
-            const message = self.raw.object.get("message") orelse return null;
-            if (message != .object) return null;
-            const content = message.object.get("content") orelse return null;
-            if (content != .array) return null;
+            const message = env.message orelse return null;
+            const content = message.content orelse return null;
             // Get first text block
-            for (content.array.items) |item| {
-                if (item != .object) continue;
-                const item_type = item.object.get("type") orelse continue;
-                if (item_type != .string) continue;
-                const block_type = ContentBlockType.fromString(item_type.string) orelse continue;
+            for (content) |item| {
+                const item_type = item.type orelse continue;
+                const block_type = ContentBlockType.fromString(item_type) orelse continue;
                 if (block_type != .text) continue;
-                const text = item.object.get("text") orelse continue;
-                if (text == .string) return text.string;
+                if (item.text) |text| return text;
             }
         }
 
@@ -142,21 +208,16 @@ pub const StreamMessage = struct {
     /// Get tool use details from assistant message
     pub fn getToolUse(self: *const StreamMessage) ?ToolUse {
         if (self.type != .assistant) return null;
-        const message = self.raw.object.get("message") orelse return null;
-        if (message != .object) return null;
-        const content = message.object.get("content") orelse return null;
-        if (content != .array) return null;
-        for (content.array.items) |item| {
-            if (item != .object) continue;
-            const item_type = item.object.get("type") orelse continue;
-            if (item_type != .string) continue;
-            const block_type = ContentBlockType.fromString(item_type.string) orelse continue;
+        const env = self.getEnvelope() orelse return null;
+        const message = env.message orelse return null;
+        const content = message.content orelse return null;
+        for (content) |item| {
+            const item_type = item.type orelse continue;
+            const block_type = ContentBlockType.fromString(item_type) orelse continue;
             if (block_type != .tool_use) continue;
-            const name = item.object.get("name") orelse continue;
-            const id = item.object.get("id") orelse continue;
-            if (name != .string or id != .string) continue;
-            const input = item.object.get("input");
-            return .{ .id = id.string, .name = name.string, .input = input };
+            const name = item.name orelse continue;
+            const id = item.id orelse continue;
+            return .{ .id = id, .name = name, .input = item.input };
         }
         return null;
     }
@@ -164,27 +225,23 @@ pub const StreamMessage = struct {
     /// Get tool result details from assistant message
     pub fn getToolResult(self: *const StreamMessage) ?ToolResult {
         if (self.type != .assistant and self.type != .user) return null;
-        const message = self.raw.object.get("message") orelse return null;
-        if (message != .object) return null;
-        const content = message.object.get("content") orelse return null;
-        if (content != .array) return null;
-        for (content.array.items) |item| {
-            if (item != .object) continue;
-            const item_type = item.object.get("type") orelse continue;
-            if (item_type != .string) continue;
-            const block_type = ContentBlockType.fromString(item_type.string) orelse continue;
+        const env = self.getEnvelope() orelse return null;
+        const message = env.message orelse return null;
+        const content = message.content orelse return null;
+        for (content) |item| {
+            const item_type = item.type orelse continue;
+            const block_type = ContentBlockType.fromString(item_type) orelse continue;
             if (block_type != .tool_result) continue;
-            const id = item.object.get("tool_use_id") orelse item.object.get("id") orelse continue;
-            if (id != .string) continue;
+            const id = item.tool_use_id orelse item.id orelse continue;
             var is_error = false;
-            if (item.object.get("is_error")) |flag| {
-                if (flag == .bool) is_error = flag.bool;
-            } else if (item.object.get("error")) |err| {
-                if (err == .string and err.string.len > 0) is_error = true;
+            if (item.is_error) |flag| {
+                is_error = flag;
+            } else if (item.@"error") |err| {
+                if (err.len > 0) is_error = true;
             }
-            const content_val = item.object.get("content");
+            const content_val = item.content;
             return .{
-                .id = id.string,
+                .id = id,
                 .content = if (content_val) |val| extractToolResultText(val) else null,
                 .is_error = is_error,
             };
@@ -232,9 +289,7 @@ pub const StreamMessage = struct {
     /// Get stop reason from result message
     pub fn getStopReason(self: *const StreamMessage) ?[]const u8 {
         if (self.type != .result) return null;
-        const subtype_val = self.raw.object.get("subtype") orelse return null;
-        if (subtype_val == .string) return subtype_val.string;
-        return null;
+        return self.subtype;
     }
 
     /// Get system subtype as enum
@@ -270,12 +325,13 @@ pub const StreamMessage = struct {
         if (self.getSystemSubtype()) |subtype| {
             if (subtype != .init) return null;
         } else return null;
-
-        const parsed = std.json.parseFromValue(InitMessage, self.arena.child_allocator, self.raw, .{
-            .ignore_unknown_fields = true,
-        }) catch return null;
-
-        return parsed.value;
+        const env = self.getEnvelope() orelse return null;
+        return .{
+            .session_id = env.session_id,
+            .model = env.model,
+            .slash_commands = env.slash_commands,
+            .tools = env.tools,
+        };
     }
 
     /// Stream event structure from Claude Code
@@ -313,9 +369,12 @@ pub const StreamMessage = struct {
     pub fn getStreamDelta(self: *const StreamMessage) ?struct { text: ?[]const u8, thinking: ?[]const u8 } {
         if (self.type != .stream_event) return null;
 
-        const parsed = std.json.parseFromValue(StreamEvent, self.arena.child_allocator, self.raw, .{
+        const env = self.getEnvelope() orelse return null;
+        const event_val = env.event orelse return null;
+        const parsed = std.json.parseFromValue(StreamEvent, self.arenaAllocator(), event_val, .{
             .ignore_unknown_fields = true,
         }) catch return null;
+        defer parsed.deinit();
 
         if (parsed.value.event.type != .content_block_delta) return null;
 
@@ -330,9 +389,12 @@ pub const StreamMessage = struct {
     /// Get stream event type (message start/stop, content block, etc.)
     pub fn getStreamEventType(self: *const StreamMessage) ?StreamEvent.Event.EventType {
         if (self.type != .stream_event) return null;
-        const parsed = std.json.parseFromValue(StreamEvent, self.arena.child_allocator, self.raw, .{
+        const env = self.getEnvelope() orelse return null;
+        const event_val = env.event orelse return null;
+        const parsed = std.json.parseFromValue(StreamEvent, self.arenaAllocator(), event_val, .{
             .ignore_unknown_fields = true,
         }) catch return null;
+        defer parsed.deinit();
         return parsed.value.event.type;
     }
 };
@@ -502,20 +564,21 @@ pub const Bridge = struct {
         errdefer arena.deinit();
 
         const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), line, .{});
+        const envelope = std.json.parseFromValueLeaky(StreamEnvelope, arena.allocator(), parsed.value, .{
+            .ignore_unknown_fields = true,
+        }) catch null;
 
-        const msg_type = if (parsed.value.object.get("type")) |t|
-            if (t == .string) MessageType.fromString(t.string) else .unknown
+        const msg_type = if (envelope) |env|
+            MessageType.fromString(env.type)
         else
             .unknown;
 
-        const subtype = if (parsed.value.object.get("subtype")) |s|
-            if (s == .string) s.string else null
-        else
-            null;
+        const subtype = if (envelope) |env| env.subtype else null;
 
         return StreamMessage{
             .type = msg_type,
             .subtype = subtype,
+            .envelope = envelope,
             .raw = parsed.value,
             .arena = arena,
         };
@@ -538,16 +601,15 @@ test "StreamMessage parsing" {
     ;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
     const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json, .{});
 
-    const msg = StreamMessage{
+    var msg = StreamMessage{
         .type = .assistant,
         .subtype = null,
         .raw = parsed.value,
         .arena = arena,
     };
+    defer msg.deinit();
 
     try testing.expectEqualStrings("Hello", msg.getContent().?);
     try testing.expect(!msg.isToolUse());
@@ -559,15 +621,14 @@ test "StreamMessage tool use parsing" {
     ;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
     const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json, .{});
-    const msg = StreamMessage{
+    var msg = StreamMessage{
         .type = .assistant,
         .subtype = null,
         .raw = parsed.value,
         .arena = arena,
     };
+    defer msg.deinit();
 
     const tool = msg.getToolUse().?;
     try testing.expectEqualStrings("tool_1", tool.id);
@@ -580,15 +641,14 @@ test "StreamMessage tool result parsing" {
     ;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
     const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json, .{});
-    const msg = StreamMessage{
+    var msg = StreamMessage{
         .type = .assistant,
         .subtype = null,
         .raw = parsed.value,
         .arena = arena,
     };
+    defer msg.deinit();
 
     const result = msg.getToolResult().?;
     try testing.expectEqualStrings("tool_2", result.id);
@@ -602,15 +662,14 @@ test "StreamMessage tool result parsing from user message" {
     ;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
     const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json, .{});
-    const msg = StreamMessage{
+    var msg = StreamMessage{
         .type = .user,
         .subtype = null,
         .raw = parsed.value,
         .arena = arena,
     };
+    defer msg.deinit();
 
     const result = msg.getToolResult().?;
     try testing.expectEqualStrings("tool_3", result.id);
@@ -749,9 +808,9 @@ test "property: getToolName/getToolId extraction preserves input values" {
             const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{}) catch return false;
             defer parsed.deinit();
 
-            var arena = std.heap.ArenaAllocator.init(testing.allocator);
-            defer arena.deinit();
-            const msg = StreamMessage{ .type = .assistant, .subtype = null, .raw = parsed.value, .arena = arena };
+            const arena = std.heap.ArenaAllocator.init(testing.allocator);
+            var msg = StreamMessage{ .type = .assistant, .subtype = null, .raw = parsed.value, .arena = arena };
+            defer msg.deinit();
 
             // Property: extracted values equal input values
             const extracted_name = msg.getToolName() orelse return false;
@@ -778,9 +837,9 @@ test "property: getContent extraction preserves input text" {
             const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{}) catch return false;
             defer parsed.deinit();
 
-            var arena = std.heap.ArenaAllocator.init(testing.allocator);
-            defer arena.deinit();
-            const msg = StreamMessage{ .type = .assistant, .subtype = null, .raw = parsed.value, .arena = arena };
+            const arena = std.heap.ArenaAllocator.init(testing.allocator);
+            var msg = StreamMessage{ .type = .assistant, .subtype = null, .raw = parsed.value, .arena = arena };
+            defer msg.deinit();
 
             // Property: extracted text equals input text
             const extracted = msg.getContent() orelse return false;
@@ -803,9 +862,9 @@ test "getToolName/getToolId return null for non-tool messages" {
     for (cases, types) |json, msg_type| {
         const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{}) catch continue;
         defer parsed.deinit();
-        var arena = std.heap.ArenaAllocator.init(testing.allocator);
-        defer arena.deinit();
-        const msg = StreamMessage{ .type = msg_type, .subtype = null, .raw = parsed.value, .arena = arena };
+        const arena = std.heap.ArenaAllocator.init(testing.allocator);
+        var msg = StreamMessage{ .type = msg_type, .subtype = null, .raw = parsed.value, .arena = arena };
+        defer msg.deinit();
         try testing.expect(msg.getToolName() == null);
         try testing.expect(msg.getToolId() == null);
     }
@@ -816,18 +875,18 @@ test "property: getStopReason only works for result type" {
 
     for (types) |msg_type| {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
-        defer arena.deinit();
         const alloc = arena.allocator();
 
         var json_val = try buildTestMessage(alloc, msg_type, .none, true);
         _ = &json_val;
 
-        const msg = StreamMessage{
+        var msg = StreamMessage{
             .type = msg_type,
             .subtype = "end_turn",
             .raw = json_val,
             .arena = arena,
         };
+        defer msg.deinit();
 
         const reason = msg.getStopReason();
         if (msg_type == .result) {
@@ -839,32 +898,34 @@ test "property: getStopReason only works for result type" {
 }
 
 test "property: system messages extract content from content or message field" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
     // Test content field
-    var json1 = try buildTestMessage(alloc, .system, .text, false);
+    var arena1 = std.heap.ArenaAllocator.init(testing.allocator);
+    const alloc1 = arena1.allocator();
+    var json1 = try buildTestMessage(alloc1, .system, .text, false);
     _ = &json1;
-    const msg1 = StreamMessage{
+    var msg1 = StreamMessage{
         .type = .system,
         .subtype = null,
         .raw = json1,
-        .arena = arena,
+        .arena = arena1,
     };
+    defer msg1.deinit();
     try testing.expectEqualStrings("system_content", msg1.getContent().?);
 
     // Test message field fallback
-    var root2 = std.json.ObjectMap.init(alloc);
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    const alloc2 = arena2.allocator();
+    var root2 = std.json.ObjectMap.init(alloc2);
     try root2.put("type", .{ .string = "system" });
     try root2.put("message", .{ .string = "fallback_message" });
     const json2 = std.json.Value{ .object = root2 };
 
-    const msg2 = StreamMessage{
+    var msg2 = StreamMessage{
         .type = .system,
         .subtype = null,
         .raw = json2,
-        .arena = arena,
+        .arena = arena2,
     };
+    defer msg2.deinit();
     try testing.expectEqualStrings("fallback_message", msg2.getContent().?);
 }

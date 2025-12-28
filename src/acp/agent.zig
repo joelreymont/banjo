@@ -187,18 +187,70 @@ const ResumeSessionParams = struct {
     cwd: []const u8 = ".",
 };
 
+const PromptContentBlock = struct {
+    type: []const u8,
+    text: ?[]const u8 = null,
+    resource: ?PromptResource = null,
+
+    pub fn jsonParse(
+        allocator: Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) std.json.ParseError(@TypeOf(source.*))!PromptContentBlock {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(
+        allocator: Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) std.json.ParseFromValueError!PromptContentBlock {
+        _ = allocator;
+        _ = options;
+        if (source != .object) return error.UnexpectedToken;
+
+        const obj = source.object;
+        const type_val = obj.get("type") orelse return error.MissingField;
+        if (type_val != .string) return error.UnexpectedToken;
+
+        var block = PromptContentBlock{ .type = type_val.string };
+        if (obj.get("text")) |text_val| {
+            if (text_val == .string) block.text = text_val.string;
+        }
+        if (obj.get("resource")) |resource_val| {
+            if (resource_val == .object) {
+                const res_obj = resource_val.object;
+                const uri_val = res_obj.get("uri") orelse return error.MissingField;
+                if (uri_val == .string) {
+                    block.resource = .{
+                        .uri = uri_val.string,
+                        .text = if (res_obj.get("text")) |t| if (t == .string) t.string else null else null,
+                    };
+                }
+            }
+        }
+        return block;
+    }
+};
+
+const PromptResource = struct {
+    uri: []const u8,
+    text: ?[]const u8 = null,
+};
+
 /// Extract text content from ACP prompt content blocks array
-fn extractTextFromPrompt(prompt: ?std.json.Value) ?[]const u8 {
+fn extractTextFromPrompt(allocator: Allocator, prompt: ?std.json.Value) ?[]const u8 {
     const blocks = prompt orelse return null;
-    if (blocks != .array) return null;
-    for (blocks.array.items) |block| {
-        if (block != .object) continue;
-        const type_val = block.object.get("type") orelse continue;
-        if (type_val != .string) continue;
-        const block_type = ContentBlockType.fromString(type_val.string) orelse continue;
+    const parsed = std.json.parseFromValue([]PromptContentBlock, allocator, blocks, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+
+    for (parsed.value) |block| {
+        const block_type = ContentBlockType.fromString(block.type) orelse continue;
         if (block_type != .text) continue;
-        const text = block.object.get("text") orelse continue;
-        if (text == .string) return text.string;
+        if (block.text) |text| return text;
     }
     return null;
 }
@@ -210,20 +262,17 @@ const ResourceData = struct {
 };
 
 /// Extract resource data from prompt content blocks (Zed sends file references as resources)
-fn extractResource(prompt: ?std.json.Value) ?ResourceData {
+fn extractResource(allocator: Allocator, prompt: ?std.json.Value) ?ResourceData {
     const blocks = prompt orelse return null;
-    if (blocks != .array) return null;
-    for (blocks.array.items) |block| {
-        if (block != .object) continue;
-        const type_val = block.object.get("type") orelse continue;
-        if (type_val != .string or !std.mem.eql(u8, type_val.string, "resource")) continue;
-        // Resource block: { type: "resource", resource: { uri, text } }
-        const resource = block.object.get("resource") orelse continue;
-        if (resource != .object) continue;
-        const uri = resource.object.get("uri") orelse continue;
-        if (uri != .string) continue;
-        const text = if (resource.object.get("text")) |t| (if (t == .string) t.string else null) else null;
-        return .{ .uri = uri.string, .text = text };
+    const parsed = std.json.parseFromValue([]PromptContentBlock, allocator, blocks, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+
+    for (parsed.value) |block| {
+        if (!std.mem.eql(u8, block.type, "resource")) continue;
+        const resource = block.resource orelse continue;
+        return .{ .uri = resource.uri, .text = resource.text };
     }
     return null;
 }
@@ -537,7 +586,7 @@ pub const Agent = struct {
         const session_id = parsed.value.sessionId;
 
         // Extract text from content blocks array
-        const prompt_text = extractTextFromPrompt(parsed.value.prompt);
+        const prompt_text = extractTextFromPrompt(self.allocator, parsed.value.prompt);
 
         const session = self.sessions.get(session_id) orelse {
             try self.writer.writeResponse(jsonrpc.Response.err(
@@ -570,7 +619,7 @@ pub const Agent = struct {
 
             const prompt_value = effective_prompt.?;
             if (prompt_value.len > 0 and prompt_value[0] == '/') {
-                const resource = extractResource(parsed.value.prompt);
+                const resource = extractResource(self.allocator, parsed.value.prompt);
                 if (self.dispatchCommand(request, session, session_id, prompt_value, resource)) |transformed| {
                     effective_prompt = transformed;
                 } else {
@@ -709,8 +758,14 @@ pub const Agent = struct {
 
             var msg = cli_bridge.readMessage() catch |err| {
                 log.err("Failed to read Claude Code message: {}", .{err});
+                session.bridge.?.deinit();
+                session.bridge = null;
                 break;
-            } orelse break;
+            } orelse {
+                session.bridge.?.deinit();
+                session.bridge = null;
+                break;
+            };
             defer msg.deinit();
 
             msg_count += 1;
@@ -884,9 +939,12 @@ pub const Agent = struct {
 
             var msg = codex_bridge.readMessage() catch |err| {
                 log.err("Failed to read Codex message: {}", .{err});
+                codex_bridge.deinit();
+                session.codex_bridge = null;
                 break;
             } orelse {
-                codex_bridge.stop();
+                codex_bridge.deinit();
+                session.codex_bridge = null;
                 break;
             };
             defer msg.deinit();
@@ -912,13 +970,14 @@ pub const Agent = struct {
                     .command_execution, .exec_command => "Bash",
                     .file_change, .apply_patch => "Edit",
                 };
-                const outcome = self.requestPermission(session_id, tool_name, approval.params) catch |err| {
+                const outcome = self.requestPermission(session, session_id, tool_name, approval.params) catch |err| {
                     log.warn("Failed to request permission from client: {}", .{err});
                     codex_bridge.respondApproval(approval.request_id, "decline") catch |resp_err| {
                         log.warn("Failed to decline Codex approval request: {}", .{resp_err});
                     };
                     continue;
                 };
+                defer if (outcome.optionId) |option_id| self.allocator.free(option_id);
                 const decision = permissionDecisionForCodex(approval.kind, outcome);
                 codex_bridge.respondApproval(approval.request_id, decision) catch |resp_err| {
                     log.warn("Failed to respond to Codex approval request: {}", .{resp_err});
@@ -1097,6 +1156,7 @@ pub const Agent = struct {
 
     fn requestPermission(
         self: *Agent,
+        session: *Session,
         session_id: []const u8,
         tool_name: []const u8,
         tool_input: std.json.Value,
@@ -1120,10 +1180,10 @@ pub const Agent = struct {
 
         try self.writer.writeTypedRequest(.{ .number = request_id }, "session/request_permission", params);
 
-        return try self.waitForPermissionResponse(.{ .number = request_id });
+        return try self.waitForPermissionResponse(session, .{ .number = request_id });
     }
 
-    fn waitForPermissionResponse(self: *Agent, request_id: jsonrpc.Request.Id) !protocol.PermissionOutcome {
+    fn waitForPermissionResponse(self: *Agent, session: *Session, request_id: jsonrpc.Request.Id) !protocol.PermissionOutcome {
         const reader = self.reader orelse return error.NoReader;
         var parsed: ?jsonrpc.ParsedMessage = null;
         defer if (parsed) |*msg| msg.deinit();
@@ -1138,6 +1198,9 @@ pub const Agent = struct {
         var state: State = .read_message;
 
         state: while (true) {
+            if (session.cancelled) {
+                return .{ .outcome = .cancelled, .optionId = null };
+            }
             switch (state) {
                 .read_message => {
                     if (parsed) |*msg| {
@@ -1180,7 +1243,11 @@ pub const Agent = struct {
             .ignore_unknown_fields = true,
         });
         defer parsed.deinit();
-        return parsed.value.outcome;
+        var outcome = parsed.value.outcome;
+        if (outcome.optionId) |option_id| {
+            outcome.optionId = try self.allocator.dupe(u8, option_id);
+        }
+        return outcome;
     }
 
     fn idsMatch(a: ?jsonrpc.Request.Id, b: jsonrpc.Request.Id) bool {
@@ -1239,10 +1306,12 @@ pub const Agent = struct {
         if (self.sessions.get(parsed.value.sessionId)) |session| {
             session.cancelled = true;
             if (session.bridge) |*b| {
-                b.stop();
+                b.deinit();
+                session.bridge = null;
             }
             if (session.codex_bridge) |*b| {
-                b.stop();
+                b.deinit();
+                session.codex_bridge = null;
             }
             log.info("Cancelled session {s}", .{parsed.value.sessionId});
         }
@@ -1983,6 +2052,52 @@ test "Agent handleRequest - initialize accepts correct protocol version" {
     try testing.expect(parsed.value.object.get("error") == null);
 }
 
+test "Agent requestPermission sends request and parses response" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    const response_json =
+        \\{"jsonrpc":"2.0","id":1,"result":{"outcome":{"outcome":"allowed","optionId":"allow_once"}}}
+        \\n
+    ;
+    const input_buf = try testing.allocator.dupe(u8, response_json);
+    defer testing.allocator.free(input_buf);
+
+    var input_stream = std.io.fixedBufferStream(input_buf);
+    var reader = jsonrpc.Reader.init(testing.allocator, input_stream.reader().any());
+    defer reader.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream, &reader);
+    defer agent.deinit();
+
+    var session = Agent.Session{
+        .id = try testing.allocator.dupe(u8, "session-1"),
+        .cwd = try testing.allocator.dupe(u8, "."),
+    };
+    defer session.deinit(testing.allocator);
+
+    const outcome = try agent.requestPermission(&session, session.id, "Bash", .{ .string = "ls" });
+    defer if (outcome.optionId) |option_id| testing.allocator.free(option_id);
+    try testing.expectEqual(protocol.OutcomeKind.allowed, outcome.outcome);
+    try testing.expectEqualStrings("allow_once", outcome.optionId.?);
+
+    var parsed = try jsonrpc.parseMessage(testing.allocator, tw.getOutput());
+    defer parsed.deinit();
+    switch (parsed.message) {
+        .request => |req| {
+            try testing.expectEqualStrings("session/request_permission", req.method);
+            const params_val = req.params orelse return error.TestExpectedEqual;
+            const parsed_params = try std.json.parseFromValue(protocol.PermissionRequest, testing.allocator, params_val, .{
+                .ignore_unknown_fields = true,
+            });
+            defer parsed_params.deinit();
+            try testing.expectEqualStrings("session-1", parsed_params.value.sessionId);
+            try testing.expectEqualStrings("Bash", parsed_params.value.toolName);
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
 test "Agent handleRequest - newSession" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
@@ -2233,7 +2348,7 @@ test "property: extractTextFromPrompt finds text regardless of position" {
             ) catch return false;
             defer freeTestPrompt(testing.allocator, &prompt);
 
-            const result = extractTextFromPrompt(prompt);
+            const result = extractTextFromPrompt(testing.allocator, prompt);
             return result != null and std.mem.eql(u8, result.?, "expected_text");
         }
     }.prop, .{});
@@ -2250,21 +2365,21 @@ test "property: extractTextFromPrompt returns null when no text block" {
             ) catch return false;
             defer freeTestPrompt(testing.allocator, &prompt);
 
-            return extractTextFromPrompt(prompt) == null;
+            return extractTextFromPrompt(testing.allocator, prompt) == null;
         }
     }.prop, .{});
 }
 
 test "property: extractTextFromPrompt null/non-array always returns null" {
     // Null always returns null
-    if (extractTextFromPrompt(null) != null) return error.TestFailed;
+    if (extractTextFromPrompt(testing.allocator, null) != null) return error.TestFailed;
 
     // Non-array types always return null
     try quickcheck.check(struct {
         fn prop(args: struct { int_val: i32, bool_val: bool }) bool {
-            if (extractTextFromPrompt(.{ .integer = args.int_val }) != null) return false;
-            if (extractTextFromPrompt(.{ .bool = args.bool_val }) != null) return false;
-            if (extractTextFromPrompt(.{ .float = 3.14 }) != null) return false;
+            if (extractTextFromPrompt(testing.allocator, .{ .integer = args.int_val }) != null) return false;
+            if (extractTextFromPrompt(testing.allocator, .{ .bool = args.bool_val }) != null) return false;
+            if (extractTextFromPrompt(testing.allocator, .{ .float = 3.14 }) != null) return false;
             return true;
         }
     }.prop, .{});

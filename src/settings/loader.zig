@@ -62,6 +62,17 @@ pub const Settings = struct {
     }
 };
 
+const SettingsFile = struct {
+    allowedTools: ?[]const []const u8 = null,
+    disallowedTools: ?[]const []const u8 = null,
+    hooks: ?Hooks = null,
+};
+
+const Hooks = struct {
+    PreToolUse: ?[]const []const u8 = null,
+    PostToolUse: ?[]const []const u8 = null,
+};
+
 /// Load settings from .claude/settings.json in the given directory
 pub fn loadSettings(allocator: Allocator, cwd: []const u8) !Settings {
     var settings = Settings.init(allocator);
@@ -84,58 +95,36 @@ pub fn loadSettings(allocator: Allocator, cwd: []const u8) !Settings {
     const content = try file.readToEndAlloc(allocator, 1024 * 1024);
     defer allocator.free(content);
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    const parsed = try std.json.parseFromSlice(SettingsFile, allocator, content, .{
+        .ignore_unknown_fields = true,
+    });
     defer parsed.deinit();
 
-    if (parsed.value != .object) return settings;
-    const obj = parsed.value.object;
-
-    // Parse allowedTools
-    if (obj.get("allowedTools")) |allowed| {
-        if (allowed == .array) {
-            for (allowed.array.items) |item| {
-                if (item == .string) {
-                    const tool = try allocator.dupe(u8, item.string);
-                    try settings.allowed_tools.put(tool, {});
-                }
-            }
+    if (parsed.value.allowedTools) |allowed| {
+        for (allowed) |tool_name| {
+            const tool = try allocator.dupe(u8, tool_name);
+            try settings.allowed_tools.put(tool, {});
         }
     }
 
-    // Parse disallowedTools
-    if (obj.get("disallowedTools")) |denied| {
-        if (denied == .array) {
-            for (denied.array.items) |item| {
-                if (item == .string) {
-                    const tool = try allocator.dupe(u8, item.string);
-                    try settings.denied_tools.put(tool, {});
-                }
-            }
+    if (parsed.value.disallowedTools) |denied| {
+        for (denied) |tool_name| {
+            const tool = try allocator.dupe(u8, tool_name);
+            try settings.denied_tools.put(tool, {});
         }
     }
 
-    // Parse hooks
-    if (obj.get("hooks")) |hooks| {
-        if (hooks == .object) {
-            if (hooks.object.get("PreToolUse")) |pre| {
-                if (pre == .array) {
-                    for (pre.array.items) |item| {
-                        if (item == .string) {
-                            const hook = try allocator.dupe(u8, item.string);
-                            try settings.pre_hooks.append(allocator, hook);
-                        }
-                    }
-                }
+    if (parsed.value.hooks) |hooks| {
+        if (hooks.PreToolUse) |pre| {
+            for (pre) |hook_cmd| {
+                const hook = try allocator.dupe(u8, hook_cmd);
+                try settings.pre_hooks.append(allocator, hook);
             }
-            if (hooks.object.get("PostToolUse")) |post| {
-                if (post == .array) {
-                    for (post.array.items) |item| {
-                        if (item == .string) {
-                            const hook = try allocator.dupe(u8, item.string);
-                            try settings.post_hooks.append(allocator, hook);
-                        }
-                    }
-                }
+        }
+        if (hooks.PostToolUse) |post| {
+            for (post) |hook_cmd| {
+                const hook = try allocator.dupe(u8, hook_cmd);
+                try settings.post_hooks.append(allocator, hook);
             }
         }
     }
