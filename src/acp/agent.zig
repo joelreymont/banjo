@@ -241,16 +241,19 @@ pub const Agent = struct {
 
     fn registerPendingRequest(self: *Agent, id: i64) !*PendingRequest {
         const req = try self.allocator.create(PendingRequest);
+        errdefer self.allocator.destroy(req);
         req.* = .{};
         try self.pending_requests.put(id, req);
         return req;
     }
 
     fn handleClientResponse(self: *Agent, id: i64, result: ?std.json.Value, err: ?jsonrpc.Error) void {
-        if (self.pending_requests.get(id)) |req| {
-            req.completed = true;
-            req.result = result;
-            req.err = err;
+        // Remove and free the pending request - we're done with it
+        if (self.pending_requests.fetchRemove(id)) |kv| {
+            // For now, just log completion. Future: store result for async consumption.
+            _ = result;
+            _ = err;
+            self.allocator.destroy(kv.value);
         }
     }
 
@@ -259,36 +262,6 @@ pub const Agent = struct {
             return caps.terminal orelse false;
         }
         return false;
-    }
-
-    //
-    // Terminal Embedding
-    //
-
-    fn createTerminal(self: *Agent, session_id: []const u8, command: []const u8, cwd: ?[]const u8) !?[]const u8 {
-        if (!self.clientSupportsTerminal()) return null;
-
-        const id = try self.sendClientRequest("terminal/create", .{
-            .sessionId = session_id,
-            .command = command,
-            .cwd = cwd,
-        });
-
-        const pending = try self.registerPendingRequest(id);
-
-        // For now, just return null - proper async handling would wait for response
-        // The terminal creation is fire-and-forget for this initial implementation
-        _ = pending;
-        return null;
-    }
-
-    fn releaseTerminal(self: *Agent, session_id: []const u8, terminal_id: []const u8) !void {
-        if (!self.clientSupportsTerminal()) return;
-
-        _ = try self.sendClientRequest("terminal/release", .{
-            .sessionId = session_id,
-            .terminalId = terminal_id,
-        });
     }
 
     fn handleInitialize(self: *Agent, request: jsonrpc.Request) !void {
@@ -933,8 +906,8 @@ pub const Agent = struct {
 
         // Report reading file
         const filename = std.fs.path.basename(uri_info.path);
-        const read_title = std.fmt.allocPrint(self.allocator, "Reading {s}", .{filename}) catch "Reading file";
-        defer if (read_title.ptr != "Reading file".ptr) self.allocator.free(read_title);
+        const read_title = try std.fmt.allocPrint(self.allocator, "Reading {s}", .{filename});
+        defer self.allocator.free(read_title);
         const read_tool_id = try self.reportToolStart(session_id, read_title, .read);
         defer self.allocator.free(read_tool_id);
         try self.reportToolComplete(session_id, read_tool_id, true);
@@ -1240,15 +1213,15 @@ pub const Agent = struct {
     //
 
     /// Generate a unique tool call ID like "banjo_tc_1"
-    fn generateToolCallId(self: *Agent) []const u8 {
+    fn generateToolCallId(self: *Agent) ![]const u8 {
         const id = self.next_tool_call_id;
         self.next_tool_call_id += 1;
-        return std.fmt.allocPrint(self.allocator, "banjo_tc_{d}", .{id}) catch "banjo_tc_0";
+        return std.fmt.allocPrint(self.allocator, "banjo_tc_{d}", .{id});
     }
 
     /// Report tool start with in_progress status, returns the tool call ID
     fn reportToolStart(self: *Agent, session_id: []const u8, title: []const u8, kind: protocol.SessionUpdate.ToolKind) ![]const u8 {
-        const tool_id = self.generateToolCallId();
+        const tool_id = try self.generateToolCallId();
         try self.sendSessionUpdate(session_id, .{
             .sessionUpdate = .tool_call,
             .toolCallId = tool_id,
