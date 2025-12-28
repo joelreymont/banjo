@@ -803,6 +803,14 @@ pub const Agent = struct {
     fn handleExplainCommand(self: *Agent, request: jsonrpc.Request, session: *Session, session_id: []const u8, resource: ResourceData) !void {
         const comments = @import("../notes/comments.zig");
 
+        // Initialize plan
+        var plan_entries = [_]protocol.SessionUpdate.PlanEntry{
+            .{ .id = "1", .content = "Read selected code", .status = .in_progress },
+            .{ .id = "2", .content = "Generate explanation", .status = .pending },
+            .{ .id = "3", .content = "Insert note comment", .status = .pending },
+        };
+        try self.sendPlan(session_id, &plan_entries);
+
         // Parse URI
         const uri_info = parseFileUri(self.allocator, resource.uri) orelse {
             return self.sendErrorAndEnd(request, session_id, "Invalid file URI");
@@ -829,6 +837,11 @@ pub const Agent = struct {
         const code = resource.text orelse {
             return self.sendErrorAndEnd(request, session_id, "No code content in reference");
         };
+
+        // Step 1 complete: code read from resource
+        plan_entries[0].status = .completed;
+        plan_entries[1].status = .in_progress;
+        try self.sendPlan(session_id, &plan_entries);
 
         // Build prompt asking for paragraph summary
         const ext = std.fs.path.extension(uri_info.path);
@@ -873,6 +886,11 @@ pub const Agent = struct {
             return self.sendErrorAndEnd(request, session_id, "Could not get explanation from Claude");
         }
 
+        // Step 2 complete: explanation generated
+        plan_entries[1].status = .completed;
+        plan_entries[2].status = .in_progress;
+        try self.sendPlan(session_id, &plan_entries);
+
         // Generate note comment
         const note_id = comments.generateNoteId();
         const comment_prefix = comments.getCommentPrefix(uri_info.path);
@@ -895,6 +913,10 @@ pub const Agent = struct {
             log.err("insertAtLine failed: {}", .{err});
             return self.sendErrorAndEnd(request, session_id, "Could not write to file");
         };
+
+        // Step 3 complete: note inserted
+        plan_entries[2].status = .completed;
+        try self.sendPlan(session_id, &plan_entries);
 
         // Send success message
         const success_msg = try std.fmt.allocPrint(self.allocator, "Added note `{s}` at {s}:{d}", .{
@@ -1053,6 +1075,14 @@ pub const Agent = struct {
             .content = .{ .type = "text", .text = msg },
         });
         try self.sendEndTurn(request);
+    }
+
+    /// Send plan progress update
+    fn sendPlan(self: *Agent, session_id: []const u8, entries: []const protocol.SessionUpdate.PlanEntry) !void {
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .plan,
+            .entries = entries,
+        });
     }
 
     /// Ensure bridge is started, return it
