@@ -198,6 +198,7 @@ pub const CodexBridge = struct {
 
         try stdin.writeAll(prompt);
         try stdin.writeAll("\n");
+        stdin.close();
     }
 
     pub fn readMessage(self: *CodexBridge) !?CodexMessage {

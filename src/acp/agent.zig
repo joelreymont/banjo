@@ -857,8 +857,6 @@ pub const Agent = struct {
                 log.err("Failed to read Codex message: {}", .{err});
                 break;
             } orelse {
-                codex_bridge.stop();
-                session.codex_bridge = null;
                 break;
             };
             defer msg.deinit();
@@ -916,6 +914,9 @@ pub const Agent = struct {
 
             if (msg.isTurnCompleted()) break;
         }
+
+        codex_bridge.stop();
+        session.codex_bridge = null;
 
         const total_ms = timer.read() / std.time.ns_per_ms;
         log.info("Codex prompt complete: {d} msgs, first response at {d}ms, total {d}ms", .{ msg_count, first_response_ms, total_ms });
