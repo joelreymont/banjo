@@ -10,6 +10,7 @@ pub const CodexMessage = struct {
     thread_id: ?[]const u8 = null,
     item: ?Item = null,
     text: ?[]const u8 = null,
+    approval_request: ?ApprovalRequest = null,
     arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *CodexMessage) void {
@@ -24,6 +25,7 @@ pub const CodexMessage = struct {
         turn_completed,
         agent_message_delta,
         reasoning_delta,
+        approval_request,
         unknown,
     };
 
@@ -42,6 +44,24 @@ pub const CodexMessage = struct {
         reasoning,
         command_execution,
         unknown,
+    };
+
+    pub const RpcRequestId = union(enum) {
+        integer: i64,
+        string: []const u8,
+    };
+
+    pub const ApprovalKind = enum {
+        command_execution,
+        file_change,
+        exec_command,
+        apply_patch,
+    };
+
+    pub const ApprovalRequest = struct {
+        request_id: RpcRequestId,
+        kind: ApprovalKind,
+        params: std.json.Value,
     };
 
     pub const ToolCall = struct {
@@ -94,6 +114,11 @@ pub const CodexMessage = struct {
     pub fn getSessionId(self: *const CodexMessage) ?[]const u8 {
         if (self.event_type != .thread_started) return null;
         return self.thread_id;
+    }
+
+    pub fn getApprovalRequest(self: *const CodexMessage) ?ApprovalRequest {
+        if (self.event_type != .approval_request) return null;
+        return self.approval_request;
     }
 
     pub fn isTurnCompleted(self: *const CodexMessage) bool {
@@ -169,6 +194,80 @@ const TurnRef = struct {
 
 const TurnStartResponse = struct {
     turn: TurnRef,
+};
+
+const ThreadStartedParams = struct {
+    thread: ThreadRef,
+};
+
+const TurnStartedParams = struct {
+    threadId: ?[]const u8 = null,
+    turn: ?TurnRef = null,
+};
+
+const TurnCompletedParams = struct {
+    threadId: ?[]const u8 = null,
+    turn: ?TurnRef = null,
+};
+
+const ItemDeltaParams = struct {
+    threadId: ?[]const u8 = null,
+    turnId: ?[]const u8 = null,
+    itemId: ?[]const u8 = null,
+    delta: ?[]const u8 = null,
+};
+
+const ItemEventParams = struct {
+    threadId: ?[]const u8 = null,
+    turnId: ?[]const u8 = null,
+    item: ItemData,
+};
+
+const ItemData = struct {
+    id: []const u8,
+    @"type": []const u8,
+    text: ?[]const u8 = null,
+    summary: ?std.json.Value = null,
+    content: ?std.json.Value = null,
+    command: ?[]const u8 = null,
+    aggregatedOutput: ?[]const u8 = null,
+    aggregated_output: ?[]const u8 = null,
+    exitCode: ?i64 = null,
+    exit_code: ?i64 = null,
+    status: ?[]const u8 = null,
+};
+
+const CommandExecutionRequestApprovalParams = struct {
+    threadId: []const u8,
+    turnId: []const u8,
+    itemId: []const u8,
+    reason: ?[]const u8 = null,
+    proposedExecpolicyAmendment: ?std.json.Value = null,
+};
+
+const FileChangeRequestApprovalParams = struct {
+    threadId: []const u8,
+    turnId: []const u8,
+    itemId: []const u8,
+    reason: ?[]const u8 = null,
+    grantRoot: ?[]const u8 = null,
+};
+
+const ApplyPatchApprovalParams = struct {
+    conversationId: []const u8,
+    callId: []const u8,
+    fileChanges: std.json.Value,
+    reason: ?[]const u8 = null,
+    grantRoot: ?[]const u8 = null,
+};
+
+const ExecCommandApprovalParams = struct {
+    conversationId: []const u8,
+    callId: []const u8,
+    command: std.json.Value,
+    cwd: []const u8,
+    reason: ?[]const u8 = null,
+    parsedCmd: std.json.Value,
 };
 
 pub const CodexBridge = struct {
@@ -303,10 +402,10 @@ pub const CodexBridge = struct {
         };
 
         try self.sendRequest(request_id, "turn/start", params);
-        const response = try self.waitForResponse(request_id);
+        var response = try self.waitForResponse(request_id);
         defer response.arena.deinit();
 
-        const turn_id = extractTurnId(response.value) orelse {
+        const turn_id = extractTurnId(response.arena.allocator(), response.value) orelse {
             return error.InvalidResponse;
         };
         try self.setTurnId(turn_id);
@@ -338,7 +437,10 @@ pub const CodexBridge = struct {
                     }
                 },
                 .request => {
-                    try self.handleServerRequest(rpc_message);
+                    if (self.mapServerRequest(rpc_message, &rpc_message.arena)) |msg| {
+                        keep_arena = true;
+                        return msg;
+                    }
                 },
                 .response, .err, .unknown => {},
             }
@@ -355,7 +457,7 @@ pub const CodexBridge = struct {
             },
         };
         try self.sendRequest(request_id, "initialize", params);
-        const response = try self.waitForResponse(request_id);
+        var response = try self.waitForResponse(request_id);
         response.arena.deinit();
         try self.sendNotification("initialized");
     }
@@ -369,10 +471,10 @@ pub const CodexBridge = struct {
             .experimentalRawEvents = false,
         };
         try self.sendRequest(request_id, "thread/start", params);
-        const response = try self.waitForResponse(request_id);
+        var response = try self.waitForResponse(request_id);
         defer response.arena.deinit();
 
-        const thread_id = extractThreadId(response.value) orelse {
+        const thread_id = extractThreadId(response.arena.allocator(), response.value) orelse {
             return error.InvalidResponse;
         };
         try self.setThreadId(thread_id);
@@ -385,10 +487,10 @@ pub const CodexBridge = struct {
             .threadId = thread_id,
         };
         try self.sendRequest(request_id, "thread/resume", params);
-        const response = try self.waitForResponse(request_id);
+        var response = try self.waitForResponse(request_id);
         defer response.arena.deinit();
 
-        const resumed_id = extractThreadId(response.value) orelse {
+        const resumed_id = extractThreadId(response.arena.allocator(), response.value) orelse {
             return error.InvalidResponse;
         };
         try self.setThreadId(resumed_id);
@@ -422,12 +524,21 @@ pub const CodexBridge = struct {
         try self.writeJsonLine(payload);
     }
 
-    fn sendResponse(self: *CodexBridge, request_id: std.json.Value, result: anytype) !void {
-        const payload = .{
-            .id = request_id,
-            .result = result,
-        };
-        try self.writeJsonLine(payload);
+    fn sendResponseId(self: *CodexBridge, request_id: CodexMessage.RpcRequestId, result: anytype) !void {
+        switch (request_id) {
+            .integer => |id| {
+                const payload = .{ .id = id, .result = result };
+                try self.writeJsonLine(payload);
+            },
+            .string => |id| {
+                const payload = .{ .id = id, .result = result };
+                try self.writeJsonLine(payload);
+            },
+        }
+    }
+
+    pub fn respondApproval(self: *CodexBridge, request_id: CodexMessage.RpcRequestId, decision: []const u8) !void {
+        try self.sendResponseId(request_id, .{ .decision = decision });
     }
 
     fn writeJsonLine(self: *CodexBridge, payload: anytype) !void {
@@ -487,7 +598,10 @@ pub const CodexBridge = struct {
                     }
                 },
                 .request => {
-                    try self.handleServerRequest(rpc_message);
+                    if (self.mapServerRequest(rpc_message, &rpc_message.arena)) |msg| {
+                        keep_arena = true;
+                        try self.pending_messages.append(self.allocator, msg);
+                    }
                 },
                 .unknown => {},
             }
@@ -558,19 +672,36 @@ pub const CodexBridge = struct {
         }
     }
 
-    fn handleServerRequest(self: *CodexBridge, msg: RpcMessage) !void {
-        const method = msg.method orelse return;
-        const request_id = msg.id orelse return;
+    fn mapServerRequest(self: *CodexBridge, msg: RpcMessage, arena: *std.heap.ArenaAllocator) ?CodexMessage {
+        const method = msg.method orelse return null;
+        const params = msg.params orelse return null;
+        const request_id_value = msg.id orelse return null;
+        const request_id = parseRpcRequestId(request_id_value) orelse return null;
 
-        if (approvalDecision(method)) |decision| {
-            const response = .{ .decision = decision };
-            try self.sendResponse(request_id, response);
-            return;
+        const kind = serverRequestKind(method);
+        if (kind == .unknown) {
+            self.sendResponseId(request_id, .{ .decision = "decline" }) catch |err| {
+                log.warn("Failed to respond to unknown Codex request: {}", .{err});
+            };
+            return null;
         }
 
-        log.warn("Unhandled Codex server request: {s}", .{method});
-        const response = .{ .decision = "decline" };
-        try self.sendResponse(request_id, response);
+        if (!parseServerRequestParams(kind, arena.allocator(), params)) {
+            self.sendResponseId(request_id, .{ .decision = "decline" }) catch |err| {
+                log.warn("Failed to respond to invalid Codex request: {}", .{err});
+            };
+            return null;
+        }
+
+        return CodexMessage{
+            .event_type = .approval_request,
+            .approval_request = .{
+                .request_id = request_id,
+                .kind = kind.toApprovalKind(),
+                .params = params,
+            },
+            .arena = arena.*,
+        };
     }
 
     fn mapNotification(
@@ -579,92 +710,71 @@ pub const CodexBridge = struct {
         params: std.json.Value,
         arena: *std.heap.ArenaAllocator,
     ) ?CodexMessage {
-        if (params != .object) return null;
-        const obj = params.object;
-
         const kind = notificationKind(method);
         switch (kind) {
             .thread_started => {
-                if (obj.get("thread")) |thread_val| {
-                    if (thread_val == .object) {
-                        if (getString(thread_val.object, "id")) |thread_id| {
-                            return CodexMessage{
-                                .event_type = .thread_started,
-                                .thread_id = thread_id,
-                                .arena = arena.*,
-                            };
-                        }
-                    }
-                }
-                return null;
+                const parsed = parseNotificationParams(ThreadStartedParams, arena, params) orelse return null;
+                return CodexMessage{
+                    .event_type = .thread_started,
+                    .thread_id = parsed.thread.id,
+                    .arena = arena.*,
+                };
             },
             .turn_started => {
+                _ = parseNotificationParams(TurnStartedParams, arena, params) orelse return null;
                 return CodexMessage{
                     .event_type = .turn_started,
                     .arena = arena.*,
                 };
             },
             .turn_completed => {
-                if (obj.get("turn")) |turn_val| {
-                    if (turn_val == .object) {
-                        if (getString(turn_val.object, "id")) |turn_id| {
-                            if (self.current_turn_id) |current| {
-                                if (!std.mem.eql(u8, current, turn_id)) {
-                                    return null;
-                                }
-                            }
-                            return CodexMessage{
-                                .event_type = .turn_completed,
-                                .thread_id = getString(obj, "threadId"),
-                                .arena = arena.*,
-                            };
-                        }
-                    }
-                }
-                return null;
+                const parsed = parseNotificationParams(TurnCompletedParams, arena, params) orelse return null;
+                const turn = parsed.turn orelse return null;
+                if (!self.matchesCurrentTurn(turn.id)) return null;
+                return CodexMessage{
+                    .event_type = .turn_completed,
+                    .thread_id = parsed.threadId,
+                    .arena = arena.*,
+                };
             },
             .agent_message_delta => {
-                if (!self.matchesCurrentTurn(obj)) return null;
-                if (getString(obj, "delta")) |delta| {
-                    self.saw_agent_delta = true;
-                    return CodexMessage{
-                        .event_type = .agent_message_delta,
-                        .text = delta,
-                        .arena = arena.*,
-                    };
-                }
-                return null;
+                const parsed = parseNotificationParams(ItemDeltaParams, arena, params) orelse return null;
+                if (!self.matchesCurrentTurn(parsed.turnId)) return null;
+                const delta = parsed.delta orelse return null;
+                self.saw_agent_delta = true;
+                return CodexMessage{
+                    .event_type = .agent_message_delta,
+                    .text = delta,
+                    .arena = arena.*,
+                };
             },
             .reasoning_summary_delta => {
-                if (!self.matchesCurrentTurn(obj)) return null;
-                if (getString(obj, "delta")) |delta| {
-                    self.saw_reasoning_delta = true;
-                    return CodexMessage{
-                        .event_type = .reasoning_delta,
-                        .text = delta,
-                        .arena = arena.*,
-                    };
-                }
-                return null;
+                const parsed = parseNotificationParams(ItemDeltaParams, arena, params) orelse return null;
+                if (!self.matchesCurrentTurn(parsed.turnId)) return null;
+                const delta = parsed.delta orelse return null;
+                self.saw_reasoning_delta = true;
+                return CodexMessage{
+                    .event_type = .reasoning_delta,
+                    .text = delta,
+                    .arena = arena.*,
+                };
             },
             .reasoning_text_delta => {
                 if (self.saw_reasoning_delta) return null;
-                if (!self.matchesCurrentTurn(obj)) return null;
-                if (getString(obj, "delta")) |delta| {
-                    self.saw_reasoning_delta = true;
-                    return CodexMessage{
-                        .event_type = .reasoning_delta,
-                        .text = delta,
-                        .arena = arena.*,
-                    };
-                }
-                return null;
+                const parsed = parseNotificationParams(ItemDeltaParams, arena, params) orelse return null;
+                if (!self.matchesCurrentTurn(parsed.turnId)) return null;
+                const delta = parsed.delta orelse return null;
+                self.saw_reasoning_delta = true;
+                return CodexMessage{
+                    .event_type = .reasoning_delta,
+                    .text = delta,
+                    .arena = arena.*,
+                };
             },
             .item_started, .item_completed => {
-                if (!self.matchesCurrentTurn(obj)) return null;
-
-                const item_val = obj.get("item") orelse return null;
-                const item = parseItem(arena.allocator(), item_val) orelse return null;
+                const parsed = parseNotificationParams(ItemEventParams, arena, params) orelse return null;
+                if (!self.matchesCurrentTurn(parsed.turnId)) return null;
+                const item = parseItem(arena.allocator(), parsed.item) orelse return null;
                 const event_type: CodexMessage.EventType = if (kind == .item_started) .item_started else .item_completed;
 
                 if (event_type == .item_completed and item.kind == .agent_message and self.saw_agent_delta) {
@@ -695,10 +805,10 @@ pub const CodexBridge = struct {
         return id;
     }
 
-    fn matchesCurrentTurn(self: *CodexBridge, obj: std.json.ObjectMap) bool {
+    fn matchesCurrentTurn(self: *CodexBridge, turn_id: ?[]const u8) bool {
         if (self.current_turn_id) |current| {
-            if (getString(obj, "turnId")) |turn_id| {
-                return std.mem.eql(u8, current, turn_id);
+            if (turn_id) |id| {
+                return std.mem.eql(u8, current, id);
             }
         }
         return true;
@@ -713,68 +823,56 @@ fn parseRequestId(value: std.json.Value) ?i64 {
     };
 }
 
-fn extractThreadId(value: std.json.Value) ?[]const u8 {
-    if (value != .object) return null;
-    const thread_val = value.object.get("thread") orelse return null;
-    if (thread_val != .object) return null;
-    return getString(thread_val.object, "id");
+fn extractThreadId(allocator: Allocator, value: std.json.Value) ?[]const u8 {
+    const parsed = std.json.parseFromValue(ThreadStartResponse, allocator, value, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+    return parsed.value.thread.id;
 }
 
-fn extractTurnId(value: std.json.Value) ?[]const u8 {
-    if (value != .object) return null;
-    const turn_val = value.object.get("turn") orelse return null;
-    if (turn_val != .object) return null;
-    return getString(turn_val.object, "id");
+fn extractTurnId(allocator: Allocator, value: std.json.Value) ?[]const u8 {
+    const parsed = std.json.parseFromValue(TurnStartResponse, allocator, value, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+    return parsed.value.turn.id;
 }
 
-fn getString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = obj.get(key) orelse return null;
-    return if (value == .string) value.string else null;
-}
+fn parseItem(allocator: Allocator, item: ItemData) ?CodexMessage.Item {
+    const kind = parseItemKind(item.@"type");
 
-fn getInt(obj: std.json.ObjectMap, key: []const u8) ?i64 {
-    const value = obj.get(key) orelse return null;
-    return if (value == .integer) value.integer else null;
-}
-
-fn parseItem(allocator: Allocator, value: std.json.Value) ?CodexMessage.Item {
-    if (value != .object) return null;
-    const obj = value.object;
-    const item_type = getString(obj, "type") orelse return null;
-    const item_id = getString(obj, "id") orelse return null;
-    const kind = parseItemKind(item_type);
-
-    var item = CodexMessage.Item{
-        .id = item_id,
+    var parsed = CodexMessage.Item{
+        .id = item.id,
         .kind = kind,
     };
 
     if (kind == .agent_message) {
-        item.text = getString(obj, "text");
-        return item;
+        parsed.text = item.text;
+        return parsed;
     }
 
     if (kind == .reasoning) {
-        if (obj.get("summary")) |summary_val| {
-            item.text = joinStringArray(allocator, summary_val, "\n");
+        if (item.summary) |summary_val| {
+            parsed.text = joinStringArray(allocator, summary_val, "\n");
         }
-        if (item.text == null) {
-            if (obj.get("content")) |content_val| {
-                item.text = joinStringArray(allocator, content_val, "\n");
+        if (parsed.text == null) {
+            if (item.content) |content_val| {
+                parsed.text = joinStringArray(allocator, content_val, "\n");
             }
         }
-        return item;
+        return parsed;
     }
 
     if (kind == .command_execution) {
-        item.command = getString(obj, "command");
-        item.aggregated_output = getString(obj, "aggregatedOutput") orelse getString(obj, "aggregated_output");
-        item.exit_code = getInt(obj, "exitCode") orelse getInt(obj, "exit_code");
-        item.status = getString(obj, "status");
-        return item;
+        parsed.command = item.command;
+        parsed.aggregated_output = item.aggregatedOutput orelse item.aggregated_output;
+        parsed.exit_code = item.exitCode orelse item.exit_code;
+        parsed.status = item.status;
+        return parsed;
     }
 
-    return item;
+    return parsed;
 }
 
 fn parseItemKind(item_type: []const u8) CodexMessage.ItemKind {
@@ -802,14 +900,44 @@ fn notificationKind(method: []const u8) NotificationKind {
     return map.get(method) orelse .unknown;
 }
 
-fn approvalDecision(method: []const u8) ?[]const u8 {
-    const map = std.StaticStringMap([]const u8).initComptime(.{
-        .{ "item/commandExecution/requestApproval", "accept" },
-        .{ "item/fileChange/requestApproval", "accept" },
-        .{ "applyPatchApproval", "approved" },
-        .{ "execCommandApproval", "approved" },
+fn parseRpcRequestId(value: std.json.Value) ?CodexMessage.RpcRequestId {
+    return switch (value) {
+        .integer => |int| .{ .integer = int },
+        .string => |str| .{ .string = str },
+        else => null,
+    };
+}
+
+fn serverRequestKind(method: []const u8) ServerRequestKind {
+    const map = std.StaticStringMap(ServerRequestKind).initComptime(.{
+        .{ "item/commandExecution/requestApproval", .command_execution },
+        .{ "item/fileChange/requestApproval", .file_change },
+        .{ "applyPatchApproval", .apply_patch },
+        .{ "execCommandApproval", .exec_command },
     });
-    return map.get(method);
+    return map.get(method) orelse .unknown;
+}
+
+fn parseServerRequestParams(kind: ServerRequestKind, allocator: Allocator, params: std.json.Value) bool {
+    return switch (kind) {
+        .command_execution => parseParams(CommandExecutionRequestApprovalParams, allocator, params),
+        .file_change => parseParams(FileChangeRequestApprovalParams, allocator, params),
+        .apply_patch => parseParams(ApplyPatchApprovalParams, allocator, params),
+        .exec_command => parseParams(ExecCommandApprovalParams, allocator, params),
+        .unknown => false,
+    };
+}
+
+fn parseNotificationParams(comptime T: type, arena: *std.heap.ArenaAllocator, params: std.json.Value) ?T {
+    const parsed = std.json.parseFromValue(T, arena.allocator(), params, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    return parsed.value;
+}
+
+fn parseParams(comptime T: type, allocator: Allocator, value: std.json.Value) bool {
+    const parsed = std.json.parseFromValue(T, allocator, value, .{ .ignore_unknown_fields = true }) catch return false;
+    parsed.deinit();
+    return true;
 }
 
 const NotificationKind = enum {
@@ -822,6 +950,24 @@ const NotificationKind = enum {
     item_started,
     item_completed,
     unknown,
+};
+
+const ServerRequestKind = enum {
+    command_execution,
+    file_change,
+    exec_command,
+    apply_patch,
+    unknown,
+
+    fn toApprovalKind(self: ServerRequestKind) CodexMessage.ApprovalKind {
+        return switch (self) {
+            .command_execution => .command_execution,
+            .file_change => .file_change,
+            .exec_command => .exec_command,
+            .apply_patch => .apply_patch,
+            .unknown => .command_execution,
+        };
+    }
 };
 
 fn joinStringArray(allocator: Allocator, value: std.json.Value, sep: []const u8) ?[]const u8 {

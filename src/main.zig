@@ -169,13 +169,13 @@ pub fn main() !void {
             var reader = jsonrpc.Reader.init(allocator, stdin);
             defer reader.deinit();
 
-            var acp_agent = Agent.init(allocator, stdout);
+            var acp_agent = Agent.init(allocator, stdout, &reader);
             defer acp_agent.deinit();
 
             // Main event loop
             while (true) {
-                var parsed = reader.next() catch |err| {
-                    log.err("Failed to parse request: {}", .{err});
+                var parsed = reader.nextMessage() catch |err| {
+                    log.err("Failed to parse message: {}", .{err});
                     continue;
                 } orelse {
                     if (opts.verbose) {
@@ -185,8 +185,8 @@ pub fn main() !void {
                 };
                 defer parsed.deinit();
 
-                acp_agent.handleRequest(parsed.request) catch |err| {
-                    log.err("Failed to handle request: {}", .{err});
+                acp_agent.handleMessage(parsed.message) catch |err| {
+                    log.err("Failed to handle message: {}", .{err});
                 };
             }
         },

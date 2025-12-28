@@ -12,11 +12,38 @@ pub const Request = struct {
         string: []const u8,
         number: i64,
         null,
+
+        pub fn jsonParse(allocator: Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!Id {
+            const value = try std.json.Value.jsonParse(allocator, source, options);
+            return jsonParseFromValue(allocator, value, options);
+        }
+
+        pub fn jsonParseFromValue(
+            allocator: Allocator,
+            source: std.json.Value,
+            options: std.json.ParseOptions,
+        ) std.json.ParseFromValueError!Id {
+            _ = allocator;
+            _ = options;
+            return switch (source) {
+                .string => |str| .{ .string = str },
+                .integer => |int| .{ .number = int },
+                .null => .null,
+                else => error.UnexpectedToken,
+            };
+        }
     };
 
     pub fn isNotification(self: Request) bool {
         return self.id == null;
     }
+};
+
+/// JSON-RPC 2.0 Notification (no id)
+pub const Notification = struct {
+    jsonrpc: []const u8 = "2.0",
+    method: []const u8,
+    params: ?std.json.Value = null,
 };
 
 /// JSON-RPC 2.0 Response
@@ -52,11 +79,20 @@ pub const Error = struct {
     pub const AuthRequired = -32000;
 };
 
-/// Notification (no id, no response expected)
-pub const Notification = struct {
+/// JSON-RPC 2.0 Message
+pub const Message = union(enum) {
+    request: Request,
+    notification: Notification,
+    response: Response,
+};
+
+const Envelope = struct {
     jsonrpc: []const u8 = "2.0",
-    method: []const u8,
+    method: ?[]const u8 = null,
     params: ?std.json.Value = null,
+    id: ?Request.Id = null,
+    result: ?std.json.Value = null,
+    @"error": ?Error = null,
 };
 
 /// Parsed request with owned memory
@@ -69,47 +105,79 @@ pub const ParsedRequest = struct {
     }
 };
 
+/// Parsed message with owned memory
+pub const ParsedMessage = struct {
+    message: Message,
+    arena: std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *ParsedMessage) void {
+        self.arena.deinit();
+    }
+};
+
 /// Parse a JSON-RPC request from a JSON string
 pub fn parseRequest(allocator: Allocator, json_str: []const u8) !ParsedRequest {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json_str, .{});
-    // Don't deinit - arena owns the memory
+    const parsed = try std.json.parseFromSlice(Envelope, arena.allocator(), json_str, .{
+        .ignore_unknown_fields = true,
+    });
+    const env = parsed.value;
 
-    const request = try parseRequestFromValue(parsed.value);
+    if (!std.mem.eql(u8, env.jsonrpc, "2.0")) return error.InvalidRequest;
+    const method = env.method orelse return error.InvalidRequest;
+
+    const request = Request{
+        .method = method,
+        .params = env.params,
+        .id = env.id,
+    };
     return .{ .request = request, .arena = arena };
 }
 
-fn parseRequestFromValue(value: std.json.Value) !Request {
-    if (value != .object) return error.InvalidRequest;
-    const obj = value.object;
+/// Parse a JSON-RPC message (request/notification/response)
+pub fn parseMessage(allocator: Allocator, json_str: []const u8) !ParsedMessage {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
 
-    // Check jsonrpc version
-    const jsonrpc = obj.get("jsonrpc") orelse return error.InvalidRequest;
-    if (jsonrpc != .string or !std.mem.eql(u8, jsonrpc.string, "2.0")) {
-        return error.InvalidRequest;
+    const parsed = try std.json.parseFromSlice(Envelope, arena.allocator(), json_str, .{
+        .ignore_unknown_fields = true,
+    });
+    const message = try parseMessageFromEnvelope(parsed.value);
+    return .{ .message = message, .arena = arena };
+}
+
+fn parseMessageFromEnvelope(env: Envelope) !Message {
+    if (!std.mem.eql(u8, env.jsonrpc, "2.0")) return error.InvalidRequest;
+
+    if (env.method) |method| {
+        if (env.id != null) {
+            return .{
+                .request = .{
+                    .method = method,
+                    .params = env.params,
+                    .id = env.id,
+                },
+            };
+        }
+        return .{
+            .notification = .{
+                .method = method,
+                .params = env.params,
+            },
+        };
     }
 
-    // Get method
-    const method_val = obj.get("method") orelse return error.InvalidRequest;
-    if (method_val != .string) return error.InvalidRequest;
+    if (env.result == null and env.@"error" == null) return error.InvalidRequest;
+    if (env.id == null) return error.InvalidRequest;
 
-    // Get optional params
-    const params = obj.get("params");
-
-    // Get optional id
-    const id: ?Request.Id = if (obj.get("id")) |id_val| switch (id_val) {
-        .string => |s| .{ .string = s },
-        .integer => |n| .{ .number = n },
-        .null => .null,
-        else => return error.InvalidRequest,
-    } else null;
-
-    return Request{
-        .method = method_val.string,
-        .params = params,
-        .id = id,
+    return .{
+        .response = .{
+            .id = env.id,
+            .result = env.result,
+            .@"error" = env.@"error",
+        },
     };
 }
 
@@ -248,6 +316,28 @@ pub const Reader = struct {
 
         const parsed = try parseRequest(self.allocator, self.buffer.items);
         return parsed;
+    }
+
+    /// Read the next JSON-RPC message (request/notification/response)
+    pub fn nextMessage(self: *Reader) !?ParsedMessage {
+        self.buffer.clearRetainingCapacity();
+
+        while (true) {
+            const byte = self.stream.readByte() catch |e| switch (e) {
+                error.EndOfStream => {
+                    if (self.buffer.items.len == 0) return null;
+                    break;
+                },
+                else => return e,
+            };
+
+            if (byte == '\n') break;
+            try self.buffer.append(self.allocator, byte);
+        }
+
+        if (self.buffer.items.len == 0) return null;
+
+        return try parseMessage(self.allocator, self.buffer.items);
     }
 };
 

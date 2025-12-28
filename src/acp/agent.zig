@@ -7,6 +7,7 @@ const Bridge = bridge.Bridge;
 const ContentBlockType = bridge.ContentBlockType;
 const SystemSubtype = bridge.SystemSubtype;
 const CodexBridge = @import("../cli/codex_bridge.zig").CodexBridge;
+const CodexMessage = @import("../cli/codex_bridge.zig").CodexMessage;
 const settings_loader = @import("../settings/loader.zig");
 const Settings = settings_loader.Settings;
 const notes_commands = @import("../notes/commands.zig");
@@ -230,9 +231,11 @@ fn extractResource(prompt: ?std.json.Value) ?ResourceData {
 pub const Agent = struct {
     allocator: Allocator,
     writer: jsonrpc.Writer,
+    reader: ?*jsonrpc.Reader = null,
     sessions: std.StringHashMap(*Session),
     client_capabilities: ?protocol.ClientCapabilities = null,
     next_tool_call_id: u64 = 0,
+    next_request_id: i64 = 1,
 
     const Session = struct {
         id: []const u8,
@@ -270,10 +273,11 @@ pub const Agent = struct {
         }
     };
 
-    pub fn init(allocator: Allocator, writer: std.io.AnyWriter) Agent {
+    pub fn init(allocator: Allocator, writer: std.io.AnyWriter, reader: ?*jsonrpc.Reader) Agent {
         return .{
             .allocator = allocator,
             .writer = jsonrpc.Writer.init(allocator, writer),
+            .reader = reader,
             .sessions = std.StringHashMap(*Session).init(allocator),
         };
     }
@@ -314,6 +318,29 @@ pub const Agent = struct {
                 ));
             }
         }
+    }
+
+    /// Handle an incoming JSON-RPC message
+    pub fn handleMessage(self: *Agent, message: jsonrpc.Message) !void {
+        switch (message) {
+            .request => |request| try self.handleRequest(request),
+            .notification => |notification| try self.handleNotification(notification),
+            .response => |response| try self.handleResponse(response),
+        }
+    }
+
+    fn handleNotification(self: *Agent, notification: jsonrpc.Notification) !void {
+        const request = jsonrpc.Request{
+            .method = notification.method,
+            .params = notification.params,
+            .id = null,
+        };
+        try self.handleRequest(request);
+    }
+
+    fn handleResponse(self: *Agent, response: jsonrpc.Response) !void {
+        _ = self;
+        log.debug("Ignoring response id {?}: ACP client responses handled inline", .{response.id});
     }
 
     fn handleInitialize(self: *Agent, request: jsonrpc.Request) !void {
@@ -880,6 +907,25 @@ pub const Agent = struct {
                 }
             }
 
+            if (msg.getApprovalRequest()) |approval| {
+                const tool_name = switch (approval.kind) {
+                    .command_execution, .exec_command => "Bash",
+                    .file_change, .apply_patch => "Edit",
+                };
+                const outcome = self.requestPermission(session_id, tool_name, approval.params) catch |err| {
+                    log.warn("Failed to request permission from client: {}", .{err});
+                    codex_bridge.respondApproval(approval.request_id, "decline") catch |resp_err| {
+                        log.warn("Failed to decline Codex approval request: {}", .{resp_err});
+                    };
+                    continue;
+                };
+                const decision = permissionDecisionForCodex(approval.kind, outcome);
+                codex_bridge.respondApproval(approval.request_id, decision) catch |resp_err| {
+                    log.warn("Failed to respond to Codex approval request: {}", .{resp_err});
+                };
+                continue;
+            }
+
             if (msg.getToolCall()) |tool| {
                 try self.handleEngineToolCall(
                     session,
@@ -1047,6 +1093,130 @@ pub const Agent = struct {
         status: protocol.SessionUpdate.ToolCallStatus,
     ) !void {
         try self.sendEngineToolResult(session_id, engine, tool_id, content, status);
+    }
+
+    fn requestPermission(
+        self: *Agent,
+        session_id: []const u8,
+        tool_name: []const u8,
+        tool_input: std.json.Value,
+    ) !protocol.PermissionOutcome {
+        const request_id = self.next_request_id;
+        self.next_request_id += 1;
+
+        const options = [_]protocol.PermissionOption{
+            .{ .kind = .allow_once, .name = "Allow once", .optionId = "allow_once" },
+            .{ .kind = .allow_session, .name = "Allow for session", .optionId = "allow_session" },
+            .{ .kind = .deny, .name = "Deny", .optionId = "deny" },
+        };
+
+        const params = protocol.PermissionRequest{
+            .sessionId = session_id,
+            .toolName = tool_name,
+            .toolInput = tool_input,
+            .interrupt = true,
+            .options = options[0..],
+        };
+
+        try self.writer.writeTypedRequest(.{ .number = request_id }, "session/request_permission", params);
+
+        return try self.waitForPermissionResponse(.{ .number = request_id });
+    }
+
+    fn waitForPermissionResponse(self: *Agent, request_id: jsonrpc.Request.Id) !protocol.PermissionOutcome {
+        const reader = self.reader orelse return error.NoReader;
+        var parsed: ?jsonrpc.ParsedMessage = null;
+        defer if (parsed) |*msg| msg.deinit();
+
+        const State = enum {
+            read_message,
+            dispatch_message,
+            done,
+        };
+
+        var outcome: ?protocol.PermissionOutcome = null;
+        var state: State = .read_message;
+
+        state: while (true) {
+            switch (state) {
+                .read_message => {
+                    if (parsed) |*msg| {
+                        msg.deinit();
+                        parsed = null;
+                    }
+                    parsed = (try reader.nextMessage()) orelse return error.UnexpectedEof;
+                    state = .dispatch_message;
+                    continue :state;
+                },
+                .dispatch_message => {
+                    const message = parsed.?.message;
+                    switch (message) {
+                        .request => |req| try self.handleRequest(req),
+                        .notification => |note| try self.handleNotification(note),
+                        .response => |resp| {
+                            if (idsMatch(resp.id, request_id)) {
+                                outcome = try self.parsePermissionOutcome(resp);
+                                state = .done;
+                                continue :state;
+                            }
+                        },
+                    }
+                    state = .read_message;
+                    continue :state;
+                },
+                .done => {
+                    return outcome orelse error.InvalidResponse;
+                },
+            }
+        }
+    }
+
+    fn parsePermissionOutcome(self: *Agent, response: jsonrpc.Response) !protocol.PermissionOutcome {
+        if (response.@"error" != null) {
+            return .{ .outcome = .denied, .optionId = null };
+        }
+        const result = response.result orelse return error.InvalidResponse;
+        const parsed = try std.json.parseFromValue(protocol.PermissionResponse, self.allocator, result, .{
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+        return parsed.value.outcome;
+    }
+
+    fn idsMatch(a: ?jsonrpc.Request.Id, b: jsonrpc.Request.Id) bool {
+        if (a == null) return false;
+        return switch (a.?) {
+            .number => |id| switch (b) {
+                .number => |other| id == other,
+                else => false,
+            },
+            .string => |id| switch (b) {
+                .string => |other| std.mem.eql(u8, id, other),
+                else => false,
+            },
+            .null => false,
+        };
+    }
+
+    fn permissionDecisionForCodex(
+        kind: CodexMessage.ApprovalKind,
+        outcome: protocol.PermissionOutcome,
+    ) []const u8 {
+        const option_id = outcome.optionId orelse "allow_once";
+        switch (kind) {
+            .command_execution, .file_change => {
+                if (outcome.outcome == .cancelled) return "cancel";
+                if (outcome.outcome == .denied) return "decline";
+                if (std.mem.eql(u8, option_id, "allow_session")) return "acceptForSession";
+                return "accept";
+            },
+            .exec_command, .apply_patch => {
+                if (outcome.outcome == .cancelled) return "abort";
+                if (outcome.outcome == .denied) return "denied";
+                if (std.mem.eql(u8, option_id, "allow_session")) return "approved_for_session";
+                return "approved";
+            },
+        }
     }
 
     fn tagText(self: *Agent, engine: Engine, text: []const u8) ![]const u8 {
@@ -1723,7 +1893,7 @@ test "Agent init/deinit" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
     defer agent.deinit();
 }
 
@@ -1731,7 +1901,7 @@ test "Agent handleRequest - initialize" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
     defer agent.deinit();
 
     const request = jsonrpc.Request{
@@ -1758,7 +1928,7 @@ test "Agent handleRequest - initialize rejects wrong protocol version" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
     defer agent.deinit();
 
     // Build params with wrong protocol version
@@ -1788,7 +1958,7 @@ test "Agent handleRequest - initialize accepts correct protocol version" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
     defer agent.deinit();
 
     // Build params with correct protocol version
@@ -1817,7 +1987,7 @@ test "Agent handleRequest - newSession" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
     defer agent.deinit();
 
     const request = jsonrpc.Request{
@@ -1843,7 +2013,7 @@ test "Agent handleRequest - methodNotFound" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
     defer agent.deinit();
 
     const request = jsonrpc.Request{
@@ -1865,7 +2035,7 @@ test "Agent handleRequest - setMode" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
     defer agent.deinit();
 
     // First create a session
@@ -1911,7 +2081,7 @@ test "Agent handleRequest - setMode session not found" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
     defer agent.deinit();
 
     var params = std.json.ObjectMap.init(testing.allocator);
@@ -1937,7 +2107,7 @@ test "Agent handleRequest - resumeSession" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
     defer agent.deinit();
 
     var params = std.json.ObjectMap.init(testing.allocator);
@@ -1963,7 +2133,7 @@ test "Agent handleRequest - resumeSession existing" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
     defer agent.deinit();
 
     // First create a session
@@ -2147,7 +2317,7 @@ test "Agent handleRequest - cancel" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
     defer agent.deinit();
 
     // First create a session
@@ -2197,7 +2367,7 @@ test "Agent handleRequest - prompt missing sessionId" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
     defer agent.deinit();
 
     // Empty params - missing sessionId
@@ -2224,7 +2394,7 @@ test "Agent handleRequest - prompt session not found" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
     defer agent.deinit();
 
     var params = std.json.ObjectMap.init(testing.allocator);
@@ -2252,7 +2422,7 @@ test "Agent handleRequest - setMode missing params" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
     defer agent.deinit();
 
     // Empty params
@@ -2276,7 +2446,7 @@ test "Agent handleRequest - resumeSession missing params" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
     defer agent.deinit();
 
     // Empty params - missing sessionId
@@ -2300,7 +2470,7 @@ test "Agent handleRequest - authenticate returns success" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
 
-    var agent = Agent.init(testing.allocator, tw.writer.stream);
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
     defer agent.deinit();
 
     const request = jsonrpc.Request{
