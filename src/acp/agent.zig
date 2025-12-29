@@ -1906,6 +1906,9 @@ pub const Agent = struct {
 
 // Tests
 const testing = std.testing;
+const c_stdlib = @cImport({
+    @cInclude("stdlib.h");
+});
 
 /// Test helper for capturing JSON-RPC output.
 /// Heap-allocates the GenericWriter to ensure AnyWriter context pointer remains valid.
@@ -1952,10 +1955,97 @@ const TestWriter = struct {
     }
 };
 
+const EnvVarGuard = struct {
+    name: [:0]const u8,
+    previous: ?[]u8,
+    allocator: Allocator,
+
+    pub fn set(allocator: Allocator, name: [:0]const u8, value: ?[]const u8) !EnvVarGuard {
+        var guard = EnvVarGuard{
+            .name = name,
+            .previous = null,
+            .allocator = allocator,
+        };
+
+        if (std.posix.getenv(name)) |prev| {
+            guard.previous = try allocator.dupe(u8, std.mem.sliceTo(prev, 0));
+        }
+
+        if (value) |val| {
+            const val_z = try allocator.allocSentinel(u8, val.len, 0);
+            std.mem.copyForwards(u8, val_z[0..val.len], val);
+            defer allocator.free(val_z);
+            _ = c_stdlib.setenv(name, val_z, 1);
+        } else {
+            _ = c_stdlib.unsetenv(name);
+        }
+
+        return guard;
+    }
+
+    pub fn deinit(self: *EnvVarGuard) void {
+        if (self.previous) |prev| {
+            const prev_z = self.allocator.allocSentinel(u8, prev.len, 0) catch {
+                self.allocator.free(prev);
+                _ = c_stdlib.unsetenv(self.name);
+                return;
+            };
+            std.mem.copyForwards(u8, prev_z[0..prev.len], prev);
+            _ = c_stdlib.setenv(self.name, prev_z, 1);
+            self.allocator.free(prev_z);
+            self.allocator.free(prev);
+        } else {
+            _ = c_stdlib.unsetenv(self.name);
+        }
+    }
+};
+
 test "isAutoResumeEnabled returns true by default" {
     // When BANJO_AUTO_RESUME is not set (typical case), should return true
     // The env var may or may not be set in CI, so we just verify the function works
     _ = isAutoResumeEnabled();
+}
+
+fn createFakeBinary(allocator: Allocator, dir: *std.testing.TmpDir, name: []const u8) ![]u8 {
+    var file = try dir.dir.createFile(name, .{});
+    file.close();
+    return try dir.dir.realpathAlloc(allocator, name);
+}
+
+test "detectEngines hides codex when PATH is empty and CODEX_EXECUTABLE is missing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const fake_claude = try createFakeBinary(testing.allocator, &tmp, "fake-claude");
+    defer testing.allocator.free(fake_claude);
+
+    var guard_path = try EnvVarGuard.set(testing.allocator, "PATH", "");
+    defer guard_path.deinit();
+    var guard_claude = try EnvVarGuard.set(testing.allocator, "CLAUDE_CODE_EXECUTABLE", fake_claude);
+    defer guard_claude.deinit();
+    var guard_codex = try EnvVarGuard.set(testing.allocator, "CODEX_EXECUTABLE", "codex-hidden");
+    defer guard_codex.deinit();
+
+    const availability = detectEngines();
+    try testing.expect(availability.claude);
+    try testing.expect(!availability.codex);
+}
+
+test "detectEngines hides claude when PATH is empty and CLAUDE_CODE_EXECUTABLE is missing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const fake_codex = try createFakeBinary(testing.allocator, &tmp, "fake-codex");
+    defer testing.allocator.free(fake_codex);
+
+    var guard_path = try EnvVarGuard.set(testing.allocator, "PATH", "");
+    defer guard_path.deinit();
+    var guard_codex = try EnvVarGuard.set(testing.allocator, "CODEX_EXECUTABLE", fake_codex);
+    defer guard_codex.deinit();
+    var guard_claude = try EnvVarGuard.set(testing.allocator, "CLAUDE_CODE_EXECUTABLE", "claude-hidden");
+    defer guard_claude.deinit();
+
+    const availability = detectEngines();
+    try testing.expect(!availability.claude);
+    try testing.expect(availability.codex);
 }
 
 test "Agent init/deinit" {
@@ -1991,6 +2081,62 @@ test "Agent handleRequest - initialize" {
     try testing.expectEqualStrings("2.0", parsed.value.object.get("jsonrpc").?.string);
     try testing.expect(parsed.value.object.get("result") != null);
     try testing.expectEqual(@as(i64, 1), parsed.value.object.get("id").?.integer);
+}
+
+test "Agent newSession warns when no engines are available" {
+    var guard_path = try EnvVarGuard.set(testing.allocator, "PATH", "");
+    defer guard_path.deinit();
+    var guard_claude = try EnvVarGuard.set(testing.allocator, "CLAUDE_CODE_EXECUTABLE", "claude-hidden");
+    defer guard_claude.deinit();
+    var guard_codex = try EnvVarGuard.set(testing.allocator, "CODEX_EXECUTABLE", "codex-hidden");
+    defer guard_codex.deinit();
+
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
+    defer agent.deinit();
+
+    var params = std.json.ObjectMap.init(testing.allocator);
+    defer params.deinit();
+    const request = jsonrpc.Request{
+        .method = "session/new",
+        .id = .{ .number = 1 },
+        .params = .{ .object = params },
+    };
+    try agent.handleRequest(request);
+
+    const expected = "Banjo could not find Claude Code or Codex. Install one (or set CLAUDE_CODE_EXECUTABLE/CODEX_EXECUTABLE) and restart the agent.";
+    var saw_warning = false;
+
+    var it = std.mem.splitScalar(u8, tw.getOutput(), '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = try jsonrpc.parseMessage(testing.allocator, line);
+        defer parsed.deinit();
+
+        const message = parsed.message;
+        if (message != .notification) continue;
+        const notification = message.notification;
+        if (!std.mem.eql(u8, notification.method, "session/update")) continue;
+
+        const params_val = notification.params orelse continue;
+        const parsed_update = try std.json.parseFromValue(protocol.SessionUpdate, testing.allocator, params_val, .{
+            .ignore_unknown_fields = true,
+        });
+        defer parsed_update.deinit();
+
+        const update = parsed_update.value.update;
+        if (update.sessionUpdate != .agent_message_chunk) continue;
+        const content = update.content orelse continue;
+        const text = content.text orelse continue;
+        if (std.mem.eql(u8, text, expected)) {
+            saw_warning = true;
+            break;
+        }
+    }
+
+    try testing.expect(saw_warning);
 }
 
 test "Agent handleRequest - initialize rejects wrong protocol version" {
