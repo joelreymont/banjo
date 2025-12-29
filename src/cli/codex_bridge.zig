@@ -1045,6 +1045,7 @@ fn joinStringLines(allocator: Allocator, lines: []const []const u8, sep: []const
 
 // Tests
 const testing = std.testing;
+const ohsnap = @import("ohsnap");
 
 test "CodexMessage agent message delta parsing" {
     const json =
@@ -1181,6 +1182,94 @@ test "CodexMessage item completed suppressed after agent delta" {
         return error.TestExpectedEqual;
     }
     arena_completed.deinit();
+}
+
+const LiveSnapshotError = error{
+    Timeout,
+    UnexpectedEof,
+};
+
+fn normalizeSnapshotText(allocator: Allocator, input: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var last_space = false;
+    for (input) |c| {
+        if (std.ascii.isWhitespace(c)) {
+            if (out.items.len == 0 or last_space) continue;
+            try out.append(allocator, ' ');
+            last_space = true;
+            continue;
+        }
+        last_space = false;
+        try out.append(allocator, c);
+    }
+
+    if (out.items.len > 0 and out.items[out.items.len - 1] == ' ') {
+        _ = out.pop();
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn collectCodexSnapshot(allocator: Allocator, prompt: []const u8) ![]u8 {
+    var bridge = CodexBridge.init(allocator, ".");
+    defer bridge.deinit();
+
+    try bridge.start(.{ .resume_session_id = null, .model = null });
+    defer bridge.stop();
+
+    try bridge.sendPrompt(prompt);
+
+    var text_buf: std.ArrayList(u8) = .empty;
+    defer text_buf.deinit(allocator);
+    var saw_delta = false;
+
+    const deadline = std.time.milliTimestamp() + 30_000;
+    while (true) {
+        if (std.time.milliTimestamp() > deadline) return error.Timeout;
+        var msg = (try bridge.readMessage()) orelse return error.UnexpectedEof;
+        defer msg.deinit();
+
+        switch (msg.event_type) {
+            .agent_message_delta => {
+                if (msg.getText()) |text| {
+                    saw_delta = true;
+                    try text_buf.appendSlice(allocator, text);
+                }
+            },
+            .item_completed => {
+                if (!saw_delta) {
+                    if (msg.getText()) |text| {
+                        try text_buf.appendSlice(allocator, text);
+                    }
+                }
+            },
+            .turn_completed => break,
+            else => {},
+        }
+    }
+
+    const normalized = try normalizeSnapshotText(allocator, text_buf.items);
+    defer allocator.free(normalized);
+
+    return std.fmt.allocPrint(allocator,
+        "engine: codex\ntext: {s}\n",
+        .{normalized},
+    );
+}
+
+test "snapshot: Codex live prompt" {
+    if (!CodexBridge.isAvailable()) return error.SkipZigTest;
+
+    const snapshot = try collectCodexSnapshot(testing.allocator, "Reply with exactly the single word BANJO.");
+    defer testing.allocator.free(snapshot);
+
+    try (ohsnap{}).snap(@src(),
+        \\engine: codex
+        \\text: BANJO
+        \\
+    ).diff(snapshot, true);
 }
 
 const CodexTestError = error{

@@ -587,6 +587,7 @@ pub const Bridge = struct {
 
 // Tests
 const testing = std.testing;
+const ohsnap = @import("ohsnap");
 
 test "MessageType.fromString" {
     try testing.expectEqual(MessageType.system, MessageType.fromString("system"));
@@ -675,6 +676,115 @@ test "StreamMessage tool result parsing from user message" {
     try testing.expectEqualStrings("tool_3", result.id);
     try testing.expectEqualStrings("fail", result.content.?);
     try testing.expect(result.is_error);
+}
+
+const LiveSnapshotError = error{
+    Timeout,
+    UnexpectedEof,
+};
+
+fn normalizeSnapshotText(allocator: Allocator, input: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var last_space = false;
+    for (input) |c| {
+        if (std.ascii.isWhitespace(c)) {
+            if (out.items.len == 0 or last_space) continue;
+            try out.append(allocator, ' ');
+            last_space = true;
+            continue;
+        }
+        last_space = false;
+        try out.append(allocator, c);
+    }
+
+    if (out.items.len > 0 and out.items[out.items.len - 1] == ' ') {
+        _ = out.pop();
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn collectClaudeSnapshot(allocator: Allocator, prompt: []const u8) ![]u8 {
+    var bridge = Bridge.init(allocator, ".");
+    defer bridge.deinit();
+
+    try bridge.start(.{
+        .resume_session_id = null,
+        .continue_last = false,
+        .permission_mode = "default",
+        .model = null,
+    });
+    defer bridge.stop();
+
+    try bridge.sendPrompt(prompt);
+
+    var text_buf: std.ArrayList(u8) = .empty;
+    defer text_buf.deinit(allocator);
+    var saw_delta = false;
+    var stop_reason: []const u8 = "unknown";
+    var stop_reason_buf: ?[]u8 = null;
+    defer if (stop_reason_buf) |buf| allocator.free(buf);
+    var saw_result = false;
+
+    const deadline = std.time.milliTimestamp() + 30_000;
+    while (true) {
+        if (std.time.milliTimestamp() > deadline) return error.Timeout;
+        var msg = (try bridge.readMessage()) orelse {
+            if (saw_result) break;
+            return error.UnexpectedEof;
+        };
+        defer msg.deinit();
+
+        switch (msg.type) {
+            .stream_event => {
+                if (msg.getStreamTextDelta()) |delta| {
+                    saw_delta = true;
+                    try text_buf.appendSlice(allocator, delta);
+                }
+            },
+            .assistant => {
+                if (!saw_delta) {
+                    if (msg.getContent()) |content| {
+                        try text_buf.appendSlice(allocator, content);
+                    }
+                }
+            },
+            .result => {
+                if (msg.getStopReason()) |reason| {
+                    stop_reason_buf = try allocator.dupe(u8, reason);
+                    stop_reason = stop_reason_buf.?;
+                }
+                saw_result = true;
+                break;
+            },
+            else => {},
+        }
+        if (saw_result) break;
+    }
+
+    const normalized = try normalizeSnapshotText(allocator, text_buf.items);
+    defer allocator.free(normalized);
+
+    return std.fmt.allocPrint(allocator,
+        "engine: claude\ntext: {s}\nstop_reason: {s}\n",
+        .{ normalized, stop_reason },
+    );
+}
+
+test "snapshot: Claude Code live prompt" {
+    if (!Bridge.isAvailable()) return error.SkipZigTest;
+
+    const snapshot = try collectClaudeSnapshot(testing.allocator, "Reply with exactly the single word BANJO.");
+    defer testing.allocator.free(snapshot);
+
+    try (ohsnap{}).snap(@src(),
+        \\engine: claude
+        \\text: BANJO
+        \\stop_reason: success
+        \\
+    ).diff(snapshot, true);
 }
 
 // =============================================================================
