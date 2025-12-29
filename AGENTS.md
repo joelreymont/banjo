@@ -1,105 +1,35 @@
 # Banjo - ACP Agent for Claude Code + Codex in Zig
 
-## Zig 0.15 API Changes
+## Must-Know (Zig 0.15)
 
-**MUST READ**: `docs/zig-0.15-api.md` for ArrayList, I/O, and JSON API changes.
+- Read `docs/zig-0.15-api.md` (ArrayList, I/O, JSON changes).
+- Allocator first (after self). If an arena is required, name it `arena`.
+- `ArrayList` is unmanaged; pass allocator to methods. `StringHashMap` still uses `.init(allocator)`.
+- No `std.io.getStdOut()`; use stdout writer.
+- Run `zig fmt src/` before committing.
 
-Key changes:
-- `ArrayList.init(allocator)` → `.empty`, methods take allocator
-- **JSON parsing**: Use `std.json.parseFromValue(T, allocator, value, .{})` to parse into typed structs
-- **JSON writing**: Use `std.json.Stringify` with `beginObject/objectField/write/endObject`
-- Use `std.io.Writer.Allocating` for building JSON strings
+## JSON (Required)
 
-## JSON Pattern (REQUIRED)
+- Define typed structs and parse with `std.json.parseFromValue`.
+- Avoid manual `.object.get(...)` chains.
+- Use `std.json.Stringify` (`beginObject/objectField/endObject`) and `std.io.Writer.Allocating`.
 
-**ALWAYS** define typed structs for JSON params and use `parseFromValue`:
+## String Matching (Mandatory)
 
-```zig
-// Define schema as struct
-const PromptParams = struct {
-    sessionId: []const u8,
-    prompt: ?[]const u8 = null,
-};
+- Any 2+ literal comparisons with `mem.eql`, `mem.indexOf`, or `mem.startsWith` must use a `StaticStringMap` or a loop over a pattern list.
+- Command dispatch must be a `StaticStringMap`.
 
-// Parse in handler
-const parsed = std.json.parseFromValue(PromptParams, allocator, json_value, .{}) catch {
-    // handle error
-};
-defer parsed.deinit();
-const params = parsed.value;
-// Use params.sessionId, params.prompt
-```
+## Comments
 
-**NEVER** manually extract fields with `params.object.get("field")` chains.
+- Keep comments minimal.
+- No ASCII art separators; for section headers use simple `//` line(s).
 
-## Architecture
+## State Machines
 
-```
-Zed (ACP Client)
-    ↓ JSON-RPC 2.0 over stdio
-banjo
-    ↓ spawn + stream-json
-Claude Code
-```
-
-## State Machine Pattern
-
-For complex state machines, use labeled switch with `continue :label`:
-
-```zig
-const State = enum { start, parsing, done };
-
-state: switch (State.start) {
-    .start => {
-        if (condition) continue :state .parsing;
-        continue :state .done;
-    },
-    .parsing => {
-        // process...
-        continue :state .done;
-    },
-    .done => {
-        return result;
-    },
-}
-```
-
-See `../dixie/src/compiler/parser/lexer.zig` for real example.
+- For complex state machines, use a labeled switch with `continue :state`.
 
 ## Testing
 
-### Property Tests (MANDATORY for data transformations)
-
-Use `src/util/quickcheck.zig` for property-based testing. Test invariants, not specific cases:
-
-```zig
-const quickcheck = @import("util/quickcheck.zig");
-
-test "property: addition is commutative" {
-    try quickcheck.check(struct {
-        fn prop(args: struct { a: i16, b: i16 }) bool {
-            const sum1 = @as(i32, args.a) + @as(i32, args.b);
-            const sum2 = @as(i32, args.b) + @as(i32, args.a);
-            return sum1 == sum2;
-        }
-    }.prop, .{});
-}
-```
-
-Quickcheck generates random values and shrinks failures to minimal counterexamples.
-**DO NOT** write unit tests with hardcoded values when a property test is possible.
-
-### Snapshot Tests
-
-Use ohsnap for testing complex output (JSON responses, formatted strings):
-
-```zig
-const ohsnap = @import("ohsnap");
-try ohsnap.snap(@src(), actual_output);
-```
-
-### Run Tests
-
-```bash
-zig build test
-```
+- Primary: snapshots (ohsnap) + property tests (quickcheck) with a real oracle.
+- `std.testing` only for trivial cases, error paths, or when no structured output exists.
+- Always run `zig build test` after major changes or adding tests.
