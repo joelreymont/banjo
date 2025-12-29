@@ -326,6 +326,7 @@ pub const CompletionItem = struct {
     documentation: ?MarkupContent = null,
     insertText: ?[]const u8 = null,
     sortText: ?[]const u8 = null, // Controls ordering in completion list
+    additionalTextEdits: ?[]const TextEdit = null,
 };
 
 pub const CompletionList = struct {
