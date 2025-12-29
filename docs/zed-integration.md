@@ -80,6 +80,14 @@ Press `Cmd+.` on any line to see available actions:
 | TODO/FIXME comment | Convert TODO to Banjo Note | Converts with pattern preserved |
 | Code line | Add Banjo Note | Inserts note comment above |
 
+## Backlinks (Find References)
+
+Zed does not execute LSP commands, so backlinks are exposed via **Find References**:
+
+1. Place cursor on `@banjo[ID]` or a note link `@[text](ID)`
+2. Run **Find References** (`Shift+F12`)
+3. Results list all notes that link to that ID
+
 **Keyboard-only flow:**
 ```
 F8              → jump to next note

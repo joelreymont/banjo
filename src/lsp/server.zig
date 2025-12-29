@@ -130,6 +130,7 @@ pub const Server = struct {
         .{ "textDocument/completion", handleCompletion },
         .{ "textDocument/semanticTokens/full", handleSemanticTokens },
         .{ "textDocument/definition", handleDefinition },
+        .{ "textDocument/references", handleReferences },
         .{ "workspace/executeCommand", handleExecuteCommand },
     });
 
@@ -196,6 +197,7 @@ pub const Server = struct {
                 .codeActionProvider = true,
                 .hoverProvider = true,
                 .definitionProvider = true,
+                .referencesProvider = true,
                 .completionProvider = .{
                     .triggerCharacters = &[_][]const u8{"["},
                 },
@@ -508,6 +510,75 @@ pub const Server = struct {
         } else {
             try self.transport.writeTypedResponse(request.id, @as(?protocol.Location, null));
         }
+    }
+
+    fn handleReferences(self: *Server, request: jsonrpc.Request) !void {
+        const params = if (request.params) |p| blk: {
+            const parsed = std.json.parseFromValue(
+                protocol.ReferenceParams,
+                self.allocator,
+                p,
+                .{ .ignore_unknown_fields = true },
+            ) catch {
+                try self.transport.writeTypedResponse(request.id, &[_]protocol.Location{});
+                return;
+            };
+            break :blk parsed;
+        } else {
+            try self.transport.writeTypedResponse(request.id, &[_]protocol.Location{});
+            return;
+        };
+        defer params.deinit();
+
+        const uri = params.value.textDocument.uri;
+        const line = params.value.position.line;
+        const char = params.value.position.character;
+
+        const content = self.documents.get(uri) orelse {
+            try self.transport.writeTypedResponse(request.id, &[_]protocol.Location{});
+            return;
+        };
+
+        const line_content = getLineContent(content, line) orelse {
+            try self.transport.writeTypedResponse(request.id, &[_]protocol.Location{});
+            return;
+        };
+
+        const target_id = findNoteIdAtPosition(line_content, char) orelse {
+            try self.transport.writeTypedResponse(request.id, &[_]protocol.Location{});
+            return;
+        };
+
+        const backlink_ids = self.note_index.getBacklinks(target_id) orelse {
+            try self.transport.writeTypedResponse(request.id, &[_]protocol.Location{});
+            return;
+        };
+
+        var locations: std.ArrayListUnmanaged(protocol.Location) = .empty;
+        defer locations.deinit(self.allocator);
+
+        var uris: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (uris.items) |u| self.allocator.free(u);
+            uris.deinit(self.allocator);
+        }
+
+        for (backlink_ids) |bl_id| {
+            if (self.note_index.getNote(bl_id)) |bl_note| {
+                const bl_line: u32 = if (bl_note.line > 0) bl_note.line - 1 else 0;
+                const bl_uri = try pathToUri(self.allocator, bl_note.file_path);
+                try uris.append(self.allocator, bl_uri);
+                try locations.append(self.allocator, .{
+                    .uri = bl_uri,
+                    .range = .{
+                        .start = .{ .line = bl_line, .character = 0 },
+                        .end = .{ .line = bl_line, .character = 1 },
+                    },
+                });
+            }
+        }
+
+        try self.transport.writeTypedResponse(request.id, locations.items);
     }
 
     fn handleCompletion(self: *Server, request: jsonrpc.Request) !void {

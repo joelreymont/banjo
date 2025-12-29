@@ -109,6 +109,16 @@ pub const Command = struct {
     arguments: ?[]const std.json.Value = null,
 };
 
+pub const ReferenceContext = struct {
+    includeDeclaration: bool = true,
+};
+
+pub const ReferenceParams = struct {
+    textDocument: TextDocumentIdentifier,
+    position: Position,
+    context: ReferenceContext,
+};
+
 pub const WorkspaceEdit = struct {
     documentChanges: ?[]const TextDocumentEdit = null,
 };
@@ -169,6 +179,7 @@ pub const ServerCapabilities = struct {
     diagnosticProvider: ?DiagnosticOptions = null,
     hoverProvider: ?bool = null,
     definitionProvider: ?bool = null,
+    referencesProvider: ?bool = null,
     completionProvider: ?CompletionOptions = null,
     semanticTokensProvider: ?SemanticTokensOptions = null,
 };
@@ -568,7 +579,7 @@ test "snapshot: PublishDiagnosticsParams" {
     try (ohsnap{}).snap(
         @src(),
         \\{"uri":"file:///test.zig","diagnostics":[{"range":{"start":{"line":5,"character":0},"end":{"line":5,"character":20}},"severity":3,"source":"banjo","message":"Note: important comment"}]}
-    ,
+        ,
     ).diff(json, true);
 }
 
@@ -596,6 +607,6 @@ test "snapshot: InitializeResult" {
     try (ohsnap{}).snap(
         @src(),
         \\{"capabilities":{"textDocumentSync":{"openClose":true,"change":1},"codeActionProvider":true}}
-    ,
+        ,
     ).diff(json, true);
 }
