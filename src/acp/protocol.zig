@@ -42,24 +42,17 @@ pub const AgentInfo = struct {
 
 pub const AgentCapabilities = struct {
     promptCapabilities: PromptCapabilities,
-    mcpCapabilities: ?McpCapabilities = null,
     sessionCapabilities: ?SessionCapabilities = null,
+    loadSession: bool = false,
 };
 
 pub const PromptCapabilities = struct {
     image: bool = false,
+    audio: bool = false,
     embeddedContext: bool = false,
 };
 
-pub const McpCapabilities = struct {
-    http: bool = false,
-    sse: bool = false,
-};
-
-pub const SessionCapabilities = struct {
-    fork: ?struct {} = null,
-    @"resume": ?struct {} = null,
-};
+pub const SessionCapabilities = struct {};
 
 pub const AuthMethod = struct {
     id: []const u8,
@@ -67,19 +60,105 @@ pub const AuthMethod = struct {
     description: []const u8,
 };
 
+pub const EmptyResponse = struct {};
+
+pub const AuthenticateResponse = EmptyResponse;
+
 // =============================================================================
 // Session
 // =============================================================================
 
 pub const NewSessionRequest = struct {
     cwd: []const u8,
-    mcpServers: ?std.json.Value = null,
     _meta: ?std.json.Value = null,
 };
 
 pub const NewSessionResponse = struct {
     sessionId: []const u8,
-    availableCommands: ?[]const SlashCommand = null,
+    configOptions: ?[]const ConfigOption = null,
+    models: ?SessionModelState = null,
+    modes: ?SessionModeState = null,
+};
+
+pub const ConfigOptionType = enum {
+    boolean,
+    enum_,
+};
+
+pub const ConfigOptionValue = struct {
+    boolean: ?bool = null,
+    string: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: ConfigOptionValue, jw: anytype) !void {
+        if (self.boolean) |val| {
+            try jw.write(val);
+            return;
+        }
+        if (self.string) |val| {
+            try jw.write(val);
+            return;
+        }
+        try jw.write(null);
+    }
+
+    pub fn jsonParseFromValue(
+        allocator: std.mem.Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) std.json.ParseFromValueError!ConfigOptionValue {
+        _ = allocator;
+        _ = options;
+        return switch (source) {
+            .bool => |val| .{ .boolean = val },
+            .string => |val| .{ .string = val },
+            else => error.UnexpectedToken,
+        };
+    }
+};
+
+pub const ConfigOption = struct {
+    id: []const u8,
+    name: []const u8,
+    description: ?[]const u8 = null,
+    type: ConfigOptionType,
+    default: ConfigOptionValue,
+    options: ?[]const []const u8 = null,
+
+    pub fn jsonStringify(self: ConfigOption, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.description) |val| {
+            try jw.objectField("description");
+            try jw.write(val);
+        }
+        try jw.objectField("type");
+        const type_str = switch (self.type) {
+            .boolean => "boolean",
+            .enum_ => "enum",
+        };
+        try jw.write(type_str);
+        try jw.objectField("default");
+        try self.default.jsonStringify(jw);
+        if (self.options) |val| {
+            try jw.objectField("options");
+            try jw.write(val);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const SessionModel = struct {
+    id: []const u8,
+    name: []const u8,
+    description: ?[]const u8 = null,
+};
+
+pub const SessionModelState = struct {
+    availableModels: []const SessionModel,
+    currentModelId: []const u8,
 };
 
 pub const SlashCommand = struct {
@@ -90,7 +169,6 @@ pub const SlashCommand = struct {
 pub const ResumeSessionRequest = struct {
     sessionId: []const u8,
     cwd: []const u8,
-    mcpServers: ?std.json.Value = null,
     _meta: ?std.json.Value = null,
 };
 
@@ -102,24 +180,29 @@ pub const ResumeSessionResponse = struct {
 // Prompt
 // =============================================================================
 
-pub const PromptRequest = struct {
-    sessionId: []const u8,
-    prompt: []const PromptChunk,
+pub const EmbeddedResourceResource = struct {
+    uri: []const u8,
+    text: ?[]const u8 = null,
+    blob: ?[]const u8 = null,
+    mimeType: ?[]const u8 = null,
 };
 
-pub const PromptChunk = struct {
-    type: ChunkType,
+pub const ContentBlock = struct {
+    type: []const u8,
     text: ?[]const u8 = null,
     data: ?[]const u8 = null,
     mimeType: ?[]const u8 = null,
     uri: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    title: ?[]const u8 = null,
+    size: ?i64 = null,
+    resource: ?EmbeddedResourceResource = null,
+};
 
-    pub const ChunkType = enum {
-        text,
-        image,
-        resource,
-        resource_link,
-    };
+pub const PromptRequest = struct {
+    sessionId: []const u8,
+    prompt: []const ContentBlock,
 };
 
 pub const PromptResponse = struct {
@@ -129,7 +212,9 @@ pub const PromptResponse = struct {
 pub const StopReason = enum {
     end_turn,
     cancelled,
+    max_tokens,
     max_turn_requests,
+    refusal,
 };
 
 // =============================================================================
@@ -141,25 +226,6 @@ pub const SessionUpdate = struct {
     sessionId: []const u8,
     update: Update,
 
-    /// The update payload with sessionUpdate discriminator
-    pub const Update = struct {
-        sessionUpdate: UpdateType,
-        // Content for message chunks
-        content: ?ContentChunk = null,
-        // Tool call fields
-        toolCallId: ?[]const u8 = null,
-        title: ?[]const u8 = null,
-        kind: ?ToolKind = null,
-        status: ?ToolCallStatus = null,
-        rawInput: ?std.json.Value = null,
-        // Plan fields
-        entries: ?[]const PlanEntry = null,
-        // Mode update
-        currentModeId: ?[]const u8 = null,
-        // Available commands update
-        availableCommands: ?[]const SlashCommand = null,
-    };
-
     pub const UpdateType = enum {
         agent_message_chunk,
         user_message_chunk,
@@ -169,20 +235,36 @@ pub const SessionUpdate = struct {
         plan,
         available_commands_update,
         current_mode_update,
+        current_model_update,
     };
 
-    pub const ContentChunk = struct {
-        type: []const u8 = "text",
-        text: ?[]const u8 = null,
-        data: ?[]const u8 = null,
-        mediaType: ?[]const u8 = null,
+    pub const ContentChunk = ContentBlock;
+
+    pub const ToolCallContent = struct {
+        type: []const u8,
+        content: ?ContentBlock = null,
+        terminalId: ?[]const u8 = null,
+        path: ?[]const u8 = null,
+        oldText: ?[]const u8 = null,
+        newText: ?[]const u8 = null,
+    };
+
+    pub const ToolCallLocation = struct {
+        path: []const u8,
+        line: ?u32 = null,
     };
 
     pub const ToolKind = enum {
         read,
-        write,
         edit,
-        command,
+        write,
+        delete,
+        move,
+        search,
+        execute,
+        think,
+        fetch,
+        switch_mode,
         other,
     };
 
@@ -203,6 +285,98 @@ pub const SessionUpdate = struct {
         pending,
         in_progress,
         completed,
+    };
+
+    pub fn jsonStringify(self: SessionUpdate, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("sessionId");
+        try jw.write(self.sessionId);
+        try jw.objectField("update");
+        try jw.write(self.update);
+        try jw.endObject();
+    }
+
+    pub fn jsonParseFromValue(
+        allocator: std.mem.Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) std.json.ParseFromValueError!SessionUpdate {
+        return std.json.parseFromValue(SessionUpdate, allocator, source, options);
+    }
+
+    pub const Update = struct {
+        sessionUpdate: UpdateType,
+        content: ?ContentChunk = null,
+        toolContent: ?[]const ToolCallContent = null,
+        toolCallId: ?[]const u8 = null,
+        title: ?[]const u8 = null,
+        kind: ?ToolKind = null,
+        status: ?ToolCallStatus = null,
+        rawInput: ?std.json.Value = null,
+        rawOutput: ?std.json.Value = null,
+        locations: ?[]const ToolCallLocation = null,
+        entries: ?[]const PlanEntry = null,
+        currentModeId: ?[]const u8 = null,
+        currentModelId: ?[]const u8 = null,
+        availableCommands: ?[]const SlashCommand = null,
+
+        pub fn jsonStringify(self: Update, jw: anytype) !void {
+            try jw.beginObject();
+            try jw.objectField("sessionUpdate");
+            try jw.write(self.sessionUpdate);
+            if (self.content) |val| {
+                try jw.objectField("content");
+                try jw.write(val);
+            } else if (self.toolContent) |val| {
+                try jw.objectField("content");
+                try jw.write(val);
+            }
+            if (self.toolCallId) |val| {
+                try jw.objectField("toolCallId");
+                try jw.write(val);
+            }
+            if (self.title) |val| {
+                try jw.objectField("title");
+                try jw.write(val);
+            }
+            if (self.kind) |val| {
+                try jw.objectField("kind");
+                try jw.write(val);
+            }
+            if (self.status) |val| {
+                try jw.objectField("status");
+                try jw.write(val);
+            }
+            if (self.rawInput) |val| {
+                try jw.objectField("rawInput");
+                try val.jsonStringify(jw);
+            }
+            if (self.rawOutput) |val| {
+                try jw.objectField("rawOutput");
+                try val.jsonStringify(jw);
+            }
+            if (self.locations) |val| {
+                try jw.objectField("locations");
+                try jw.write(val);
+            }
+            if (self.entries) |val| {
+                try jw.objectField("entries");
+                try jw.write(val);
+            }
+            if (self.currentModeId) |val| {
+                try jw.objectField("currentModeId");
+                try jw.write(val);
+            }
+            if (self.currentModelId) |val| {
+                try jw.objectField("currentModelId");
+                try jw.write(val);
+            }
+            if (self.availableCommands) |val| {
+                try jw.objectField("availableCommands");
+                try jw.write(val);
+            }
+            try jw.endObject();
+        }
     };
 
     // Convenience constructors
@@ -230,6 +404,17 @@ pub const SessionUpdate = struct {
     }
 };
 
+pub const ToolCallUpdate = struct {
+    toolCallId: []const u8,
+    title: ?[]const u8 = null,
+    kind: ?SessionUpdate.ToolKind = null,
+    status: ?SessionUpdate.ToolCallStatus = null,
+    rawInput: ?std.json.Value = null,
+    rawOutput: ?std.json.Value = null,
+    content: ?[]const SessionUpdate.ToolCallContent = null,
+    locations: ?[]const SessionUpdate.ToolCallLocation = null,
+};
+
 // =============================================================================
 // Cancel
 // =============================================================================
@@ -244,22 +429,21 @@ pub const CancelNotification = struct {
 
 pub const PermissionRequest = struct {
     sessionId: []const u8,
-    toolName: []const u8,
-    toolInput: std.json.Value,
-    interrupt: bool = false,
+    toolCall: ToolCallUpdate,
     options: []const PermissionOption,
 };
 
 pub const PermissionOption = struct {
-    kind: PermissionKind,
+    kind: PermissionOptionKind,
     name: []const u8,
     optionId: []const u8,
 };
 
-pub const PermissionKind = enum {
+pub const PermissionOptionKind = enum {
     allow_once,
-    allow_session,
-    deny,
+    allow_always,
+    reject_once,
+    reject_always,
 };
 
 pub const PermissionResponse = struct {
@@ -267,13 +451,12 @@ pub const PermissionResponse = struct {
 };
 
 pub const PermissionOutcome = struct {
-    outcome: OutcomeKind,
+    outcome: PermissionOutcomeKind,
     optionId: ?[]const u8 = null,
 };
 
-pub const OutcomeKind = enum {
-    allowed,
-    denied,
+pub const PermissionOutcomeKind = enum {
+    selected,
     cancelled,
 };
 
@@ -282,7 +465,10 @@ pub const OutcomeKind = enum {
 // =============================================================================
 
 pub const ReadTextFileRequest = struct {
+    sessionId: []const u8,
     path: []const u8,
+    line: ?u32 = null,
+    limit: ?u32 = null,
 };
 
 pub const ReadTextFileResponse = struct {
@@ -290,6 +476,7 @@ pub const ReadTextFileResponse = struct {
 };
 
 pub const WriteTextFileRequest = struct {
+    sessionId: []const u8,
     path: []const u8,
     content: []const u8,
 };
@@ -301,8 +488,12 @@ pub const WriteTextFileResponse = struct {};
 // =============================================================================
 
 pub const CreateTerminalRequest = struct {
+    sessionId: []const u8,
     command: []const u8,
+    args: ?[]const []const u8 = null,
+    env: ?[]const EnvVariable = null,
     cwd: ?[]const u8 = null,
+    outputByteLimit: ?u64 = null,
 };
 
 pub const CreateTerminalResponse = struct {
@@ -310,20 +501,59 @@ pub const CreateTerminalResponse = struct {
 };
 
 pub const TerminalOutputRequest = struct {
+    sessionId: []const u8,
     terminalId: []const u8,
 };
 
 pub const TerminalOutputResponse = struct {
     output: []const u8,
-    exitCode: ?i32 = null,
+    exitStatus: ?TerminalExitStatus = null,
+    truncated: bool = false,
+};
+
+pub const TerminalExitStatus = struct {
+    exitCode: ?u32 = null,
+    signal: ?[]const u8 = null,
+};
+
+pub const WaitForTerminalExitRequest = struct {
+    sessionId: []const u8,
+    terminalId: []const u8,
+};
+
+pub const WaitForTerminalExitResponse = struct {
+    exitCode: ?u32 = null,
+    signal: ?[]const u8 = null,
 };
 
 pub const TerminalKillRequest = struct {
+    sessionId: []const u8,
     terminalId: []const u8,
 };
 
 pub const TerminalReleaseRequest = struct {
+    sessionId: []const u8,
     terminalId: []const u8,
+};
+
+pub const EnvVariable = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+// =============================================================================
+// Session Modes
+// =============================================================================
+
+pub const SessionMode = struct {
+    id: []const u8,
+    name: []const u8,
+    description: ?[]const u8 = null,
+};
+
+pub const SessionModeState = struct {
+    availableModes: []const SessionMode,
+    currentModeId: []const u8,
 };
 
 // =============================================================================
@@ -332,8 +562,33 @@ pub const TerminalReleaseRequest = struct {
 
 pub const SetModeRequest = struct {
     sessionId: []const u8,
-    mode: PermissionMode,
+    modeId: []const u8,
 };
+
+pub const SetModeResponse = EmptyResponse;
+
+// =============================================================================
+// Set Model
+// =============================================================================
+
+pub const SetModelRequest = struct {
+    sessionId: []const u8,
+    modelId: []const u8,
+};
+
+pub const SetModelResponse = EmptyResponse;
+
+// =============================================================================
+// Set Config
+// =============================================================================
+
+pub const SetConfigRequest = struct {
+    sessionId: []const u8,
+    configId: []const u8,
+    value: ConfigOptionValue,
+};
+
+pub const SetConfigResponse = EmptyResponse;
 
 pub const PermissionMode = enum {
     default,

@@ -3,16 +3,17 @@
 ## Must-Know (Zig 0.15)
 
 - Read `docs/zig-0.15-api.md` (ArrayList, I/O, JSON changes).
-- Allocator first (after self). If an arena is required, name it `arena`.
+- Allocator MUST be the first parameter (after self). If an arena allocator is used, the first parameter MUST be named `arena`.
 - `ArrayList` is unmanaged; pass allocator to methods. `StringHashMap` still uses `.init(allocator)`.
 - No `std.io.getStdOut()`; use stdout writer.
 - Run `zig fmt src/` before committing.
 
 ## JSON (Required)
 
-- Define typed structs and parse with `std.json.parseFromValue`.
-- Avoid manual `.object.get(...)` chains.
-- Use `std.json.Stringify` (`beginObject/objectField/endObject`) and `std.io.Writer.Allocating`.
+- ALWAYS use typed structs for JSON parsing and serialization.
+- NO manual `.object.get(...)` chains or ad-hoc `std.json.Value` construction for ACP/CLI payloads.
+- `std.json.Value` is only acceptable for raw passthrough fields (`rawInput`, `rawOutput`, `_meta`).
+- Use `std.json.parseFromValue` and `writer.writeTypedResponse` / `writer.writeTypedNotification`.
 
 ## String Matching (Mandatory)
 

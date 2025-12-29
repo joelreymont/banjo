@@ -5,6 +5,7 @@ const protocol = @import("protocol.zig");
 const diagnostics = @import("diagnostics.zig");
 const comments = @import("../notes/comments.zig");
 const jsonrpc = @import("../jsonrpc.zig");
+const summary = @import("summary.zig");
 
 const log = std.log.scoped(.lsp);
 
@@ -96,6 +97,9 @@ pub const Server = struct {
             const elapsed = now - entry.value_ptr.*;
             // Flush if debounce exceeded OR if clock went backwards (NTP, suspend, etc.)
             if (elapsed >= DEBOUNCE_NS or elapsed < 0) {
+                if (elapsed < 0) {
+                    log.warn("Diagnostics clock skew detected (elapsed {d}ns)", .{elapsed});
+                }
                 const uri = entry.key_ptr.*;
                 if (self.documents.get(uri)) |content| {
                     try self.publishDiagnostics(uri, content);
@@ -225,7 +229,10 @@ pub const Server = struct {
                 self.allocator,
                 p,
                 .{ .ignore_unknown_fields = true },
-            ) catch return;
+            ) catch |err| {
+                log.warn("DidOpen parse failed: {}", .{err});
+                return;
+            };
             break :blk parsed;
         } else return;
         defer params.deinit();
@@ -239,14 +246,13 @@ pub const Server = struct {
         const text_copy = try self.allocator.dupe(u8, text);
         errdefer self.allocator.free(text_copy);
 
-        // Remove old entry if exists
-        if (self.documents.fetchRemove(uri)) |old| {
-            _ = self.pending_diagnostics.remove(uri);
-            self.allocator.free(old.key);
-            self.allocator.free(old.value);
+        const put_result = try self.documents.getOrPut(uri_copy);
+        if (put_result.found_existing) {
+            self.allocator.free(uri_copy);
+            _ = self.pending_diagnostics.remove(put_result.key_ptr.*);
+            self.allocator.free(put_result.value_ptr.*);
         }
-
-        try self.documents.put(uri_copy, text_copy);
+        put_result.value_ptr.* = text_copy;
 
         // Rebuild index and publish diagnostics
         try self.rebuildIndex();
@@ -260,7 +266,10 @@ pub const Server = struct {
                 self.allocator,
                 p,
                 .{ .ignore_unknown_fields = true },
-            ) catch return;
+            ) catch |err| {
+                log.warn("DidChange parse failed: {}", .{err});
+                return;
+            };
             break :blk parsed;
         } else return;
         defer params.deinit();
@@ -275,17 +284,17 @@ pub const Server = struct {
                 _ = self.pending_diagnostics.remove(uri);
                 self.allocator.free(old.key);
                 self.allocator.free(old.value);
-
-                const uri_copy = try self.allocator.dupe(u8, uri);
-                errdefer self.allocator.free(uri_copy);
-                const text_copy = try self.allocator.dupe(u8, new_text);
-                errdefer self.allocator.free(text_copy);
-
-                try self.documents.put(uri_copy, text_copy);
-
-                // Schedule diagnostics with debouncing
-                try self.scheduleDiagnostics(uri_copy);
             }
+
+            const uri_copy = try self.allocator.dupe(u8, uri);
+            errdefer self.allocator.free(uri_copy);
+            const text_copy = try self.allocator.dupe(u8, new_text);
+            errdefer self.allocator.free(text_copy);
+
+            try self.documents.put(uri_copy, text_copy);
+
+            // Schedule diagnostics with debouncing
+            try self.scheduleDiagnostics(uri_copy);
         }
     }
 
@@ -398,7 +407,8 @@ pub const Server = struct {
                 if (self.note_index.getNote(bl_id)) |bl_note| {
                     const filename = std.fs.path.basename(bl_note.file_path);
                     try hover_content.writer.print("\n**{s}** (line {d}):\n", .{ filename, bl_note.line });
-                    try hover_content.writer.print("> {s}\n", .{getSummary(bl_note.content)});
+                    const bl_summary = summary.getSummary(bl_note.content, .{ .max_len = 40, .prefer_word_boundary = true });
+                    try hover_content.writer.print("> {s}\n", .{bl_summary});
 
                     // Show context from file if available
                     const bl_uri = pathToUri(self.allocator, bl_note.file_path) catch null;
@@ -527,9 +537,16 @@ pub const Server = struct {
         };
 
         // Trigger on @[ for note links
-        const prefix = if (char >= 2 and char <= line_content.len) line_content[char - 2 .. char] else "";
+        const line_len_u32 = std.math.cast(u32, line_content.len) orelse {
+            try self.transport.writeTypedResponse(request.id, protocol.CompletionList{ .items = &.{} });
+            return;
+        };
+        const prefix = if (char >= 2 and char <= line_len_u32) blk: {
+            const char_idx: usize = @as(usize, @intCast(char));
+            break :blk line_content[char_idx - 2 .. char_idx];
+        } else "";
         log.info("completion check: char={d}, prefix='{s}'", .{ char, prefix });
-        if (!mem.eql(u8, prefix, "@[")) {
+        if (!mem.eql(u8, prefix, comments.link_prefix)) {
             try self.transport.writeTypedResponse(request.id, protocol.CompletionList{ .items = &.{} });
             return;
         }
@@ -549,53 +566,56 @@ pub const Server = struct {
         // Get current file path from URI
         const current_path = uriToPath(uri) orelse uri;
 
-        // First: notes from current file (highest priority)
+        const NoteEntry = struct {
+            id: []const u8,
+            info: diagnostics.NoteIndex.NoteInfo,
+        };
+
+        var current_notes: std.ArrayListUnmanaged(NoteEntry) = .empty;
+        var other_notes: std.ArrayListUnmanaged(NoteEntry) = .empty;
+        defer current_notes.deinit(self.allocator);
+        defer other_notes.deinit(self.allocator);
+
         var it = self.note_index.notes.iterator();
         while (it.next()) |entry| {
-            const note_id = entry.key_ptr.*;
-            const note_info = entry.value_ptr.*;
-
-            if (mem.eql(u8, note_info.file_path, current_path)) {
-                const summary = getSummary(note_info.content);
-                const detail = try std.fmt.allocPrint(self.allocator, "line {d}", .{note_info.line});
-                try allocated_strings.append(self.allocator, detail);
-                const insertText = try std.fmt.allocPrint(self.allocator, "{s}]({s})", .{ summary, note_id });
-                try allocated_strings.append(self.allocator, insertText);
-                const sortText = try std.fmt.allocPrint(self.allocator, "0{s}", .{note_id});
-                try allocated_strings.append(self.allocator, sortText);
-                try items.append(self.allocator, .{
-                    .label = summary,
-                    .kind = 6, // Variable
-                    .detail = detail,
-                    .insertText = insertText,
-                    .sortText = sortText,
-                });
+            const note_view = NoteEntry{
+                .id = entry.key_ptr.*,
+                .info = entry.value_ptr.*,
+            };
+            if (mem.eql(u8, note_view.info.file_path, current_path)) {
+                try current_notes.append(self.allocator, note_view);
+            } else {
+                try other_notes.append(self.allocator, note_view);
             }
         }
 
-        // Second: notes from other open files
-        it = self.note_index.notes.iterator();
-        while (it.next()) |entry| {
-            const note_id = entry.key_ptr.*;
-            const note_info = entry.value_ptr.*;
+        for (current_notes.items) |note_view| {
+            const detail = try std.fmt.allocPrint(self.allocator, "line {d}", .{note_view.info.line});
+            try allocated_strings.append(self.allocator, detail);
+            try appendNoteCompletion(
+                self.allocator,
+                &items,
+                &allocated_strings,
+                note_view.id,
+                note_view.info,
+                detail,
+                "0",
+            );
+        }
 
-            if (!mem.eql(u8, note_info.file_path, current_path)) {
-                const filename = std.fs.path.basename(note_info.file_path);
-                const summary = getSummary(note_info.content);
-                const detail = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ filename, note_info.line });
-                try allocated_strings.append(self.allocator, detail);
-                const insertText = try std.fmt.allocPrint(self.allocator, "{s}]({s})", .{ summary, note_id });
-                try allocated_strings.append(self.allocator, insertText);
-                const sortText = try std.fmt.allocPrint(self.allocator, "1{s}", .{note_id});
-                try allocated_strings.append(self.allocator, sortText);
-                try items.append(self.allocator, .{
-                    .label = summary,
-                    .kind = 6, // Variable
-                    .detail = detail,
-                    .insertText = insertText,
-                    .sortText = sortText,
-                });
-            }
+        for (other_notes.items) |note_view| {
+            const filename = std.fs.path.basename(note_view.info.file_path);
+            const detail = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ filename, note_view.info.line });
+            try allocated_strings.append(self.allocator, detail);
+            try appendNoteCompletion(
+                self.allocator,
+                &items,
+                &allocated_strings,
+                note_view.id,
+                note_view.info,
+                detail,
+                "1",
+            );
         }
 
         try self.transport.writeTypedResponse(request.id, protocol.CompletionList{
@@ -646,9 +666,12 @@ pub const Server = struct {
                 if (mem.indexOf(u8, line_content, "@banjo[")) |marker_start| {
                     if (mem.indexOfPos(u8, line_content, marker_start + 7, "]")) |id_end| {
                         const delta_line = line_num - prev_line;
-                        const start_char: u32 = @intCast(marker_start);
+                        const start_char = castU32(marker_start) orelse {
+                            prev_line = line_num;
+                            continue;
+                        };
                         const delta_char = if (delta_line == 0) start_char - prev_char else start_char;
-                        const length: u32 = @intCast(id_end + 1 - marker_start);
+                        const length = castU32(id_end + 1 - marker_start) orelse continue;
 
                         try tokens.appendSlice(self.allocator, &[_]u32{
                             delta_line, delta_char, length, 0, 0,
@@ -662,7 +685,7 @@ pub const Server = struct {
                 // Find all @[text](id) patterns
                 var search_pos: usize = 0;
                 while (search_pos < line_content.len) {
-                    const link_start = mem.indexOfPos(u8, line_content, search_pos, "@[") orelse break;
+                    const link_start = mem.indexOfPos(u8, line_content, search_pos, comments.link_prefix) orelse break;
                     const mid = mem.indexOfPos(u8, line_content, link_start + 2, "](") orelse {
                         search_pos = link_start + 2;
                         continue;
@@ -673,9 +696,16 @@ pub const Server = struct {
                     };
 
                     const delta_line = line_num - prev_line;
-                    const start_char: u32 = @intCast(link_start);
+                    const start_char = castU32(link_start) orelse {
+                        prev_line = line_num;
+                        search_pos = link_end + 1;
+                        continue;
+                    };
                     const delta_char = if (delta_line == 0) start_char - prev_char else start_char;
-                    const length: u32 = @intCast(link_end + 1 - link_start);
+                    const length = castU32(link_end + 1 - link_start) orelse {
+                        search_pos = link_end + 1;
+                        continue;
+                    };
 
                     try tokens.appendSlice(self.allocator, &[_]u32{
                         delta_line, delta_char, length, 1, 0,
@@ -873,7 +903,7 @@ pub const Server = struct {
         if (args.len < 2) return;
 
         const uri = if (args[0] == .string) args[0].string else return;
-        const line: u32 = if (args[1] == .integer) @intCast(args[1].integer) else return;
+        const line = if (args[1] == .integer) castU32FromI64(args[1].integer) orelse return else return;
         const is_comment = if (args.len > 2 and args[2] == .bool) args[2].bool else true;
 
         const content = self.documents.get(uri) orelse return;
@@ -1099,11 +1129,13 @@ pub const Server = struct {
         }
     }
 
+    // line is 1-based (note metadata), convert to 0-based for LSP content.
     fn findNoteAtLine(self: *Server, content: []const u8, line: u32) ?comments.ParsedNote {
         return comments.parseNoteLine(self.allocator, getLineContent(content, line - 1) orelse return null, line) catch null;
     }
 };
 
+// line is 0-based (LSP positions).
 fn getLineContent(content: []const u8, line: u32) ?[]const u8 {
     var current_line: u32 = 0;
     var start: usize = 0;
@@ -1148,30 +1180,11 @@ fn isCommentLine(content: []const u8, line: u32) bool {
     return false;
 }
 
-fn getSummary(text: []const u8) []const u8 {
-    // Find first line
-    var end: usize = text.len;
-    for (text, 0..) |c, i| {
-        if (c == '\n') {
-            end = i;
-            break;
-        }
-    }
-
-    // If short enough, return as-is
-    if (end <= 40) return text[0..end];
-
-    // Find last space before position 40 to avoid splitting words
-    var split: usize = 40;
-    while (split > 0 and text[split] != ' ') : (split -= 1) {}
-    return if (split > 0) text[0..split] else text[0..40];
-}
-
 /// Find note ID at cursor position. Handles:
 /// - @banjo[id] - returns id
 /// - @[text](id) - returns id
 fn findNoteIdAtPosition(line: []const u8, char: u32) ?[]const u8 {
-    const pos: usize = @intCast(char);
+    const pos = std.math.cast(usize, char) orelse return null;
 
     // Check for @banjo[id] patterns - find all of them
     var banjo_pos: usize = 0;
@@ -1190,7 +1203,7 @@ fn findNoteIdAtPosition(line: []const u8, char: u32) ?[]const u8 {
     // Check for @[text](id) link patterns - find all of them
     var search_pos: usize = 0;
     while (search_pos < line.len) {
-        const link_start = mem.indexOfPos(u8, line, search_pos, "@[") orelse break;
+        const link_start = mem.indexOfPos(u8, line, search_pos, comments.link_prefix) orelse break;
         const mid = mem.indexOfPos(u8, line, link_start + 2, "](") orelse {
             search_pos = link_start + 2;
             continue;
@@ -1241,6 +1254,37 @@ fn hasTodoPattern(line: []const u8) ?[]const u8 {
     return null;
 }
 
+fn castU32(value: usize) ?u32 {
+    return std.math.cast(u32, value);
+}
+
+fn castU32FromI64(value: i64) ?u32 {
+    return std.math.cast(u32, value);
+}
+
+fn appendNoteCompletion(
+    allocator: Allocator,
+    items: *std.ArrayListUnmanaged(protocol.CompletionItem),
+    allocated_strings: *std.ArrayListUnmanaged([]const u8),
+    note_id: []const u8,
+    note_info: diagnostics.NoteIndex.NoteInfo,
+    detail: []const u8,
+    sort_prefix: []const u8,
+) !void {
+    const summary_text = summary.getSummary(note_info.content, .{ .max_len = 40, .prefer_word_boundary = true });
+    const insertText = try std.fmt.allocPrint(allocator, "{s}]({s})", .{ summary_text, note_id });
+    try allocated_strings.append(allocator, insertText);
+    const sortText = try std.fmt.allocPrint(allocator, "{s}{s}", .{ sort_prefix, note_id });
+    try allocated_strings.append(allocator, sortText);
+    try items.append(allocator, .{
+        .label = summary_text,
+        .kind = 6, // Variable
+        .detail = detail,
+        .insertText = insertText,
+        .sortText = sortText,
+    });
+}
+
 const LineContext = struct {
     before: []const u8,
     current: []const u8,
@@ -1257,24 +1301,28 @@ fn getLineContext(content: []const u8, line_num: u32, context_lines: u32) LineCo
     var after_start: usize = 0;
     var after_end: usize = 0;
     var pos: usize = 0;
+    const before_target = line_num -| context_lines;
+    const prev_line = line_num -| 1;
+    const next_line = line_num +| 1;
+    const after_target = line_num +| context_lines;
 
     while (lines_iter.next()) |line| {
         const next_pos = pos + line.len + 1;
 
-        if (current_line == line_num -| context_lines and line_num > context_lines) {
+        if (current_line == before_target and line_num > context_lines) {
             before_start = pos;
         }
-        if (current_line == line_num - 1) {
+        if (current_line == prev_line) {
             before_end = pos + line.len;
         }
         if (current_line == line_num) {
             line_start = pos;
             line_end = pos + line.len;
         }
-        if (current_line == line_num + 1) {
+        if (current_line == next_line) {
             after_start = pos;
         }
-        if (current_line == line_num + context_lines) {
+        if (current_line == after_target) {
             after_end = pos + line.len;
         }
 

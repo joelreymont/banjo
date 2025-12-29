@@ -24,7 +24,6 @@ claude -p \
 | `--permission-mode <mode>` | Set perm mode |
 | `--allowedTools <tools>` | Whitelist tools |
 | `--disallowedTools <tools>` | Blacklist tools |
-| `--mcp-config <json>` | MCP servers |
 | `-c, --continue` | Continue last session |
 | `-r, --resume <id>` | Resume by session ID |
 

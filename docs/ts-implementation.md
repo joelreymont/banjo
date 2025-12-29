@@ -19,7 +19,6 @@ Anthropic API
 | File | LOC | Purpose |
 |------|-----|---------|
 | `acp-agent.ts` | 839 | Main agent, session mgmt |
-| `mcp-server.ts` | 806 | Tool implementations |
 | `tools.ts` | 697 | Tool conversion, hooks |
 | `settings.ts` | 523 | Permission management |
 | `utils.ts` | 172 | Streams, helpers |
@@ -106,7 +105,7 @@ Tools registered via MCP server:
 - Read, Write, Edit (file ops)
 - Bash, BashOutput, KillShell (terminal)
 
-When client has capability (e.g., `fs.readTextFile`), tool delegates to client instead of local fs.
+When client has capability (e.g., `fs/read_text_file`), tool delegates to client instead of local fs.
 
 ## What's NOT Supported
 

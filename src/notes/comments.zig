@@ -2,6 +2,8 @@ const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 
+pub const link_prefix = "@[";
+
 /// Parsed note from a comment
 pub const ParsedNote = struct {
     id: []const u8,
@@ -81,7 +83,7 @@ fn parseLinks(allocator: Allocator, content: []const u8) ![]const []const u8 {
     var pos: usize = 0;
     while (pos < content.len) {
         // Find @[
-        const link_start = mem.indexOfPos(u8, content, pos, "@[") orelse break;
+        const link_start = mem.indexOfPos(u8, content, pos, link_prefix) orelse break;
         // Find ](
         const mid = mem.indexOfPos(u8, content, link_start + 2, "](") orelse {
             pos = link_start + 2;
@@ -139,13 +141,15 @@ pub fn scanFileForNotes(allocator: Allocator, content: []const u8) ![]ParsedNote
 /// Generate a new unique note ID
 pub fn generateNoteId() [12]u8 {
     // Combine timestamp (8 chars) + crypto random (4 chars) to avoid collisions
-    const timestamp = std.time.milliTimestamp();
+    const timestamp_ms = std.time.milliTimestamp();
+    const timestamp_u64: u64 = if (timestamp_ms < 0) 0 else @intCast(timestamp_ms);
+    const timestamp_low: u32 = @truncate(timestamp_u64); // compact ID; low bits are sufficient for uniqueness
     var random_bytes: [2]u8 = undefined;
     std.crypto.random.bytes(&random_bytes);
     const random = std.mem.readInt(u16, &random_bytes, .little);
     var buf: [12]u8 = undefined;
     _ = std.fmt.bufPrint(&buf, "{x:0>8}{x:0>4}", .{
-        @as(u32, @truncate(@as(u64, @intCast(timestamp)))),
+        timestamp_low,
         random,
     }) catch unreachable;
     return buf;
@@ -171,13 +175,13 @@ pub fn insertAtLine(allocator: Allocator, file_path: []const u8, line_num: u32, 
     // Line 0 is invalid (lines are 1-indexed)
     if (line_num == 0) return error.LineOutOfBounds;
 
-    // Verify path is still canonical (TOCTOU mitigation)
+    // Resolve to a canonical path and use it for the actual file open.
     const real_path = std.fs.cwd().realpathAlloc(allocator, file_path) catch return error.FileNotFound;
     defer allocator.free(real_path);
     if (!std.mem.eql(u8, real_path, file_path)) return error.PathChanged;
 
     // Read file
-    const file = std.fs.openFileAbsolute(file_path, .{ .mode = .read_only }) catch return error.FileNotFound;
+    const file = std.fs.openFileAbsolute(real_path, .{ .mode = .read_only }) catch return error.FileNotFound;
     const content = try file.readToEndAlloc(allocator, 10 * 1024 * 1024);
     file.close();
     defer allocator.free(content);

@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_utils = @import("cli/io_utils.zig");
 const Allocator = std.mem.Allocator;
 
 /// JSON-RPC 2.0 Request
@@ -225,6 +226,64 @@ pub fn serializeResponse(allocator: Allocator, response: Response) ![]u8 {
     return out.toOwnedSlice();
 }
 
+pub fn serializeTypedResponse(
+    allocator: Allocator,
+    id: ?Request.Id,
+    result: anytype,
+    options: std.json.Stringify.Options,
+) ![]u8 {
+    var out: std.io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var jw: std.json.Stringify = .{
+        .writer = &out.writer,
+        .options = options,
+    };
+
+    try jw.beginObject();
+    try jw.objectField("jsonrpc");
+    try jw.write("2.0");
+    try jw.objectField("result");
+    try jw.write(result);
+    try jw.objectField("id");
+    if (id) |i| {
+        switch (i) {
+            .string => |s| try jw.write(s),
+            .number => |n| try jw.write(n),
+            .null => try jw.write(null),
+        }
+    } else {
+        try jw.write(null);
+    }
+    try jw.endObject();
+
+    return try out.toOwnedSlice();
+}
+
+pub fn serializeTypedNotification(
+    allocator: Allocator,
+    method: []const u8,
+    params: anytype,
+    options: std.json.Stringify.Options,
+) ![]u8 {
+    var out: std.io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var jw: std.json.Stringify = .{
+        .writer = &out.writer,
+        .options = options,
+    };
+
+    try jw.beginObject();
+    try jw.objectField("jsonrpc");
+    try jw.write("2.0");
+    try jw.objectField("method");
+    try jw.write(method);
+    try jw.objectField("params");
+    try jw.write(params);
+    try jw.endObject();
+
+    return try out.toOwnedSlice();
+}
+
 /// Serialize a notification to JSON using std.json.Stringify
 pub fn serializeNotification(allocator: Allocator, notification: Notification) ![]u8 {
     var out: std.io.Writer.Allocating = .init(allocator);
@@ -281,12 +340,23 @@ pub const Reader = struct {
     stream: std.io.AnyReader,
     allocator: Allocator,
     buffer: std.ArrayList(u8),
+    fd: ?std.posix.fd_t = null,
 
     pub fn init(allocator: Allocator, stream: std.io.AnyReader) Reader {
         return .{
             .stream = stream,
             .allocator = allocator,
             .buffer = .empty,
+            .fd = null,
+        };
+    }
+
+    pub fn initWithFd(allocator: Allocator, stream: std.io.AnyReader, fd: std.posix.fd_t) Reader {
+        return .{
+            .stream = stream,
+            .allocator = allocator,
+            .buffer = .empty,
+            .fd = fd,
         };
     }
 
@@ -339,6 +409,37 @@ pub const Reader = struct {
 
         return try parseMessage(self.allocator, self.buffer.items);
     }
+
+    /// Read the next JSON-RPC message with a deadline (milliseconds since epoch).
+    pub fn nextMessageWithTimeout(self: *Reader, deadline_ms: i64) !?ParsedMessage {
+        if (self.fd == null) {
+            return self.nextMessage();
+        }
+        self.buffer.clearRetainingCapacity();
+
+        while (true) {
+            const now = std.time.milliTimestamp();
+            if (now >= deadline_ms) return error.Timeout;
+            const timeout_ms = io_utils.pollSliceMs(deadline_ms, now);
+            const ready = try io_utils.waitForReadable(self.fd.?, timeout_ms);
+            if (!ready) continue;
+
+            const byte = self.stream.readByte() catch |e| switch (e) {
+                error.EndOfStream => {
+                    if (self.buffer.items.len == 0) return null;
+                    break;
+                },
+                else => return e,
+            };
+
+            if (byte == '\n') break;
+            try self.buffer.append(self.allocator, byte);
+        }
+
+        if (self.buffer.items.len == 0) return null;
+
+        return try parseMessage(self.allocator, self.buffer.items);
+    }
 };
 
 /// JSON-RPC message writer - writes newline-delimited JSON to a stream
@@ -362,28 +463,7 @@ pub const Writer = struct {
 
     /// Write a response with a typed result (avoids Value intermediary)
     pub fn writeTypedResponse(self: *Writer, id: ?Request.Id, result: anytype) !void {
-        var out: std.io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        var jw: std.json.Stringify = .{ .writer = &out.writer };
-
-        try jw.beginObject();
-        try jw.objectField("jsonrpc");
-        try jw.write("2.0");
-        try jw.objectField("result");
-        try jw.write(result);
-        try jw.objectField("id");
-        if (id) |i| {
-            switch (i) {
-                .string => |s| try jw.write(s),
-                .number => |n| try jw.write(n),
-                .null => try jw.write(null),
-            }
-        } else {
-            try jw.write(null);
-        }
-        try jw.endObject();
-
-        const json = try out.toOwnedSlice();
+        const json = try serializeTypedResponse(self.allocator, id, result, .{});
         defer self.allocator.free(json);
         try self.stream.writeAll(json);
         try self.stream.writeByte('\n');
@@ -398,23 +478,12 @@ pub const Writer = struct {
 
     /// Write a notification with typed params (avoids Value intermediary)
     pub fn writeTypedNotification(self: *Writer, method: []const u8, params: anytype) !void {
-        var out: std.io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        var jw: std.json.Stringify = .{
-            .writer = &out.writer,
-            .options = .{ .emit_null_optional_fields = false },
-        };
-
-        try jw.beginObject();
-        try jw.objectField("jsonrpc");
-        try jw.write("2.0");
-        try jw.objectField("method");
-        try jw.write(method);
-        try jw.objectField("params");
-        try jw.write(params);
-        try jw.endObject();
-
-        const json = try out.toOwnedSlice();
+        const json = try serializeTypedNotification(
+            self.allocator,
+            method,
+            params,
+            .{ .emit_null_optional_fields = false },
+        );
         defer self.allocator.free(json);
         try self.stream.writeAll(json);
         try self.stream.writeByte('\n');
@@ -432,7 +501,10 @@ pub const Writer = struct {
     pub fn writeTypedRequest(self: *Writer, id: Request.Id, method: []const u8, params: anytype) !void {
         var out: std.io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
-        var jw: std.json.Stringify = .{ .writer = &out.writer };
+        var jw: std.json.Stringify = .{
+            .writer = &out.writer,
+            .options = .{ .emit_null_optional_fields = false },
+        };
 
         try jw.beginObject();
         try jw.objectField("jsonrpc");
@@ -487,6 +559,19 @@ test "parse notification (no id)" {
     defer parsed.deinit();
     try testing.expectEqualStrings("notify", parsed.request.method);
     try testing.expect(parsed.request.isNotification());
+}
+
+test "Reader nextMessageWithTimeout returns timeout" {
+    const fds = try std.posix.pipe();
+    defer std.posix.close(fds[0]);
+    defer std.posix.close(fds[1]);
+
+    const file = std.fs.File{ .handle = fds[0] };
+    var reader = Reader.initWithFd(testing.allocator, file.deprecatedReader().any(), fds[0]);
+    defer reader.deinit();
+
+    const deadline_ms = std.time.milliTimestamp() - 1;
+    try testing.expectError(error.Timeout, reader.nextMessageWithTimeout(deadline_ms));
 }
 
 test "serialize success response" {

@@ -45,15 +45,15 @@ Client                          Agent
 ### File System (Agent→Client)
 | Method | Description |
 |--------|-------------|
-| `fs/readTextFile` | Read file |
-| `fs/writeTextFile` | Write file |
+| `fs/read_text_file` | Read file |
+| `fs/write_text_file` | Write file |
 
 ### Terminal (Agent→Client)
 | Method | Description |
 |--------|-------------|
 | `terminal/create` | Execute command |
 | `terminal/output` | Get output |
-| `terminal/waitForExit` | Wait completion |
+| `terminal/wait_for_exit` | Wait completion |
 | `terminal/kill` | Terminate |
 | `terminal/release` | Release resources |
 
@@ -63,129 +63,144 @@ Client                          Agent
 
 **Request (InitializeRequest):**
 ```zig
-const InitializeParams = struct {
-    protocolVersion: u32,                    // Required: protocol version (currently 1)
-    clientInfo: ?Implementation = null,      // Optional: {name, version}
-    clientCapabilities: ?ClientCapabilities = null,
-    _meta: ?std.json.Value = null,           // Reserved for extensibility
+const InitializeRequest = struct {
+    protocolVersion: i32,                    // Required: protocol version (currently 1)
+    clientInfo: ClientInfo,
+    clientCapabilities: ClientCapabilities,
+};
+
+const ClientInfo = struct {
+    name: []const u8,
+    version: []const u8,
 };
 
 const ClientCapabilities = struct {
-    fs: ?FsCapability = null,
-    terminal: bool = false,
+    fs: ?FsCapabilities = null,
+    terminal: ?bool = null,
 };
 
-const FsCapability = struct {
-    readTextFile: bool = false,
-    writeTextFile: bool = false,
+const FsCapabilities = struct {
+    readTextFile: ?bool = null,
+    writeTextFile: ?bool = null,
 };
 ```
 
 **Response (InitializeResponse):**
 ```zig
-const InitializeResult = struct {
-    protocolVersion: u32,
-    agentInfo: ?Implementation = null,
+const InitializeResponse = struct {
+    protocolVersion: i32,
+    agentInfo: AgentInfo,
     agentCapabilities: AgentCapabilities,
-    authMethods: []const AuthMethod = &.{},
+    authMethods: []const AuthMethod,
 };
+```
+
+### authenticate
+
+**Request:** client-selected auth method (Banjo ignores params).
+
+**Response (AuthenticateResponse):**
+```zig
+const AuthenticateResponse = struct {};
 ```
 
 ### session/new
 
 **Request (NewSessionRequest):**
 ```zig
-const NewSessionParams = struct {
+const NewSessionRequest = struct {
     cwd: []const u8,                         // Required: absolute path to working directory
-    mcpServers: []const McpServer = &.{},    // Required: MCP servers (can be empty)
     _meta: ?std.json.Value = null,
 };
 
-const McpServer = union(enum) {
-    stdio: McpServerStdio,
-    http: McpServerHttp,
-    sse: McpServerSse,
-};
-
-const McpServerStdio = struct {
-    name: []const u8,
-    command: []const u8,
-    args: []const []const u8 = &.{},
-    env: ?std.json.ObjectMap = null,
-};
-
-const McpServerHttp = struct {
+const McpServerSse = struct {
     name: []const u8,
     url: []const u8,
+    headers: []const HttpHeader = &.{},
+};
+
+const EnvVariable = struct {
+    name: []const u8,
+    value: []const u8,
 };
 ```
 
 **Response (NewSessionResponse):**
 ```zig
-const NewSessionResult = struct {
+const NewSessionResponse = struct {
     sessionId: []const u8,                   // Required: unique session identifier
     configOptions: ?[]const ConfigOption = null,
     models: ?SessionModelState = null,
     modes: ?SessionModeState = null,
 };
+
+const ConfigOption = struct {
+    id: []const u8,
+    name: []const u8,
+    description: ?[]const u8 = null,
+    type: "boolean" | "enum",
+    default: bool | string,
+    options: ?[]const []const u8 = null,
+};
+
+const SessionModelState = struct {
+    availableModels: []const SessionModel,
+    currentModelId: []const u8,
+};
+
+const SessionModel = struct {
+    id: []const u8,
+    name: []const u8,
+    description: ?[]const u8 = null,
+};
 ```
+
+Note: Banjo currently populates `modes` only.
+Banjo now also populates `configOptions` and `models`.
 
 ### session/prompt
 
 **Request (PromptRequest):**
 ```zig
-const PromptParams = struct {
+const PromptRequest = struct {
     sessionId: []const u8,                   // Required
     prompt: []const ContentBlock,            // Required: user message content
-    _meta: ?std.json.Value = null,
 };
 
-const ContentBlock = union(enum) {
-    text: TextContent,
-    image: ImageContent,
-    resource: ResourceContent,
-    resource_link: ResourceLinkContent,
-    context: EmbeddedContext,
-};
-
-const TextContent = struct {
-    type: []const u8 = "text",
-    text: []const u8,
+const ContentBlock = struct {
+    type: []const u8,                        // "text", "image", "audio", "resource", "resource_link"
+    text: ?[]const u8 = null,                // For text blocks
+    data: ?[]const u8 = null,                // Base64 for image/audio
+    mimeType: ?[]const u8 = null,            // image/png, audio/wav, etc
+    uri: ?[]const u8 = null,                 // For resource_link
+    name: ?[]const u8 = null,                // For resource_link
+    description: ?[]const u8 = null,
+    title: ?[]const u8 = null,
+    size: ?i64 = null,
+    resource: ?EmbeddedResourceResource = null, // For resource blocks
 };
 
 // Embedded resource with contents (from Cmd+> / "Add to Agent")
-const ResourceContent = struct {
-    type: []const u8 = "resource",
-    resource: TextResourceContents,
-};
-
-const TextResourceContents = struct {
-    type: []const u8 = "text_resource_contents",
-    uri: []const u8,  // e.g. "file:///path/to/file.zig#L42:50"
-    text: []const u8, // file contents
-};
-
-// Resource link without contents (agent must fetch)
-const ResourceLinkContent = struct {
-    type: []const u8 = "resource_link",
-    uri: []const u8,
-    name: []const u8,
+const EmbeddedResourceResource = struct {
+    uri: []const u8,                         // e.g. "file:///path/to/file.zig#L42:50"
+    text: ?[]const u8 = null,                // File contents
+    blob: ?[]const u8 = null,                // Base64 for binary
+    mimeType: ?[]const u8 = null,
 };
 ```
 
 **Response (PromptResponse):**
 ```zig
-const PromptResult = struct {
+const PromptResponse = struct {
     stopReason: StopReason,                  // Required
-    _meta: ?std.json.Value = null,
 };
 
 const StopReason = enum {
     end_turn,
+    cancelled,
     max_tokens,
     max_turn_requests,
     refusal,
-    cancelled,
 };
 ```
 
@@ -201,9 +216,95 @@ const CancelParams = struct {
 ### session/set_mode
 
 ```zig
-const SetModeParams = struct {
+const SetModeRequest = struct {
     sessionId: []const u8,
-    mode: []const u8,  // "default", "plan", "acceptEdits", etc.
+    modeId: []const u8,  // "default", "plan", "acceptEdits", etc.
+};
+```
+
+Banjo also accepts the legacy `mode` field if `modeId` is missing.
+
+**Response (SetModeResponse):**
+```zig
+const SetModeResponse = struct {};
+```
+
+### session/set_model
+
+```zig
+const SetModelRequest = struct {
+    sessionId: []const u8,
+    modelId: []const u8,  // "sonnet", "opus", "haiku"
+};
+```
+
+**Response (SetModelResponse):**
+```zig
+const SetModelResponse = struct {};
+```
+
+Banjo sends `current_model_update` when the model changes.
+
+### session/set_config
+
+```zig
+const SetConfigRequest = struct {
+    sessionId: []const u8,
+    configId: []const u8, // "auto_resume", "duet_default", "duet_primary"
+    value: bool | string,
+};
+```
+
+**Response (SetConfigResponse):**
+```zig
+const SetConfigResponse = struct {};
+```
+
+### session/request_permission
+
+```zig
+const PermissionRequest = struct {
+    sessionId: []const u8,
+    toolCall: ToolCallUpdate,
+    options: []const PermissionOption,
+};
+
+const ToolCallUpdate = struct {
+    toolCallId: []const u8,
+    title: ?[]const u8 = null,
+    kind: ?ToolKind = null,
+    status: ?ToolCallStatus = null,
+    rawInput: ?std.json.Value = null,
+    rawOutput: ?std.json.Value = null,
+    content: ?[]const ToolCallContent = null,
+    locations: ?[]const ToolCallLocation = null,
+};
+
+const PermissionOption = struct {
+    kind: PermissionOptionKind,
+    name: []const u8,
+    optionId: []const u8,
+};
+
+const PermissionOptionKind = enum {
+    allow_once,
+    allow_always,
+    reject_once,
+    reject_always,
+};
+
+const PermissionResponse = struct {
+    outcome: PermissionOutcome,
+};
+
+const PermissionOutcome = struct {
+    outcome: PermissionOutcomeKind,
+    optionId: ?[]const u8 = null,
+};
+
+const PermissionOutcomeKind = enum {
+    selected,
+    cancelled,
 };
 ```
 
@@ -232,11 +333,23 @@ Wire format uses `sessionUpdate` as discriminator inside `update` object:
 | `agent_message_chunk` | Agent response text | `content: {type, text}` |
 | `user_message_chunk` | User message echo | `content: {type, text}` |
 | `agent_thought_chunk` | Agent thinking | `content: {type, text}` |
-| `tool_call` | Tool invocation | `toolCallId, title, kind, status` |
-| `tool_call_update` | Tool progress/result | `toolCallId, status, content` |
+| `tool_call` | Tool invocation | `toolCallId, title, kind, status, rawInput` |
+| `tool_call_update` | Tool progress/result | `toolCallId, status, content, rawOutput` |
 | `plan` | Todo list | `entries: [{id, content, status}]` |
 | `available_commands_update` | Slash commands | `availableCommands` |
 | `current_mode_update` | Mode change | `currentModeId` |
+
+Tool call content payload:
+```zig
+const ToolCallContent = struct {
+    type: []const u8,
+    content: ?ContentBlock = null,
+    terminalId: ?[]const u8 = null,
+    path: ?[]const u8 = null,
+    oldText: ?[]const u8 = null,
+    newText: ?[]const u8 = null,
+};
+```
 
 See `docs/wire-formats.md` for complete schema.
 
@@ -262,7 +375,7 @@ See `docs/wire-formats.md` for complete schema.
 
 ## Implementation Notes
 
-1. **Required fields**: `mcpServers` in session/new is REQUIRED (can be empty array `[]`)
+1. **Required fields**: `cwd` in session/new is REQUIRED
 
 2. **Unknown fields**: Use `ignore_unknown_fields = true` when parsing JSON to handle:
    - `_meta` extensibility field
@@ -281,6 +394,8 @@ See `docs/wire-formats.md` for complete schema.
    - Standard JSON-RPC 2.0 codes
    - `-32000`: Authentication required
    - `-32001`: Unsupported protocol version
+
+6. **Content handling**: Banjo merges text + context blocks, resolves `resource_link` via `fs/read_text_file` when available, and includes image/audio metadata as readable context.
 
 ## Zed Configuration
 
@@ -339,17 +454,17 @@ icon = "icon/banjo.svg"
 [agent_servers.banjo.targets.darwin-aarch64]
 archive = "https://github.com/user/banjo/releases/download/v0.1.0/banjo-darwin-arm64.tar.gz"
 cmd = "./banjo"
-args = ["--output-format", "stream-json", "--input-format", "stream-json"]
+args = []
 
 [agent_servers.banjo.targets.darwin-x86_64]
 archive = "https://github.com/user/banjo/releases/download/v0.1.0/banjo-darwin-x86_64.tar.gz"
 cmd = "./banjo"
-args = ["--output-format", "stream-json", "--input-format", "stream-json"]
+args = []
 
 [agent_servers.banjo.targets.linux-x86_64]
 archive = "https://github.com/user/banjo/releases/download/v0.1.0/banjo-linux-x86_64.tar.gz"
 cmd = "./banjo"
-args = ["--output-format", "stream-json", "--input-format", "stream-json"]
+args = []
 ```
 
 ### Icon Requirements

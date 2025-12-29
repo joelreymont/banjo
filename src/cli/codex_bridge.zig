@@ -4,6 +4,11 @@ const Allocator = std.mem.Allocator;
 const config = @import("config");
 const log = std.log.scoped(.codex_bridge);
 const executable = @import("executable.zig");
+const io_utils = @import("io_utils.zig");
+const test_utils = @import("test_utils.zig");
+
+const max_json_line_bytes: usize = 4 * 1024 * 1024;
+const rpc_timeout_ms: i64 = 30_000;
 
 pub const CodexMessage = struct {
     event_type: EventType,
@@ -193,7 +198,8 @@ const TurnRef = struct {
 };
 
 const TurnStartResponse = struct {
-    turn: TurnRef,
+    turn: ?TurnRef = null,
+    turnId: ?[]const u8 = null,
 };
 
 const ThreadStartedParams = struct {
@@ -203,11 +209,13 @@ const ThreadStartedParams = struct {
 const TurnStartedParams = struct {
     threadId: ?[]const u8 = null,
     turn: ?TurnRef = null,
+    turnId: ?[]const u8 = null,
 };
 
 const TurnCompletedParams = struct {
     threadId: ?[]const u8 = null,
     turn: ?TurnRef = null,
+    turnId: ?[]const u8 = null,
 };
 
 const ItemDeltaParams = struct {
@@ -221,6 +229,33 @@ const ItemEventParams = struct {
     threadId: ?[]const u8 = null,
     turnId: ?[]const u8 = null,
     item: ItemData,
+};
+
+const ReasoningLineEntry = struct {
+    text: ?[]const u8 = null,
+
+    pub fn jsonParseFromValue(
+        allocator: Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) std.json.ParseFromValueError!ReasoningLineEntry {
+        _ = options;
+        const ReasoningLineObject = struct {
+            text: ?[]const u8 = null,
+        };
+        return switch (source) {
+            .string => |text| .{ .text = text },
+            .object => {
+                const parsed = try std.json.parseFromValue(ReasoningLineObject, allocator, source, .{
+                    .ignore_unknown_fields = true,
+                });
+                defer parsed.deinit();
+                return .{ .text = parsed.value.text };
+            },
+            .null => .{ .text = null },
+            else => error.UnexpectedToken,
+        };
+    }
 };
 
 const ReasoningLines = struct {
@@ -251,24 +286,17 @@ const ReasoningLines = struct {
                 const lines = try allocator.alloc([]const u8, 0);
                 return .{ .lines = lines };
             },
-            .array => |arr| {
+            .array => {
+                const parsed = try std.json.parseFromValueLeaky([]ReasoningLineEntry, allocator, source, .{
+                    .ignore_unknown_fields = true,
+                });
                 var list: std.ArrayList([]const u8) = .empty;
                 defer list.deinit(allocator);
-
-                for (arr.items) |item| {
-                    switch (item) {
-                        .string => |text| try list.append(allocator, text),
-                        .object => |obj| {
-                            if (obj.get("text")) |text_val| {
-                                if (text_val == .string) {
-                                    try list.append(allocator, text_val.string);
-                                }
-                            }
-                        },
-                        else => {},
+                for (parsed) |entry| {
+                    if (entry.text) |text| {
+                        try list.append(allocator, text);
                     }
                 }
-
                 return .{ .lines = try list.toOwnedSlice(allocator) };
             },
             else => return error.UnexpectedToken,
@@ -278,7 +306,7 @@ const ReasoningLines = struct {
 
 const ItemData = struct {
     id: []const u8,
-    @"type": []const u8,
+    type: []const u8,
     text: ?[]const u8 = null,
     summary: ?ReasoningLines = null,
     content: ?ReasoningLines = null,
@@ -327,14 +355,16 @@ pub const CodexBridge = struct {
     allocator: Allocator,
     process: ?std.process.Child = null,
     cwd: []const u8,
-    stdout_reader: ?std.fs.File.Reader = null,
-    stdout_buf: [64 * 1024]u8 = undefined,
+    stdout_file: ?std.fs.File = null,
     next_request_id: i64 = 1,
     thread_id: ?[]const u8 = null,
     current_turn_id: ?[]const u8 = null,
+    approval_policy: ?[]const u8 = null,
     saw_agent_delta: bool = false,
     saw_reasoning_delta: bool = false,
     pending_messages: std.ArrayList(CodexMessage) = .empty,
+    pending_head: usize = 0,
+    line_buffer: std.ArrayList(u8) = .empty,
 
     pub fn init(allocator: Allocator, cwd: []const u8) CodexBridge {
         return .{
@@ -355,13 +385,15 @@ pub const CodexBridge = struct {
         }
         self.clearPendingMessages();
         self.pending_messages.deinit(self.allocator);
+        self.line_buffer.deinit(self.allocator);
     }
 
     fn clearPendingMessages(self: *CodexBridge) void {
-        for (self.pending_messages.items) |*msg| {
+        for (self.pending_messages.items[self.pending_head..]) |*msg| {
             msg.deinit();
         }
         self.pending_messages.clearRetainingCapacity();
+        self.pending_head = 0;
     }
 
     fn findCodexBinary() []const u8 {
@@ -380,6 +412,7 @@ pub const CodexBridge = struct {
     pub const StartOptions = struct {
         resume_session_id: ?[]const u8 = null,
         model: ?[]const u8 = null,
+        approval_policy: ?[]const u8 = null,
     };
 
     pub fn getThreadId(self: *const CodexBridge) ?[]const u8 {
@@ -393,8 +426,10 @@ pub const CodexBridge = struct {
         const codex_path = findCodexBinary();
         log.info("Using codex binary: {s}", .{codex_path});
 
-        try args.append(self.allocator, codex_path);
-        try args.append(self.allocator, "app-server");
+        try args.appendSlice(self.allocator, &[_][]const u8{
+            codex_path,
+            "app-server",
+        });
 
         var child = std.process.Child.init(args.items, self.allocator);
         child.cwd = self.cwd;
@@ -408,12 +443,10 @@ pub const CodexBridge = struct {
             _ = child.wait() catch {};
         }
         self.process = child;
-        if (self.process.?.stdout) |stdout| {
-            self.stdout_reader = stdout.reader(&self.stdout_buf);
-        } else {
-            self.stdout_reader = null;
-        }
+        self.stdout_file = self.process.?.stdout;
+        self.line_buffer.clearRetainingCapacity();
 
+        self.approval_policy = opts.approval_policy;
         try self.initialize();
 
         if (opts.resume_session_id) |sid| {
@@ -432,10 +465,11 @@ pub const CodexBridge = struct {
             _ = proc.kill() catch {};
             _ = proc.wait() catch {};
             self.process = null;
-            self.stdout_reader = null;
+            self.stdout_file = null;
             self.saw_agent_delta = false;
             self.saw_reasoning_delta = false;
             self.clearPendingMessages();
+            self.line_buffer.clearRetainingCapacity();
             log.info("Stopped Codex", .{});
         }
     }
@@ -451,7 +485,7 @@ pub const CodexBridge = struct {
         const params = TurnStartParams{
             .threadId = thread_id,
             .input = inputs[0..],
-            .approvalPolicy = "never",
+            .approvalPolicy = self.approval_policy,
         };
 
         try self.sendRequest(request_id, "turn/start", params);
@@ -467,8 +501,14 @@ pub const CodexBridge = struct {
     }
 
     pub fn readMessage(self: *CodexBridge) !?CodexMessage {
-        if (self.pending_messages.items.len > 0) {
-            return self.pending_messages.orderedRemove(0);
+        if (self.pending_head < self.pending_messages.items.len) {
+            const msg = self.pending_messages.items[self.pending_head];
+            self.pending_head += 1;
+            if (self.pending_head >= self.pending_messages.items.len) {
+                self.pending_messages.clearRetainingCapacity();
+                self.pending_head = 0;
+            }
+            return msg;
         }
 
         while (true) {
@@ -484,13 +524,53 @@ pub const CodexBridge = struct {
                     const params = rpc_message.params orelse {
                         continue;
                     };
-                    if (self.mapNotification(method, params, &rpc_message.arena)) |msg| {
+                    if (self.mapNotification(&rpc_message.arena, method, params)) |msg| {
                         keep_arena = true;
                         return msg;
                     }
                 },
                 .request => {
-                    if (self.mapServerRequest(rpc_message, &rpc_message.arena)) |msg| {
+                    if (self.mapServerRequest(&rpc_message.arena, rpc_message)) |msg| {
+                        keep_arena = true;
+                        return msg;
+                    }
+                },
+                .response, .err, .unknown => {},
+            }
+        }
+    }
+
+    pub fn readMessageWithTimeout(self: *CodexBridge, deadline_ms: i64) !?CodexMessage {
+        if (self.pending_head < self.pending_messages.items.len) {
+            const msg = self.pending_messages.items[self.pending_head];
+            self.pending_head += 1;
+            if (self.pending_head >= self.pending_messages.items.len) {
+                self.pending_messages.clearRetainingCapacity();
+                self.pending_head = 0;
+            }
+            return msg;
+        }
+
+        while (true) {
+            var rpc_message = (try self.readRpcMessageWithTimeout(deadline_ms)) orelse return null;
+            var keep_arena = false;
+            defer if (!keep_arena) rpc_message.arena.deinit();
+
+            switch (rpc_message.kind) {
+                .notification => {
+                    const method = rpc_message.method orelse {
+                        continue;
+                    };
+                    const params = rpc_message.params orelse {
+                        continue;
+                    };
+                    if (self.mapNotification(&rpc_message.arena, method, params)) |msg| {
+                        keep_arena = true;
+                        return msg;
+                    }
+                },
+                .request => {
+                    if (self.mapServerRequest(&rpc_message.arena, rpc_message)) |msg| {
                         keep_arena = true;
                         return msg;
                     }
@@ -520,7 +600,7 @@ pub const CodexBridge = struct {
         const params = ThreadStartParams{
             .model = model,
             .cwd = self.cwd,
-            .approvalPolicy = "never",
+            .approvalPolicy = self.approval_policy,
             .experimentalRawEvents = false,
         };
         try self.sendRequest(request_id, "thread/start", params);
@@ -597,7 +677,9 @@ pub const CodexBridge = struct {
     fn writeJsonLine(self: *CodexBridge, payload: anytype) !void {
         const proc = self.process orelse return error.NotStarted;
         const stdin = proc.stdin orelse return error.NoStdin;
-        const json = try std.json.Stringify.valueAlloc(self.allocator, payload, .{});
+        const json = try std.json.Stringify.valueAlloc(self.allocator, payload, .{
+            .emit_null_optional_fields = false,
+        });
         defer self.allocator.free(json);
         try stdin.writeAll(json);
         try stdin.writeAll("\n");
@@ -609,8 +691,9 @@ pub const CodexBridge = struct {
     };
 
     fn waitForResponse(self: *CodexBridge, request_id: i64) !ResponsePayload {
+        const deadline = std.time.milliTimestamp() + rpc_timeout_ms;
         while (true) {
-            var rpc_message = (try self.readRpcMessage()) orelse return error.UnexpectedEof;
+            var rpc_message = (try self.readRpcMessageWithTimeout(deadline)) orelse return error.UnexpectedEof;
             var keep_arena = false;
             defer if (!keep_arena) rpc_message.arena.deinit();
 
@@ -645,13 +728,13 @@ pub const CodexBridge = struct {
                     const params = rpc_message.params orelse {
                         continue;
                     };
-                    if (self.mapNotification(method, params, &rpc_message.arena)) |msg| {
+                    if (self.mapNotification(&rpc_message.arena, method, params)) |msg| {
                         keep_arena = true;
                         try self.pending_messages.append(self.allocator, msg);
                     }
                 },
                 .request => {
-                    if (self.mapServerRequest(rpc_message, &rpc_message.arena)) |msg| {
+                    if (self.mapServerRequest(&rpc_message.arena, rpc_message)) |msg| {
                         keep_arena = true;
                         try self.pending_messages.append(self.allocator, msg);
                     }
@@ -659,6 +742,10 @@ pub const CodexBridge = struct {
                 .unknown => {},
             }
         }
+    }
+
+    fn readRpcMessageWithTimeout(self: *CodexBridge, deadline_ms: i64) !?RpcMessage {
+        return self.readRpcMessageWithDeadline(deadline_ms);
     }
 
     const RpcMessage = struct {
@@ -680,19 +767,18 @@ pub const CodexBridge = struct {
     };
 
     fn readRpcMessage(self: *CodexBridge) !?RpcMessage {
+        return self.readRpcMessageWithDeadline(null);
+    }
+
+    fn readRpcMessageWithDeadline(self: *CodexBridge, deadline_ms: ?i64) !?RpcMessage {
         _ = self.process orelse return error.NotStarted;
-        const reader = if (self.stdout_reader) |*stdout_reader| &stdout_reader.interface else return error.NoStdout;
 
         while (true) {
-            const line = reader.takeDelimiter('\n') catch |e| switch (e) {
-                error.ReadFailed => return null,
-                error.StreamTooLong => return error.LineTooLong,
-            } orelse return null;
-
-            if (line.len == 0) continue;
-
             var arena = std.heap.ArenaAllocator.init(self.allocator);
-            errdefer arena.deinit();
+            var keep_arena = false;
+            defer if (!keep_arena) arena.deinit();
+
+            const line = (try self.readLine(arena.allocator(), deadline_ms)) orelse return null;
 
             const parsed = try std.json.parseFromSlice(RpcEnvelope, arena.allocator(), line, .{
                 .ignore_unknown_fields = true,
@@ -713,6 +799,7 @@ pub const CodexBridge = struct {
                 kind = .err;
             }
 
+            keep_arena = true;
             return RpcMessage{
                 .kind = kind,
                 .arena = arena,
@@ -725,7 +812,58 @@ pub const CodexBridge = struct {
         }
     }
 
-    fn mapServerRequest(self: *CodexBridge, msg: RpcMessage, arena: *std.heap.ArenaAllocator) ?CodexMessage {
+    fn readLine(self: *CodexBridge, arena: Allocator, deadline_ms: ?i64) !?[]const u8 {
+        while (true) {
+            if (std.mem.indexOfScalar(u8, self.line_buffer.items, '\n')) |nl| {
+                const line_len = nl;
+                if (line_len == 0) {
+                    self.discardLinePrefix(nl + 1);
+                    continue;
+                }
+                if (line_len > max_json_line_bytes) return error.LineTooLong;
+                const line = try arena.alloc(u8, line_len);
+                @memcpy(line, self.line_buffer.items[0..line_len]);
+                self.discardLinePrefix(nl + 1);
+                return line;
+            }
+
+            if (deadline_ms) |deadline| {
+                const now = std.time.milliTimestamp();
+                if (now >= deadline) return error.Timeout;
+                const slice_ms = io_utils.pollSliceMs(deadline, now);
+                const readable = try waitForReadable(self, slice_ms);
+                if (!readable) continue;
+            } else {
+                _ = try waitForReadable(self, -1);
+            }
+
+            const stdout = self.stdout_file orelse return error.NoStdout;
+            var buf: [4096]u8 = undefined;
+            const count = stdout.read(&buf) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return err,
+            };
+            if (count == 0) {
+                if (self.line_buffer.items.len == 0) return null;
+                const line = try arena.alloc(u8, self.line_buffer.items.len);
+                @memcpy(line, self.line_buffer.items);
+                self.line_buffer.clearRetainingCapacity();
+                return line;
+            }
+            try self.line_buffer.appendSlice(self.allocator, buf[0..count]);
+            if (self.line_buffer.items.len > max_json_line_bytes) return error.LineTooLong;
+        }
+    }
+
+    fn discardLinePrefix(self: *CodexBridge, count: usize) void {
+        const remaining = self.line_buffer.items.len - count;
+        if (remaining > 0) {
+            std.mem.copyForwards(u8, self.line_buffer.items[0..remaining], self.line_buffer.items[count..]);
+        }
+        self.line_buffer.items.len = remaining;
+    }
+
+    fn mapServerRequest(self: *CodexBridge, arena: *std.heap.ArenaAllocator, msg: RpcMessage) ?CodexMessage {
         const method = msg.method orelse return null;
         const params = msg.params orelse return null;
         const request_id_value = msg.id orelse return null;
@@ -739,7 +877,7 @@ pub const CodexBridge = struct {
             return null;
         }
 
-        if (!parseServerRequestParams(kind, arena.allocator(), params)) {
+        if (!parseServerRequestParams(arena.allocator(), kind, params)) {
             self.sendResponseId(request_id, .{ .decision = "decline" }) catch |err| {
                 log.warn("Failed to respond to invalid Codex request: {}", .{err});
             };
@@ -759,14 +897,14 @@ pub const CodexBridge = struct {
 
     fn mapNotification(
         self: *CodexBridge,
+        arena: *std.heap.ArenaAllocator,
         method: []const u8,
         params: std.json.Value,
-        arena: *std.heap.ArenaAllocator,
     ) ?CodexMessage {
         const kind = notificationKind(method);
         switch (kind) {
             .thread_started => {
-                const parsed = parseNotificationParams(ThreadStartedParams, arena, params) orelse return null;
+                const parsed = parseNotificationParams(arena, ThreadStartedParams, params) orelse return null;
                 return CodexMessage{
                     .event_type = .thread_started,
                     .thread_id = parsed.thread.id,
@@ -774,16 +912,28 @@ pub const CodexBridge = struct {
                 };
             },
             .turn_started => {
-                _ = parseNotificationParams(TurnStartedParams, arena, params) orelse return null;
+                _ = parseNotificationParams(arena, TurnStartedParams, params) orelse return null;
                 return CodexMessage{
                     .event_type = .turn_started,
                     .arena = arena.*,
                 };
             },
             .turn_completed => {
-                const parsed = parseNotificationParams(TurnCompletedParams, arena, params) orelse return null;
-                const turn = parsed.turn orelse return null;
-                if (!self.matchesCurrentTurn(turn.id)) return null;
+                const parsed = parseNotificationParams(arena, TurnCompletedParams, params) orelse {
+                    log.warn("Codex turn_completed parse failed", .{});
+                    return null;
+                };
+                const turn_id = if (parsed.turn) |turn|
+                    turn.id
+                else
+                    parsed.turnId orelse {
+                        log.warn("Codex turn_completed missing turnId", .{});
+                        return null;
+                    };
+                if (!self.matchesCurrentTurn(turn_id)) {
+                    log.warn("Codex turn_completed ignored for turn {s}", .{turn_id});
+                    return null;
+                }
                 return CodexMessage{
                     .event_type = .turn_completed,
                     .thread_id = parsed.threadId,
@@ -791,7 +941,7 @@ pub const CodexBridge = struct {
                 };
             },
             .agent_message_delta => {
-                const parsed = parseNotificationParams(ItemDeltaParams, arena, params) orelse return null;
+                const parsed = parseNotificationParams(arena, ItemDeltaParams, params) orelse return null;
                 if (!self.matchesCurrentTurn(parsed.turnId)) return null;
                 const delta = parsed.delta orelse return null;
                 self.saw_agent_delta = true;
@@ -802,7 +952,7 @@ pub const CodexBridge = struct {
                 };
             },
             .reasoning_summary_delta => {
-                const parsed = parseNotificationParams(ItemDeltaParams, arena, params) orelse return null;
+                const parsed = parseNotificationParams(arena, ItemDeltaParams, params) orelse return null;
                 if (!self.matchesCurrentTurn(parsed.turnId)) return null;
                 const delta = parsed.delta orelse return null;
                 self.saw_reasoning_delta = true;
@@ -814,7 +964,7 @@ pub const CodexBridge = struct {
             },
             .reasoning_text_delta => {
                 if (self.saw_reasoning_delta) return null;
-                const parsed = parseNotificationParams(ItemDeltaParams, arena, params) orelse return null;
+                const parsed = parseNotificationParams(arena, ItemDeltaParams, params) orelse return null;
                 if (!self.matchesCurrentTurn(parsed.turnId)) return null;
                 const delta = parsed.delta orelse return null;
                 self.saw_reasoning_delta = true;
@@ -825,7 +975,7 @@ pub const CodexBridge = struct {
                 };
             },
             .item_started, .item_completed => {
-                const parsed = parseNotificationParams(ItemEventParams, arena, params) orelse return null;
+                const parsed = parseNotificationParams(arena, ItemEventParams, params) orelse return null;
                 if (!self.matchesCurrentTurn(parsed.turnId)) return null;
                 const item = parseItem(arena.allocator(), parsed.item) orelse return null;
                 const event_type: CodexMessage.EventType = if (kind == .item_started) .item_started else .item_completed;
@@ -860,8 +1010,13 @@ pub const CodexBridge = struct {
 
     fn matchesCurrentTurn(self: *CodexBridge, turn_id: ?[]const u8) bool {
         if (self.current_turn_id) |current| {
-            if (turn_id) |id| {
-                return std.mem.eql(u8, current, id);
+            const id = turn_id orelse {
+                log.warn("Codex event missing turnId (expected {s})", .{current});
+                return true;
+            };
+            if (!std.mem.eql(u8, current, id)) {
+                log.warn("Codex turn ID mismatch: expected {s}, got {s}", .{ current, id });
+                return false;
             }
         }
         return true;
@@ -887,11 +1042,12 @@ fn extractTurnId(allocator: Allocator, value: std.json.Value) ?[]const u8 {
     const parsed = std.json.parseFromValueLeaky(TurnStartResponse, allocator, value, .{
         .ignore_unknown_fields = true,
     }) catch return null;
-    return parsed.turn.id;
+    if (parsed.turn) |turn| return turn.id;
+    return parsed.turnId;
 }
 
 fn parseItem(allocator: Allocator, item: ItemData) ?CodexMessage.Item {
-    const kind = parseItemKind(item.@"type");
+    const kind = parseItemKind(item.type);
 
     var parsed = CodexMessage.Item{
         .id = item.id,
@@ -969,23 +1125,23 @@ fn serverRequestKind(method: []const u8) ServerRequestKind {
     return map.get(method) orelse .unknown;
 }
 
-fn parseServerRequestParams(kind: ServerRequestKind, allocator: Allocator, params: std.json.Value) bool {
+fn parseServerRequestParams(allocator: Allocator, kind: ServerRequestKind, params: std.json.Value) bool {
     return switch (kind) {
-        .command_execution => parseParams(CommandExecutionRequestApprovalParams, allocator, params),
-        .file_change => parseParams(FileChangeRequestApprovalParams, allocator, params),
-        .apply_patch => parseParams(ApplyPatchApprovalParams, allocator, params),
-        .exec_command => parseParams(ExecCommandApprovalParams, allocator, params),
+        .command_execution => parseParams(allocator, CommandExecutionRequestApprovalParams, params),
+        .file_change => parseParams(allocator, FileChangeRequestApprovalParams, params),
+        .apply_patch => parseParams(allocator, ApplyPatchApprovalParams, params),
+        .exec_command => parseParams(allocator, ExecCommandApprovalParams, params),
         .unknown => false,
     };
 }
 
-fn parseNotificationParams(comptime T: type, arena: *std.heap.ArenaAllocator, params: std.json.Value) ?T {
+fn parseNotificationParams(arena: *std.heap.ArenaAllocator, comptime T: type, params: std.json.Value) ?T {
     const parsed = std.json.parseFromValue(T, arena.allocator(), params, .{ .ignore_unknown_fields = true }) catch return null;
     defer parsed.deinit();
     return parsed.value;
 }
 
-fn parseParams(comptime T: type, allocator: Allocator, value: std.json.Value) bool {
+fn parseParams(allocator: Allocator, comptime T: type, value: std.json.Value) bool {
     const parsed = std.json.parseFromValue(T, allocator, value, .{ .ignore_unknown_fields = true }) catch return false;
     parsed.deinit();
     return true;
@@ -1058,7 +1214,7 @@ test "CodexMessage agent message delta parsing" {
     });
 
     var bridge = CodexBridge.init(testing.allocator, ".");
-    var msg = bridge.mapNotification(parsed.value.method.?, parsed.value.params.?, &arena) orelse {
+    var msg = bridge.mapNotification(&arena, parsed.value.method.?, parsed.value.params.?) orelse {
         arena.deinit();
         return error.TestExpectedEqual;
     };
@@ -1078,7 +1234,7 @@ test "CodexMessage command execution item parsing" {
     });
 
     var bridge = CodexBridge.init(testing.allocator, ".");
-    var msg = bridge.mapNotification(parsed.value.method.?, parsed.value.params.?, &arena) orelse {
+    var msg = bridge.mapNotification(&arena, parsed.value.method.?, parsed.value.params.?) orelse {
         arena.deinit();
         return error.TestExpectedEqual;
     };
@@ -1101,7 +1257,7 @@ test "CodexMessage thread started parsing" {
     });
 
     var bridge = CodexBridge.init(testing.allocator, ".");
-    var msg = bridge.mapNotification(parsed.value.method.?, parsed.value.params.?, &arena) orelse {
+    var msg = bridge.mapNotification(&arena, parsed.value.method.?, parsed.value.params.?) orelse {
         arena.deinit();
         return error.TestExpectedEqual;
     };
@@ -1121,7 +1277,7 @@ test "CodexMessage reasoning summary parsing" {
     });
 
     var bridge = CodexBridge.init(testing.allocator, ".");
-    var msg = bridge.mapNotification(parsed.value.method.?, parsed.value.params.?, &arena) orelse {
+    var msg = bridge.mapNotification(&arena, parsed.value.method.?, parsed.value.params.?) orelse {
         arena.deinit();
         return error.TestExpectedEqual;
     };
@@ -1141,7 +1297,7 @@ test "CodexMessage tool call parsing from item started" {
     });
 
     var bridge = CodexBridge.init(testing.allocator, ".");
-    var msg = bridge.mapNotification(parsed.value.method.?, parsed.value.params.?, &arena) orelse {
+    var msg = bridge.mapNotification(&arena, parsed.value.method.?, parsed.value.params.?) orelse {
         arena.deinit();
         return error.TestExpectedEqual;
     };
@@ -1166,7 +1322,7 @@ test "CodexMessage item completed suppressed after agent delta" {
     const parsed_delta = try std.json.parseFromSlice(RpcEnvelope, arena_delta.allocator(), delta_json, .{
         .ignore_unknown_fields = true,
     });
-    var delta_msg = bridge.mapNotification(parsed_delta.value.method.?, parsed_delta.value.params.?, &arena_delta) orelse {
+    var delta_msg = bridge.mapNotification(&arena_delta, parsed_delta.value.method.?, parsed_delta.value.params.?) orelse {
         arena_delta.deinit();
         return error.TestExpectedEqual;
     };
@@ -1176,7 +1332,7 @@ test "CodexMessage item completed suppressed after agent delta" {
     const parsed_completed = try std.json.parseFromSlice(RpcEnvelope, arena_completed.allocator(), completed_json, .{
         .ignore_unknown_fields = true,
     });
-    var completed_msg = bridge.mapNotification(parsed_completed.value.method.?, parsed_completed.value.params.?, &arena_completed);
+    var completed_msg = bridge.mapNotification(&arena_completed, parsed_completed.value.method.?, parsed_completed.value.params.?);
     if (completed_msg) |*msg| {
         defer msg.deinit();
         return error.TestExpectedEqual;
@@ -1187,36 +1343,19 @@ test "CodexMessage item completed suppressed after agent delta" {
 const LiveSnapshotError = error{
     Timeout,
     UnexpectedEof,
+    AuthRequired,
 };
 
-fn normalizeSnapshotText(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-
-    var last_space = false;
-    for (input) |c| {
-        if (std.ascii.isWhitespace(c)) {
-            if (out.items.len == 0 or last_space) continue;
-            try out.append(allocator, ' ');
-            last_space = true;
-            continue;
-        }
-        last_space = false;
-        try out.append(allocator, c);
-    }
-
-    if (out.items.len > 0 and out.items[out.items.len - 1] == ' ') {
-        _ = out.pop();
-    }
-
-    return try out.toOwnedSlice(allocator);
+fn isAuthRequiredText(text: []const u8) bool {
+    return std.mem.indexOf(u8, text, "login") != null or
+        std.mem.indexOf(u8, text, "authenticate") != null;
 }
 
 fn collectCodexSnapshot(allocator: Allocator, prompt: []const u8) ![]u8 {
     var bridge = CodexBridge.init(allocator, ".");
     defer bridge.deinit();
 
-    try bridge.start(.{ .resume_session_id = null, .model = null });
+    try bridge.start(.{ .resume_session_id = null, .model = null, .approval_policy = "never" });
     defer bridge.stop();
 
     try bridge.sendPrompt(prompt);
@@ -1225,15 +1364,16 @@ fn collectCodexSnapshot(allocator: Allocator, prompt: []const u8) ![]u8 {
     defer text_buf.deinit(allocator);
     var saw_delta = false;
 
-    const deadline = std.time.milliTimestamp() + 30_000;
+    const deadline = std.time.milliTimestamp() + 60_000;
     while (true) {
         if (std.time.milliTimestamp() > deadline) return error.Timeout;
-        var msg = (try bridge.readMessage()) orelse return error.UnexpectedEof;
+        var msg = (try readCodexMessageWithTimeout(&bridge, deadline)) orelse return error.UnexpectedEof;
         defer msg.deinit();
 
         switch (msg.event_type) {
             .agent_message_delta => {
                 if (msg.getText()) |text| {
+                    if (isAuthRequiredText(text)) return error.AuthRequired;
                     saw_delta = true;
                     try text_buf.appendSlice(allocator, text);
                 }
@@ -1241,6 +1381,7 @@ fn collectCodexSnapshot(allocator: Allocator, prompt: []const u8) ![]u8 {
             .item_completed => {
                 if (!saw_delta) {
                     if (msg.getText()) |text| {
+                        if (isAuthRequiredText(text)) return error.AuthRequired;
                         try text_buf.appendSlice(allocator, text);
                     }
                 }
@@ -1250,16 +1391,22 @@ fn collectCodexSnapshot(allocator: Allocator, prompt: []const u8) ![]u8 {
         }
     }
 
-    const normalized = try normalizeSnapshotText(allocator, text_buf.items);
+    const normalized = try test_utils.normalizeSnapshotText(allocator, text_buf.items);
     defer allocator.free(normalized);
 
-    return std.fmt.allocPrint(allocator,
+    return std.fmt.allocPrint(
+        allocator,
         "engine: codex\ntext: {s}\n",
         .{normalized},
     );
 }
 
+fn readCodexMessageWithTimeout(bridge: *CodexBridge, deadline_ms: i64) !?CodexMessage {
+    return bridge.readMessageWithTimeout(deadline_ms);
+}
+
 test "snapshot: Codex live prompt" {
+    if (!config.live_cli_tests) return error.SkipZigTest;
     if (!CodexBridge.isAvailable()) return error.SkipZigTest;
 
     const snapshot = try collectCodexSnapshot(testing.allocator, "Reply with exactly the single word BANJO.");
@@ -1278,60 +1425,33 @@ const CodexTestError = error{
 };
 
 fn hasBufferedData(bridge: *CodexBridge) bool {
-    if (bridge.stdout_reader) |*reader| {
-        return reader.interface.seek < reader.interface.end;
-    }
-    return false;
+    return bridge.line_buffer.items.len > 0;
 }
 
 fn waitForReadable(bridge: *CodexBridge, timeout_ms: i32) !bool {
     const proc = bridge.process orelse return error.NotStarted;
     const stdout = proc.stdout orelse return error.NoStdout;
-
-    var fds = [_]std.posix.pollfd{
-        .{
-            .fd = stdout.handle,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        },
-    };
-    const count = try std.posix.poll(&fds, timeout_ms);
-    if (count == 0) return false;
-    if ((fds[0].revents & std.posix.POLL.HUP) != 0) return error.UnexpectedEof;
-    return (fds[0].revents & std.posix.POLL.IN) != 0;
+    return io_utils.waitForReadable(stdout.handle, timeout_ms);
 }
 
 fn waitForTurnCompleted(bridge: *CodexBridge, timeout_ms: i64) !void {
     const deadline = std.time.milliTimestamp() + timeout_ms;
 
     while (true) {
-        const now = std.time.milliTimestamp();
-        if (now >= deadline) return error.Timeout;
-
-        if (hasBufferedData(bridge)) {
-            var msg = (try bridge.readMessage()) orelse return error.UnexpectedEof;
-            defer msg.deinit();
-            if (msg.isTurnCompleted()) return;
-            continue;
-        }
-
-        const remaining_ms = deadline - now;
-        const slice_ms: i32 = @intCast(@min(@as(i64, 200), remaining_ms));
-        const readable = try waitForReadable(bridge, slice_ms);
-        if (!readable) continue;
-        var msg = (try bridge.readMessage()) orelse return error.UnexpectedEof;
+        var msg = (try bridge.readMessageWithTimeout(deadline)) orelse return error.UnexpectedEof;
         defer msg.deinit();
         if (msg.isTurnCompleted()) return;
     }
 }
 
 test "Codex app-server supports multi-turn prompts in one process" {
+    if (!config.live_cli_tests) return error.SkipZigTest;
     if (!CodexBridge.isAvailable()) return error.SkipZigTest;
 
     var bridge = CodexBridge.init(testing.allocator, ".");
     defer bridge.deinit();
 
-    try bridge.start(.{ .resume_session_id = null, .model = null });
+    try bridge.start(.{ .resume_session_id = null, .model = null, .approval_policy = "never" });
     defer bridge.stop();
 
     try bridge.sendPrompt("say hello in one word");

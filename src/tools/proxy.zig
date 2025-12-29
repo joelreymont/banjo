@@ -1,23 +1,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const jsonrpc = @import("../jsonrpc.zig");
+const protocol = @import("../acp/protocol.zig");
 
 const log = std.log.scoped(.tool_proxy);
-
-// Request parameter schemas for Zed ACP
-const ReadFileParams = struct {
-    path: []const u8,
-};
-
-const WriteFileParams = struct {
-    path: []const u8,
-    content: []const u8,
-};
-
-const CreateTerminalParams = struct {
-    command: []const u8,
-    cwd: ?[]const u8 = null,
-};
 
 /// Tool proxy for delegating operations to Zed via ACP
 ///
@@ -28,7 +14,7 @@ const CreateTerminalParams = struct {
 /// - Better integration with editor state
 pub const ToolProxy = struct {
     allocator: Allocator,
-    writer: *jsonrpc.Writer,
+    writer: jsonrpc.Writer,
     pending_requests: std.AutoHashMap(i64, PendingRequest),
     next_request_id: i64 = 1,
 
@@ -36,7 +22,7 @@ pub const ToolProxy = struct {
         method: []const u8,
     };
 
-    pub fn init(allocator: Allocator, writer: *jsonrpc.Writer) ToolProxy {
+    pub fn init(allocator: Allocator, writer: jsonrpc.Writer) ToolProxy {
         return .{
             .allocator = allocator,
             .writer = writer,
@@ -49,53 +35,153 @@ pub const ToolProxy = struct {
     }
 
     /// Request to read a file via Zed
-    pub fn readFile(self: *ToolProxy, path: []const u8) !i64 {
+    pub fn readFile(self: *ToolProxy, session_id: []const u8, path: []const u8, line: ?u32, limit: ?u32) !i64 {
         const request_id = self.next_request_id;
-        self.next_request_id += 1;
+        self.next_request_id +%= 1;
 
         try self.writer.writeTypedRequest(
             .{ .number = request_id },
-            "fs/readTextFile",
-            ReadFileParams{ .path = path },
+            "fs/read_text_file",
+            protocol.ReadTextFileRequest{
+                .sessionId = session_id,
+                .path = path,
+                .line = line,
+                .limit = limit,
+            },
         );
 
-        try self.pending_requests.put(request_id, .{ .method = "fs/readTextFile" });
+        try self.pending_requests.put(request_id, .{ .method = "fs/read_text_file" });
         log.debug("Sent readTextFile request {d}: {s}", .{ request_id, path });
 
         return request_id;
     }
 
     /// Request to write a file via Zed
-    pub fn writeFile(self: *ToolProxy, path: []const u8, content: []const u8) !i64 {
+    pub fn writeFile(self: *ToolProxy, session_id: []const u8, path: []const u8, content: []const u8) !i64 {
         const request_id = self.next_request_id;
-        self.next_request_id += 1;
+        self.next_request_id +%= 1;
 
         try self.writer.writeTypedRequest(
             .{ .number = request_id },
-            "fs/writeTextFile",
-            WriteFileParams{ .path = path, .content = content },
+            "fs/write_text_file",
+            protocol.WriteTextFileRequest{
+                .sessionId = session_id,
+                .path = path,
+                .content = content,
+            },
         );
 
-        try self.pending_requests.put(request_id, .{ .method = "fs/writeTextFile" });
+        try self.pending_requests.put(request_id, .{ .method = "fs/write_text_file" });
         log.debug("Sent writeTextFile request {d}: {s}", .{ request_id, path });
 
         return request_id;
     }
 
     /// Request to create a terminal via Zed
-    pub fn createTerminal(self: *ToolProxy, command: []const u8, cwd: ?[]const u8) !i64 {
+    pub fn createTerminal(
+        self: *ToolProxy,
+        session_id: []const u8,
+        command: []const u8,
+        args: ?[]const []const u8,
+        env: ?[]const protocol.EnvVariable,
+        cwd: ?[]const u8,
+        output_byte_limit: ?u64,
+    ) !i64 {
         const request_id = self.next_request_id;
-        self.next_request_id += 1;
+        self.next_request_id +%= 1;
 
         try self.writer.writeTypedRequest(
             .{ .number = request_id },
             "terminal/create",
-            CreateTerminalParams{ .command = command, .cwd = cwd },
+            protocol.CreateTerminalRequest{
+                .sessionId = session_id,
+                .command = command,
+                .args = args,
+                .env = env,
+                .cwd = cwd,
+                .outputByteLimit = output_byte_limit,
+            },
         );
 
         try self.pending_requests.put(request_id, .{ .method = "terminal/create" });
         log.debug("Sent terminal/create request {d}: {s}", .{ request_id, command });
 
+        return request_id;
+    }
+
+    /// Request terminal output from Zed
+    pub fn terminalOutput(self: *ToolProxy, session_id: []const u8, terminal_id: []const u8) !i64 {
+        const request_id = self.next_request_id;
+        self.next_request_id +%= 1;
+
+        try self.writer.writeTypedRequest(
+            .{ .number = request_id },
+            "terminal/output",
+            protocol.TerminalOutputRequest{
+                .sessionId = session_id,
+                .terminalId = terminal_id,
+            },
+        );
+
+        try self.pending_requests.put(request_id, .{ .method = "terminal/output" });
+        log.debug("Sent terminal/output request {d} for terminal {s}", .{ request_id, terminal_id });
+        return request_id;
+    }
+
+    /// Wait for a terminal to exit
+    pub fn waitForExit(self: *ToolProxy, session_id: []const u8, terminal_id: []const u8) !i64 {
+        const request_id = self.next_request_id;
+        self.next_request_id +%= 1;
+
+        try self.writer.writeTypedRequest(
+            .{ .number = request_id },
+            "terminal/wait_for_exit",
+            protocol.WaitForTerminalExitRequest{
+                .sessionId = session_id,
+                .terminalId = terminal_id,
+            },
+        );
+
+        try self.pending_requests.put(request_id, .{ .method = "terminal/wait_for_exit" });
+        log.debug("Sent terminal/waitForExit request {d} for terminal {s}", .{ request_id, terminal_id });
+        return request_id;
+    }
+
+    /// Kill a terminal command without releasing it
+    pub fn killTerminal(self: *ToolProxy, session_id: []const u8, terminal_id: []const u8) !i64 {
+        const request_id = self.next_request_id;
+        self.next_request_id +%= 1;
+
+        try self.writer.writeTypedRequest(
+            .{ .number = request_id },
+            "terminal/kill",
+            protocol.TerminalKillRequest{
+                .sessionId = session_id,
+                .terminalId = terminal_id,
+            },
+        );
+
+        try self.pending_requests.put(request_id, .{ .method = "terminal/kill" });
+        log.debug("Sent terminal/kill request {d} for terminal {s}", .{ request_id, terminal_id });
+        return request_id;
+    }
+
+    /// Release a terminal and free its resources
+    pub fn releaseTerminal(self: *ToolProxy, session_id: []const u8, terminal_id: []const u8) !i64 {
+        const request_id = self.next_request_id;
+        self.next_request_id +%= 1;
+
+        try self.writer.writeTypedRequest(
+            .{ .number = request_id },
+            "terminal/release",
+            protocol.TerminalReleaseRequest{
+                .sessionId = session_id,
+                .terminalId = terminal_id,
+            },
+        );
+
+        try self.pending_requests.put(request_id, .{ .method = "terminal/release" });
+        log.debug("Sent terminal/release request {d} for terminal {s}", .{ request_id, terminal_id });
         return request_id;
     }
 
@@ -105,10 +191,9 @@ pub const ToolProxy = struct {
     }
 
     /// Handle a response from Zed
-    pub fn handleResponse(self: *ToolProxy, request_id: i64, result: std.json.Value) ?[]const u8 {
+    pub fn handleResponse(self: *ToolProxy, request_id: i64) ?[]const u8 {
         if (self.pending_requests.fetchRemove(request_id)) |entry| {
             log.debug("Received response for {s} (id={d})", .{ entry.value.method, request_id });
-            _ = result; // Caller should process result based on method
             return entry.value.method;
         }
         return null;
@@ -126,14 +211,14 @@ pub const ToolProxy = struct {
 const testing = std.testing;
 
 test "ToolProxy init/deinit" {
-    var writer: jsonrpc.Writer = undefined;
-    var proxy = ToolProxy.init(testing.allocator, &writer);
+    const writer = jsonrpc.Writer.init(testing.allocator, std.io.null_writer.any());
+    var proxy = ToolProxy.init(testing.allocator, writer);
     defer proxy.deinit();
 }
 
 test "ToolProxy request tracking" {
-    var writer: jsonrpc.Writer = undefined;
-    var proxy = ToolProxy.init(testing.allocator, &writer);
+    const writer = jsonrpc.Writer.init(testing.allocator, std.io.null_writer.any());
+    var proxy = ToolProxy.init(testing.allocator, writer);
     defer proxy.deinit();
 
     // Can't actually send requests without a real writer, but we can test tracking
@@ -141,7 +226,7 @@ test "ToolProxy request tracking" {
     try testing.expect(proxy.isPending(1));
     try testing.expect(!proxy.isPending(2));
 
-    const method = proxy.handleResponse(1, .null);
+    const method = proxy.handleResponse(1);
     try testing.expectEqualStrings("test", method.?);
     try testing.expect(!proxy.isPending(1));
 }

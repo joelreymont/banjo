@@ -1,8 +1,14 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const config = @import("config");
 const log = std.log.scoped(.cli_bridge);
 const executable = @import("executable.zig");
+const io_utils = @import("io_utils.zig");
+const test_utils = @import("test_utils.zig");
+
+const max_json_line_bytes: usize = 4 * 1024 * 1024;
+const live_snapshot_timeout_ms: i64 = 60_000;
 
 /// Stream JSON message types from Claude Code
 pub const MessageType = enum {
@@ -66,9 +72,54 @@ const ContentBlock = struct {
     id: ?[]const u8 = null,
     tool_use_id: ?[]const u8 = null,
     input: ?std.json.Value = null,
-    content: ?std.json.Value = null,
+    content: ?ToolResultContent = null,
     is_error: ?bool = null,
     @"error": ?[]const u8 = null,
+};
+
+const ToolResultBlock = struct {
+    type: ?[]const u8 = null,
+    text: ?[]const u8 = null,
+};
+
+const ToolResultContent = union(enum) {
+    text: []const u8,
+    blocks: []ToolResultBlock,
+
+    pub fn jsonParse(
+        allocator: Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) std.json.ParseError(@TypeOf(source.*))!ToolResultContent {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(
+        allocator: Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) std.json.ParseFromValueError!ToolResultContent {
+        _ = options;
+        return switch (source) {
+            .string => |text| .{ .text = text },
+            .array => {
+                const parsed = try std.json.parseFromValueLeaky([]ToolResultBlock, allocator, source, .{
+                    .ignore_unknown_fields = true,
+                });
+                return .{ .blocks = parsed };
+            },
+            .object => {
+                const parsed = try std.json.parseFromValueLeaky(ToolResultBlock, allocator, source, .{
+                    .ignore_unknown_fields = true,
+                });
+                const list = try allocator.alloc(ToolResultBlock, 1);
+                list[0] = parsed;
+                return .{ .blocks = list };
+            },
+            else => error.UnexpectedToken,
+        };
+    }
 };
 
 const MessageObject = struct {
@@ -249,27 +300,20 @@ pub const StreamMessage = struct {
         return null;
     }
 
-    fn extractToolResultText(val: std.json.Value) ?[]const u8 {
-        return switch (val) {
-            .string => val.string,
-            .array => |arr| blk: {
-                for (arr.items) |item| {
-                    if (item != .object) continue;
-                    const item_type = item.object.get("type") orelse continue;
-                    if (item_type != .string) continue;
-                    if (!std.mem.eql(u8, item_type.string, "text")) continue;
-                    const text = item.object.get("text") orelse continue;
-                    if (text == .string) break :blk text.string;
+    fn extractToolResultText(content: ToolResultContent) ?[]const u8 {
+        return switch (content) {
+            .text => |text| text,
+            .blocks => |blocks| blk: {
+                for (blocks) |block| {
+                    const text = block.text orelse continue;
+                    if (block.type) |block_type| {
+                        const parsed = ContentBlockType.fromString(block_type) orelse continue;
+                        if (parsed != .text) continue;
+                    }
+                    break :blk text;
                 }
                 break :blk null;
             },
-            .object => |obj| blk: {
-                if (obj.get("text")) |text| {
-                    if (text == .string) break :blk text.string;
-                }
-                break :blk null;
-            },
-            else => null,
         };
     }
 
@@ -367,18 +411,10 @@ pub const StreamMessage = struct {
 
     /// Get stream event data (text or thinking delta)
     pub fn getStreamDelta(self: *const StreamMessage) ?struct { text: ?[]const u8, thinking: ?[]const u8 } {
-        if (self.type != .stream_event) return null;
+        const event = self.parseStreamEvent() orelse return null;
+        if (event.type != .content_block_delta) return null;
 
-        const env = self.getEnvelope() orelse return null;
-        const event_val = env.event orelse return null;
-        const parsed = std.json.parseFromValue(StreamEvent, self.arenaAllocator(), event_val, .{
-            .ignore_unknown_fields = true,
-        }) catch return null;
-        defer parsed.deinit();
-
-        if (parsed.value.event.type != .content_block_delta) return null;
-
-        const delta = parsed.value.event.delta orelse return null;
+        const delta = event.delta orelse return null;
         return switch (delta.type) {
             .text_delta => .{ .text = delta.text, .thinking = null },
             .thinking_delta => .{ .text = null, .thinking = delta.thinking },
@@ -388,14 +424,23 @@ pub const StreamMessage = struct {
 
     /// Get stream event type (message start/stop, content block, etc.)
     pub fn getStreamEventType(self: *const StreamMessage) ?StreamEvent.Event.EventType {
+        const event = self.parseStreamEvent() orelse return null;
+        return event.type;
+    }
+
+    fn parseStreamEvent(self: *const StreamMessage) ?StreamEvent.Event {
         if (self.type != .stream_event) return null;
         const env = self.getEnvelope() orelse return null;
         const event_val = env.event orelse return null;
+        // Parse into the message arena; deinit only releases parse bookkeeping.
         const parsed = std.json.parseFromValue(StreamEvent, self.arenaAllocator(), event_val, .{
             .ignore_unknown_fields = true,
-        }) catch return null;
+        }) catch |err| {
+            log.warn("Failed to parse stream event: {}", .{err});
+            return null;
+        };
         defer parsed.deinit();
-        return parsed.value.event.type;
+        return parsed.value.event;
     }
 };
 
@@ -443,13 +488,15 @@ pub const Bridge = struct {
 
         const claude_path = findClaudeBinary();
         log.info("Using claude binary: {s}", .{claude_path});
-        try args.append(self.allocator, claude_path);
-        try args.append(self.allocator, "-p");
-        try args.append(self.allocator, "--verbose"); // Required with -p and stream-json
-        try args.append(self.allocator, "--input-format");
-        try args.append(self.allocator, "stream-json");
-        try args.append(self.allocator, "--output-format");
-        try args.append(self.allocator, "stream-json");
+        try args.appendSlice(self.allocator, &[_][]const u8{
+            claude_path,
+            "-p",
+            "--verbose", // Required with -p and stream-json
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+        });
 
         if (opts.resume_session_id) |sid| {
             try args.append(self.allocator, "--resume");
@@ -461,11 +508,6 @@ pub const Bridge = struct {
         if (opts.permission_mode) |mode| {
             try args.append(self.allocator, "--permission-mode");
             try args.append(self.allocator, mode);
-        }
-
-        if (opts.mcp_config) |config| {
-            try args.append(self.allocator, "--mcp-config");
-            try args.append(self.allocator, config);
         }
 
         if (opts.model) |model| {
@@ -498,7 +540,6 @@ pub const Bridge = struct {
         resume_session_id: ?[]const u8 = null,
         continue_last: bool = false, // Use --continue to resume last session
         permission_mode: ?[]const u8 = null,
-        mcp_config: ?[]const u8 = null,
         model: ?[]const u8 = null,
     };
 
@@ -542,16 +583,35 @@ pub const Bridge = struct {
         const reader = if (self.stdout_reader) |*stdout_reader| &stdout_reader.interface else return error.NoStdout;
 
         log.debug("Waiting for CLI stdout...", .{});
-        const line = reader.takeDelimiter('\n') catch |e| switch (e) {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        var keep_arena = false;
+        defer if (!keep_arena) arena.deinit();
+
+        var line_writer: std.io.Writer.Allocating = .init(arena.allocator());
+        defer line_writer.deinit();
+
+        _ = reader.streamDelimiterLimit(&line_writer.writer, '\n', .limited(max_json_line_bytes)) catch |e| switch (e) {
             error.ReadFailed => {
                 log.debug("CLI read failed", .{});
                 return null;
             },
+            error.WriteFailed => return error.OutOfMemory,
             error.StreamTooLong => return error.LineTooLong,
-        } orelse {
-            log.debug("CLI returned null (EOF or empty)", .{});
-            return null;
         };
+
+        if (reader.peekGreedy(1)) |peek| {
+            if (peek.len > 0 and peek[0] == '\n') {
+                reader.toss(1);
+            }
+        } else |err| switch (err) {
+            error.ReadFailed => {
+                log.debug("CLI read failed", .{});
+                return null;
+            },
+            error.EndOfStream => {},
+        }
+
+        const line = line_writer.written();
 
         if (line.len == 0) {
             log.debug("CLI returned empty line", .{});
@@ -559,9 +619,6 @@ pub const Bridge = struct {
         }
 
         log.debug("CLI stdout: {s}", .{line});
-
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        errdefer arena.deinit();
 
         const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), line, .{});
         const envelope = std.json.parseFromValueLeaky(StreamEnvelope, arena.allocator(), parsed.value, .{
@@ -575,6 +632,7 @@ pub const Bridge = struct {
 
         const subtype = if (envelope) |env| env.subtype else null;
 
+        keep_arena = true;
         return StreamMessage{
             .type = msg_type,
             .subtype = subtype,
@@ -681,30 +739,8 @@ test "StreamMessage tool result parsing from user message" {
 const LiveSnapshotError = error{
     Timeout,
     UnexpectedEof,
+    AuthRequired,
 };
-
-fn normalizeSnapshotText(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-
-    var last_space = false;
-    for (input) |c| {
-        if (std.ascii.isWhitespace(c)) {
-            if (out.items.len == 0 or last_space) continue;
-            try out.append(allocator, ' ');
-            last_space = true;
-            continue;
-        }
-        last_space = false;
-        try out.append(allocator, c);
-    }
-
-    if (out.items.len > 0 and out.items[out.items.len - 1] == ' ') {
-        _ = out.pop();
-    }
-
-    return try out.toOwnedSlice(allocator);
-}
 
 fn collectClaudeSnapshot(allocator: Allocator, prompt: []const u8) ![]u8 {
     var bridge = Bridge.init(allocator, ".");
@@ -728,16 +764,21 @@ fn collectClaudeSnapshot(allocator: Allocator, prompt: []const u8) ![]u8 {
     defer if (stop_reason_buf) |buf| allocator.free(buf);
     var saw_result = false;
 
-    const deadline = std.time.milliTimestamp() + 30_000;
+    const deadline = std.time.milliTimestamp() + live_snapshot_timeout_ms;
     while (true) {
         if (std.time.milliTimestamp() > deadline) return error.Timeout;
-        var msg = (try bridge.readMessage()) orelse {
+        var msg = (try readClaudeMessageWithTimeout(&bridge, deadline)) orelse {
             if (saw_result) break;
             return error.UnexpectedEof;
         };
         defer msg.deinit();
 
         switch (msg.type) {
+            .system => {
+                if (msg.getSystemSubtype()) |subtype| {
+                    if (subtype == .auth_required) return error.AuthRequired;
+                }
+            },
             .stream_event => {
                 if (msg.getStreamTextDelta()) |delta| {
                     saw_delta = true;
@@ -764,16 +805,47 @@ fn collectClaudeSnapshot(allocator: Allocator, prompt: []const u8) ![]u8 {
         if (saw_result) break;
     }
 
-    const normalized = try normalizeSnapshotText(allocator, text_buf.items);
+    const normalized = try test_utils.normalizeSnapshotText(allocator, text_buf.items);
     defer allocator.free(normalized);
 
-    return std.fmt.allocPrint(allocator,
+    return std.fmt.allocPrint(
+        allocator,
         "engine: claude\ntext: {s}\nstop_reason: {s}\n",
         .{ normalized, stop_reason },
     );
 }
 
+fn hasBufferedClaudeData(bridge: *Bridge) bool {
+    if (bridge.stdout_reader) |*reader| {
+        return reader.interface.seek < reader.interface.end;
+    }
+    return false;
+}
+
+fn waitForClaudeReadable(bridge: *Bridge, timeout_ms: i32) !bool {
+    const proc = bridge.process orelse return error.NotStarted;
+    const stdout = proc.stdout orelse return error.NoStdout;
+    return io_utils.waitForReadable(stdout.handle, timeout_ms);
+}
+
+fn readClaudeMessageWithTimeout(bridge: *Bridge, deadline_ms: i64) !?StreamMessage {
+    while (true) {
+        const now = std.time.milliTimestamp();
+        if (now >= deadline_ms) return error.Timeout;
+
+        if (hasBufferedClaudeData(bridge)) {
+            return try bridge.readMessage();
+        }
+
+        const slice_ms = io_utils.pollSliceMs(deadline_ms, now);
+        const readable = try waitForClaudeReadable(bridge, slice_ms);
+        if (!readable) continue;
+        return try bridge.readMessage();
+    }
+}
+
 test "snapshot: Claude Code live prompt" {
+    if (!config.live_cli_tests) return error.SkipZigTest;
     if (!Bridge.isAvailable()) return error.SkipZigTest;
 
     const snapshot = try collectClaudeSnapshot(testing.allocator, "Reply with exactly the single word BANJO.");
@@ -800,72 +872,41 @@ fn buildTestMessage(
     content_type: enum { text, tool_use, image, none },
     include_subtype: bool,
 ) !std.json.Value {
-    var root = std.json.ObjectMap.init(allocator);
-    errdefer root.deinit();
+    var json_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer json_buf.deinit(allocator);
 
-    try root.put("type", .{ .string = @tagName(msg_type) });
+    try json_buf.appendSlice(allocator, "{\"type\":\"");
+    try json_buf.appendSlice(allocator, @tagName(msg_type));
+    try json_buf.appendSlice(allocator, "\"");
 
-    if (include_subtype) {
-        try root.put("subtype", .{ .string = "test_subtype" });
+    if (include_subtype and msg_type != .result) {
+        try json_buf.appendSlice(allocator, ",\"subtype\":\"test_subtype\"");
     }
 
     if (msg_type == .system) {
         if (content_type != .none) {
-            try root.put("content", .{ .string = "system_content" });
+            try json_buf.appendSlice(allocator, ",\"content\":\"system_content\"");
         }
     } else if (msg_type == .assistant) {
-        var message_obj = std.json.ObjectMap.init(allocator);
-        errdefer message_obj.deinit();
-
-        var content_array = std.json.Array.init(allocator);
-        errdefer content_array.deinit();
-
-        if (content_type == .text) {
-            var text_block = std.json.ObjectMap.init(allocator);
-            errdefer text_block.deinit();
-            try text_block.put("type", .{ .string = "text" });
-            try text_block.put("text", .{ .string = "assistant_text" });
-            try content_array.append(.{ .object = text_block });
-        } else if (content_type == .tool_use) {
-            var tool_block = std.json.ObjectMap.init(allocator);
-            errdefer tool_block.deinit();
-            try tool_block.put("type", .{ .string = "tool_use" });
-            try tool_block.put("name", .{ .string = "default_tool" });
-            try tool_block.put("id", .{ .string = "toolu_default" });
-            try content_array.append(.{ .object = tool_block });
-        } else if (content_type == .image) {
-            var img_block = std.json.ObjectMap.init(allocator);
-            errdefer img_block.deinit();
-            try img_block.put("type", .{ .string = "image" });
-            try content_array.append(.{ .object = img_block });
+        if (content_type != .none) {
+            const content_block = switch (content_type) {
+                .text => "{\"type\":\"text\",\"text\":\"assistant_text\"}",
+                .tool_use => "{\"type\":\"tool_use\",\"name\":\"default_tool\",\"id\":\"toolu_default\"}",
+                .image => "{\"type\":\"image\"}",
+                .none => "",
+            };
+            try json_buf.appendSlice(allocator, ",\"message\":{\"content\":[");
+            try json_buf.appendSlice(allocator, content_block);
+            try json_buf.appendSlice(allocator, "]}");
         }
-
-        try message_obj.put("content", .{ .array = content_array });
-        try root.put("message", .{ .object = message_obj });
     } else if (msg_type == .result) {
         if (include_subtype) {
-            try root.put("subtype", .{ .string = "end_turn" });
+            try json_buf.appendSlice(allocator, ",\"subtype\":\"end_turn\"");
         }
     }
 
-    return .{ .object = root };
-}
-
-fn freeTestMessage(allocator: std.mem.Allocator, val: *std.json.Value) void {
-    _ = allocator;
-    // Free nested structures
-    if (val.object.get("message")) |msg| {
-        if (msg.object.get("content")) |content| {
-            for (content.array.items) |*item| {
-                item.object.deinit();
-            }
-            var arr = content.array;
-            arr.deinit();
-        }
-        var msg_obj = msg.object;
-        msg_obj.deinit();
-    }
-    val.object.deinit();
+    try json_buf.appendSlice(allocator, "}");
+    return try std.json.parseFromSliceLeaky(std.json.Value, allocator, json_buf.items, .{});
 }
 
 test "property: MessageType.fromString covers all variants" {
@@ -1025,10 +1066,12 @@ test "property: system messages extract content from content or message field" {
     // Test message field fallback
     var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
     const alloc2 = arena2.allocator();
-    var root2 = std.json.ObjectMap.init(alloc2);
-    try root2.put("type", .{ .string = "system" });
-    try root2.put("message", .{ .string = "fallback_message" });
-    const json2 = std.json.Value{ .object = root2 };
+    const json2 = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        alloc2,
+        "{\"type\":\"system\",\"message\":\"fallback_message\"}",
+        .{},
+    );
 
     var msg2 = StreamMessage{
         .type = .system,

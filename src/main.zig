@@ -15,64 +15,29 @@ const Mode = enum {
 /// CLI options matching Claude Code interface
 const CliOptions = struct {
     mode: Mode = .agent,
-    output_format: Format = .stream_json,
-    input_format: Format = .stream_json,
     verbose: bool = false,
     session_id: ?[]const u8 = null,
     permission_mode: []const u8 = "default",
-    allowed_tools: ?[]const u8 = null,
-    disallowed_tools: ?[]const u8 = null,
-    mcp_config: ?[]const u8 = null,
-    include_partial_messages: bool = false,
-    allow_dangerously_skip_permissions: bool = false,
-
-    const Format = enum { stream_json, text };
 };
 
 const ArgAction = enum {
     mode_agent,
     mode_lsp,
-    output_format,
-    input_format,
     verbose,
     session_id,
     permission_mode,
-    allowed_tools,
-    disallowed_tools,
-    mcp_config,
-    include_partial_messages,
-    allow_dangerously_skip_permissions,
-    permission_prompt_tool,
-    setting_sources,
-    print,
     help,
 };
 
 const arg_map = std.StaticStringMap(ArgAction).initComptime(.{
     .{ "--agent", .mode_agent },
     .{ "--lsp", .mode_lsp },
-    .{ "--output-format", .output_format },
-    .{ "--input-format", .input_format },
     .{ "--verbose", .verbose },
     .{ "-v", .verbose },
     .{ "--session-id", .session_id },
     .{ "--permission-mode", .permission_mode },
-    .{ "--allowedTools", .allowed_tools },
-    .{ "--disallowedTools", .disallowed_tools },
-    .{ "--mcp-config", .mcp_config },
-    .{ "--include-partial-messages", .include_partial_messages },
-    .{ "--allow-dangerously-skip-permissions", .allow_dangerously_skip_permissions },
-    .{ "--permission-prompt-tool", .permission_prompt_tool },
-    .{ "--setting-sources", .setting_sources },
-    .{ "-p", .print },
-    .{ "--print", .print },
     .{ "-h", .help },
     .{ "--help", .help },
-});
-
-const format_map = std.StaticStringMap(CliOptions.Format).initComptime(.{
-    .{ "stream-json", .stream_json },
-    .{ "text", .text },
 });
 
 fn parseArgs(allocator: std.mem.Allocator) !CliOptions {
@@ -87,17 +52,9 @@ fn parseArgs(allocator: std.mem.Allocator) !CliOptions {
         switch (action) {
             .mode_agent => opts.mode = .agent,
             .mode_lsp => opts.mode = .lsp,
-            .output_format => opts.output_format = parseFormat(args.next()),
-            .input_format => opts.input_format = parseFormat(args.next()),
             .verbose => opts.verbose = true,
             .session_id => opts.session_id = args.next(),
             .permission_mode => opts.permission_mode = args.next() orelse "default",
-            .allowed_tools => opts.allowed_tools = args.next(),
-            .disallowed_tools => opts.disallowed_tools = args.next(),
-            .mcp_config => opts.mcp_config = args.next(),
-            .include_partial_messages => opts.include_partial_messages = true,
-            .allow_dangerously_skip_permissions => opts.allow_dangerously_skip_permissions = true,
-            .permission_prompt_tool, .setting_sources, .print => _ = args.next(),
             .help => {
                 printHelp();
                 std.process.exit(0);
@@ -106,10 +63,6 @@ fn parseArgs(allocator: std.mem.Allocator) !CliOptions {
     }
 
     return opts;
-}
-
-fn parseFormat(val: ?[]const u8) CliOptions.Format {
-    return if (val) |v| format_map.get(v) orelse .text else .stream_json;
 }
 
 fn printHelp() void {
@@ -127,14 +80,9 @@ fn printHelp() void {
         \\  --lsp                       LSP server mode for note stickies
         \\
         \\Options:
-        \\  --output-format <format>    Output format: stream-json, text
-        \\  --input-format <format>     Input format: stream-json, text
         \\  --verbose                   Enable verbose logging
         \\  --session-id <id>           Session ID for resuming
         \\  --permission-mode <mode>    Permission mode: default, plan, etc.
-        \\  --allowedTools <tools>      Comma-separated allowed tools
-        \\  --disallowedTools <tools>   Comma-separated disallowed tools
-        \\  --mcp-config <json>         MCP server configuration
         \\  -h, --help                  Show this help
         \\
     ) catch {};
@@ -166,7 +114,7 @@ pub fn main() !void {
                 }
             }
 
-            var reader = jsonrpc.Reader.init(allocator, stdin);
+            var reader = jsonrpc.Reader.initWithFd(allocator, stdin, std.posix.STDIN_FILENO);
             defer reader.deinit();
 
             var acp_agent = Agent.init(allocator, stdout, &reader);

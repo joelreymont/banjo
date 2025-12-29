@@ -11,13 +11,19 @@ const NotesByFile = std.StringHashMap(NoteList);
 pub const CommandResult = struct {
     success: bool,
     message: []const u8,
-    /// Allocated message that needs to be freed
-    allocated: ?[]const u8 = null,
 
     pub fn deinit(self: *CommandResult, allocator: Allocator) void {
-        if (self.allocated) |msg| {
-            allocator.free(msg);
-        }
+        allocator.free(self.message);
+    }
+};
+
+pub const SetupPayload = struct {
+    settings_json: []const u8,
+    message: []const u8,
+
+    pub fn deinit(self: *SetupPayload, allocator: Allocator) void {
+        allocator.free(self.settings_json);
+        allocator.free(self.message);
     }
 };
 
@@ -68,6 +74,11 @@ const command_handlers = std.StaticStringMap(CommandHandler).initComptime(.{
     .{ "/note", handleNote },
 });
 
+fn makeResult(allocator: Allocator, success: bool, message: []const u8) !CommandResult {
+    const copy = try allocator.dupe(u8, message);
+    return .{ .success = success, .message = copy };
+}
+
 /// Parse and execute a /note or /notes command
 /// Note: With comment-based notes, most operations are done via LSP code actions.
 /// Agent panel commands are for listing and searching only.
@@ -82,7 +93,7 @@ pub fn executeCommand(allocator: Allocator, project_root: []const u8, command: [
         return handler(allocator, project_root, args);
     }
 
-    return .{ .success = false, .message = "Unknown command. Try /setup, /notes, or /note" };
+    return makeResult(allocator, false, "Unknown command. Try /setup, /notes, or /note");
 }
 
 fn handleSetup(allocator: Allocator, project_root: []const u8, _: []const u8) !CommandResult {
@@ -97,12 +108,16 @@ const note_subcommands = std.StaticStringMap([]const u8).initComptime(.{
     .{ "create", "To create a note:\n1. Write a comment in your code: // TODO: fix this\n2. Place cursor on that line\n3. Press Cmd+. and select 'Create Banjo Note'\n\nThe comment will be converted to: // @banjo[id] TODO: fix this" },
 });
 
-fn handleNote(_: Allocator, _: []const u8, args: []const u8) !CommandResult {
+fn handleNote(allocator: Allocator, _: []const u8, args: []const u8) !CommandResult {
     const subcmd = if (mem.indexOf(u8, args, " ")) |idx| args[0..idx] else args;
     if (note_subcommands.get(subcmd)) |msg| {
-        return .{ .success = true, .message = msg };
+        return makeResult(allocator, true, msg);
     }
-    return .{ .success = false, .message = "Usage: /notes - list notes\n/note create - create a note (use code action instead)" };
+    return makeResult(
+        allocator,
+        false,
+        "Usage: /notes - list notes\n/note create - create a note (use code action instead)",
+    );
 }
 
 /// List all notes in project grouped by file
@@ -126,10 +141,11 @@ fn listNotes(allocator: Allocator, project_root: []const u8) !CommandResult {
     try scanProjectForNotes(allocator, project_root, &notes_by_file);
 
     if (notes_by_file.count() == 0) {
-        return .{
-            .success = true,
-            .message = "No notes found.\n\nTo create a note:\n1. Write a comment: // TODO: something\n2. Press Cmd+. and select 'Create Banjo Note'",
-        };
+        return makeResult(
+            allocator,
+            true,
+            "No notes found.\n\nTo create a note:\n1. Write a comment: // TODO: something\n2. Press Cmd+. and select 'Create Banjo Note'",
+        );
     }
 
     // Build output grouped by file
@@ -159,11 +175,8 @@ fn listNotes(allocator: Allocator, project_root: []const u8) !CommandResult {
 
     try writer.print("\n---\n**Total:** {d} notes in {d} files\n", .{ total_notes, notes_by_file.count() });
 
-    return .{
-        .success = true,
-        .message = output.items,
-        .allocated = output.toOwnedSlice(allocator) catch null,
-    };
+    const message = try output.toOwnedSlice(allocator);
+    return .{ .success = true, .message = message };
 }
 
 /// Scan project recursively for note comments
@@ -229,15 +242,12 @@ fn setupLsp(allocator: Allocator, project_root: []const u8) !CommandResult {
     try scanForLanguages(allocator, project_root, &detected);
 
     if (detected.count() == 0) {
-        return .{
-            .success = false,
-            .message = "No supported languages found in project.",
-        };
+        return makeResult(allocator, false, "No supported languages found in project.");
     }
 
     // Find banjo binary
     const banjo_path = findBanjoBinary(allocator) catch {
-        return .{ .success = false, .message = "Could not find banjo binary" };
+        return makeResult(allocator, false, "Could not find banjo binary");
     };
     defer allocator.free(banjo_path);
 
@@ -279,7 +289,7 @@ fn setupLsp(allocator: Allocator, project_root: []const u8) !CommandResult {
 
     fs.makeDirAbsolute(zed_dir_path) catch |err| switch (err) {
         error.PathAlreadyExists => {},
-        else => return .{ .success = false, .message = "Failed to create .zed directory" },
+        else => return makeResult(allocator, false, "Failed to create .zed directory"),
     };
 
     // Write settings.json
@@ -287,12 +297,12 @@ fn setupLsp(allocator: Allocator, project_root: []const u8) !CommandResult {
     defer allocator.free(settings_path);
 
     const file = fs.createFileAbsolute(settings_path, .{}) catch {
-        return .{ .success = false, .message = "Failed to create .zed/settings.json" };
+        return makeResult(allocator, false, "Failed to create .zed/settings.json");
     };
     defer file.close();
 
     file.writeAll(json.items) catch {
-        return .{ .success = false, .message = "Failed to write .zed/settings.json" };
+        return makeResult(allocator, false, "Failed to write .zed/settings.json");
     };
 
     // Build success message
@@ -306,11 +316,8 @@ fn setupLsp(allocator: Allocator, project_root: []const u8) !CommandResult {
     }
     try msg_writer.writeAll("\nReload Zed to activate the LSP.");
 
-    return .{
-        .success = true,
-        .message = msg.items,
-        .allocated = msg.toOwnedSlice(allocator) catch null,
-    };
+    const message = try msg.toOwnedSlice(allocator);
+    return .{ .success = true, .message = message };
 }
 
 /// Recursively scan directory for source files and detect languages

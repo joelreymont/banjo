@@ -73,9 +73,13 @@ The `update` field uses a `sessionUpdate` discriminator:
   "toolCallId": "uuid",
   "status": "completed",
   "title": "Read",
-  "content": [{ "type": "text", "text": "file contents..." }]
+  "content": [
+    { "type": "content", "content": { "type": "text", "text": "file contents..." } }
+  ]
 }
 ```
+
+Tool call content entries may also include `terminalId` (terminal output) or `path`/`oldText`/`newText` (file edits).
 
 #### plan
 ```json
@@ -113,7 +117,10 @@ The `update` field uses a `sessionUpdate` discriminator:
 
 ```json
 { "type": "text", "text": "..." }
-{ "type": "image", "data": "base64...", "mediaType": "image/png" }
+{ "type": "image", "data": "base64...", "mimeType": "image/png" }
+{ "type": "audio", "data": "base64...", "mimeType": "audio/wav" }
+{ "type": "resource", "resource": { "uri": "file:///path/to/file", "text": "..." } }
+{ "type": "resource_link", "uri": "file:///path/to/file", "name": "file.zig" }
 ```
 
 ### ToolCallStatus
@@ -126,9 +133,15 @@ The `update` field uses a `sessionUpdate` discriminator:
 ### ToolCallKind
 
 - `read` - File read
-- `write` - File write
 - `edit` - File edit
-- `command` - Terminal command
+- `write` - File write
+- `delete` - File delete
+- `move` - File move
+- `search` - Search
+- `execute` - Terminal command
+- `think` - Internal reasoning
+- `fetch` - Network fetch
+- `switch_mode` - Mode change
 - `other` - Other tool types
 
 ### PromptResponse
@@ -145,7 +158,9 @@ Response to `session/prompt`:
 |------------|-------------|
 | `end_turn` | Normal completion |
 | `cancelled` | User cancelled |
+| `max_tokens` | Token limit reached |
 | `max_turn_requests` | Hit max budget/turns |
+| `refusal` | Model refused |
 
 ### CLI → ACP Stop Reason Mapping
 

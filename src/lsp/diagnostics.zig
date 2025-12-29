@@ -3,6 +3,7 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const protocol = @import("protocol.zig");
 const comments = @import("../notes/comments.zig");
+const summary = @import("summary.zig");
 
 /// Diagnostic with ownership info for deferred cleanup
 pub const OwnedDiagnostic = struct {
@@ -86,6 +87,7 @@ pub const NoteIndex = struct {
             self.allocator.free(old.value.file_path);
             self.allocator.free(old.value.content);
         }
+        try self.removeBacklinksForSource(note.id);
 
         const id = try self.allocator.dupe(u8, note.id);
         errdefer self.allocator.free(id);
@@ -98,23 +100,27 @@ pub const NoteIndex = struct {
 
         // Index backlinks BEFORE adding note to map (so errdefers work correctly)
         for (note.links) |target_id| {
-            const source_id = try self.allocator.dupe(u8, note.id);
-            errdefer self.allocator.free(source_id);
-
             // Check if target already exists before allocating
             if (self.backlinks.getPtr(target_id)) |list| {
-                // Target exists, just append source
-                try list.append(self.allocator, source_id);
+                if (listContains(list.items, note.id)) continue;
+                const source_id = try self.allocator.dupe(u8, note.id);
+                list.append(self.allocator, source_id) catch |err| {
+                    self.allocator.free(source_id);
+                    return err;
+                };
             } else {
                 // New target, need to allocate key
+                const source_id = try self.allocator.dupe(u8, note.id);
                 const target = try self.allocator.dupe(u8, target_id);
                 const result = self.backlinks.getOrPut(target) catch |e| {
                     self.allocator.free(target);
+                    self.allocator.free(source_id);
                     return e;
                 };
                 result.value_ptr.* = .empty;
                 result.value_ptr.append(self.allocator, source_id) catch |e| {
                     // Remove and free the entry we just added
+                    self.allocator.free(source_id);
                     _ = self.backlinks.remove(target);
                     self.allocator.free(target);
                     return e;
@@ -128,6 +134,43 @@ pub const NoteIndex = struct {
             .line = note.line,
             .content = content,
         });
+    }
+
+    fn listContains(list: []const []const u8, needle: []const u8) bool {
+        for (list) |item| {
+            if (mem.eql(u8, item, needle)) return true;
+        }
+        return false;
+    }
+
+    fn removeBacklinksForSource(self: *NoteIndex, source_id: []const u8) !void {
+        var to_remove: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer to_remove.deinit(self.allocator);
+
+        var it = self.backlinks.iterator();
+        while (it.next()) |entry| {
+            var list = entry.value_ptr.*;
+            var i: usize = 0;
+            while (i < list.items.len) {
+                if (mem.eql(u8, list.items[i], source_id)) {
+                    self.allocator.free(list.items[i]);
+                    _ = list.orderedRemove(i);
+                    continue;
+                }
+                i += 1;
+            }
+            if (list.items.len == 0) {
+                try to_remove.append(self.allocator, entry.key_ptr.*);
+            }
+        }
+
+        for (to_remove.items) |key| {
+            if (self.backlinks.fetchRemove(key)) |removed| {
+                self.allocator.free(removed.key);
+                var list = removed.value;
+                list.deinit(self.allocator);
+            }
+        }
     }
 
     /// Get backlinks to a note (notes that link TO this note)
@@ -155,10 +198,10 @@ pub fn noteToDiagnostic(
     const line: u32 = if (note.line > 0) note.line - 1 else 0;
 
     // Get summary (first 80 chars)
-    const summary = getSummary(note.content);
+    const summary_text = summary.getSummary(note.content, .{ .max_len = 80, .prefer_word_boundary = false });
 
     // Format message
-    const message = try std.fmt.allocPrint(allocator, "Note: {s}", .{summary});
+    const message = try std.fmt.allocPrint(allocator, "Note: {s}", .{summary_text});
     errdefer allocator.free(message);
 
     // Build related information for backlinks
@@ -183,7 +226,8 @@ pub fn noteToDiagnostic(
             for (backlink_ids) |bl_id| {
                 if (idx.getNote(bl_id)) |bl_note| {
                     const bl_line: u32 = if (bl_note.line > 0) bl_note.line - 1 else 0;
-                    const bl_msg = try std.fmt.allocPrint(allocator, "Linked from: {s}", .{getSummary(bl_note.content)});
+                    const bl_summary = summary.getSummary(bl_note.content, .{ .max_len = 80, .prefer_word_boundary = false });
+                    const bl_msg = try std.fmt.allocPrint(allocator, "Linked from: {s}", .{bl_summary});
                     errdefer allocator.free(bl_msg);
                     const bl_uri = try pathToUri(allocator, bl_note.file_path);
 
@@ -270,25 +314,6 @@ pub fn extractDiagnostics(allocator: Allocator, owned: []const OwnedDiagnostic) 
     return result;
 }
 
-fn getSummary(text: []const u8) []const u8 {
-    // Get first line, max 80 chars
-    var end: usize = 0;
-    for (text, 0..) |c, i| {
-        if (c == '\n') {
-            end = i;
-            break;
-        }
-    } else {
-        end = text.len;
-    }
-
-    const max_len = 80;
-    if (end > max_len) {
-        return text[0..max_len];
-    }
-    return text[0..end];
-}
-
 //
 // Tests
 //
@@ -314,14 +339,14 @@ test "noteToDiagnostic creates info diagnostic" {
 
 test "getSummary truncates long text" {
     const long_text = "a" ** 100;
-    const summary = getSummary(long_text);
-    try testing.expectEqual(@as(usize, 80), summary.len);
+    const summary_text = summary.getSummary(long_text, .{ .max_len = 80, .prefer_word_boundary = false });
+    try testing.expectEqual(@as(usize, 80), summary_text.len);
 }
 
 test "getSummary stops at newline" {
     const text = "First line\nSecond line";
-    const summary = getSummary(text);
-    try testing.expectEqualStrings("First line", summary);
+    const summary_text = summary.getSummary(text, .{ .max_len = 80, .prefer_word_boundary = false });
+    try testing.expectEqualStrings("First line", summary_text);
 }
 
 test "NoteIndex tracks backlinks" {
@@ -347,6 +372,24 @@ test "NoteIndex tracks backlinks" {
     try index.addNote(note_b, "/test.zig");
 
     // Check backlinks to note-b
+    const backlinks = index.getBacklinks("note-b").?;
+    try testing.expectEqual(@as(usize, 1), backlinks.len);
+    try testing.expectEqualStrings("note-a", backlinks[0]);
+}
+
+test "NoteIndex avoids duplicate backlinks" {
+    var index = NoteIndex.init(testing.allocator);
+    defer index.deinit();
+
+    const note_a = comments.ParsedNote{
+        .id = "note-a",
+        .line = 1,
+        .content = "Links to [[B][note-b]]",
+        .links = &[_][]const u8{"note-b"},
+    };
+    try index.addNote(note_a, "/test.zig");
+    try index.addNote(note_a, "/test.zig");
+
     const backlinks = index.getBacklinks("note-b").?;
     try testing.expectEqual(@as(usize, 1), backlinks.len);
     try testing.expectEqualStrings("note-a", backlinks[0]);

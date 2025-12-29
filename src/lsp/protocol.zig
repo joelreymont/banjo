@@ -405,54 +405,24 @@ pub const Transport = struct {
 
     /// Write a typed response
     pub fn writeTypedResponse(self: *Transport, id: ?jsonrpc.Request.Id, result: anytype) !void {
-        var out: std.io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        var jw: std.json.Stringify = .{
-            .writer = &out.writer,
-            .options = .{ .emit_null_optional_fields = false },
-        };
-
-        try jw.beginObject();
-        try jw.objectField("jsonrpc");
-        try jw.write("2.0");
-        try jw.objectField("result");
-        try jw.write(result);
-        try jw.objectField("id");
-        if (id) |i| {
-            switch (i) {
-                .string => |s| try jw.write(s),
-                .number => |n| try jw.write(n),
-                .null => try jw.write(null),
-            }
-        } else {
-            try jw.write(null);
-        }
-        try jw.endObject();
-
-        const json = try out.toOwnedSlice();
+        const json = try jsonrpc.serializeTypedResponse(
+            self.allocator,
+            id,
+            result,
+            .{ .emit_null_optional_fields = false },
+        );
         defer self.allocator.free(json);
         try self.writeMessage(json);
     }
 
     /// Write a notification
     pub fn writeNotification(self: *Transport, method: []const u8, params: anytype) !void {
-        var out: std.io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        var jw: std.json.Stringify = .{
-            .writer = &out.writer,
-            .options = .{ .emit_null_optional_fields = false },
-        };
-
-        try jw.beginObject();
-        try jw.objectField("jsonrpc");
-        try jw.write("2.0");
-        try jw.objectField("method");
-        try jw.write(method);
-        try jw.objectField("params");
-        try jw.write(params);
-        try jw.endObject();
-
-        const json = try out.toOwnedSlice();
+        const json = try jsonrpc.serializeTypedNotification(
+            self.allocator,
+            method,
+            params,
+            .{ .emit_null_optional_fields = false },
+        );
         defer self.allocator.free(json);
         try self.writeMessage(json);
     }
@@ -531,7 +501,7 @@ test "Transport reads Content-Length message" {
     const message = "Content-Length: 46\r\n\r\n" ++ json_body;
     var fbs = std.io.fixedBufferStream(message);
 
-    var transport = Transport.init(testing.allocator, fbs.reader().any(), undefined);
+    var transport = Transport.init(testing.allocator, fbs.reader().any(), std.io.null_writer.any());
     defer transport.deinit();
 
     const parsed = try transport.readMessage();
@@ -547,11 +517,23 @@ test "Transport handles missing Content-Length" {
     const message = "Content-Type: application/json\r\n\r\n{}";
     var fbs = std.io.fixedBufferStream(message);
 
-    var transport = Transport.init(testing.allocator, fbs.reader().any(), undefined);
+    var transport = Transport.init(testing.allocator, fbs.reader().any(), std.io.null_writer.any());
     defer transport.deinit();
 
     const result = transport.readMessage();
     try testing.expectError(error.MissingContentLength, result);
+}
+
+test "Transport rejects invalid JSON-RPC message" {
+    const json_body = "{\"jsonrpc\":\"1.0\",\"method\":\"initialize\"}";
+    const message = std.fmt.comptimePrint("Content-Length: {d}\r\n\r\n{s}", .{ json_body.len, json_body });
+    var fbs = std.io.fixedBufferStream(message);
+
+    var transport = Transport.init(testing.allocator, fbs.reader().any(), std.io.null_writer.any());
+    defer transport.deinit();
+
+    const result = transport.readMessage();
+    try testing.expectError(error.InvalidRequest, result);
 }
 
 // Snapshot tests

@@ -39,7 +39,8 @@ pub fn check(comptime property: anytype, config: Config) !void {
 
 fn checkType(comptime Args: type, comptime property: anytype, config: Config) !void {
     const seed = if (config.seed == 0) blk: {
-        break :blk @as(u64, @intCast(std.time.timestamp()));
+        const ts = std.time.timestamp();
+        break :blk if (ts >= 0) @as(u64, @intCast(ts)) else 0;
     } else config.seed;
 
     var prng = std.Random.DefaultPrng.init(seed);
@@ -95,12 +96,20 @@ pub fn generate(comptime T: type, random: std.Random) T {
 fn generateInt(comptime T: type, random: std.Random) T {
     // 20% chance of boundary values
     if (random.uintLessThan(u8, 5) == 0) {
+        if (@typeInfo(T).int.signedness == .signed) {
+            const boundaries = [_]T{
+                0,
+                1,
+                std.math.maxInt(T),
+                std.math.minInt(T),
+                -1,
+            };
+            return boundaries[random.uintLessThan(usize, boundaries.len)];
+        }
         const boundaries = [_]T{
             0,
             1,
             std.math.maxInt(T),
-            if (@typeInfo(T).int.signedness == .signed) std.math.minInt(T) else 0,
-            if (@typeInfo(T).int.signedness == .signed) -1 else std.math.maxInt(T),
         };
         return boundaries[random.uintLessThan(usize, boundaries.len)];
     }
