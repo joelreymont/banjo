@@ -12,6 +12,7 @@ const settings_loader = @import("../settings/loader.zig");
 const Settings = settings_loader.Settings;
 const notes_commands = @import("../notes/commands.zig");
 const config = @import("config");
+const test_env = @import("../util/test_env.zig");
 
 const log = std.log.scoped(.agent);
 
@@ -27,6 +28,7 @@ const RoutingResult = struct {
 
 /// Banjo version with git hash
 pub const version = "0.3.0 (" ++ config.git_hash ++ ")";
+const no_engine_warning = "Banjo could not find Claude Code or Codex. Install one (or set CLAUDE_CODE_EXECUTABLE/CODEX_EXECUTABLE) and restart the agent.";
 
 /// Check if auto-resume is enabled (default: true)
 fn isAutoResumeEnabled() bool {
@@ -553,7 +555,7 @@ pub const Agent = struct {
                 .sessionUpdate = .agent_message_chunk,
                 .content = .{
                     .type = "text",
-                    .text = "Banjo could not find Claude Code or Codex. Install one (or set CLAUDE_CODE_EXECUTABLE/CODEX_EXECUTABLE) and restart the agent.",
+                    .text = no_engine_warning,
                 },
             });
         }
@@ -1906,9 +1908,7 @@ pub const Agent = struct {
 
 // Tests
 const testing = std.testing;
-const c_stdlib = @cImport({
-    @cInclude("stdlib.h");
-});
+const EnvVarGuard = test_env.EnvVarGuard;
 
 /// Test helper for capturing JSON-RPC output.
 /// Heap-allocates the GenericWriter to ensure AnyWriter context pointer remains valid.
@@ -1955,50 +1955,6 @@ const TestWriter = struct {
     }
 };
 
-const EnvVarGuard = struct {
-    name: [:0]const u8,
-    previous: ?[]u8,
-    allocator: Allocator,
-
-    pub fn set(allocator: Allocator, name: [:0]const u8, value: ?[]const u8) !EnvVarGuard {
-        var guard = EnvVarGuard{
-            .name = name,
-            .previous = null,
-            .allocator = allocator,
-        };
-
-        if (std.posix.getenv(name)) |prev| {
-            guard.previous = try allocator.dupe(u8, std.mem.sliceTo(prev, 0));
-        }
-
-        if (value) |val| {
-            const val_z = try allocator.allocSentinel(u8, val.len, 0);
-            std.mem.copyForwards(u8, val_z[0..val.len], val);
-            defer allocator.free(val_z);
-            _ = c_stdlib.setenv(name, val_z, 1);
-        } else {
-            _ = c_stdlib.unsetenv(name);
-        }
-
-        return guard;
-    }
-
-    pub fn deinit(self: *EnvVarGuard) void {
-        if (self.previous) |prev| {
-            const prev_z = self.allocator.allocSentinel(u8, prev.len, 0) catch {
-                self.allocator.free(prev);
-                _ = c_stdlib.unsetenv(self.name);
-                return;
-            };
-            std.mem.copyForwards(u8, prev_z[0..prev.len], prev);
-            _ = c_stdlib.setenv(self.name, prev_z, 1);
-            self.allocator.free(prev_z);
-            self.allocator.free(prev);
-        } else {
-            _ = c_stdlib.unsetenv(self.name);
-        }
-    }
-};
 
 test "isAutoResumeEnabled returns true by default" {
     // When BANJO_AUTO_RESUME is not set (typical case), should return true
@@ -2106,7 +2062,7 @@ test "Agent newSession warns when no engines are available" {
     };
     try agent.handleRequest(request);
 
-    const expected = "Banjo could not find Claude Code or Codex. Install one (or set CLAUDE_CODE_EXECUTABLE/CODEX_EXECUTABLE) and restart the agent.";
+    const expected = no_engine_warning;
     var saw_warning = false;
 
     var it = std.mem.splitScalar(u8, tw.getOutput(), '\n');
