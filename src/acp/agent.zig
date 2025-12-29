@@ -28,7 +28,7 @@ const RoutingResult = struct {
 };
 
 /// Banjo version with git hash
-pub const version = "0.3.0 (" ++ config.git_hash ++ ")";
+pub const version = "0.5.0 (" ++ config.git_hash ++ ")";
 const no_engine_warning = "Banjo could not find Claude Code or Codex. Install one (or set CLAUDE_CODE_EXECUTABLE/CODEX_EXECUTABLE) and restart the agent.";
 const max_context_bytes = 64 * 1024; // cap embedded resource text to keep prompts bounded
 const max_media_preview_bytes = 2048; // small preview for binary media captions

@@ -1,6 +1,6 @@
 id = "banjo"
 name = "Banjo"
-version = "0.3.1"
+version = "0.5.0"
 schema_version = 1
 description = "A Second Brain for your code - Claude Code + Codex agent with notes and backlinks"
 authors = ["Joel Reymont <joelr@well.com>"]

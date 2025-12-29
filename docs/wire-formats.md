@@ -347,7 +347,7 @@ codex app-server
 Initialize the session, then send an `initialized` notification:
 
 ```json
-{ "id": 1, "method": "initialize", "params": { "clientInfo": { "name": "banjo", "title": "Banjo ACP Agent", "version": "0.3.1" } } }
+{ "id": 1, "method": "initialize", "params": { "clientInfo": { "name": "banjo", "title": "Banjo ACP Agent", "version": "0.5.0" } } }
 { "method": "initialized" }
 ```
 
