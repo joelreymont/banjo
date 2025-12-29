@@ -101,13 +101,13 @@ pub fn main() !void {
 
     switch (opts.mode) {
         .lsp => {
-            log.info("Banjo LSP v{s} ({s}) starting", .{ config.version, config.git_hash });
+            log.info("Banjo Duet LSP v{s} ({s}) starting", .{ config.version, config.git_hash });
             var server = LspServer.init(allocator, stdin, stdout);
             defer server.deinit();
             try server.run();
         },
         .agent => {
-            log.info("Banjo Agent v{s} ({s}) starting", .{ config.version, config.git_hash });
+            log.info("Banjo Duet v{s} ({s}) starting", .{ config.version, config.git_hash });
             if (opts.verbose) {
                 if (opts.session_id) |sid| {
                     log.info("Session ID: {s}", .{sid});

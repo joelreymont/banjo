@@ -93,6 +93,26 @@ const InitializeResponse = struct {
     agentCapabilities: AgentCapabilities,
     authMethods: []const AuthMethod,
 };
+
+const AgentCapabilities = struct {
+    promptCapabilities: PromptCapabilities,
+    mcpCapabilities: ?McpCapabilities = null,
+    sessionCapabilities: ?SessionCapabilities = null,
+    loadSession: bool = false,
+};
+
+const PromptCapabilities = struct {
+    image: bool = false,
+    audio: bool = false,
+    embeddedContext: bool = false,
+};
+
+const McpCapabilities = struct {
+    http: bool = false,
+    sse: bool = false,
+};
+
+const SessionCapabilities = struct {};
 ```
 
 ### authenticate
@@ -129,18 +149,24 @@ const EnvVariable = struct {
 ```zig
 const NewSessionResponse = struct {
     sessionId: []const u8,                   // Required: unique session identifier
-    configOptions: ?[]const ConfigOption = null,
+    configOptions: ?[]const SessionConfigOption = null,
     models: ?SessionModelState = null,
     modes: ?SessionModeState = null,
 };
 
-const ConfigOption = struct {
+const SessionConfigOption = struct { // ACP schema (select-only, unstable)
     id: []const u8,
     name: []const u8,
     description: ?[]const u8 = null,
-    type: "boolean" | "enum",
-    default: bool | string,
-    options: ?[]const []const u8 = null,
+    type: "select",
+    currentValue: []const u8,
+    options: []const SessionConfigSelectOption,
+};
+
+const SessionConfigSelectOption = struct {
+    value: []const u8,
+    name: []const u8,
+    description: ?[]const u8 = null,
 };
 
 const SessionModelState = struct {
@@ -155,8 +181,8 @@ const SessionModel = struct {
 };
 ```
 
-Note: Banjo currently populates `modes` only.
-Banjo now also populates `configOptions` and `models`.
+Banjo populates `configOptions`, `models`, and `modes`.
+ACP currently defines only `type: "select"` for config options (value IDs are strings).
 
 ### session/prompt
 
@@ -245,19 +271,21 @@ const SetModelResponse = struct {};
 
 Banjo sends `current_model_update` when the model changes.
 
-### session/set_config
+### session/set_config_option
 
 ```zig
-const SetConfigRequest = struct {
+const SetConfigOptionRequest = struct {
     sessionId: []const u8,
     configId: []const u8, // "auto_resume", "duet_default", "duet_primary"
-    value: bool | string,
+    value: []const u8, // value ID (string)
 };
 ```
 
-**Response (SetConfigResponse):**
+**Response (SetConfigOptionResponse):**
 ```zig
-const SetConfigResponse = struct {};
+const SetConfigOptionResponse = struct {
+    configOptions: []const SessionConfigOption,
+};
 ```
 
 ### session/request_permission

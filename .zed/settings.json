@@ -1,0 +1,11 @@
+{
+  "lsp": {
+    "banjo-notes": {
+      "binary": { "path": "/Users/joel/Work/banjo/zig-out/bin/banjo", "arguments": ["--lsp"] }
+    }
+  },
+  "languages": {
+    "Zig": { "language_servers": ["zls", "banjo-notes"] },
+    "Markdown": { "language_servers": ["banjo-notes"] }
+  }
+}

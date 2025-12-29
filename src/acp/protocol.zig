@@ -42,6 +42,7 @@ pub const AgentInfo = struct {
 
 pub const AgentCapabilities = struct {
     promptCapabilities: PromptCapabilities,
+    mcpCapabilities: ?McpCapabilities = null,
     sessionCapabilities: ?SessionCapabilities = null,
     loadSession: bool = false,
 };
@@ -50,6 +51,11 @@ pub const PromptCapabilities = struct {
     image: bool = false,
     audio: bool = false,
     embeddedContext: bool = false,
+};
+
+pub const McpCapabilities = struct {
+    http: bool = false,
+    sse: bool = false,
 };
 
 pub const SessionCapabilities = struct {};
@@ -75,79 +81,54 @@ pub const NewSessionRequest = struct {
 
 pub const NewSessionResponse = struct {
     sessionId: []const u8,
-    configOptions: ?[]const ConfigOption = null,
+    configOptions: ?[]const SessionConfigOption = null,
     models: ?SessionModelState = null,
     modes: ?SessionModeState = null,
-};
 
-pub const ConfigOptionType = enum {
-    boolean,
-    enum_,
-};
-
-pub const ConfigOptionValue = struct {
-    boolean: ?bool = null,
-    string: ?[]const u8 = null,
-
-    pub fn jsonStringify(self: ConfigOptionValue, jw: anytype) !void {
-        if (self.boolean) |val| {
-            try jw.write(val);
-            return;
+    // Custom serializer: only output fields Zed's ACP client supports
+    pub fn jsonStringify(self: NewSessionResponse, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("sessionId");
+        try jw.write(self.sessionId);
+        if (self.modes) |modes| {
+            try jw.objectField("modes");
+            try jw.write(modes);
         }
-        if (self.string) |val| {
-            try jw.write(val);
-            return;
-        }
-        try jw.write(null);
-    }
-
-    pub fn jsonParseFromValue(
-        allocator: std.mem.Allocator,
-        source: std.json.Value,
-        options: std.json.ParseOptions,
-    ) std.json.ParseFromValueError!ConfigOptionValue {
-        _ = allocator;
-        _ = options;
-        return switch (source) {
-            .bool => |val| .{ .boolean = val },
-            .string => |val| .{ .string = val },
-            else => error.UnexpectedToken,
-        };
+        // Note: configOptions and models not yet supported by Zed ACP
+        try jw.endObject();
     }
 };
 
-pub const ConfigOption = struct {
-    id: []const u8,
+pub const SessionConfigOptionType = enum {
+    select,
+};
+
+pub const SessionConfigSelectOption = struct {
+    value: []const u8,
     name: []const u8,
     description: ?[]const u8 = null,
-    type: ConfigOptionType,
-    default: ConfigOptionValue,
-    options: ?[]const []const u8 = null,
 
-    pub fn jsonStringify(self: ConfigOption, jw: anytype) !void {
+    pub fn jsonStringify(self: SessionConfigSelectOption, jw: anytype) !void {
         try jw.beginObject();
-        try jw.objectField("id");
-        try jw.write(self.id);
+        try jw.objectField("value");
+        try jw.write(self.value);
         try jw.objectField("name");
         try jw.write(self.name);
         if (self.description) |val| {
             try jw.objectField("description");
             try jw.write(val);
         }
-        try jw.objectField("type");
-        const type_str = switch (self.type) {
-            .boolean => "boolean",
-            .enum_ => "enum",
-        };
-        try jw.write(type_str);
-        try jw.objectField("default");
-        try self.default.jsonStringify(jw);
-        if (self.options) |val| {
-            try jw.objectField("options");
-            try jw.write(val);
-        }
         try jw.endObject();
     }
+};
+
+pub const SessionConfigOption = struct {
+    id: []const u8,
+    name: []const u8,
+    description: ?[]const u8 = null,
+    type: SessionConfigOptionType,
+    currentValue: []const u8,
+    options: []const SessionConfigSelectOption,
 };
 
 pub const SessionModel = struct {
@@ -582,13 +563,15 @@ pub const SetModelResponse = EmptyResponse;
 // Set Config
 // =============================================================================
 
-pub const SetConfigRequest = struct {
+pub const SetConfigOptionRequest = struct {
     sessionId: []const u8,
     configId: []const u8,
-    value: ConfigOptionValue,
+    value: []const u8,
 };
 
-pub const SetConfigResponse = EmptyResponse;
+pub const SetConfigOptionResponse = struct {
+    configOptions: []const SessionConfigOption,
+};
 
 pub const PermissionMode = enum {
     default,

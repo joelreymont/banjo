@@ -4,6 +4,43 @@
 
 JSON-RPC 2.0 over stdio between Zed and agents.
 
+### initialize Response
+
+```json
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "protocolVersion": 1,
+    "agentInfo": {
+      "name": "Banjo (Claude Code + Codex)",
+      "title": "Banjo (Claude Code + Codex)",
+      "version": "0.5.0 (hash)"
+    },
+    "agentCapabilities": {
+      "promptCapabilities": {
+        "image": true,
+        "audio": false,
+        "embeddedContext": true
+      },
+      "mcpCapabilities": {
+        "http": false,
+        "sse": false
+      },
+      "sessionCapabilities": {},
+      "loadSession": false
+    },
+    "authMethods": [
+      {
+        "id": "claude-login",
+        "name": "Log in with Claude Code",
+        "description": "Run `claude /login` in the terminal"
+      }
+    ]
+  },
+  "id": 1
+}
+```
+
 ### session/update Notification
 
 ```json
@@ -112,6 +149,45 @@ Tool call content entries may also include `terminalId` (terminal output) or `pa
   "currentModeId": "plan"
 }
 ```
+
+### session/new Response
+
+```json
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "sessionId": "string",
+    "configOptions": [
+      {
+        "id": "auto_resume",
+        "name": "Auto-resume sessions",
+        "description": "Resume the last session on startup",
+        "type": "select",
+        "currentValue": "true",
+        "options": [
+          { "value": "true", "name": "On" },
+          { "value": "false", "name": "Off" }
+        ]
+      }
+    ],
+    "models": {
+      "availableModels": [
+        { "id": "sonnet", "name": "Claude Sonnet", "description": "Fast, balanced" }
+      ],
+      "currentModelId": "sonnet"
+    },
+    "modes": {
+      "availableModes": [
+        { "id": "default", "name": "Default", "description": "Ask before executing tools" }
+      ],
+      "currentModeId": "default"
+    }
+  },
+  "id": 1
+}
+```
+
+Note: ACP config options use `type: "select"` with `currentValue` and `options` value IDs.
 
 ### ContentChunk Types
 

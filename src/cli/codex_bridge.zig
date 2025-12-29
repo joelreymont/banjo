@@ -584,8 +584,8 @@ pub const CodexBridge = struct {
         const request_id = self.nextRequestId();
         const params = InitializeParams{
             .clientInfo = .{
-                .name = "banjo",
-                .title = "Banjo ACP Agent",
+                .name = "banjo-duet",
+                .title = "Banjo Duet",
                 .version = config.version,
             },
         };

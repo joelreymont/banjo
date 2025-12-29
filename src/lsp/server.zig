@@ -374,63 +374,71 @@ pub const Server = struct {
         defer params.deinit();
 
         const uri = params.value.textDocument.uri;
-        const line = params.value.position.line + 1; // Convert to 1-indexed
+        const line = params.value.position.line;
+        const char = params.value.position.character;
 
         const content = self.documents.get(uri) orelse {
             try self.transport.writeTypedResponse(request.id, null);
             return;
         };
 
-        // Find note on this line
-        const note = self.findNoteAtLine(content, line) orelse {
+        const line_content = getLineContent(content, line) orelse {
             try self.transport.writeTypedResponse(request.id, null);
             return;
         };
-        defer {
-            self.allocator.free(note.id);
-            self.allocator.free(note.content);
-            for (note.links) |link| self.allocator.free(link);
-            self.allocator.free(note.links);
-        }
+
+        const target = findHoverTarget(line_content, char) orelse {
+            try self.transport.writeTypedResponse(request.id, null);
+            return;
+        };
 
         // Build hover content with backlinks
         var hover_content: std.io.Writer.Allocating = .init(self.allocator);
         defer hover_content.deinit();
 
-        try hover_content.writer.print("**Note:** {s}\n\n", .{note.content});
-        try hover_content.writer.print("ID: `{s}`\n", .{note.id});
+        switch (target.kind) {
+            .link => {
+                const note = self.note_index.getNote(target.id) orelse {
+                    try self.transport.writeTypedResponse(request.id, null);
+                    return;
+                };
+                try hover_content.writer.print("**Note:** {s}\n\n", .{note.content});
+                try hover_content.writer.print("ID: `{s}`\n", .{target.id});
+            },
+            .note => {
+                try hover_content.writer.print("**Backlinks for `{s}`:**\n", .{target.id});
+                if (self.note_index.getBacklinks(target.id)) |backlink_ids| {
+                    for (backlink_ids) |bl_id| {
+                        if (self.note_index.getNote(bl_id)) |bl_note| {
+                            const filename = std.fs.path.basename(bl_note.file_path);
+                            try hover_content.writer.print("\n**{s}** (line {d}):\n", .{ filename, bl_note.line });
+                            const bl_summary = summary.getSummary(bl_note.content, .{ .max_len = 40, .prefer_word_boundary = true });
+                            try hover_content.writer.print("> {s}\n", .{bl_summary});
 
-        // Add backlinks with context if any
-        if (self.note_index.getBacklinks(note.id)) |backlink_ids| {
-            try hover_content.writer.writeAll("\n---\n**Backlinks:**\n");
-            for (backlink_ids) |bl_id| {
-                if (self.note_index.getNote(bl_id)) |bl_note| {
-                    const filename = std.fs.path.basename(bl_note.file_path);
-                    try hover_content.writer.print("\n**{s}** (line {d}):\n", .{ filename, bl_note.line });
-                    const bl_summary = summary.getSummary(bl_note.content, .{ .max_len = 40, .prefer_word_boundary = true });
-                    try hover_content.writer.print("> {s}\n", .{bl_summary});
-
-                    // Show context from file if available
-                    const bl_uri = pathToUri(self.allocator, bl_note.file_path) catch null;
-                    if (bl_uri) |uri_str| {
-                        defer self.allocator.free(uri_str);
-                        if (self.documents.get(uri_str)) |doc_content| {
-                            const context = getLineContext(doc_content, bl_note.line, 1);
-                            if (context.before.len > 0 or context.after.len > 0) {
-                                try hover_content.writer.writeAll("```\n");
-                                if (context.before.len > 0) {
-                                    try hover_content.writer.print("{s}\n", .{context.before});
+                            const bl_uri = pathToUri(self.allocator, bl_note.file_path) catch null;
+                            if (bl_uri) |uri_str| {
+                                defer self.allocator.free(uri_str);
+                                if (self.documents.get(uri_str)) |doc_content| {
+                                    const context = getLineContext(doc_content, bl_note.line, 1);
+                                    if (context.before.len > 0 or context.after.len > 0) {
+                                        try hover_content.writer.writeAll("```\n");
+                                        if (context.before.len > 0) {
+                                            try hover_content.writer.print("{s}\n", .{context.before});
+                                        }
+                                        try hover_content.writer.print("→ {s}\n", .{context.current});
+                                        if (context.after.len > 0) {
+                                            try hover_content.writer.print("{s}\n", .{context.after});
+                                        }
+                                        try hover_content.writer.writeAll("```\n");
+                                    }
                                 }
-                                try hover_content.writer.print("→ {s}\n", .{context.current});
-                                if (context.after.len > 0) {
-                                    try hover_content.writer.print("{s}\n", .{context.after});
-                                }
-                                try hover_content.writer.writeAll("```\n");
                             }
                         }
                     }
+                } else {
+                    try hover_content.writer.writeAll("\n_No backlinks yet._\n");
                 }
-            }
+            },
         }
 
         const hover_text = try hover_content.toOwnedSlice();
@@ -1183,10 +1191,28 @@ fn isCommentLine(content: []const u8, line: u32) bool {
 /// Find note ID at cursor position. Handles:
 /// - @banjo[id] - returns id
 /// - @[text](id) - returns id
-fn findNoteIdAtPosition(line: []const u8, char: u32) ?[]const u8 {
-    const pos = std.math.cast(usize, char) orelse return null;
+const HoverTargetKind = enum {
+    note,
+    link,
+};
 
-    // Check for @banjo[id] patterns - find all of them
+const HoverTarget = struct {
+    id: []const u8,
+    kind: HoverTargetKind,
+};
+
+fn findHoverTarget(line: []const u8, char: u32) ?HoverTarget {
+    if (findNoteIdAtBanjoToken(line, char)) |id| {
+        return .{ .id = id, .kind = .note };
+    }
+    if (findNoteIdAtLink(line, char)) |id| {
+        return .{ .id = id, .kind = .link };
+    }
+    return null;
+}
+
+fn findNoteIdAtBanjoToken(line: []const u8, char: u32) ?[]const u8 {
+    const pos = std.math.cast(usize, char) orelse return null;
     var banjo_pos: usize = 0;
     while (mem.indexOfPos(u8, line, banjo_pos, "@banjo[")) |start| {
         const id_start = start + 7; // "@banjo[".len
@@ -1199,8 +1225,11 @@ fn findNoteIdAtPosition(line: []const u8, char: u32) ?[]const u8 {
             banjo_pos = id_start;
         }
     }
+    return null;
+}
 
-    // Check for @[text](id) link patterns - find all of them
+fn findNoteIdAtLink(line: []const u8, char: u32) ?[]const u8 {
+    const pos = std.math.cast(usize, char) orelse return null;
     var search_pos: usize = 0;
     while (search_pos < line.len) {
         const link_start = mem.indexOfPos(u8, line, search_pos, comments.link_prefix) orelse break;
@@ -1219,8 +1248,12 @@ fn findNoteIdAtPosition(line: []const u8, char: u32) ?[]const u8 {
 
         search_pos = link_end + 1;
     }
-
     return null;
+}
+
+fn findNoteIdAtPosition(line: []const u8, char: u32) ?[]const u8 {
+    if (findNoteIdAtBanjoToken(line, char)) |id| return id;
+    return findNoteIdAtLink(line, char);
 }
 
 fn uriToPath(uri: []const u8) ?[]const u8 {
@@ -1371,6 +1404,16 @@ test "isCommentLine excludes banjo notes" {
     const content = "// @banjo[abc] note\n// regular comment";
     try testing.expect(!isCommentLine(content, 1)); // already a note
     try testing.expect(isCommentLine(content, 2)); // can be converted
+}
+
+test "findHoverTarget prioritizes note token over link" {
+    const line = "// @banjo[note-1] See @[Note](note-2)";
+    const note_target = findHoverTarget(line, 10).?;
+    try testing.expectEqualStrings("note-1", note_target.id);
+    try testing.expectEqual(HoverTargetKind.note, note_target.kind);
+    const link_target = findHoverTarget(line, 30).?;
+    try testing.expectEqualStrings("note-2", link_target.id);
+    try testing.expectEqual(HoverTargetKind.link, link_target.kind);
 }
 
 test "Server initializes correctly" {

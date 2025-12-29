@@ -29,7 +29,7 @@ const RoutingResult = struct {
 
 /// Banjo version with git hash
 pub const version = "0.5.0 (" ++ config.git_hash ++ ")";
-const no_engine_warning = "Banjo could not find Claude Code or Codex. Install one (or set CLAUDE_CODE_EXECUTABLE/CODEX_EXECUTABLE) and restart the agent.";
+const no_engine_warning = "Banjo Duet could not find Claude Code or Codex. Install one (or set CLAUDE_CODE_EXECUTABLE/CODEX_EXECUTABLE) and restart the agent.";
 const max_context_bytes = 64 * 1024; // cap embedded resource text to keep prompts bounded
 const max_media_preview_bytes = 2048; // small preview for binary media captions
 const resource_line_limit: u32 = 200; // limit resource excerpt lines to reduce UI spam
@@ -262,7 +262,7 @@ const SetModeParams = struct {
 };
 
 const SetModelParams = protocol.SetModelRequest;
-const SetConfigParams = protocol.SetConfigRequest;
+const SetConfigParams = protocol.SetConfigOptionRequest;
 
 const ResumeSessionParams = struct {
     sessionId: []const u8,
@@ -396,7 +396,7 @@ pub const Agent = struct {
         .{ "session/cancel", handleCancel },
         .{ "session/set_mode", handleSetMode },
         .{ "session/set_model", handleSetModel },
-        .{ "session/set_config", handleSetConfig },
+        .{ "session/set_config_option", handleSetConfig },
         .{ "unstable_resumeSession", handleResumeSession },
     });
 
@@ -484,14 +484,18 @@ pub const Agent = struct {
     fn sendInitializeResponse(self: *Agent, request: jsonrpc.Request) !void {
         const response = protocol.InitializeResponse{
             .agentInfo = .{
-                .name = "Banjo (Claude Code + Codex)",
-                .title = "Banjo (Claude Code + Codex)",
+                .name = "Banjo Duet",
+                .title = "Banjo Duet",
                 .version = version,
             },
             .agentCapabilities = .{
                 .promptCapabilities = .{
                     .image = true,
                     .embeddedContext = true,
+                },
+                .mcpCapabilities = .{
+                    .http = false,
+                    .sse = false,
                 },
                 .sessionCapabilities = .{},
                 .loadSession = false,
@@ -581,42 +585,10 @@ pub const Agent = struct {
             .currentModeId = @tagName(session.permission_mode),
         };
 
-        const config_options = [_]protocol.ConfigOption{
-            .{
-                .id = "auto_resume",
-                .name = "Auto-resume sessions",
-                .description = "Resume the last session on startup",
-                .type = .boolean,
-                .default = .{ .boolean = session.config.auto_resume },
-            },
-            .{
-                .id = "duet_default",
-                .name = "Default engine",
-                .description = "Engine to use when prompt has no /claude or /codex prefix",
-                .type = .enum_,
-                .default = .{ .string = @tagName(session.config.duet_default) },
-                .options = duet_default_options[0..],
-            },
-            .{
-                .id = "duet_primary",
-                .name = "Primary engine",
-                .description = "First engine to answer in /both mode",
-                .type = .enum_,
-                .default = .{ .string = @tagName(session.config.duet_primary) },
-                .options = duet_primary_options[0..],
-            },
-        };
-
-        const model_state = protocol.SessionModelState{
-            .availableModels = available_models[0..],
-            .currentModelId = session.model.?,
-        };
-
         // Build response - must be sent BEFORE session updates
+        // Note: configOptions and models are not yet supported by Zed's ACP client
         const result = protocol.NewSessionResponse{
             .sessionId = session_id,
-            .configOptions = config_options[0..],
-            .models = model_state,
             .modes = mode_state,
         };
         try self.writer.writeTypedResponse(request.id, result);
@@ -2156,14 +2128,14 @@ pub const Agent = struct {
         defer parsed.deinit();
         const params = parsed.value;
 
-        if (self.sessions.get(params.sessionId) == null) {
+        const session = self.sessions.get(params.sessionId) orelse {
             try self.writer.writeResponse(jsonrpc.Response.err(
                 request.id,
                 jsonrpc.Error.InvalidParams,
                 "Session not found",
             ));
             return;
-        }
+        };
 
         const config_id = config_option_map.get(params.configId) orelse {
             try self.writer.writeResponse(jsonrpc.Response.err(
@@ -2176,11 +2148,15 @@ pub const Agent = struct {
 
         switch (config_id) {
             .auto_resume => {
-                const value = params.value.boolean orelse {
+                const value = if (std.mem.eql(u8, params.value, "true"))
+                    true
+                else if (std.mem.eql(u8, params.value, "false"))
+                    false
+                else {
                     try self.writer.writeResponse(jsonrpc.Response.err(
                         request.id,
                         jsonrpc.Error.InvalidParams,
-                        "auto_resume expects boolean",
+                        "auto_resume expects \"true\" or \"false\"",
                     ));
                     return;
                 };
@@ -2188,15 +2164,7 @@ pub const Agent = struct {
                 self.updateAllSessions(.auto_resume, .{ .auto_resume = value });
             },
             .duet_default => {
-                const value = params.value.string orelse {
-                    try self.writer.writeResponse(jsonrpc.Response.err(
-                        request.id,
-                        jsonrpc.Error.InvalidParams,
-                        "duet_default expects string",
-                    ));
-                    return;
-                };
-                const route = route_map.get(value) orelse {
+                const route = route_map.get(params.value) orelse {
                     try self.writer.writeResponse(jsonrpc.Response.err(
                         request.id,
                         jsonrpc.Error.InvalidParams,
@@ -2208,15 +2176,7 @@ pub const Agent = struct {
                 self.updateAllSessions(.duet_default, .{ .duet_default = route });
             },
             .duet_primary => {
-                const value = params.value.string orelse {
-                    try self.writer.writeResponse(jsonrpc.Response.err(
-                        request.id,
-                        jsonrpc.Error.InvalidParams,
-                        "duet_primary expects string",
-                    ));
-                    return;
-                };
-                const primary = engine_map.get(value) orelse {
+                const primary = engine_map.get(params.value) orelse {
                     try self.writer.writeResponse(jsonrpc.Response.err(
                         request.id,
                         jsonrpc.Error.InvalidParams,
@@ -2230,7 +2190,10 @@ pub const Agent = struct {
         }
 
         log.info("Updated config {s} for session {s}", .{ params.configId, params.sessionId });
-        try self.writer.writeTypedResponse(request.id, protocol.SetConfigResponse{});
+        var config_options = buildConfigOptions(session);
+        try self.writer.writeTypedResponse(request.id, protocol.SetConfigOptionResponse{
+            .configOptions = config_options[0..],
+        });
     }
 
     fn updateAllSessions(self: *Agent, config_id: ConfigOptionId, update: SessionConfigUpdate) void {
@@ -2320,7 +2283,7 @@ pub const Agent = struct {
 
     /// Handle /version command
     fn handleVersionCommand(self: *Agent, request: jsonrpc.Request, session_id: []const u8) !void {
-        const version_msg = std.fmt.comptimePrint("Banjo {s} - ACP Agent for Claude Code + Codex", .{version});
+        const version_msg = std.fmt.comptimePrint("Banjo Duet {s} - ACP Agent for Claude Code + Codex", .{version});
         try self.sendSessionUpdate(session_id, .{
             .sessionUpdate = .agent_message_chunk,
             .content = .{ .type = "text", .text = version_msg },
@@ -2708,8 +2671,51 @@ pub const Agent = struct {
         .{ .id = "haiku", .name = "Claude Haiku", .description = "Fastest" },
     };
 
-    const duet_default_options = [_][]const u8{ "claude", "codex", "both" };
-    const duet_primary_options = [_][]const u8{ "claude", "codex" };
+    const auto_resume_config_options = [_]protocol.SessionConfigSelectOption{
+        .{ .value = "true", .name = "On" },
+        .{ .value = "false", .name = "Off" },
+    };
+
+    const duet_default_config_options = [_]protocol.SessionConfigSelectOption{
+        .{ .value = "claude", .name = "Claude" },
+        .{ .value = "codex", .name = "Codex" },
+        .{ .value = "both", .name = "Both" },
+    };
+
+    const duet_primary_config_options = [_]protocol.SessionConfigSelectOption{
+        .{ .value = "claude", .name = "Claude" },
+        .{ .value = "codex", .name = "Codex" },
+    };
+
+    fn buildConfigOptions(session: *const Session) [3]protocol.SessionConfigOption {
+        const auto_resume_value = if (session.config.auto_resume) "true" else "false";
+        return .{
+            .{
+                .id = "auto_resume",
+                .name = "Auto-resume sessions",
+                .description = "Resume the last session on startup",
+                .type = .select,
+                .currentValue = auto_resume_value,
+                .options = auto_resume_config_options[0..],
+            },
+            .{
+                .id = "duet_default",
+                .name = "Default engine",
+                .description = "Engine to use when prompt has no /claude or /codex prefix",
+                .type = .select,
+                .currentValue = @tagName(session.config.duet_default),
+                .options = duet_default_config_options[0..],
+            },
+            .{
+                .id = "duet_primary",
+                .name = "Primary engine",
+                .description = "First engine to answer in /both mode",
+                .type = .select,
+                .currentValue = @tagName(session.config.duet_primary),
+                .options = duet_primary_config_options[0..],
+            },
+        };
+    }
 
     /// Combined commands for initial session (before CLI provides its list)
     const initial_commands = slash_commands ++ common_cli_commands;
@@ -2891,22 +2897,6 @@ const expected_modes_json =
     "{\"id\":\"plan\",\"name\":\"Plan\",\"description\":\"Plan only, no execution\"}]," ++
     "\"currentModeId\":\"default\"}";
 
-const expected_config_json =
-    "[{\"id\":\"auto_resume\",\"name\":\"Auto-resume sessions\",\"description\":\"Resume the last session on startup\"," ++
-    "\"type\":\"boolean\",\"default\":true}," ++
-    "{\"id\":\"duet_default\",\"name\":\"Default engine\",\"description\":\"Engine to use when prompt has no /claude or /codex prefix\"," ++
-    "\"type\":\"enum\",\"default\":\"both\",\"options\":[\"claude\",\"codex\",\"both\"]}," ++
-    "{\"id\":\"duet_primary\",\"name\":\"Primary engine\",\"description\":\"First engine to answer in /both mode\"," ++
-    "\"type\":\"enum\",\"default\":\"claude\",\"options\":[\"claude\",\"codex\"]}]";
-
-const expected_models_json =
-    "[{\"id\":\"sonnet\",\"name\":\"Claude Sonnet\",\"description\":\"Fast, balanced\"}," ++
-    "{\"id\":\"opus\",\"name\":\"Claude Opus\",\"description\":\"Most capable\"}," ++
-    "{\"id\":\"haiku\",\"name\":\"Claude Haiku\",\"description\":\"Fastest\"}]";
-
-const expected_model_state_json =
-    "{\"availableModels\":" ++ expected_models_json ++ ",\"currentModelId\":\"sonnet\"}";
-
 const expected_commands_json =
     "[{\"name\":\"explain\",\"description\":\"Summarize selected code as a note comment\"}," ++
     "{\"name\":\"setup\",\"description\":\"Configure Zed for banjo LSP integration\"}," ++
@@ -2924,8 +2914,9 @@ fn expectedInitializeResponse(comptime request_id: i64) []const u8 {
     const version_str = std.fmt.comptimePrint("{d}", .{protocol.ProtocolVersion});
     const request_id_str = std.fmt.comptimePrint("{d}", .{request_id});
     return "{\"jsonrpc\":\"2.0\",\"result\":{\"protocolVersion\":" ++ version_str ++
-        ",\"agentInfo\":{\"name\":\"Banjo (Claude Code + Codex)\",\"title\":\"Banjo (Claude Code + Codex)\",\"version\":\"" ++ version ++
+        ",\"agentInfo\":{\"name\":\"Banjo Duet\",\"title\":\"Banjo Duet\",\"version\":\"" ++ version ++
         "\"},\"agentCapabilities\":{\"promptCapabilities\":{\"image\":true,\"audio\":false,\"embeddedContext\":true}," ++
+        "\"mcpCapabilities\":{\"http\":false,\"sse\":false}," ++
         "\"sessionCapabilities\":{}," ++
         "\"loadSession\":false},\"authMethods\":[{\"id\":\"claude-login\",\"name\":\"Log in with Claude Code\"," ++
         "\"description\":\"Run `claude /login` in the terminal\"}]}," ++
@@ -2938,9 +2929,10 @@ fn expectedNewSessionOutput(
     comptime include_warning: bool,
 ) []const u8 {
     const request_id_str = std.fmt.comptimePrint("{d}", .{request_id});
+    // Note: configOptions and models removed - not yet supported by Zed's ACP client
     if (include_warning) {
-        return "{\"jsonrpc\":\"2.0\",\"result\":{\"sessionId\":\"" ++ session_id ++ "\",\"configOptions\":" ++ expected_config_json ++
-            ",\"models\":" ++ expected_model_state_json ++ ",\"modes\":" ++ expected_modes_json ++
+        return "{\"jsonrpc\":\"2.0\",\"result\":{\"sessionId\":\"" ++ session_id ++
+            "\",\"modes\":" ++ expected_modes_json ++
             "},\"id\":" ++ request_id_str ++ "}\n" ++
             "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"" ++ session_id ++
             "\",\"update\":{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":" ++ expected_commands_json ++
@@ -2952,8 +2944,8 @@ fn expectedNewSessionOutput(
             no_engine_warning ++ "\"}}}}\n";
     }
 
-    return "{\"jsonrpc\":\"2.0\",\"result\":{\"sessionId\":\"" ++ session_id ++ "\",\"configOptions\":" ++ expected_config_json ++
-        ",\"models\":" ++ expected_model_state_json ++ ",\"modes\":" ++ expected_modes_json ++
+    return "{\"jsonrpc\":\"2.0\",\"result\":{\"sessionId\":\"" ++ session_id ++
+        "\",\"modes\":" ++ expected_modes_json ++
         "},\"id\":" ++ request_id_str ++ "}\n" ++
         "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"" ++ session_id ++
         "\",\"update\":{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":" ++ expected_commands_json ++
@@ -3470,17 +3462,17 @@ test "Agent handleRequest - setConfig" {
     defer set_config_params.deinit();
     try set_config_params.put("sessionId", .{ .string = session_id });
     try set_config_params.put("configId", .{ .string = "auto_resume" });
-    try set_config_params.put("value", .{ .bool = false });
+    try set_config_params.put("value", .{ .string = "false" });
 
     const set_config_request = jsonrpc.Request{
-        .method = "session/set_config",
+        .method = "session/set_config_option",
         .id = .{ .number = 2 },
         .params = .{ .object = set_config_params },
     };
     try agent.handleRequest(set_config_request);
 
     try (ohsnap{}).snap(@src(),
-        \\{"jsonrpc":"2.0","result":{},"id":2}
+        \\{"jsonrpc":"2.0","result":{"configOptions":[{"id":"auto_resume","name":"Auto-resume sessions","description":"Resume the last session on startup","type":"select","currentValue":"false","options":[{"value":"true","name":"On"},{"value":"false","name":"Off"}]},{"id":"duet_default","name":"Default engine","description":"Engine to use when prompt has no /claude or /codex prefix","type":"select","currentValue":"both","options":[{"value":"claude","name":"Claude"},{"value":"codex","name":"Codex"},{"value":"both","name":"Both"}]},{"id":"duet_primary","name":"Primary engine","description":"First engine to answer in /both mode","type":"select","currentValue":"claude","options":[{"value":"claude","name":"Claude"},{"value":"codex","name":"Codex"}]}]},"id":2}
         \\
     ).diff(tw.getOutput(), true);
 }

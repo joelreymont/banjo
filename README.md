@@ -1,16 +1,16 @@
-# Banjo
+# Banjo Duet
 
-![Banjo](assets/logo.jpg)
+![Banjo Duet](assets/logo.png)
 
-Banjo is a Second Brain for your code — an ACP agent in Zig that runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and Codex inside [Zed](https://zed.dev)'s Agent Panel.
+Banjo Duet is a Second Brain for your code — an ACP agent in Zig that runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and Codex inside [Zed](https://zed.dev)'s Agent Panel.
 
 > **Requires Claude Code or Codex installed.**
 > Run `claude /login` if you haven't already.
 
 ## Installation
 
-1. Open Zed → Extensions → Search "Banjo" → Install
-2. Open Agent Panel (`Cmd+?`) → Select "Banjo (Claude Code + Codex)"
+1. Open Zed → Extensions → Search "Banjo Duet" → Install
+2. Open Agent Panel (`Cmd+?`) → Select "Banjo Duet"
 
 ## Features
 
@@ -23,7 +23,7 @@ Banjo is a Second Brain for your code — an ACP agent in Zig that runs [Claude 
 
 ## Notes
 
-Banjo lets you attach notes to code as `@banjo[id]` comments. Notes appear as LSP diagnostics.
+Banjo Duet lets you attach notes to code as `@banjo[id]` comments. Notes appear as LSP diagnostics.
 
 ### Quick Start
 
