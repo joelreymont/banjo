@@ -38,6 +38,70 @@ const comment_prefixes = [_]CommentPrefix{
 
 const banjo_marker = "@banjo[";
 
+fn stripCommentPrefix(line: []const u8) ?[]const u8 {
+    const trimmed = mem.trimLeft(u8, line, " \t");
+    if (trimmed.len == 0) return null;
+
+    if (mem.startsWith(u8, trimmed, "<!--")) {
+        var pos: usize = 4;
+        while (pos < trimmed.len and (trimmed[pos] == ' ' or trimmed[pos] == '\t')) pos += 1;
+        var end = trimmed.len;
+        if (mem.endsWith(u8, trimmed, "-->")) {
+            end -= 3;
+        }
+        return mem.trim(u8, trimmed[pos..end], " \t");
+    }
+
+    if (mem.startsWith(u8, trimmed, "//")) {
+        var pos: usize = 2;
+        while (pos < trimmed.len and (trimmed[pos] == '/' or trimmed[pos] == '!')) pos += 1;
+        while (pos < trimmed.len and (trimmed[pos] == ' ' or trimmed[pos] == '\t')) pos += 1;
+        return trimmed[pos..];
+    }
+
+    if (mem.startsWith(u8, trimmed, "--")) {
+        var pos: usize = 2;
+        while (pos < trimmed.len and trimmed[pos] == '-') pos += 1;
+        while (pos < trimmed.len and (trimmed[pos] == ' ' or trimmed[pos] == '\t')) pos += 1;
+        return trimmed[pos..];
+    }
+
+    if (mem.startsWith(u8, trimmed, "#")) {
+        var pos: usize = 1;
+        while (pos < trimmed.len and trimmed[pos] == '#') pos += 1;
+        while (pos < trimmed.len and (trimmed[pos] == ' ' or trimmed[pos] == '\t')) pos += 1;
+        return trimmed[pos..];
+    }
+
+    if (mem.startsWith(u8, trimmed, ";")) {
+        var pos: usize = 1;
+        while (pos < trimmed.len and trimmed[pos] == ';') pos += 1;
+        while (pos < trimmed.len and (trimmed[pos] == ' ' or trimmed[pos] == '\t')) pos += 1;
+        return trimmed[pos..];
+    }
+
+    return null;
+}
+
+fn parseLinksInto(allocator: Allocator, links: *std.ArrayListUnmanaged([]const u8), content: []const u8) !void {
+    var pos: usize = 0;
+    while (pos < content.len) {
+        const link_start = mem.indexOfPos(u8, content, pos, link_prefix) orelse break;
+        const mid = mem.indexOfPos(u8, content, link_start + 2, "](") orelse {
+            pos = link_start + 2;
+            continue;
+        };
+        const link_end = mem.indexOfPos(u8, content, mid + 2, ")") orelse {
+            pos = mid + 2;
+            continue;
+        };
+
+        const target_id = content[mid + 2 .. link_end];
+        try links.append(allocator, try allocator.dupe(u8, target_id));
+        pos = link_end + 1;
+    }
+}
+
 /// Parse a single line for a @banjo note comment
 /// Returns null if line doesn't contain a banjo note
 pub fn parseNoteLine(allocator: Allocator, line: []const u8, line_number: u32) !?ParsedNote {
@@ -80,27 +144,7 @@ fn parseLinks(allocator: Allocator, content: []const u8) ![]const []const u8 {
         links.deinit(allocator);
     }
 
-    var pos: usize = 0;
-    while (pos < content.len) {
-        // Find @[
-        const link_start = mem.indexOfPos(u8, content, pos, link_prefix) orelse break;
-        // Find ](
-        const mid = mem.indexOfPos(u8, content, link_start + 2, "](") orelse {
-            pos = link_start + 2;
-            continue;
-        };
-        // Find )
-        const link_end = mem.indexOfPos(u8, content, mid + 2, ")") orelse {
-            pos = mid + 2;
-            continue;
-        };
-
-        // Extract target ID (between ]( and ))
-        const target_id = content[mid + 2 .. link_end];
-        try links.append(allocator, try allocator.dupe(u8, target_id));
-
-        pos = link_end + 1;
-    }
+    try parseLinksInto(allocator, &links, content);
 
     return try links.toOwnedSlice(allocator);
 }
@@ -113,25 +157,58 @@ pub fn scanFileForNotes(allocator: Allocator, content: []const u8) ![]ParsedNote
         notes.deinit(allocator);
     }
 
-    var line_number: u32 = 1;
-    var line_start: usize = 0;
+    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer lines.deinit(allocator);
 
-    for (content, 0..) |c, i| {
-        if (c == '\n') {
-            const line = content[line_start..i];
-            if (try parseNoteLine(allocator, line, line_number)) |note| {
-                try notes.append(allocator, note);
-            }
-            line_number += 1;
-            line_start = i + 1;
-        }
+    var line_iter = mem.splitScalar(u8, content, '\n');
+    while (line_iter.next()) |line| {
+        try lines.append(allocator, line);
     }
 
-    // Handle last line without trailing newline
-    if (line_start < content.len) {
-        const line = content[line_start..];
-        if (try parseNoteLine(allocator, line, line_number)) |note| {
+    var i: usize = 0;
+    while (i < lines.items.len) : (i += 1) {
+        const line = lines.items[i];
+        const line_number: u32 = @intCast(i + 1);
+        if (try parseNoteLine(allocator, line, line_number)) |note_parsed| {
+            var note = note_parsed;
+            errdefer note.deinit(allocator);
+
+            var content_buf: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer content_buf.deinit(allocator);
+            try content_buf.appendSlice(allocator, note.content);
+
+            var link_list: std.ArrayListUnmanaged([]const u8) = .empty;
+            errdefer link_list.deinit(allocator);
+            try link_list.appendSlice(allocator, note.links);
+            const initial_links_len = link_list.items.len;
+            errdefer {
+                for (link_list.items[initial_links_len..]) |link| allocator.free(link);
+            }
+
+            var j = i + 1;
+            while (j < lines.items.len) : (j += 1) {
+                const next_line = lines.items[j];
+                if (mem.indexOf(u8, next_line, banjo_marker) != null) break;
+                const comment_content = stripCommentPrefix(next_line) orelse break;
+                if (comment_content.len > 0) {
+                    if (content_buf.items.len > 0) try content_buf.append(allocator, '\n');
+                    try content_buf.appendSlice(allocator, comment_content);
+                }
+                try parseLinksInto(allocator, &link_list, comment_content);
+            }
+
+            if (content_buf.items.len > 0) {
+                const new_content = try content_buf.toOwnedSlice(allocator);
+                allocator.free(note.content);
+                note.content = new_content;
+            }
+
+            const new_links = try link_list.toOwnedSlice(allocator);
+            allocator.free(note.links);
+            note.links = new_links;
+
             try notes.append(allocator, note);
+            i = j - 1;
         }
     }
 
@@ -332,6 +409,25 @@ test "scanFileForNotes finds all notes" {
     try testing.expectEqual(@as(u32, 2), notes[0].line);
     try testing.expectEqualStrings("note-2", notes[1].id);
     try testing.expectEqual(@as(u32, 4), notes[1].line);
+}
+
+test "scanFileForNotes captures links in comment blocks" {
+    const alloc = testing.allocator;
+    const content =
+        \\//! @banjo[note-1] First line
+        \\//! See @[other](note-2)
+    ;
+
+    const notes = try scanFileForNotes(alloc, content);
+    defer {
+        for (notes) |*n| @constCast(n).deinit(alloc);
+        alloc.free(notes);
+    }
+
+    try testing.expectEqual(@as(usize, 1), notes.len);
+    try testing.expectEqual(@as(usize, 1), notes[0].links.len);
+    try testing.expectEqualStrings("note-2", notes[0].links[0]);
+    try testing.expect(mem.indexOf(u8, notes[0].content, "See @[other](note-2)") != null);
 }
 
 test "getCommentPrefix returns correct prefix" {

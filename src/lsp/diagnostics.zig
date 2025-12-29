@@ -44,15 +44,18 @@ pub const NoteIndex = struct {
     const BacklinkList = std.ArrayListUnmanaged([]const u8);
     const NotesMap = std.StringHashMap(NoteInfo);
     const BacklinksMap = std.StringHashMap(BacklinkList);
+    const FileNotesMap = std.StringHashMap(std.ArrayListUnmanaged([]const u8));
 
     notes: NotesMap,
     backlinks: BacklinksMap,
+    file_notes: FileNotesMap,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator) NoteIndex {
         return .{
             .notes = NotesMap.init(allocator),
             .backlinks = BacklinksMap.init(allocator),
+            .file_notes = FileNotesMap.init(allocator),
             .allocator = allocator,
         };
     }
@@ -77,12 +80,21 @@ pub const NoteIndex = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.backlinks.deinit();
+
+        // Free file note map
+        var file_it = self.file_notes.iterator();
+        while (file_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.file_notes.deinit();
     }
 
     /// Add a note to the index
     pub fn addNote(self: *NoteIndex, note: comments.ParsedNote, file_path: []const u8) !void {
         // Check for existing note with same ID and free it
         if (self.notes.fetchRemove(note.id)) |old| {
+            self.removeNoteFromFileMap(old.value.file_path, old.key);
             self.allocator.free(old.key);
             self.allocator.free(old.value.file_path);
             self.allocator.free(old.value.content);
@@ -134,6 +146,23 @@ pub const NoteIndex = struct {
             .line = note.line,
             .content = content,
         });
+        try self.addNoteToFileMap(path, id);
+    }
+
+    pub fn removeNotesByFile(self: *NoteIndex, file_path: []const u8) !void {
+        if (self.file_notes.fetchRemove(file_path)) |removed| {
+            var list = removed.value;
+            for (list.items) |note_id| {
+                if (self.notes.fetchRemove(note_id)) |note| {
+                    try self.removeBacklinksForSource(note.key);
+                    self.allocator.free(note.key);
+                    self.allocator.free(note.value.file_path);
+                    self.allocator.free(note.value.content);
+                }
+            }
+            list.deinit(self.allocator);
+            self.allocator.free(removed.key);
+        }
     }
 
     fn listContains(list: []const []const u8, needle: []const u8) bool {
@@ -141,6 +170,43 @@ pub const NoteIndex = struct {
             if (mem.eql(u8, item, needle)) return true;
         }
         return false;
+    }
+
+    fn addNoteToFileMap(self: *NoteIndex, file_path: []const u8, note_id: []const u8) !void {
+        if (self.file_notes.getPtr(file_path)) |list| {
+            if (!listContains(list.items, note_id)) {
+                try list.append(self.allocator, note_id);
+            }
+            return;
+        }
+
+        const key = try self.allocator.dupe(u8, file_path);
+        errdefer self.allocator.free(key);
+
+        var list: std.ArrayListUnmanaged([]const u8) = .empty;
+        try list.append(self.allocator, note_id);
+        errdefer list.deinit(self.allocator);
+
+        try self.file_notes.put(key, list);
+    }
+
+    fn removeNoteFromFileMap(self: *NoteIndex, file_path: []const u8, note_id: []const u8) void {
+        const list = self.file_notes.getPtr(file_path) orelse return;
+        var i: usize = 0;
+        while (i < list.items.len) {
+            if (mem.eql(u8, list.items[i], note_id)) {
+                _ = list.orderedRemove(i);
+                break;
+            }
+            i += 1;
+        }
+        if (list.items.len == 0) {
+            if (self.file_notes.fetchRemove(file_path)) |removed| {
+                var list_removed = removed.value;
+                list_removed.deinit(self.allocator);
+                self.allocator.free(removed.key);
+            }
+        }
     }
 
     fn removeBacklinksForSource(self: *NoteIndex, source_id: []const u8) !void {
@@ -393,6 +459,27 @@ test "NoteIndex avoids duplicate backlinks" {
     const backlinks = index.getBacklinks("note-b").?;
     try testing.expectEqual(@as(usize, 1), backlinks.len);
     try testing.expectEqualStrings("note-a", backlinks[0]);
+}
+
+test "NoteIndex removeNotesByFile clears notes and backlinks" {
+    var index = NoteIndex.init(testing.allocator);
+    defer index.deinit();
+
+    var note_a = (try comments.parseNoteLine(testing.allocator, "// @banjo[a] Link @[b](b)", 1)).?;
+    var note_b = (try comments.parseNoteLine(testing.allocator, "// @banjo[b] Target", 2)).?;
+    defer note_a.deinit(testing.allocator);
+    defer note_b.deinit(testing.allocator);
+
+    try index.addNote(note_a, "/tmp/a.zig");
+    try index.addNote(note_b, "/tmp/b.zig");
+
+    try index.removeNotesByFile("/tmp/a.zig");
+
+    try testing.expect(index.getNote("a") == null);
+    const backlinks = index.getBacklinks("b") orelse &.{};
+    for (backlinks) |id| {
+        try testing.expect(!mem.eql(u8, id, "a"));
+    }
 }
 
 // Snapshot tests

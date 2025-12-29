@@ -56,6 +56,8 @@ pub const Server = struct {
 
     /// Pending diagnostic publishes: uri -> last_change_timestamp
     pending_diagnostics: std.StringHashMap(i128),
+    /// Pending note index updates: uri -> last_change_timestamp
+    pending_note_index: std.StringHashMap(i128),
 
     /// Note index for backlink lookups (rebuilt on each file change)
     note_index: diagnostics.NoteIndex,
@@ -68,6 +70,7 @@ pub const Server = struct {
             .initialized = false,
             .documents = std.StringHashMap([]const u8).init(allocator),
             .pending_diagnostics = std.StringHashMap(i128).init(allocator),
+            .pending_note_index = std.StringHashMap(i128).init(allocator),
             .note_index = diagnostics.NoteIndex.init(allocator),
         };
     }
@@ -84,6 +87,7 @@ pub const Server = struct {
         }
         self.documents.deinit();
         self.pending_diagnostics.deinit();
+        self.pending_note_index.deinit();
         self.note_index.deinit();
     }
 
@@ -93,6 +97,9 @@ pub const Server = struct {
             // Flush any pending diagnostics that have exceeded debounce delay
             self.flushPendingDiagnostics() catch |e| {
                 log.err("Failed to flush diagnostics: {}", .{e});
+            };
+            self.flushPendingNoteIndex() catch |e| {
+                log.err("Failed to flush note index: {}", .{e});
             };
 
             const parsed = self.transport.readMessage() catch |e| {
@@ -143,6 +150,34 @@ pub const Server = struct {
         // Remove flushed entries
         for (to_remove.items) |uri| {
             _ = self.pending_diagnostics.remove(uri);
+        }
+    }
+
+    fn flushPendingNoteIndex(self: *Server) !void {
+        if (self.pending_note_index.count() == 0) return;
+
+        const now = std.time.nanoTimestamp();
+
+        var to_remove: std.ArrayList([]const u8) = .empty;
+        defer to_remove.deinit(self.allocator);
+
+        var it = self.pending_note_index.iterator();
+        while (it.next()) |entry| {
+            const elapsed = now - entry.value_ptr.*;
+            if (elapsed >= DEBOUNCE_NS or elapsed < 0) {
+                if (elapsed < 0) {
+                    log.warn("Note index clock skew detected (elapsed {d}ns)", .{elapsed});
+                }
+                const uri = entry.key_ptr.*;
+                if (self.documents.get(uri)) |content| {
+                    self.updateNoteIndexForUri(uri, content) catch {};
+                }
+                try to_remove.append(self.allocator, uri);
+            }
+        }
+
+        for (to_remove.items) |uri| {
+            _ = self.pending_note_index.remove(uri);
         }
     }
 
@@ -313,19 +348,27 @@ pub const Server = struct {
         // Full sync: last change is the full content
         if (params.value.contentChanges.len > 0) {
             const new_text = params.value.contentChanges[params.value.contentChanges.len - 1].text;
+            var old_has_notes = false;
+            if (self.documents.get(uri)) |old_content| {
+                old_has_notes = hasBanjoMarker(old_content);
+            }
 
             if (self.documents.fetchRemove(uri)) |old| {
                 _ = self.pending_diagnostics.remove(uri);
+                _ = self.pending_note_index.remove(uri);
                 self.allocator.free(old.key);
                 self.allocator.free(old.value);
             }
-
             const uri_copy = try self.allocator.dupe(u8, uri);
             errdefer self.allocator.free(uri_copy);
             const text_copy = try self.allocator.dupe(u8, new_text);
             errdefer self.allocator.free(text_copy);
 
             try self.documents.put(uri_copy, text_copy);
+
+            if (shouldScheduleNoteIndexUpdate(old_has_notes, text_copy)) {
+                try self.scheduleNoteIndexUpdate(uri_copy);
+            }
 
             // Schedule diagnostics with debouncing
             try self.scheduleDiagnostics(uri_copy);
@@ -335,6 +378,17 @@ pub const Server = struct {
     fn scheduleDiagnostics(self: *Server, uri: []const u8) !void {
         const now = std.time.nanoTimestamp();
         try self.pending_diagnostics.put(uri, now);
+    }
+
+    fn scheduleNoteIndexUpdate(self: *Server, uri: []const u8) !void {
+        const now = std.time.nanoTimestamp();
+        try self.pending_note_index.put(uri, now);
+    }
+
+    fn updateNoteIndexForUri(self: *Server, uri: []const u8, content: []const u8) !void {
+        const file_path = uriToPath(uri) orelse uri;
+        self.note_index.removeNotesByFile(file_path) catch {};
+        self.addNotesFromContent(file_path, content) catch {};
     }
 
     fn handleDidClose(self: *Server, request: jsonrpc.Request) !void {
@@ -352,6 +406,7 @@ pub const Server = struct {
         const uri = params.value.textDocument.uri;
 
         _ = self.pending_diagnostics.remove(uri);
+        _ = self.pending_note_index.remove(uri);
 
         if (self.documents.fetchRemove(uri)) |old| {
             self.allocator.free(old.key);
@@ -677,22 +732,51 @@ pub const Server = struct {
         var additional_edits: ?[]protocol.TextEdit = null;
         defer if (additional_edits) |edits| self.allocator.free(edits);
 
-        const should_insert_note = isCommentLine(content, line + 1);
-        if (should_insert_note) {
-            if (findCommentInsertOffset(line_content)) |insert_char| {
-                const note_id = comments.generateNoteId();
-                const insert_text = try std.fmt.allocPrint(self.allocator, "@banjo[{s}] ", .{&note_id});
-                try allocated_strings.append(self.allocator, insert_text);
+        var self_note: ?comments.ParsedNote = null;
+        defer if (self_note) |*note| note.deinit(self.allocator);
 
-                additional_edits = try self.allocator.dupe(protocol.TextEdit, &[_]protocol.TextEdit{.{
-                    .range = .{
-                        .start = .{ .line = line, .character = insert_char },
-                        .end = .{ .line = line, .character = insert_char },
-                    },
-                    .newText = insert_text,
-                }});
+        if (mem.indexOf(u8, line_content, "@banjo[") != null) {
+            if (comments.parseNoteLine(self.allocator, line_content, line + 1) catch null) |note| {
+                self_note = note;
             }
         }
+
+        const should_insert_note = isCommentLine(content, line + 1);
+        if (should_insert_note) {
+            const block_start = findCommentBlockStart(content, line);
+            const block_end = findCommentBlockEnd(content, line);
+            if (commentBlockHasNote(content, block_start, block_end)) {
+                var scan_line = block_start;
+                while (scan_line <= block_end) : (scan_line += 1) {
+                    if (getLineContent(content, scan_line)) |block_line| {
+                        if (mem.indexOf(u8, block_line, "@banjo[") != null) {
+                            if (comments.parseNoteLine(self.allocator, block_line, scan_line + 1) catch null) |note| {
+                                self_note = note;
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else {
+                if (getLineContent(content, block_start)) |block_line| {
+                    if (findCommentInsertOffset(block_line)) |insert_char| {
+                        const note_id = comments.generateNoteId();
+                        const insert_text = try std.fmt.allocPrint(self.allocator, "@banjo[{s}] ", .{&note_id});
+                        try allocated_strings.append(self.allocator, insert_text);
+
+                        additional_edits = try self.allocator.dupe(protocol.TextEdit, &[_]protocol.TextEdit{.{
+                            .range = .{
+                                .start = .{ .line = block_start, .character = insert_char },
+                                .end = .{ .line = block_start, .character = insert_char },
+                            },
+                            .newText = insert_text,
+                        }});
+                    }
+                }
+            }
+        }
+
+        const self_note_id = if (self_note) |note| note.id else null;
 
         // Get current file path from URI
         const current_path = uriToPath(uri) orelse uri;
@@ -713,6 +797,9 @@ pub const Server = struct {
                 .id = entry.key_ptr.*,
                 .info = entry.value_ptr.*,
             };
+            if (self_note_id != null and mem.eql(u8, self_note_id.?, note_view.id)) {
+                continue;
+            }
             if (mem.eql(u8, note_view.info.file_path, current_path)) {
                 try current_notes.append(self.allocator, note_view);
             } else {
@@ -914,17 +1001,19 @@ pub const Server = struct {
 
         const line_text = getLineContent(content, line) orelse "";
         const is_comment = isCommentLine(content, line + 1); // isCommentLine uses 1-indexed
+        const block_start = if (is_comment) findCommentBlockStart(content, line) else line;
+        const block_end = if (is_comment) findCommentBlockEnd(content, line) else line;
+        const block_line_text = if (is_comment) getLineContent(content, block_start) orelse "" else line_text;
 
-        // Check if line has a banjo note (skip if so - no create action needed)
-        if (self.findNoteAtLine(content, line + 1)) |note| {
-            self.allocator.free(note.id);
-            self.allocator.free(note.content);
-            for (note.links) |link| self.allocator.free(link);
-            self.allocator.free(note.links);
-            // Could add "Delete Note" action here in the future
-        } else if (is_comment) {
+        // Skip create action if the comment block already contains a note marker.
+        if (commentBlockHasNote(content, block_start, block_end)) {
+            try self.transport.writeTypedResponse(request.id, &[_]protocol.CodeAction{});
+            return;
+        }
+
+        if (is_comment) {
             // Comment line: insert @banjo[id] after comment prefix and whitespace
-            const insert_char = findCommentInsertOffset(line_text) orelse {
+            const insert_char = findCommentInsertOffset(block_line_text) orelse {
                 try self.transport.writeTypedResponse(request.id, &[_]protocol.CodeAction{});
                 return;
             };
@@ -932,7 +1021,7 @@ pub const Server = struct {
             const insert_text = try std.fmt.allocPrint(self.allocator, "@banjo[{s}] ", .{&note_id});
             try allocs.append(self.allocator, insert_text);
 
-            const title = if (hasTodoPattern(line_text)) |pattern|
+            const title = if (hasTodoPattern(block_line_text)) |pattern|
                 try std.fmt.allocPrint(self.allocator, "Convert {s} to Banjo Note", .{pattern})
             else
                 try self.allocator.dupe(u8, "Create Banjo Note");
@@ -940,8 +1029,8 @@ pub const Server = struct {
 
             const edits = try self.allocator.dupe(protocol.TextEdit, &[_]protocol.TextEdit{.{
                 .range = .{
-                    .start = .{ .line = line, .character = insert_char },
-                    .end = .{ .line = line, .character = insert_char },
+                    .start = .{ .line = block_start, .character = insert_char },
+                    .end = .{ .line = block_start, .character = insert_char },
                 },
                 .newText = insert_text,
             }});
@@ -988,7 +1077,6 @@ pub const Server = struct {
                 .edit = .{ .documentChanges = doc_changes },
             });
         }
-
         try self.transport.writeTypedResponse(request.id, actions.items);
     }
 
@@ -1043,13 +1131,17 @@ pub const Server = struct {
         const is_comment = if (args.len > 2 and args[2] == .bool) args[2].bool else true;
 
         const content = self.documents.get(uri) orelse return;
-        const line_content = getLineContent(content, line - 1) orelse return;
         const file_path = uriToPath(uri) orelse return;
 
         // Generate note ID
         const note_id = comments.generateNoteId();
 
         if (is_comment) {
+            const target_line = findCommentBlockStart(content, line - 1);
+            const target_end = findCommentBlockEnd(content, line - 1);
+            if (commentBlockHasNote(content, target_line, target_end)) return;
+
+            const line_content = getLineContent(content, target_line) orelse return;
             // Comment line: insert @banjo[id] after comment prefix and whitespace
             const insert_char = findCommentInsertOffset(line_content) orelse return;
             const insert_text = try std.fmt.allocPrint(self.allocator, "@banjo[{s}] ", .{&note_id});
@@ -1060,9 +1152,10 @@ pub const Server = struct {
                 .{ line_content[0..insert_char], insert_text, line_content[insert_char..] },
             );
             defer self.allocator.free(new_line);
-            try self.applyLineEdit(uri, line - 1, new_line);
+            try self.applyLineEdit(uri, target_line, new_line);
         } else {
             // Code line: insert note comment above
+            const line_content = getLineContent(content, line - 1) orelse return;
             const prefix = comments.getCommentPrefix(file_path);
             const indent = getIndent(line_content);
             const new_line = try std.fmt.allocPrint(
@@ -1345,19 +1438,42 @@ fn getIndent(line: []const u8) []const u8 {
     return line; // All whitespace
 }
 
-const comment_prefixes = [_][]const u8{ "//", "#", "--", ";", "<!--" };
+const CommentPrefixKind = enum {
+    slash,
+    hash,
+    dash,
+    semi,
+    html,
+};
+
+const CommentPrefix = struct {
+    kind: CommentPrefixKind,
+    len: usize,
+};
+
+fn getCommentPrefix(trimmed: []const u8) ?CommentPrefix {
+    if (mem.startsWith(u8, trimmed, "<!--")) return .{ .kind = .html, .len = 4 };
+    if (mem.startsWith(u8, trimmed, "//")) return .{ .kind = .slash, .len = 2 };
+    if (mem.startsWith(u8, trimmed, "--")) return .{ .kind = .dash, .len = 2 };
+    if (mem.startsWith(u8, trimmed, "#")) return .{ .kind = .hash, .len = 1 };
+    if (mem.startsWith(u8, trimmed, ";")) return .{ .kind = .semi, .len = 1 };
+    return null;
+}
 
 fn isCommentLine(content: []const u8, line: u32) bool {
     const line_content = getLineContent(content, line - 1) orelse return false;
     const trimmed = mem.trimLeft(u8, line_content, " \t");
-
-    for (comment_prefixes) |prefix| {
-        if (mem.startsWith(u8, trimmed, prefix)) {
-            // Make sure it's not already a banjo note
-            return mem.indexOf(u8, trimmed, "@banjo[") == null;
-        }
+    if (getCommentPrefix(trimmed) != null) {
+        // Make sure it's not already a banjo note
+        return mem.indexOf(u8, trimmed, "@banjo[") == null;
     }
     return false;
+}
+
+fn isCommentBlockLine(content: []const u8, line: u32) bool {
+    const line_content = getLineContent(content, line - 1) orelse return false;
+    const trimmed = mem.trimLeft(u8, line_content, " \t");
+    return getCommentPrefix(trimmed) != null;
 }
 
 /// Find note ID at cursor position. Handles:
@@ -1467,26 +1583,75 @@ fn castU32FromI64(value: i64) ?u32 {
     return std.math.cast(u32, value);
 }
 
+fn hasBanjoMarker(content: []const u8) bool {
+    return mem.indexOf(u8, content, "@banjo[") != null;
+}
+
+fn shouldScheduleNoteIndexUpdate(old_has_notes: bool, new_content: []const u8) bool {
+    return old_has_notes or hasBanjoMarker(new_content);
+}
+
 fn findCommentInsertOffset(line_content: []const u8) ?u32 {
     const trimmed = mem.trimLeft(u8, line_content, " \t");
     if (trimmed.len == 0) return null;
 
     const leading_spaces = line_content.len - trimmed.len;
-    var prefix_len: ?usize = null;
-    for (comment_prefixes) |prefix| {
-        if (mem.startsWith(u8, trimmed, prefix)) {
-            prefix_len = prefix.len;
-            break;
-        }
-    }
-    if (prefix_len == null) return null;
+    const prefix = getCommentPrefix(trimmed) orelse return null;
 
-    var pos = prefix_len.?;
+    var pos = prefix.len;
+    switch (prefix.kind) {
+        .slash => {
+            while (pos < trimmed.len and (trimmed[pos] == '/' or trimmed[pos] == '!')) {
+                pos += 1;
+            }
+        },
+        .dash => {
+            while (pos < trimmed.len and trimmed[pos] == '-') {
+                pos += 1;
+            }
+        },
+        .hash => {
+            while (pos < trimmed.len and trimmed[pos] == '#') {
+                pos += 1;
+            }
+        },
+        .semi, .html => {},
+    }
     while (pos < trimmed.len and (trimmed[pos] == ' ' or trimmed[pos] == '\t')) {
         pos += 1;
     }
 
     return castU32(leading_spaces + pos);
+}
+
+fn findCommentBlockStart(content: []const u8, line: u32) u32 {
+    var current = line;
+    while (current > 0) {
+        const prev = current - 1;
+        if (!isCommentBlockLine(content, prev + 1)) break;
+        current = prev;
+    }
+    return current;
+}
+
+fn findCommentBlockEnd(content: []const u8, line: u32) u32 {
+    var current = line;
+    while (true) {
+        const next = current + 1;
+        if (getLineContent(content, next) == null) break;
+        if (!isCommentBlockLine(content, next + 1)) break;
+        current = next;
+    }
+    return current;
+}
+
+fn commentBlockHasNote(content: []const u8, start_line: u32, end_line: u32) bool {
+    var line = start_line;
+    while (line <= end_line) : (line += 1) {
+        const line_content = getLineContent(content, line) orelse continue;
+        if (mem.indexOf(u8, line_content, "@banjo[") != null) return true;
+    }
+    return false;
 }
 
 fn appendNoteCompletion(
@@ -1615,6 +1780,13 @@ test "findHoverTarget prioritizes note token over link" {
 test "findCommentInsertOffset finds insertion point after prefix and whitespace" {
     try testing.expectEqual(@as(u32, 9), findCommentInsertOffset("    //   TODO").?);
     try testing.expectEqual(@as(u32, 5), findCommentInsertOffset("<!-- note").?);
+    try testing.expectEqual(@as(u32, 8), findCommentInsertOffset("    //! Discriminator").?);
+}
+
+test "shouldScheduleNoteIndexUpdate checks for banjo markers" {
+    try testing.expect(shouldScheduleNoteIndexUpdate(false, "// @banjo[id] note"));
+    try testing.expect(!shouldScheduleNoteIndexUpdate(false, "// regular comment"));
+    try testing.expect(shouldScheduleNoteIndexUpdate(true, "// regular comment"));
 }
 
 test "executeCreateNote inserts note marker after comment prefix" {
@@ -1662,6 +1834,95 @@ test "executeCreateNote inserts note marker after comment prefix" {
     try testing.expect(std.mem.startsWith(u8, new_text, "    //   @banjo["));
 }
 
+test "executeCreateNote inserts on first line of comment block" {
+    var input = std.io.fixedBufferStream("");
+    var output_buf: [4096]u8 = undefined;
+    var output = std.io.fixedBufferStream(&output_buf);
+
+    var server = Server.init(testing.allocator, input.reader().any(), output.writer().any());
+    defer server.deinit();
+
+    const uri = "file:///test.zig";
+    const content =
+        \\//! Discriminator for decision tree
+        \\//! Second line
+    ;
+    try server.documents.put(try testing.allocator.dupe(u8, uri), try testing.allocator.dupe(u8, content));
+
+    const args = [_]std.json.Value{
+        .{ .string = uri },
+        .{ .integer = 2 },
+        .{ .bool = true },
+    };
+    try server.executeCreateNote(@as(?[]const std.json.Value, args[0..]));
+
+    const written = output.getWritten();
+    const body_start = std.mem.indexOf(u8, written, "\r\n\r\n") orelse return error.TestUnexpectedResult;
+    const json_body = written[body_start + 4 ..];
+
+    const ApplyEditRequest = struct {
+        jsonrpc: []const u8,
+        method: []const u8,
+        params: struct {
+            edit: struct {
+                changes: std.json.ArrayHashMap([]protocol.TextEdit),
+            },
+        },
+    };
+
+    var parsed = try std.json.parseFromSlice(ApplyEditRequest, testing.allocator, json_body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    const edits = parsed.value.params.edit.changes.map.get(uri) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 0), edits[0].range.start.line);
+    try testing.expect(std.mem.startsWith(u8, edits[0].newText, "//! @banjo["));
+}
+
+test "executeCreateNote from last line inserts on first block line" {
+    var input = std.io.fixedBufferStream("");
+    var output_buf: [4096]u8 = undefined;
+    var output = std.io.fixedBufferStream(&output_buf);
+
+    var server = Server.init(testing.allocator, input.reader().any(), output.writer().any());
+    defer server.deinit();
+
+    const uri = "file:///test.zig";
+    const content =
+        \\//! Discriminator for decision tree
+        \\//! Second line
+        \\//! Third line
+    ;
+    try server.documents.put(try testing.allocator.dupe(u8, uri), try testing.allocator.dupe(u8, content));
+
+    const args = [_]std.json.Value{
+        .{ .string = uri },
+        .{ .integer = 3 },
+        .{ .bool = true },
+    };
+    try server.executeCreateNote(@as(?[]const std.json.Value, args[0..]));
+
+    const written = output.getWritten();
+    const body_start = std.mem.indexOf(u8, written, "\r\n\r\n") orelse return error.TestUnexpectedResult;
+    const json_body = written[body_start + 4 ..];
+
+    const ApplyEditRequest = struct {
+        jsonrpc: []const u8,
+        method: []const u8,
+        params: struct {
+            edit: struct {
+                changes: std.json.ArrayHashMap([]protocol.TextEdit),
+            },
+        },
+    };
+
+    var parsed = try std.json.parseFromSlice(ApplyEditRequest, testing.allocator, json_body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    const edits = parsed.value.params.edit.changes.map.get(uri) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 0), edits[0].range.start.line);
+    try testing.expect(std.mem.startsWith(u8, edits[0].newText, "//! @banjo["));
+}
+
 test "completion adds note marker edit when linking from comment line" {
     var input = std.io.fixedBufferStream("");
     var output_buf: [8192]u8 = undefined;
@@ -1672,8 +1933,10 @@ test "completion adds note marker edit when linking from comment line" {
 
     const uri = "file:///test.zig";
     const content =
-        \\// @banjo[note-a] First note
+        \\// TODO first line
         \\// @[
+        \\
+        \\// @banjo[note-a] First note
     ;
     try server.documents.put(try testing.allocator.dupe(u8, uri), try testing.allocator.dupe(u8, content));
     try server.rebuildIndex();
@@ -1702,6 +1965,7 @@ test "completion adds note marker edit when linking from comment line" {
     try testing.expect(response.value.result.items.len > 0);
     const edits = response.value.result.items[0].additionalTextEdits orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(usize, 1), edits.len);
+    try testing.expectEqual(@as(u32, 0), edits[0].range.start.line);
     try testing.expectEqual(@as(u32, 3), edits[0].range.start.character);
     try testing.expect(std.mem.startsWith(u8, edits[0].newText, "@banjo["));
 }
@@ -1745,6 +2009,113 @@ test "completion does not add note marker edit on non-comment line" {
 
     try testing.expect(response.value.result.items.len > 0);
     try testing.expect(response.value.result.items[0].additionalTextEdits == null);
+}
+
+test "completion excludes self note" {
+    var input = std.io.fixedBufferStream("");
+    var output_buf: [8192]u8 = undefined;
+    var output = std.io.fixedBufferStream(&output_buf);
+
+    var server = Server.init(testing.allocator, input.reader().any(), output.writer().any());
+    defer server.deinit();
+
+    const uri = "file:///test.zig";
+    const line = "// @banjo[note-a] My note @[";
+    const content = try std.fmt.allocPrint(
+        testing.allocator,
+        "{s}\n// @banjo[note-b] Another note\n",
+        .{line},
+    );
+    defer testing.allocator.free(content);
+    try server.documents.put(try testing.allocator.dupe(u8, uri), try testing.allocator.dupe(u8, content));
+    try server.rebuildIndex();
+
+    const request_json = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/completion\",\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":0,\"character\":{d}}}}}}}",
+        .{ uri, line.len },
+    );
+    defer testing.allocator.free(request_json);
+
+    var parsed = try jsonrpc.parseRequest(testing.allocator, request_json);
+    defer parsed.deinit();
+
+    try server.handleRequest(parsed.request);
+
+    const written = output.getWritten();
+    const body_start = std.mem.indexOf(u8, written, "\r\n\r\n") orelse return error.TestUnexpectedResult;
+    const json_body = written[body_start + 4 ..];
+
+    const CompletionResponse = struct {
+        jsonrpc: []const u8,
+        id: i64,
+        result: protocol.CompletionList,
+    };
+
+    var response = try std.json.parseFromSlice(CompletionResponse, testing.allocator, json_body, .{ .ignore_unknown_fields = true });
+    defer response.deinit();
+
+    try testing.expect(response.value.result.items.len > 0);
+    for (response.value.result.items) |item| {
+        const insert_text = item.insertText orelse continue;
+        try testing.expect(mem.indexOf(u8, insert_text, "(note-a)") == null);
+    }
+}
+
+test "note index updates are debounced" {
+    var input = std.io.fixedBufferStream("");
+    var output_buf: [4096]u8 = undefined;
+    var output = std.io.fixedBufferStream(&output_buf);
+
+    var server = Server.init(testing.allocator, input.reader().any(), output.writer().any());
+    defer server.deinit();
+
+    const uri = "file:///test.zig";
+    const initial = "// @banjo[a] First\n";
+    try server.documents.put(try testing.allocator.dupe(u8, uri), try testing.allocator.dupe(u8, initial));
+    try server.rebuildIndex();
+    try testing.expect(server.note_index.getNote("a") != null);
+
+    const request_json =
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/didChange\",\"params\":" ++
+        "{\"textDocument\":{\"uri\":\"file:///test.zig\",\"version\":2},\"contentChanges\":[{\"text\":\"// @banjo[b] Second\"}]}}";
+    var parsed = try jsonrpc.parseRequest(testing.allocator, request_json);
+    defer parsed.deinit();
+
+    try server.handleRequest(parsed.request);
+
+    try testing.expect(server.pending_note_index.count() == 1);
+    try testing.expect(server.note_index.getNote("b") == null);
+
+    var it = server.pending_note_index.iterator();
+    const entry = it.next().?;
+    entry.value_ptr.* = std.time.nanoTimestamp() - (DEBOUNCE_NS * 2);
+    try server.flushPendingNoteIndex();
+
+    try testing.expect(server.note_index.getNote("a") == null);
+    try testing.expect(server.note_index.getNote("b") != null);
+}
+
+test "didChange without banjo markers skips note index update" {
+    var input = std.io.fixedBufferStream("");
+    var output_buf: [4096]u8 = undefined;
+    var output = std.io.fixedBufferStream(&output_buf);
+
+    var server = Server.init(testing.allocator, input.reader().any(), output.writer().any());
+    defer server.deinit();
+
+    const uri = "file:///test.zig";
+    const initial = "// regular comment\n";
+    try server.documents.put(try testing.allocator.dupe(u8, uri), try testing.allocator.dupe(u8, initial));
+
+    const request_json =
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"textDocument/didChange\",\"params\":" ++
+        "{\"textDocument\":{\"uri\":\"file:///test.zig\",\"version\":2},\"contentChanges\":[{\"text\":\"// still regular\"}]}}";
+    var parsed = try jsonrpc.parseRequest(testing.allocator, request_json);
+    defer parsed.deinit();
+
+    try server.handleRequest(parsed.request);
+    try testing.expectEqual(@as(usize, 0), server.pending_note_index.count());
 }
 
 test "Server initializes correctly" {
