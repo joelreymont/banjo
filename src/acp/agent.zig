@@ -34,8 +34,10 @@ const max_codex_image_bytes: usize = 8 * 1024 * 1024; // guard against massive b
 const resource_line_limit: u32 = 200; // limit resource excerpt lines to reduce UI spam
 const max_terminal_output_bytes: usize = 8192; // cap terminal mirror output to keep commands manageable
 const max_tool_preview_bytes: usize = 1024; // keep tool call previews readable in the panel
+const max_dot_output_bytes: usize = 128 * 1024; // dot task list output cap
 const default_model_id = "sonnet";
 const response_timeout_ms: i64 = 30_000;
+const prompt_poll_ms: i64 = 250;
 
 const SessionConfig = struct {
     auto_resume: bool,
@@ -67,10 +69,89 @@ fn mapCliStopReason(cli_reason: []const u8) protocol.StopReason {
     return map.get(cli_reason) orelse .end_turn;
 }
 
+const max_turn_markers = [_][]const u8{
+    "max_turn",
+    "max_turns",
+    "max_turn_requests",
+};
+
+fn containsMaxTurnMarker(text: ?[]const u8) bool {
+    const haystack = text orelse return false;
+    for (max_turn_markers) |marker| {
+        if (std.mem.indexOf(u8, haystack, marker) != null) return true;
+    }
+    return false;
+}
+
+fn isCodexMaxTurnError(err: codex_cli.TurnError) bool {
+    return containsMaxTurnMarker(err.code) or
+        containsMaxTurnMarker(err.type) or
+        containsMaxTurnMarker(err.message);
+}
+
 fn elapsedMs(start_ms: i64) u64 {
     const now = std.time.milliTimestamp();
     if (now <= start_ms) return 0;
     return @intCast(now - start_ms);
+}
+
+fn dotOutputHasPendingTasks(allocator: Allocator, output: []const u8) !bool {
+    const parsed = try std.json.parseFromSlice([]DotTask, allocator, output, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    return parsed.value.len > 0;
+}
+
+fn dotHasPendingTasks(allocator: Allocator, cwd: []const u8) bool {
+    var args = [_][]const u8{ "dot", "ls", "--json" };
+    var child = std.process.Child.init(&args, allocator);
+    child.cwd = cwd;
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    child.spawn() catch |err| {
+        log.warn("dot ls failed to start: {}", .{err});
+        return false;
+    };
+    errdefer {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+    }
+
+    const stdout = child.stdout orelse return false;
+    const stderr = child.stderr orelse return false;
+    const out = stdout.readToEndAlloc(allocator, max_dot_output_bytes) catch |err| {
+        log.warn("dot ls stdout read failed: {}", .{err});
+        return false;
+    };
+    defer allocator.free(out);
+    const err_out = stderr.readToEndAlloc(allocator, max_dot_output_bytes) catch |err| {
+        log.warn("dot ls stderr read failed: {}", .{err});
+        return false;
+    };
+    defer allocator.free(err_out);
+
+    const term = child.wait() catch |err| {
+        log.warn("dot ls wait failed: {}", .{err});
+        return false;
+    };
+    switch (term) {
+        .Exited => |code| if (code != 0) {
+            log.warn("dot ls exited with code {d}: {s}", .{ code, err_out });
+            return false;
+        },
+        else => {
+            log.warn("dot ls did not exit cleanly: {}", .{term});
+            return false;
+        },
+    }
+
+    return dotOutputHasPendingTasks(allocator, out) catch |err| {
+        log.warn("dot ls output parse failed: {}", .{err});
+        return false;
+    };
 }
 
 fn routeFromEnv() Route {
@@ -114,6 +195,10 @@ const falsey_env_values = std.StaticStringMap(void).initComptime(.{
     .{ "false", {} },
     .{ "0", {} },
 });
+
+const DotTask = struct {
+    status: []const u8,
+};
 
 const route_map = std.StaticStringMap(Route).initComptime(.{
     .{ "claude", .claude },
@@ -317,6 +402,8 @@ pub const Agent = struct {
     next_request_id: i64 = 1,
     config_defaults: SessionConfig,
     tool_proxy: ToolProxy,
+    pending_response_numbers: std.AutoHashMap(i64, jsonrpc.ParsedMessage),
+    pending_response_strings: std.StringHashMap(jsonrpc.ParsedMessage),
 
     const Session = struct {
         id: []const u8,
@@ -372,6 +459,8 @@ pub const Agent = struct {
             .sessions = std.StringHashMap(*Session).init(allocator),
             .config_defaults = configFromEnv(),
             .tool_proxy = undefined,
+            .pending_response_numbers = std.AutoHashMap(i64, jsonrpc.ParsedMessage).init(allocator),
+            .pending_response_strings = std.StringHashMap(jsonrpc.ParsedMessage).init(allocator),
         };
         agent.tool_proxy = ToolProxy.init(allocator, agent.writer);
         return agent;
@@ -384,6 +473,9 @@ pub const Agent = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.sessions.deinit();
+        self.clearPendingResponses();
+        self.pending_response_numbers.deinit();
+        self.pending_response_strings.deinit();
         self.tool_proxy.deinit();
     }
 
@@ -1314,13 +1406,12 @@ pub const Agent = struct {
         self.captureCodexSessionId(session);
     }
 
-    fn runClaudePrompt(self: *Agent, session: *Session, session_id: []const u8, prompt: []const u8) !protocol.StopReason {
-        const start_ms = std.time.milliTimestamp();
-        const engine = Engine.claude;
-        var stream_prefix_pending = true;
-        var thought_prefix_pending = true;
-        defer self.clearPendingExecuteTools(session);
-
+    fn sendClaudePromptWithRestart(
+        self: *Agent,
+        session: *Session,
+        session_id: []const u8,
+        prompt: []const u8,
+    ) !*Bridge {
         const cli_bridge = try self.ensureClaudeBridge(session, session_id);
         cli_bridge.sendPrompt(prompt) catch |err| {
             log.warn("Claude Code sendPrompt failed ({}), restarting", .{err});
@@ -1335,6 +1426,40 @@ pub const Agent = struct {
                 return error.BridgeStartFailed;
             }
         };
+        return &session.bridge.?;
+    }
+
+    fn sendCodexPromptWithRestart(
+        self: *Agent,
+        session: *Session,
+        session_id: []const u8,
+        inputs: []const CodexUserInput,
+    ) !*CodexBridge {
+        const codex_bridge = try self.ensureCodexBridge(session, session_id);
+        codex_bridge.sendPrompt(inputs) catch |err| {
+            log.warn("Codex sendPrompt failed ({}), restarting", .{err});
+            codex_bridge.stop();
+            try self.startCodexBridge(session, session_id);
+            if (session.codex_bridge) |*restarted| {
+                restarted.sendPrompt(inputs) catch |retry_err| {
+                    log.err("Codex sendPrompt retry failed: {}", .{retry_err});
+                    return retry_err;
+                };
+            } else {
+                return error.BridgeStartFailed;
+            }
+        };
+        return &session.codex_bridge.?;
+    }
+
+    fn runClaudePrompt(self: *Agent, session: *Session, session_id: []const u8, prompt: []const u8) !protocol.StopReason {
+        const start_ms = std.time.milliTimestamp();
+        const engine = Engine.claude;
+        var stream_prefix_pending = true;
+        var thought_prefix_pending = true;
+        defer self.clearPendingExecuteTools(session);
+
+        const cli_bridge = try self.sendClaudePromptWithRestart(session, session_id, prompt);
         const prompt_sent_ms = elapsedMs(start_ms);
         log.info("Claude prompt sent at {d}ms", .{prompt_sent_ms});
 
@@ -1348,7 +1473,16 @@ pub const Agent = struct {
                 break;
             }
 
-            var msg = cli_bridge.readMessage() catch |err| {
+            const deadline_ms = std.time.milliTimestamp() + prompt_poll_ms;
+            var msg = cli_bridge.readMessageWithTimeout(deadline_ms) catch |err| {
+                if (err == error.Timeout) {
+                    self.pollClientMessages(session);
+                    if (session.cancelled) {
+                        stop_reason = .cancelled;
+                        break;
+                    }
+                    continue;
+                }
                 log.err("Failed to read Claude Code message: {}", .{err});
                 session.bridge.?.deinit();
                 session.bridge = null;
@@ -1400,6 +1534,13 @@ pub const Agent = struct {
                 },
                 .result => {
                     if (msg.getStopReason()) |reason| {
+                        if (std.mem.eql(u8, reason, "error_max_turns") and dotHasPendingTasks(self.allocator, session.cwd)) {
+                            log.info("Claude Code hit max turns; dot tasks pending, continuing", .{});
+                            _ = try self.sendClaudePromptWithRestart(session, session_id, "continue");
+                            stream_prefix_pending = true;
+                            thought_prefix_pending = true;
+                            continue;
+                        }
                         stop_reason = mapCliStopReason(reason);
                     }
                     break;
@@ -1495,7 +1636,6 @@ pub const Agent = struct {
         var thought_prefix_pending = true;
         defer self.clearPendingExecuteTools(session);
 
-        const codex_bridge = try self.ensureCodexBridge(session, session_id);
         var input_list: std.ArrayListUnmanaged(CodexUserInput) = .empty;
         defer input_list.deinit(self.allocator);
 
@@ -1509,20 +1649,7 @@ pub const Agent = struct {
         const inputs = input_list.items;
         if (inputs.len == 0) return .end_turn;
 
-        codex_bridge.sendPrompt(inputs) catch |err| {
-            log.warn("Codex sendPrompt failed ({}), restarting", .{err});
-            codex_bridge.stop();
-            try self.startCodexBridge(session, session_id);
-            if (session.codex_bridge) |*restarted| {
-                restarted.sendPrompt(inputs) catch |retry_err| {
-                    log.err("Codex sendPrompt retry failed: {}", .{retry_err});
-                    return retry_err;
-                };
-            } else {
-                return error.BridgeStartFailed;
-            }
-        };
-        const active_bridge = &session.codex_bridge.?;
+        const active_bridge = try self.sendCodexPromptWithRestart(session, session_id, inputs);
         const prompt_sent_ms = elapsedMs(start_ms);
         log.info("Codex prompt sent at {d}ms", .{prompt_sent_ms});
 
@@ -1532,7 +1659,13 @@ pub const Agent = struct {
         while (true) {
             if (session.cancelled) return .cancelled;
 
-            var msg = active_bridge.readMessage() catch |err| {
+            const deadline_ms = std.time.milliTimestamp() + prompt_poll_ms;
+            var msg = active_bridge.readMessageWithTimeout(deadline_ms) catch |err| {
+                if (err == error.Timeout) {
+                    self.pollClientMessages(session);
+                    if (session.cancelled) return .cancelled;
+                    continue;
+                }
                 log.err("Failed to read Codex message: {}", .{err});
                 active_bridge.deinit();
                 session.codex_bridge = null;
@@ -1639,6 +1772,21 @@ pub const Agent = struct {
                 if (first_response_ms == 0) first_response_ms = msg_time_ms;
                 try self.sendEngineText(session, session_id, engine, text);
                 continue;
+            }
+
+            if (msg.event_type == .turn_completed) {
+                if (msg.turn_error) |err| {
+                    if (isCodexMaxTurnError(err) and dotHasPendingTasks(self.allocator, session.cwd)) {
+                        log.info("Codex hit max turns; dot tasks pending, continuing", .{});
+                        const continue_inputs = [_]CodexUserInput{
+                            .{ .type = "text", .text = "continue" },
+                        };
+                        _ = try self.sendCodexPromptWithRestart(session, session_id, continue_inputs[0..]);
+                        stream_prefix_pending = true;
+                        thought_prefix_pending = true;
+                        continue;
+                    }
+                }
             }
 
             if (msg.isTurnCompleted()) break;
@@ -2261,6 +2409,9 @@ pub const Agent = struct {
             }
             switch (state) {
                 .read_message => {
+                    if (self.takePendingResponse(request_id)) |response_msg| {
+                        return response_msg;
+                    }
                     if (parsed) |*msg| {
                         msg.deinit();
                         parsed = null;
@@ -2280,12 +2431,45 @@ pub const Agent = struct {
                                 parsed = null;
                                 return response_msg;
                             }
+                            try self.stashResponse(parsed.?);
+                            parsed = null;
                         },
                     }
                     state = .read_message;
                     continue :state;
                 },
             }
+        }
+    }
+
+    fn pollClientMessages(self: *Agent, session: *Session) void {
+        const reader = self.reader orelse return;
+        while (true) {
+            const deadline_ms = std.time.milliTimestamp();
+            var parsed = reader.nextMessageWithTimeout(deadline_ms) catch |err| switch (err) {
+                error.Timeout => return,
+                else => {
+                    log.warn("Failed to poll client message: {}", .{err});
+                    return;
+                },
+            } orelse return;
+
+            switch (parsed.message) {
+                .response => {
+                    self.stashResponse(parsed) catch |err| {
+                        log.warn("Failed to stash client response: {}", .{err});
+                        parsed.deinit();
+                    };
+                },
+                else => {
+                    self.handleMessage(parsed.message) catch |err| {
+                        log.warn("Failed to handle client message: {}", .{err});
+                    };
+                    parsed.deinit();
+                },
+            }
+
+            if (session.cancelled) return;
         }
     }
 
@@ -2318,6 +2502,65 @@ pub const Agent = struct {
             },
             .null => false,
         };
+    }
+
+    fn stashResponse(self: *Agent, msg: jsonrpc.ParsedMessage) !void {
+        const resp = msg.message.response;
+        const id = resp.id orelse {
+            var owned = msg;
+            owned.deinit();
+            return;
+        };
+        switch (id) {
+            .number => |num| {
+                if (self.pending_response_numbers.fetchRemove(num)) |entry| {
+                    var owned = entry.value;
+                    owned.deinit();
+                }
+                try self.pending_response_numbers.put(num, msg);
+            },
+            .string => |str| {
+                if (self.pending_response_strings.fetchRemove(str)) |entry| {
+                    var owned = entry.value;
+                    owned.deinit();
+                }
+                try self.pending_response_strings.put(str, msg);
+            },
+            .null => {
+                var owned = msg;
+                owned.deinit();
+            },
+        }
+    }
+
+    fn takePendingResponse(self: *Agent, request_id: jsonrpc.Request.Id) ?jsonrpc.ParsedMessage {
+        return switch (request_id) {
+            .number => |num| blk: {
+                if (self.pending_response_numbers.fetchRemove(num)) |entry| break :blk entry.value;
+                break :blk null;
+            },
+            .string => |str| blk: {
+                if (self.pending_response_strings.fetchRemove(str)) |entry| break :blk entry.value;
+                break :blk null;
+            },
+            .null => null,
+        };
+    }
+
+    fn clearPendingResponses(self: *Agent) void {
+        var num_it = self.pending_response_numbers.iterator();
+        while (num_it.next()) |entry| {
+            var owned = entry.value_ptr.*;
+            owned.deinit();
+        }
+        self.pending_response_numbers.clearRetainingCapacity();
+
+        var str_it = self.pending_response_strings.iterator();
+        while (str_it.next()) |entry| {
+            var owned = entry.value_ptr.*;
+            owned.deinit();
+        }
+        self.pending_response_strings.clearRetainingCapacity();
     }
 
     fn permissionDecisionForCodex(
@@ -2460,16 +2703,23 @@ pub const Agent = struct {
             return;
         };
 
-        session.permission_mode = std.meta.stringToEnum(protocol.PermissionMode, mode_value) orelse .default;
+        const new_mode = std.meta.stringToEnum(protocol.PermissionMode, mode_value) orelse {
+            try self.writer.writeResponse(jsonrpc.Response.err(
+                request.id,
+                jsonrpc.Error.InvalidParams,
+                "Invalid permission mode",
+            ));
+            return;
+        };
+
+        session.permission_mode = new_mode;
         log.info("Set mode for session {s} to {s}", .{ params.sessionId, mode_value });
         if (session.codex_bridge) |*codex_bridge| {
             codex_bridge.approval_policy = codexApprovalPolicy(session.permission_mode);
         }
-        if (session.bridge) |*claude_bridge| {
-            // Claude CLI does not accept control messages to change permission mode.
-            claude_bridge.deinit();
-            session.bridge = null;
-        }
+        // Claude CLI does not accept control messages to change permission mode.
+        // Mark for restart on next prompt. Don't deinit here - a prompt may be using the bridge.
+        session.force_new_claude = true;
 
         try self.sendSessionUpdate(params.sessionId, .{
             .sessionUpdate = .current_mode_update,
@@ -2741,6 +2991,7 @@ pub const Agent = struct {
         self.clearSessionId(&session.codex_session_id);
         session.force_new_claude = true;
         session.force_new_codex = true;
+        session.cancelled = false;
         self.clearPendingExecuteTools(session);
     }
 
@@ -3387,7 +3638,7 @@ pub const Agent = struct {
     /// Generate a unique tool call ID like "banjo_tc_1"
     fn generateToolCallId(self: *Agent) ![]const u8 {
         const id = self.next_tool_call_id;
-        self.next_tool_call_id +%= 1;
+        self.next_tool_call_id += 1;
         return std.fmt.allocPrint(self.allocator, "banjo_tc_{d}", .{id});
     }
 
@@ -3534,6 +3785,25 @@ fn expectedNewSessionOutput(
 test "configFromEnv returns defaults" {
     // Env vars may be set in CI; just ensure the function returns a config.
     _ = configFromEnv();
+}
+
+test "dotOutputHasPendingTasks detects pending tasks" {
+    const has_tasks = try dotOutputHasPendingTasks(testing.allocator, "[{\"status\":\"open\"}]");
+    try testing.expect(has_tasks);
+
+    const no_tasks = try dotOutputHasPendingTasks(testing.allocator, "[]");
+    try testing.expect(!no_tasks);
+}
+
+test "max turn marker helpers detect max turn errors" {
+    try testing.expect(containsMaxTurnMarker("error_max_turns"));
+    try testing.expect(containsMaxTurnMarker("max_turn_requests"));
+    try testing.expect(!containsMaxTurnMarker("budget_exceeded"));
+
+    try testing.expect(isCodexMaxTurnError(.{ .code = "max_turns", .message = null, .type = null }));
+    try testing.expect(isCodexMaxTurnError(.{ .code = null, .message = "max_turn_requests", .type = null }));
+    try testing.expect(isCodexMaxTurnError(.{ .code = null, .message = null, .type = "error_max_turns" }));
+    try testing.expect(!isCodexMaxTurnError(.{ .code = "budget", .message = null, .type = null }));
 }
 
 fn createFakeBinary(allocator: Allocator, dir: *std.testing.TmpDir, name: []const u8) ![]u8 {
@@ -3987,7 +4257,10 @@ test "Agent handleRequest - setMode" {
         \\{"jsonrpc":"2.0","result":{},"id":2}
         \\
     ).diff(tw.getOutput(), true);
-    try testing.expect(agent.sessions.get(session_id).?.bridge == null);
+    // Bridge is NOT killed immediately (would cause use-after-free if prompt is running).
+    // Instead, force_new_claude is set so next prompt restarts with new mode.
+    try testing.expect(agent.sessions.get(session_id).?.bridge != null);
+    try testing.expect(agent.sessions.get(session_id).?.force_new_claude);
 }
 
 test "Agent handleRequest - setMode session not found" {
@@ -4011,6 +4284,52 @@ test "Agent handleRequest - setMode session not found" {
 
     try (ohsnap{}).snap(@src(),
         \\{"jsonrpc":"2.0","error":{"code":-32602,"message":"Session not found"},"id":1}
+        \\
+    ).diff(tw.getOutput(), true);
+}
+
+test "Agent handleRequest - setMode invalid mode" {
+    var guard_session = try EnvVarGuard.set(testing.allocator, "BANJO_TEST_SESSION_ID", "session-test");
+    defer guard_session.deinit();
+    var guard_path = try EnvVarGuard.set(testing.allocator, "PATH", "");
+    defer guard_path.deinit();
+    var guard_claude = try EnvVarGuard.set(testing.allocator, "CLAUDE_CODE_EXECUTABLE", "claude-hidden");
+    defer guard_claude.deinit();
+    var guard_codex = try EnvVarGuard.set(testing.allocator, "CODEX_EXECUTABLE", "codex-hidden");
+    defer guard_codex.deinit();
+
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
+    defer agent.deinit();
+
+    // Create session
+    var new_session_params = std.json.ObjectMap.init(testing.allocator);
+    defer new_session_params.deinit();
+    const create_request = jsonrpc.Request{
+        .method = "session/new",
+        .id = .{ .number = 1 },
+        .params = .{ .object = new_session_params },
+    };
+    try agent.handleRequest(create_request);
+    tw.output.clearRetainingCapacity();
+
+    // Try to set invalid mode
+    var params = std.json.ObjectMap.init(testing.allocator);
+    defer params.deinit();
+    try params.put("sessionId", .{ .string = "session-test" });
+    try params.put("modeId", .{ .string = "invalidMode" });
+
+    const request = jsonrpc.Request{
+        .method = "session/set_mode",
+        .id = .{ .number = 2 },
+        .params = .{ .object = params },
+    };
+    try agent.handleRequest(request);
+
+    try (ohsnap{}).snap(@src(),
+        \\{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid permission mode"},"id":2}
         \\
     ).diff(tw.getOutput(), true);
 }
