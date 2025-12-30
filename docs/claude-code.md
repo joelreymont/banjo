@@ -76,6 +76,18 @@ Output stream contains JSON objects per line:
 | assistant | - | Model response with content blocks |
 | result | success/error | Final result with stats |
 
+### Turn Limits and Continue
+
+Claude Code signals max-turn limits with a `result` message:
+
+```json
+{ "type": "result", "subtype": "error_max_turns", "is_error": false }
+```
+
+Banjo detects this and will auto-send `continue` when Dots reports pending tasks
+via `dot ls --json`. If Dots is not installed or returns no tasks, Banjo ends
+the prompt with `max_turn_requests`.
+
 ## Tool Use Events in Stream
 
 When Claude uses a tool, stream contains:
@@ -86,29 +98,128 @@ When Claude uses a tool, stream contains:
 
 ## Hooks Architecture
 
-### Claude Code Hooks (shell commands)
-Defined in `.claude/settings.json`:
+### Hook Events
+
+Claude Code provides 8 hook lifecycle events:
+
+| Event | When | Can Block |
+|-------|------|-----------|
+| `SessionStart` | Session begins | No |
+| `UserPromptSubmit` | User submits prompt | No |
+| `PreToolUse` | Before tool execution | Yes |
+| `PermissionRequest` | Permission dialog shown | Yes |
+| `PostToolUse` | After tool completes | No |
+| `Notification` | Notifications sent | No |
+| `Stop` | Claude stops | No |
+| `SubagentStop` | Subagent stops | No |
+
+### Hook Input (stdin)
+
+All hooks receive JSON via stdin:
+
 ```json
 {
-  "hooks": {
-    "PreToolUse": ["./scripts/check-tool.sh"],
-    "PostToolUse": ["./scripts/log-tool.sh"]
+  "session_id": "abc123",
+  "transcript_path": "/path/to/transcript.jsonl",
+  "cwd": "/working/directory",
+  "permission_mode": "default",
+  "hook_event_name": "PermissionRequest",
+  "tool_name": "Bash",
+  "tool_input": { "command": "npm run build" },
+  "tool_use_id": "toolu_01ABC123"
+}
+```
+
+### Hook Output (stdout)
+
+Return JSON to control behavior:
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PermissionRequest",
+    "decision": {
+      "behavior": "allow",
+      "updatedInput": { "command": "npm run build --quiet" }
+    }
   }
 }
 ```
-These run INSIDE Claude Code process.
 
-### SDK Hooks (JS callbacks)
-The TS implementation uses `@anthropic-ai/claude-agent-sdk` which provides JS callback hooks. These run in the ACP adapter process, NOT in Claude Code.
+Decision behaviors:
+- `allow` - Approve without prompting (optionally modify input with `updatedInput`)
+- `deny` - Block with optional `message` and `interrupt: true` to stop Claude
+- `ask` - Show permission dialog to user
 
-### Zig Implementation Strategy
-Without the SDK, we implement "hooks" by:
-1. Parsing stream-json output
-2. Detecting tool_use events
-3. Intercepting before forwarding to Zed
-4. Can allow/deny/modify based on settings
+### Exit Codes
 
-This is equivalent functionality but at the ACP layer.
+- `0` - Success, parse stdout JSON for decision
+- `2` - Blocking error, stderr shown to user
+- Other - Non-blocking error, stderr shown in verbose mode
+
+### Configuration
+
+Hooks are defined in `~/.claude/settings.json` or `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "matcher": "Bash",
+        "hooks": [{ "type": "command", "command": "/path/to/script.sh" }]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [{ "type": "command", "command": "/path/to/validate.py" }]
+      }
+    ]
+  }
+}
+```
+
+Matchers: `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep`, `Task`, `WebFetch`, `WebSearch`, `*` (all)
+
+### Environment Variables
+
+- `CLAUDE_PROJECT_DIR` - Absolute path to project root
+- `CLAUDE_CODE_REMOTE` - "true" if running in web environment
+- `CLAUDE_ENV_FILE` - Only available in SessionStart
+
+### Banjo Permission Hook
+
+Banjo uses a PermissionRequest hook to forward tool approvals to Zed via ACP:
+
+1. Banjo creates Unix socket at `/tmp/banjo-{session}.sock`
+2. Hook connects and sends tool details
+3. Banjo forwards to Zed via `session/request_permission`
+4. User approves/denies in Zed UI
+5. Banjo sends response to hook
+6. Hook returns decision to Claude Code
+
+This enables interactive permission control even in stream-json mode.
+
+**Setup (manual for now):**
+
+1. Copy `scripts/permission-hook.py` to a known location (e.g., `~/.local/bin/banjo-permission-hook.py`)
+2. Make it executable: `chmod +x ~/.local/bin/banjo-permission-hook.py`
+3. Add to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "hooks": [{ "type": "command", "command": "~/.local/bin/banjo-permission-hook.py" }]
+      }
+    ]
+  }
+}
+```
+
+Existing user hooks in `~/.claude/settings.json` continue to work alongside the Banjo hook.
 
 ## Known Issues
 

@@ -471,6 +471,13 @@ pub const Bridge = struct {
     session_id: ?[]const u8 = null,
     stdout_reader: ?std.fs.File.Reader = null,
     stdout_buf: [64 * 1024]u8 = undefined,
+    message_queue: std.ArrayList(StreamMessage) = .empty,
+    queue_head: usize = 0,
+    queue_mutex: std.Thread.Mutex = .{},
+    queue_cond: std.Thread.Condition = .{},
+    reader_thread: ?std.Thread = null,
+    reader_closed: bool = false,
+    stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(allocator: Allocator, cwd: []const u8) Bridge {
         return .{
@@ -484,6 +491,7 @@ pub const Bridge = struct {
         if (self.session_id) |sid| {
             self.allocator.free(sid);
         }
+        self.message_queue.deinit(self.allocator);
     }
 
     /// Find Claude Code binary - check env var and common locations
@@ -544,6 +552,29 @@ pub const Bridge = struct {
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Inherit;
 
+        // Set permission socket environment variable if provided
+        var env: ?std.process.EnvMap = null;
+        defer if (env) |*e| e.deinit();
+
+        if (opts.permission_socket_path) |socket_path| {
+            env = std.process.EnvMap.init(self.allocator);
+
+            // Copy current environment
+            var env_iter = std.process.getEnvMap(self.allocator) catch null;
+            if (env_iter) |*iter| {
+                defer iter.deinit();
+                var it = iter.iterator();
+                while (it.next()) |entry| {
+                    try env.?.put(entry.key_ptr.*, entry.value_ptr.*);
+                }
+            }
+
+            // Add our socket path
+            try env.?.put("BANJO_PERMISSION_SOCKET", socket_path);
+            child.env_map = &env.?;
+            log.info("Set BANJO_PERMISSION_SOCKET={s}", .{socket_path});
+        }
+
         try child.spawn();
         errdefer {
             _ = child.kill() catch {};
@@ -555,8 +586,22 @@ pub const Bridge = struct {
         } else {
             self.stdout_reader = null;
         }
+        self.queue_mutex.lock();
+        self.reader_closed = false;
+        self.queue_mutex.unlock();
+        self.stop_requested.store(false, .release);
+        self.clearQueue();
+        self.startReaderThread() catch |err| {
+            self.stop();
+            return err;
+        };
 
         log.info("Started Claude Code in {s}", .{self.cwd});
+    }
+
+    fn startReaderThread(self: *Bridge) !void {
+        if (self.reader_thread != null) return;
+        self.reader_thread = try std.Thread.spawn(.{}, readerMain, .{self});
     }
 
     pub const StartOptions = struct {
@@ -565,17 +610,28 @@ pub const Bridge = struct {
         skip_permissions: bool = false,
         permission_mode: ?[]const u8 = null,
         model: ?[]const u8 = null,
+        permission_socket_path: ?[]const u8 = null, // Unix socket for permission hook
     };
 
     /// Stop the CLI process
     pub fn stop(self: *Bridge) void {
+        self.stop_requested.store(true, .release);
         if (self.process) |*proc| {
             _ = proc.kill() catch {};
             _ = proc.wait() catch {};
             self.process = null;
             self.stdout_reader = null;
-            log.info("Stopped Claude Code", .{});
         }
+        if (self.reader_thread) |thread| {
+            thread.join();
+            self.reader_thread = null;
+        }
+        self.queue_mutex.lock();
+        self.reader_closed = true;
+        self.queue_mutex.unlock();
+        self.queue_cond.broadcast();
+        self.clearQueue();
+        log.info("Stopped Claude Code", .{});
     }
 
     /// Send a prompt to the CLI
@@ -601,8 +657,8 @@ pub const Bridge = struct {
         try stdin.writeAll(data);
     }
 
-    /// Read next message from CLI stdout
-    pub fn readMessage(self: *Bridge) !?StreamMessage {
+    /// Read next message from CLI stdout (reader thread only).
+    fn readMessageRaw(self: *Bridge) !?StreamMessage {
         _ = self.process orelse return error.NotStarted;
         const reader = if (self.stdout_reader) |*stdout_reader| &stdout_reader.interface else return error.NoStdout;
 
@@ -664,6 +720,83 @@ pub const Bridge = struct {
             .raw = parsed.value,
             .arena = arena,
         };
+    }
+
+    /// Read next message from the queue.
+    pub fn readMessage(self: *Bridge) !?StreamMessage {
+        return self.popMessage(null);
+    }
+
+    /// Read next message with a deadline (milliseconds since epoch).
+    pub fn readMessageWithTimeout(self: *Bridge, deadline_ms: i64) !?StreamMessage {
+        return self.popMessage(deadline_ms);
+    }
+
+    fn popMessage(self: *Bridge, deadline_ms: ?i64) !?StreamMessage {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+
+        while (true) {
+            if (self.queue_head < self.message_queue.items.len) {
+                const msg = self.message_queue.items[self.queue_head];
+                self.queue_head += 1;
+                if (self.queue_head >= self.message_queue.items.len) {
+                    self.message_queue.clearRetainingCapacity();
+                    self.queue_head = 0;
+                }
+                return msg;
+            }
+
+            if (self.reader_closed) return null;
+
+            if (deadline_ms) |deadline| {
+                const now = std.time.milliTimestamp();
+                if (now >= deadline) return error.Timeout;
+                const slice_ms = io_utils.pollSliceMs(deadline, now);
+                const timeout_ns: u64 = @as(u64, @intCast(slice_ms)) * std.time.ns_per_ms;
+                self.queue_cond.timedWait(&self.queue_mutex, timeout_ns) catch |err| switch (err) {
+                    error.Timeout => continue,
+                };
+            } else {
+                self.queue_cond.wait(&self.queue_mutex);
+            }
+        }
+    }
+
+    fn clearQueue(self: *Bridge) void {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+
+        for (self.message_queue.items[self.queue_head..]) |*msg| {
+            msg.deinit();
+        }
+        self.message_queue.clearRetainingCapacity();
+        self.queue_head = 0;
+    }
+
+    fn readerMain(self: *Bridge) void {
+        while (true) {
+            if (self.stop_requested.load(.acquire)) break;
+            var msg = self.readMessageRaw() catch |err| {
+                log.err("Claude reader failed: {}", .{err});
+                break;
+            } orelse break;
+
+            self.queue_mutex.lock();
+            self.message_queue.append(self.allocator, msg) catch |err| {
+                self.queue_mutex.unlock();
+                log.err("Failed to queue Claude message: {}", .{err});
+                msg.deinit();
+                continue;
+            };
+            self.queue_mutex.unlock();
+            self.queue_cond.signal();
+        }
+
+        self.queue_mutex.lock();
+        self.reader_closed = true;
+        self.queue_mutex.unlock();
+        self.queue_cond.broadcast();
     }
 };
 
@@ -853,19 +986,7 @@ fn waitForClaudeReadable(bridge: *Bridge, timeout_ms: i32) !bool {
 }
 
 fn readClaudeMessageWithTimeout(bridge: *Bridge, deadline_ms: i64) !?StreamMessage {
-    while (true) {
-        const now = std.time.milliTimestamp();
-        if (now >= deadline_ms) return error.Timeout;
-
-        if (hasBufferedClaudeData(bridge)) {
-            return try bridge.readMessage();
-        }
-
-        const slice_ms = io_utils.pollSliceMs(deadline_ms, now);
-        const readable = try waitForClaudeReadable(bridge, slice_ms);
-        if (!readable) continue;
-        return try bridge.readMessage();
-    }
+    return bridge.readMessageWithTimeout(deadline_ms);
 }
 
 fn collectClaudeControlProbe(allocator: Allocator, input: StreamControlInput) ![]u8 {

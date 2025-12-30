@@ -409,7 +409,7 @@ pub const Agent = struct {
         id: []const u8,
         cwd: []const u8,
         cancelled: bool = false,
-        permission_mode: protocol.PermissionMode = .bypassPermissions,
+        permission_mode: protocol.PermissionMode = .default,
         config: SessionConfig,
         availability: EngineAvailability,
         model: ?[]const u8 = null,
@@ -421,11 +421,14 @@ pub const Agent = struct {
         force_new_claude: bool = false,
         force_new_codex: bool = false,
         pending_execute_tools: std.StringHashMap(void),
+        permission_socket: ?std.posix.socket_t = null,
+        permission_socket_path: ?[]const u8 = null,
 
         pub fn deinit(self: *Session, allocator: Allocator) void {
             if (self.bridge) |*b| b.deinit();
             if (self.codex_bridge) |*b| b.deinit();
             if (self.settings) |*s| s.deinit();
+            self.closePermissionSocket(allocator);
             var it = self.pending_execute_tools.iterator();
             while (it.next()) |entry| {
                 allocator.free(entry.key_ptr.*);
@@ -436,6 +439,48 @@ pub const Agent = struct {
             if (self.model) |m| allocator.free(m);
             if (self.cli_session_id) |sid| allocator.free(sid);
             if (self.codex_session_id) |sid| allocator.free(sid);
+        }
+
+        fn closePermissionSocket(self: *Session, allocator: Allocator) void {
+            if (self.permission_socket) |sock| {
+                std.posix.close(sock);
+                self.permission_socket = null;
+            }
+            if (self.permission_socket_path) |path| {
+                std.fs.cwd().deleteFile(path) catch {};
+                allocator.free(path);
+                self.permission_socket_path = null;
+            }
+        }
+
+        fn createPermissionSocket(self: *Session, allocator: Allocator) !void {
+            // Create socket path: /tmp/banjo-{session_id}.sock
+            const path = try std.fmt.allocPrint(allocator, "/tmp/banjo-{s}.sock", .{self.id});
+            errdefer allocator.free(path);
+
+            // Remove existing socket file if present
+            std.fs.cwd().deleteFile(path) catch {};
+
+            // Create non-blocking Unix domain socket
+            const sock = try std.posix.socket(
+                std.posix.AF.UNIX,
+                std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK,
+                0,
+            );
+            errdefer std.posix.close(sock);
+
+            // Bind to path
+            var addr: std.posix.sockaddr.un = .{ .path = undefined };
+            @memset(&addr.path, 0);
+            const path_len = @min(path.len, addr.path.len - 1);
+            @memcpy(addr.path[0..path_len], path[0..path_len]);
+
+            try std.posix.bind(sock, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
+            try std.posix.listen(sock, 1);
+
+            self.permission_socket = sock;
+            self.permission_socket_path = path;
+            log.info("Created permission socket at {s}", .{path});
         }
 
         /// Check if a tool is allowed based on settings
@@ -1361,10 +1406,19 @@ pub const Agent = struct {
             .skip_permissions = mode == .bypassPermissions,
             .permission_mode = if (mode == .bypassPermissions) null else @tagName(mode),
             .model = session.model,
+            .permission_socket_path = session.permission_socket_path,
         };
     }
 
     fn startClaudeBridge(self: *Agent, session: *Session, session_id: []const u8) !void {
+        // Create permission socket for non-bypass modes
+        if (session.permission_mode != .bypassPermissions and session.permission_socket == null) {
+            session.createPermissionSocket(self.allocator) catch |err| {
+                log.warn("Failed to create permission socket: {}", .{err});
+                // Continue without socket - will fall back to bypass behavior
+            };
+        }
+
         session.bridge.?.start(buildClaudeStartOptions(session)) catch |err| {
             log.err("Failed to start Claude Code: {}", .{err});
             session.bridge = null;
@@ -2443,6 +2497,9 @@ pub const Agent = struct {
     }
 
     fn pollClientMessages(self: *Agent, session: *Session) void {
+        // Check permission socket for hook requests
+        self.pollPermissionSocket(session);
+
         const reader = self.reader orelse return;
         while (true) {
             const deadline_ms = std.time.milliTimestamp();
@@ -2471,6 +2528,140 @@ pub const Agent = struct {
 
             if (session.cancelled) return;
         }
+    }
+
+    fn pollPermissionSocket(self: *Agent, session: *Session) void {
+        const sock = session.permission_socket orelse return;
+
+        // Try to accept a connection (non-blocking)
+        var client_addr: std.posix.sockaddr.un = undefined;
+        var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.un);
+        const client_fd = std.posix.accept(sock, @ptrCast(&client_addr), &addr_len, 0) catch |err| {
+            if (err == error.WouldBlock) return; // No pending connection
+            log.warn("Permission socket accept error: {}", .{err});
+            return;
+        };
+        defer std.posix.close(client_fd);
+
+        // Read request from hook
+        var buf: [4096]u8 = undefined;
+        const n = std.posix.read(client_fd, &buf) catch |err| {
+            log.warn("Permission socket read error: {}", .{err});
+            return;
+        };
+        if (n == 0) return;
+
+        // Parse JSON request
+        const request_json = std.mem.trimRight(u8, buf[0..n], "\n\r");
+        var parsed = std.json.parseFromSlice(PermissionHookRequest, self.allocator, request_json, .{
+            .ignore_unknown_fields = true,
+        }) catch |err| {
+            log.warn("Permission hook request parse error: {}", .{err});
+            self.sendPermissionResponse(client_fd, "ask", null);
+            return;
+        };
+        defer parsed.deinit();
+
+        const req = parsed.value;
+        log.info("Permission request from hook: tool={s} id={s}", .{ req.tool_name, req.tool_use_id });
+
+        // Forward to Zed via ACP
+        const decision = self.requestPermissionFromClient(session, req) catch |err| {
+            log.warn("Failed to request permission from client: {}", .{err});
+            self.sendPermissionResponse(client_fd, "ask", null);
+            return;
+        };
+
+        // Send response back to hook
+        self.sendPermissionResponse(client_fd, decision.behavior, decision.message);
+    }
+
+    const PermissionHookRequest = struct {
+        tool_name: []const u8,
+        tool_input: std.json.Value,
+        tool_use_id: []const u8,
+        session_id: []const u8,
+    };
+
+    const PermissionDecision = struct {
+        behavior: []const u8, // "allow", "deny", "ask"
+        message: ?[]const u8,
+    };
+
+    fn sendPermissionResponse(self: *Agent, fd: std.posix.fd_t, decision: []const u8, message: ?[]const u8) void {
+        _ = self;
+        var buf: [512]u8 = undefined;
+        const response = if (message) |msg|
+            std.fmt.bufPrint(&buf, "{{\"decision\":\"{s}\",\"message\":\"{s}\"}}\n", .{ decision, msg }) catch return
+        else
+            std.fmt.bufPrint(&buf, "{{\"decision\":\"{s}\"}}\n", .{decision}) catch return;
+        _ = std.posix.write(fd, response) catch {};
+    }
+
+    fn requestPermissionFromClient(self: *Agent, session: *Session, req: PermissionHookRequest) !PermissionDecision {
+        // Map tool name to kind
+        const kind = mapToolKind(req.tool_name);
+
+        // Build ACP permission request
+        const request_id = self.next_request_id;
+        self.next_request_id += 1;
+        const tool_call_id = try std.fmt.allocPrint(self.allocator, "hook_{s}", .{req.tool_use_id});
+        defer self.allocator.free(tool_call_id);
+
+        const params = protocol.PermissionRequest{
+            .sessionId = session.id,
+            .toolCall = .{
+                .toolCallId = tool_call_id,
+                .title = req.tool_name,
+                .kind = kind,
+                .status = .pending,
+                .rawInput = req.tool_input,
+            },
+            .options = &[_]protocol.PermissionOption{
+                .{ .kind = .allow_once, .name = "Allow", .optionId = "allow_once" },
+                .{ .kind = .allow_always, .name = "Allow Always", .optionId = "allow_always" },
+                .{ .kind = .reject_once, .name = "Deny", .optionId = "reject_once" },
+            },
+        };
+
+        try self.writer.writeTypedRequest(.{ .number = request_id }, "session/request_permission", params);
+
+        // Wait for response
+        var response = self.waitForResponse(session, .{ .number = request_id }) catch |err| {
+            if (err == error.Cancelled) {
+                return .{ .behavior = "deny", .message = "Cancelled" };
+            }
+            return err;
+        };
+        defer response.deinit();
+
+        // Parse response
+        if (response.message != .response) {
+            return .{ .behavior = "ask", .message = null };
+        }
+        const resp = response.message.response;
+        if (resp.result) |result| {
+            const outcome = std.json.parseFromValue(protocol.PermissionResponse, self.allocator, result, .{
+                .ignore_unknown_fields = true,
+            }) catch {
+                return .{ .behavior = "ask", .message = null };
+            };
+            defer outcome.deinit();
+
+            if (outcome.value.outcome.outcome == .selected) {
+                if (outcome.value.outcome.optionId) |opt_id| {
+                    if (std.mem.startsWith(u8, opt_id, "allow")) {
+                        return .{ .behavior = "allow", .message = null };
+                    } else {
+                        return .{ .behavior = "deny", .message = "Permission denied" };
+                    }
+                }
+            } else if (outcome.value.outcome.outcome == .cancelled) {
+                return .{ .behavior = "deny", .message = "Cancelled" };
+            }
+        }
+
+        return .{ .behavior = "ask", .message = null };
     }
 
     fn parsePermissionOutcome(self: *Agent, response: jsonrpc.Response) !protocol.PermissionOutcome {
@@ -3475,10 +3666,11 @@ pub const Agent = struct {
         .{ .name = "review", .description = "Code review" },
     };
 
-    // Note: In stream-json mode, Claude Code can't request interactive permission.
-    // Only bypassPermissions (auto-approve all) and plan (no execution) work reliably.
-    // default/acceptEdits block waiting for input that never comes.
+    // Permission modes for Claude Code. Non-bypass modes use the PermissionRequest
+    // hook to forward tool approval requests to Zed via ACP.
     const available_modes = [_]protocol.SessionMode{
+        .{ .id = "default", .name = "Default", .description = "Ask before executing tools" },
+        .{ .id = "acceptEdits", .name = "Accept edits", .description = "Auto-accept file edits, ask for others" },
         .{ .id = "bypassPermissions", .name = "Auto-approve", .description = "Run all tools without prompting" },
         .{ .id = "plan", .name = "Plan only", .description = "Plan without executing tools" },
     };
@@ -3717,9 +3909,11 @@ const TestWriter = struct {
 
 const expected_modes_json =
     "{\"availableModes\":[" ++
+    "{\"id\":\"default\",\"name\":\"Default\",\"description\":\"Ask before executing tools\"}," ++
+    "{\"id\":\"acceptEdits\",\"name\":\"Accept edits\",\"description\":\"Auto-accept file edits, ask for others\"}," ++
     "{\"id\":\"bypassPermissions\",\"name\":\"Auto-approve\",\"description\":\"Run all tools without prompting\"}," ++
     "{\"id\":\"plan\",\"name\":\"Plan only\",\"description\":\"Plan without executing tools\"}]," ++
-    "\"currentModeId\":\"bypassPermissions\"}";
+    "\"currentModeId\":\"default\"}";
 
 const expected_commands_json =
     "[{\"name\":\"explain\",\"description\":\"Summarize selected code as a note comment\"}," ++
@@ -3764,7 +3958,7 @@ fn expectedNewSessionOutput(
             "\",\"update\":{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":" ++ expected_commands_json ++
             "}}}\n" ++
             "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"" ++ session_id ++
-            "\",\"update\":{\"sessionUpdate\":\"current_mode_update\",\"currentModeId\":\"bypassPermissions\"}}}\n" ++
+            "\",\"update\":{\"sessionUpdate\":\"current_mode_update\",\"currentModeId\":\"default\"}}}\n" ++
             "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"" ++ session_id ++
             "\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"" ++
             no_engine_warning ++ "\"}}}}\n";
@@ -3777,7 +3971,7 @@ fn expectedNewSessionOutput(
         "\",\"update\":{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":" ++ expected_commands_json ++
         "}}}\n" ++
         "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"" ++ session_id ++
-        "\",\"update\":{\"sessionUpdate\":\"current_mode_update\",\"currentModeId\":\"bypassPermissions\"}}}\n";
+        "\",\"update\":{\"sessionUpdate\":\"current_mode_update\",\"currentModeId\":\"default\"}}}\n";
 }
 
 test "configFromEnv returns defaults" {
