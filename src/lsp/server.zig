@@ -170,7 +170,9 @@ pub const Server = struct {
                 }
                 const uri = entry.key_ptr.*;
                 if (self.documents.get(uri)) |content| {
-                    self.updateNoteIndexForUri(uri, content) catch {};
+                    self.updateNoteIndexForUri(uri, content) catch |err| {
+                        log.warn("Failed to update note index for {s}: {}", .{ uri, err });
+                    };
                 }
                 try to_remove.append(self.allocator, uri);
             }
@@ -387,8 +389,12 @@ pub const Server = struct {
 
     fn updateNoteIndexForUri(self: *Server, uri: []const u8, content: []const u8) !void {
         const file_path = uriToPath(uri) orelse uri;
-        self.note_index.removeNotesByFile(file_path) catch {};
-        self.addNotesFromContent(file_path, content) catch {};
+        self.note_index.removeNotesByFile(file_path) catch |err| {
+            log.warn("Failed to remove notes for {s}: {}", .{ file_path, err });
+        };
+        self.addNotesFromContent(file_path, content) catch |err| {
+            log.warn("Failed to add notes for {s}: {}", .{ file_path, err });
+        };
     }
 
     fn handleDidClose(self: *Server, request: jsonrpc.Request) !void {
@@ -398,7 +404,10 @@ pub const Server = struct {
                 self.allocator,
                 p,
                 .{ .ignore_unknown_fields = true },
-            ) catch return;
+            ) catch |err| {
+                log.warn("Failed to parse didClose params: {}", .{err});
+                return;
+            };
             break :blk parsed;
         } else return;
         defer params.deinit();
@@ -430,7 +439,10 @@ pub const Server = struct {
                 self.allocator,
                 p,
                 .{ .ignore_unknown_fields = true },
-            ) catch return;
+            ) catch |err| {
+                log.warn("Failed to parse didSave params: {}", .{err});
+                return;
+            };
             break :blk parsed;
         } else return;
         defer params.deinit();
@@ -1319,19 +1331,28 @@ pub const Server = struct {
     }
 
     fn addNotesFromContent(self: *Server, file_path: []const u8, content: []const u8) !void {
-        const notes = comments.scanFileForNotes(self.allocator, content) catch return;
+        const notes = comments.scanFileForNotes(self.allocator, content) catch |err| {
+            log.warn("Failed to scan notes for {s}: {}", .{ file_path, err });
+            return;
+        };
         defer {
             for (notes) |*n| @constCast(n).deinit(self.allocator);
             self.allocator.free(notes);
         }
 
         for (notes) |note| {
-            self.note_index.addNote(note, file_path) catch continue;
+            self.note_index.addNote(note, file_path) catch |err| {
+                log.warn("Failed to add note {s} in {s}: {}", .{ note.id, file_path, err });
+                continue;
+            };
         }
     }
 
     fn scanProjectNotes(self: *Server, dir_path: []const u8, open_paths: *const std.StringHashMap(void)) !void {
-        var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
+        var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| {
+            log.warn("Failed to open notes dir {s}: {}", .{ dir_path, err });
+            return;
+        };
         defer dir.close();
 
         var iter = dir.iterate();
@@ -1353,13 +1374,22 @@ pub const Server = struct {
             if (!note_extension_set.has(ext)) continue;
             if (open_paths.get(full_path) != null) continue;
 
-            const file = std.fs.openFileAbsolute(full_path, .{}) catch continue;
+            const file = std.fs.openFileAbsolute(full_path, .{}) catch |err| {
+                log.warn("Failed to open note file {s}: {}", .{ full_path, err });
+                continue;
+            };
             defer file.close();
 
-            const content = file.readToEndAlloc(self.allocator, 10 * 1024 * 1024) catch continue;
+            const content = file.readToEndAlloc(self.allocator, 10 * 1024 * 1024) catch |err| {
+                log.warn("Failed to read note file {s}: {}", .{ full_path, err });
+                continue;
+            };
             defer self.allocator.free(content);
 
-            self.addNotesFromContent(full_path, content) catch continue;
+            self.addNotesFromContent(full_path, content) catch |err| {
+                log.warn("Failed to scan note file {s}: {}", .{ full_path, err });
+                continue;
+            };
         }
     }
 
@@ -1390,7 +1420,10 @@ pub const Server = struct {
                 self.allocator.free(path_copy);
             }
 
-            self.addNotesFromContent(file_path, content) catch continue;
+            self.addNotesFromContent(file_path, content) catch |err| {
+                log.warn("Failed to scan open note file {s}: {}", .{ file_path, err });
+                continue;
+            };
         }
 
         if (self.root_uri) |root_uri| {

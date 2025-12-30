@@ -20,12 +20,15 @@ claude -p \
 | `--output-format stream-json` | JSON stream output |
 | `--input-format stream-json` | JSON stream input |
 | `--include-partial-messages` | Partial chunks |
+| `--replay-user-messages` | Echo user messages back on stdout (stream-json only) |
 | `--dangerously-skip-permissions` | Bypass perms |
 | `--permission-mode <mode>` | Set perm mode |
 | `--allowedTools <tools>` | Whitelist tools |
 | `--disallowedTools <tools>` | Blacklist tools |
 | `-c, --continue` | Continue last session |
 | `-r, --resume <id>` | Resume by session ID |
+| `--fork-session` | Resume and create new session ID |
+| `--no-session-persistence` | Disable session persistence (print mode only) |
 
 ## Stream JSON Input Format
 
@@ -40,6 +43,11 @@ When using `--input-format stream-json`, send messages as:
 - `type` must be "user" or "control" at top level
 - `message.role` must be "user"
 - `message.content` is the prompt text
+
+The CLI reference does not document image/audio payloads for stream-json input.
+Our live tests with content blocks show:
+- `image` blocks are accepted but can fail if the image cannot be processed.
+- `audio` blocks are rejected (unsupported input tag).
 
 Example command:
 ```bash
@@ -105,6 +113,20 @@ This is equivalent functionality but at the ACP layer.
 
 - Node.js subprocess spawning has bugs (use Python or direct exec)
 - `--verbose` requires `--json` in print mode
+
+## Live Multimodal Tests (stream-json)
+
+Image content block:
+```
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Describe the image in one word."},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"...base64..."}}]}}
+```
+Result (Claude Code 2.0.76): error "Could not process image".
+
+Audio content block:
+```
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Transcribe the audio."},{"type":"audio","source":{"type":"base64","media_type":"audio/wav","data":"...base64..."}}]}}
+```
+Result: error "Input tag 'audio' ... does not match any of the expected tags".
 
 ## Sources
 

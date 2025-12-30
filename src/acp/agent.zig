@@ -6,8 +6,10 @@ const protocol = @import("protocol.zig");
 const bridge = @import("../cli/bridge.zig");
 const Bridge = bridge.Bridge;
 const SystemSubtype = bridge.SystemSubtype;
-const CodexBridge = @import("../cli/codex_bridge.zig").CodexBridge;
-const CodexMessage = @import("../cli/codex_bridge.zig").CodexMessage;
+const codex_cli = @import("../cli/codex_bridge.zig");
+const CodexBridge = codex_cli.CodexBridge;
+const CodexMessage = codex_cli.CodexMessage;
+const CodexUserInput = codex_cli.UserInput;
 const settings_loader = @import("../settings/loader.zig");
 const Settings = settings_loader.Settings;
 const notes_commands = @import("../notes/commands.zig");
@@ -21,17 +23,14 @@ const Engine = enum { claude, codex };
 
 const Route = enum { claude, codex, both };
 
-const RoutingResult = struct {
-    route: Route,
-    prompt: []const u8,
-    consumed: bool,
-};
-
 /// Banjo version with git hash
 pub const version = "0.5.0 (" ++ config.git_hash ++ ")";
 const no_engine_warning = "Banjo Duet could not find Claude Code or Codex. Install one (or set CLAUDE_CODE_EXECUTABLE/CODEX_EXECUTABLE) and restart the agent.";
+const terminal_mirror_warning = "Banjo warning: Terminal mirroring failed; tool output may be incomplete.";
+const terminal_truncated_warning = "Banjo warning: Terminal output truncated; view the terminal for full output.";
 const max_context_bytes = 64 * 1024; // cap embedded resource text to keep prompts bounded
 const max_media_preview_bytes = 2048; // small preview for binary media captions
+const max_codex_image_bytes: usize = 8 * 1024 * 1024; // guard against massive base64 images
 const resource_line_limit: u32 = 200; // limit resource excerpt lines to reduce UI spam
 const max_terminal_output_bytes: usize = 8192; // cap terminal mirror output to keep commands manageable
 const default_model_id = "sonnet";
@@ -204,36 +203,12 @@ fn mapToolKind(tool_name: []const u8) protocol.SessionUpdate.ToolKind {
     return map.get(tool_name) orelse .other;
 }
 
-fn parseRoutePrefix(text: []const u8, default_route: Route) RoutingResult {
-    if (text.len == 0 or text[0] != '/') {
-        return .{ .route = default_route, .prompt = text, .consumed = false };
-    }
-
-    const routing = matchRoute(text) orelse {
-        return .{ .route = default_route, .prompt = text, .consumed = false };
+fn routeLabel(route: Route) []const u8 {
+    return switch (route) {
+        .claude => "Claude",
+        .codex => "Codex",
+        .both => "Both",
     };
-
-    var idx = routing.prefix_len;
-    while (idx < text.len and (text[idx] == ' ' or text[idx] == '\t')) idx += 1;
-    return .{ .route = routing.route, .prompt = text[idx..], .consumed = true };
-}
-
-const RouteMatch = struct {
-    route: Route,
-    prefix_len: usize,
-};
-
-fn matchRoute(text: []const u8) ?RouteMatch {
-    if (text.len == 0 or text[0] != '/') return null;
-    const end = std.mem.indexOfAny(u8, text, " \t\r\n") orelse text.len;
-    const token = text[0..end];
-    const map = std.StaticStringMap(Route).initComptime(.{
-        .{ "/claude", .claude },
-        .{ "/codex", .codex },
-        .{ "/both", .both },
-    });
-    const route = map.get(token) orelse return null;
-    return .{ .route = route, .prefix_len = token.len };
 }
 
 // JSON-RPC method parameter schemas
@@ -301,12 +276,21 @@ const ResourceData = struct {
 const PromptParts = struct {
     user_text: ?[]const u8 = null,
     context: ?[]const u8 = null,
+    codex_context: ?[]const u8 = null,
     resource: ?ResourceData = null,
+    codex_inputs: ?[]const CodexUserInput = null,
+    codex_input_strings: ?[]const []const u8 = null,
 
     fn deinit(self: *PromptParts, allocator: Allocator) void {
         if (self.user_text) |text| allocator.free(text);
         if (self.context) |text| allocator.free(text);
+        if (self.codex_context) |text| allocator.free(text);
         if (self.resource) |*res| res.deinit(allocator);
+        if (self.codex_inputs) |inputs| allocator.free(inputs);
+        if (self.codex_input_strings) |strings| {
+            for (strings) |item| allocator.free(item);
+            allocator.free(strings);
+        }
     }
 };
 
@@ -484,6 +468,7 @@ pub const Agent = struct {
     }
 
     fn sendInitializeResponse(self: *Agent, request: jsonrpc.Request) !void {
+        const availability = detectEngines();
         const response = protocol.InitializeResponse{
             .agentInfo = .{
                 .name = "Banjo Duet",
@@ -492,7 +477,7 @@ pub const Agent = struct {
             },
             .agentCapabilities = .{
                 .promptCapabilities = .{
-                    .image = true,
+                    .image = availability.codex,
                     .embeddedContext = true,
                 },
                 .mcpCapabilities = .{
@@ -684,27 +669,12 @@ pub const Agent = struct {
         session.cancelled = false;
         log.info("Prompt received for session {s}: {s}", .{ session_id, prompt_text orelse "(empty)" });
 
-        var route = session.config.duet_default;
+        const route = session.config.duet_default;
         var effective_prompt = prompt_text;
 
         if (prompt_text) |text| {
-            const routing = parseRoutePrefix(text, route);
-            route = routing.route;
-            effective_prompt = routing.prompt;
-
-            if (routing.consumed and effective_prompt.?.len == 0) {
-                try self.sendSessionUpdate(session_id, .{
-                    .sessionUpdate = .agent_message_chunk,
-                    .content = .{ .type = "text", .text = "Usage: /claude <prompt> | /codex <prompt> | /both <prompt>" },
-                });
-                try self.sendEndTurn(request);
-                response_sent = true;
-                return;
-            }
-
-            const prompt_value = effective_prompt.?;
-            if (prompt_value.len > 0 and prompt_value[0] == '/') {
-                if (self.dispatchCommand(request, session, session_id, prompt_value, prompt_parts.resource)) |transformed| {
+            if (text.len > 0 and text[0] == '/') {
+                if (self.dispatchCommand(request, session, session_id, text, prompt_parts.resource)) |transformed| {
                     effective_prompt = transformed;
                 } else {
                     response_sent = true;
@@ -713,14 +683,20 @@ pub const Agent = struct {
             }
         }
 
+        const base_prompt = effective_prompt;
+
         var combined_prompt: ?[]const u8 = null;
         defer if (combined_prompt) |text| self.allocator.free(text);
+
+        var codex_prompt_owned: ?[]const u8 = null;
+        defer if (codex_prompt_owned) |text| self.allocator.free(text);
+        var codex_prompt: ?[]const u8 = base_prompt;
 
         if (prompt_parts.context) |context| {
             var builder: std.ArrayListUnmanaged(u8) = .empty;
             defer builder.deinit(self.allocator);
 
-            if (effective_prompt) |text| {
+            if (base_prompt) |text| {
                 try builder.appendSlice(self.allocator, text);
             }
             if (context.len > 0) {
@@ -735,13 +711,37 @@ pub const Agent = struct {
             }
         }
 
+        if (prompt_parts.codex_context) |context| {
+            var builder: std.ArrayListUnmanaged(u8) = .empty;
+            defer builder.deinit(self.allocator);
+
+            if (base_prompt) |text| {
+                try builder.appendSlice(self.allocator, text);
+            }
+            if (context.len > 0) {
+                if (builder.items.len > 0) {
+                    try builder.appendSlice(self.allocator, "\n\n");
+                }
+                try builder.appendSlice(self.allocator, context);
+            }
+            if (builder.items.len > 0) {
+                codex_prompt_owned = try builder.toOwnedSlice(self.allocator);
+                codex_prompt = codex_prompt_owned;
+            }
+        }
+
         if (effective_prompt == null and prompt_parts.context != null) {
             effective_prompt = prompt_parts.context;
         }
 
+        if (codex_prompt == null and prompt_parts.codex_inputs != null) {
+            codex_prompt = "";
+        }
+
         var stop_reason: protocol.StopReason = .end_turn;
         if (effective_prompt) |text| {
-            stop_reason = try self.runDuetPrompt(session, session_id, text, route);
+            const codex_text = codex_prompt orelse text;
+            stop_reason = try self.runDuetPrompt(session, session_id, text, route, codex_text, prompt_parts.codex_inputs);
         }
 
         try self.writer.writeTypedResponse(request.id, protocol.PromptResponse{ .stopReason = stop_reason });
@@ -762,10 +762,22 @@ pub const Agent = struct {
     ) !PromptParts {
         var user_buf: std.ArrayListUnmanaged(u8) = .empty;
         var context_buf: std.ArrayListUnmanaged(u8) = .empty;
+        var codex_context_buf: std.ArrayListUnmanaged(u8) = .empty;
         var resource: ?ResourceData = null;
+        var codex_inputs: std.ArrayListUnmanaged(CodexUserInput) = .empty;
+        var codex_input_strings: std.ArrayListUnmanaged([]const u8) = .empty;
+        const codex_available = CodexBridge.isAvailable();
         errdefer user_buf.deinit(self.allocator);
         errdefer context_buf.deinit(self.allocator);
+        errdefer codex_context_buf.deinit(self.allocator);
         errdefer if (resource) |*res| res.deinit(self.allocator);
+        errdefer codex_inputs.deinit(self.allocator);
+        errdefer {
+            for (codex_input_strings.items) |item| {
+                self.allocator.free(item);
+            }
+            codex_input_strings.deinit(self.allocator);
+        }
 
         for (blocks) |block| {
             const kind = content_kind_map.get(block.type) orelse .unknown;
@@ -778,25 +790,36 @@ pub const Agent = struct {
                 .resource => {
                     const embedded = block.resource orelse continue;
                     try self.appendEmbeddedResource(&context_buf, &resource, embedded);
+                    try self.appendEmbeddedResourceContext(&codex_context_buf, embedded);
                 },
                 .resource_link => {
                     const uri = block.uri orelse continue;
                     const name = block.name orelse uri;
                     const link = ResourceLinkData{ .uri = uri, .name = name, .mimeType = block.mimeType };
-                    if (try self.appendResourceLink(session, session_id, &context_buf, &resource, link)) {
+                    if (try self.appendResourceLink(session, session_id, &context_buf, &codex_context_buf, &resource, link)) {
                         continue;
                     }
                     try self.appendResourceLinkFallback(&context_buf, link);
+                    try self.appendResourceLinkFallback(&codex_context_buf, link);
                 },
                 .image => {
                     const mime_type = block.mimeType orelse continue;
                     const data = block.data orelse continue;
+                    if (codex_available) {
+                        const appended = try self.appendCodexImageInput(&codex_inputs, &codex_input_strings, block);
+                        if (!appended) {
+                            try self.appendMediaBlock(&codex_context_buf, "Image", mime_type, data);
+                        }
+                    } else {
+                        try self.appendMediaBlock(&codex_context_buf, "Image", mime_type, data);
+                    }
                     try self.appendMediaBlock(&context_buf, "Image", mime_type, data);
                 },
                 .audio => {
                     const mime_type = block.mimeType orelse continue;
                     const data = block.data orelse continue;
                     try self.appendMediaBlock(&context_buf, "Audio", mime_type, data);
+                    try self.appendMediaBlock(&codex_context_buf, "Audio", mime_type, data);
                 },
                 .unknown => {},
             }
@@ -805,7 +828,10 @@ pub const Agent = struct {
         var parts = PromptParts{
             .user_text = null,
             .context = null,
+            .codex_context = null,
             .resource = resource,
+            .codex_inputs = null,
+            .codex_input_strings = null,
         };
 
         if (user_buf.items.len > 0) {
@@ -818,6 +844,24 @@ pub const Agent = struct {
             parts.context = try context_buf.toOwnedSlice(self.allocator);
         } else {
             context_buf.deinit(self.allocator);
+        }
+
+        if (codex_context_buf.items.len > 0) {
+            parts.codex_context = try codex_context_buf.toOwnedSlice(self.allocator);
+        } else {
+            codex_context_buf.deinit(self.allocator);
+        }
+
+        if (codex_inputs.items.len > 0) {
+            parts.codex_inputs = try codex_inputs.toOwnedSlice(self.allocator);
+        } else {
+            codex_inputs.deinit(self.allocator);
+        }
+
+        if (codex_input_strings.items.len > 0) {
+            parts.codex_input_strings = try codex_input_strings.toOwnedSlice(self.allocator);
+        } else {
+            codex_input_strings.deinit(self.allocator);
         }
 
         return parts;
@@ -877,11 +921,29 @@ pub const Agent = struct {
         }
     }
 
+    fn appendEmbeddedResourceContext(
+        self: *Agent,
+        context_buf: *std.ArrayListUnmanaged(u8),
+        embedded: protocol.EmbeddedResourceResource,
+    ) !void {
+        if (embedded.text) |text| {
+            const lang = self.languageHint(embedded.uri, embedded.mimeType);
+            try self.appendContextBlock(context_buf, embedded.uri, lang, text);
+            return;
+        }
+
+        if (embedded.blob) |blob| {
+            const mime = embedded.mimeType orelse "application/octet-stream";
+            try self.appendMediaBlock(context_buf, "Resource blob", mime, blob);
+        }
+    }
+
     fn appendResourceLink(
         self: *Agent,
         session: *Session,
         session_id: []const u8,
         context_buf: *std.ArrayListUnmanaged(u8),
+        codex_context_buf: *std.ArrayListUnmanaged(u8),
         resource: *?ResourceData,
         link: ResourceLinkData,
     ) !bool {
@@ -895,6 +957,7 @@ pub const Agent = struct {
         };
         const lang = self.languageHint(link.uri, link.mimeType);
         try self.appendContextBlock(context_buf, link.uri, lang, content);
+        try self.appendContextBlock(codex_context_buf, link.uri, lang, content);
         if (resource.* == null) {
             const uri_buf = try self.allocator.dupe(u8, link.uri);
             const resource_text = self.clampOwnedResourceText(content) catch |err| {
@@ -940,6 +1003,38 @@ pub const Agent = struct {
         if (preview_len < data.len) {
             try writer.writeAll("\n[data truncated]");
         }
+    }
+
+    fn appendCodexImageInput(
+        self: *Agent,
+        codex_inputs: *std.ArrayListUnmanaged(CodexUserInput),
+        codex_input_strings: *std.ArrayListUnmanaged([]const u8),
+        block: protocol.ContentBlock,
+    ) !bool {
+        if (block.uri) |uri| {
+            if (parseFileUri(self.allocator, uri)) |uri_info| {
+                defer uri_info.deinit(self.allocator);
+                try codex_inputs.ensureUnusedCapacity(self.allocator, 1);
+                try codex_input_strings.ensureUnusedCapacity(self.allocator, 1);
+                const path = try self.allocator.dupe(u8, uri_info.path);
+                codex_inputs.appendAssumeCapacity(.{ .type = "localImage", .path = path });
+                codex_input_strings.appendAssumeCapacity(path);
+                return true;
+            }
+        }
+
+        const data = block.data orelse return false;
+        if (data.len > max_codex_image_bytes) {
+            log.warn("Codex image input too large ({d} bytes); skipping", .{data.len});
+            return false;
+        }
+        try codex_inputs.ensureUnusedCapacity(self.allocator, 1);
+        try codex_input_strings.ensureUnusedCapacity(self.allocator, 1);
+        const mime_type = block.mimeType orelse "application/octet-stream";
+        const url = try std.fmt.allocPrint(self.allocator, "data:{s};base64,{s}", .{ mime_type, data });
+        codex_inputs.appendAssumeCapacity(.{ .type = "image", .url = url });
+        codex_input_strings.appendAssumeCapacity(url);
+        return true;
     }
 
     fn appendContextBlock(
@@ -1017,7 +1112,8 @@ pub const Agent = struct {
         }
 
         const result = resp.result orelse {
-            return null;
+            _ = self.tool_proxy.handleResponse(request_id);
+            return error.InvalidToolResponse;
         };
         _ = self.tool_proxy.handleResponse(request_id);
         const parsed = try std.json.parseFromValue(protocol.ReadTextFileResponse, self.allocator, result, .{
@@ -1049,7 +1145,8 @@ pub const Agent = struct {
         }
 
         const result = resp.result orelse {
-            return false;
+            _ = self.tool_proxy.handleResponse(request_id);
+            return error.InvalidToolResponse;
         };
         _ = self.tool_proxy.handleResponse(request_id);
         const parsed = try std.json.parseFromValue(protocol.WriteTextFileResponse, self.allocator, result, .{
@@ -1061,7 +1158,15 @@ pub const Agent = struct {
 
     const DuetState = enum { start, next_engine, run_engine };
 
-    fn runDuetPrompt(self: *Agent, session: *Session, session_id: []const u8, prompt: []const u8, route: Route) !protocol.StopReason {
+    fn runDuetPrompt(
+        self: *Agent,
+        session: *Session,
+        session_id: []const u8,
+        prompt: []const u8,
+        route: Route,
+        codex_prompt: []const u8,
+        codex_inputs: ?[]const CodexUserInput,
+    ) !protocol.StopReason {
         var stop_reason: protocol.StopReason = .end_turn;
         const primary = session.config.duet_primary;
 
@@ -1102,7 +1207,7 @@ pub const Agent = struct {
             .run_engine => {
                 const reason = switch (current) {
                     .claude => try self.runClaudePrompt(session, session_id, prompt),
-                    .codex => try self.runCodexPrompt(session, session_id, prompt),
+                    .codex => try self.runCodexPrompt(session, session_id, codex_prompt, codex_inputs),
                 };
                 stop_reason = mergeStopReason(stop_reason, reason);
                 if (session.cancelled) return .cancelled;
@@ -1358,7 +1463,13 @@ pub const Agent = struct {
         return stop_reason;
     }
 
-    fn runCodexPrompt(self: *Agent, session: *Session, session_id: []const u8, prompt: []const u8) !protocol.StopReason {
+    fn runCodexPrompt(
+        self: *Agent,
+        session: *Session,
+        session_id: []const u8,
+        prompt: []const u8,
+        codex_inputs: ?[]const CodexUserInput,
+    ) !protocol.StopReason {
         const start_ms = std.time.milliTimestamp();
         const engine = Engine.codex;
         var stream_prefix_pending = true;
@@ -1366,12 +1477,25 @@ pub const Agent = struct {
         defer self.clearPendingExecuteTools(session);
 
         const codex_bridge = try self.ensureCodexBridge(session, session_id);
-        codex_bridge.sendPrompt(prompt) catch |err| {
+        var input_list: std.ArrayListUnmanaged(CodexUserInput) = .empty;
+        defer input_list.deinit(self.allocator);
+
+        if (prompt.len > 0) {
+            try input_list.append(self.allocator, .{ .type = "text", .text = prompt });
+        }
+        if (codex_inputs) |inputs| {
+            try input_list.appendSlice(self.allocator, inputs);
+        }
+
+        const inputs = input_list.items;
+        if (inputs.len == 0) return .end_turn;
+
+        codex_bridge.sendPrompt(inputs) catch |err| {
             log.warn("Codex sendPrompt failed ({}), restarting", .{err});
             codex_bridge.stop();
             try self.startCodexBridge(session, session_id);
             if (session.codex_bridge) |*restarted| {
-                restarted.sendPrompt(prompt) catch |retry_err| {
+                restarted.sendPrompt(inputs) catch |retry_err| {
                     log.err("Codex sendPrompt retry failed: {}", .{retry_err});
                     return retry_err;
                 };
@@ -1622,6 +1746,7 @@ pub const Agent = struct {
         tool_id: []const u8,
         content: ?[]const u8,
         status: protocol.SessionUpdate.ToolCallStatus,
+        terminal_id: ?[]const u8,
     ) !void {
         var id_buf: [256]u8 = undefined;
         const tagged_id = self.formatToolId(&id_buf, engine, tool_id) orelse blk: {
@@ -1636,13 +1761,23 @@ pub const Agent = struct {
         }
         defer if (tagged_content) |text| self.allocator.free(text);
 
+        var entries: [2]protocol.SessionUpdate.ToolCallContent = undefined;
+        var count: usize = 0;
+
+        if (tagged_content) |text| {
+            entries[count] = .{ .type = "content", .content = .{ .type = "text", .text = text } };
+            count += 1;
+        }
+        if (terminal_id) |tid| {
+            entries[count] = .{ .type = "terminal", .terminalId = tid };
+            count += 1;
+        }
+
         try self.sendSessionUpdate(session_id, .{
             .sessionUpdate = .tool_call_update,
             .toolCallId = tagged_id,
             .status = status,
-            .toolContent = if (tagged_content) |text| &.{
-                .{ .type = "content", .content = .{ .type = "text", .text = text } },
-            } else null,
+            .toolContent = if (count > 0) entries[0..count] else null,
         });
     }
 
@@ -1707,7 +1842,10 @@ pub const Agent = struct {
             .write => {
                 const parsed = std.json.parseFromValue(WriteToolInput, self.allocator, input_value, .{
                     .ignore_unknown_fields = true,
-                }) catch return;
+                }) catch |err| {
+                    log.warn("Failed to parse {s} tool input: {}", .{ tool_name, err });
+                    return;
+                };
                 defer parsed.deinit();
                 const path = parsed.value.file_path orelse parsed.value.path orelse return;
                 const content = parsed.value.content orelse parsed.value.text orelse return;
@@ -1716,7 +1854,10 @@ pub const Agent = struct {
             .edit => {
                 const parsed = std.json.parseFromValue(EditToolInput, self.allocator, input_value, .{
                     .ignore_unknown_fields = true,
-                }) catch return;
+                }) catch |err| {
+                    log.warn("Failed to parse {s} tool input: {}", .{ tool_name, err });
+                    return;
+                };
                 defer parsed.deinit();
                 const path = parsed.value.file_path orelse parsed.value.path orelse return;
                 const content = parsed.value.new_text orelse parsed.value.newText orelse parsed.value.content orelse return;
@@ -1738,14 +1879,19 @@ pub const Agent = struct {
         return try out.toOwnedSlice(self.allocator);
     }
 
+    const TerminalMirrorError = error{
+        TerminalRequestFailed,
+        InvalidTerminalResponse,
+    };
+
     fn mirrorTerminalOutput(
         self: *Agent,
         session: *Session,
         session_id: []const u8,
         output: []const u8,
-    ) !void {
-        if (!self.canUseTerminal()) return;
-        if (output.len == 0) return;
+    ) !?[]const u8 {
+        if (!self.canUseTerminal()) return null;
+        if (output.len == 0) return null;
 
         var snippet = output;
         var truncated = false;
@@ -1767,17 +1913,27 @@ pub const Agent = struct {
         defer self.allocator.free(shell_cmd);
 
         var args = [_][]const u8{ "-lc", shell_cmd };
-        const create_id = try self.tool_proxy.createTerminal(session_id, "/bin/sh", args[0..], null, session.cwd, null);
+        const create_id = try self.tool_proxy.createTerminal(
+            session_id,
+            "/bin/sh",
+            args[0..],
+            null,
+            session.cwd,
+            @as(u64, max_terminal_output_bytes),
+        );
         var response = try self.waitForResponse(session, .{ .number = create_id });
         defer response.deinit();
 
         const resp = response.message.response;
         if (resp.@"error") |err_val| {
             self.tool_proxy.handleError(create_id, err_val);
-            return;
+            return error.TerminalRequestFailed;
         }
 
-        const result = resp.result orelse return;
+        const result = resp.result orelse {
+            _ = self.tool_proxy.handleResponse(create_id);
+            return error.InvalidTerminalResponse;
+        };
         _ = self.tool_proxy.handleResponse(create_id);
         const parsed = try std.json.parseFromValue(protocol.CreateTerminalResponse, self.allocator, result, .{
             .ignore_unknown_fields = true,
@@ -1785,33 +1941,67 @@ pub const Agent = struct {
         defer parsed.deinit();
 
         const terminal_id = parsed.value.terminalId;
+        const terminal_id_copy = try self.allocator.dupe(u8, terminal_id);
+        errdefer self.allocator.free(terminal_id_copy);
         const wait_id = try self.tool_proxy.waitForExit(session_id, terminal_id);
         var wait_resp = try self.waitForResponse(session, .{ .number = wait_id });
         defer wait_resp.deinit();
         if (wait_resp.message.response.@"error") |err_val| {
             self.tool_proxy.handleError(wait_id, err_val);
-            return;
+            return error.TerminalRequestFailed;
         }
-        const wait_result = wait_resp.message.response.result orelse return;
+        const wait_result = wait_resp.message.response.result orelse {
+            _ = self.tool_proxy.handleResponse(wait_id);
+            return error.InvalidTerminalResponse;
+        };
         _ = self.tool_proxy.handleResponse(wait_id);
         const wait_parsed = try std.json.parseFromValue(protocol.WaitForTerminalExitResponse, self.allocator, wait_result, .{
             .ignore_unknown_fields = true,
         });
         defer wait_parsed.deinit();
 
+        const output_id = try self.tool_proxy.terminalOutput(session_id, terminal_id);
+        var output_resp = try self.waitForResponse(session, .{ .number = output_id });
+        defer output_resp.deinit();
+        if (output_resp.message.response.@"error") |err_val| {
+            self.tool_proxy.handleError(output_id, err_val);
+            return error.TerminalRequestFailed;
+        }
+        const output_result = output_resp.message.response.result orelse {
+            _ = self.tool_proxy.handleResponse(output_id);
+            return error.InvalidTerminalResponse;
+        };
+        _ = self.tool_proxy.handleResponse(output_id);
+        const output_parsed = try std.json.parseFromValue(protocol.TerminalOutputResponse, self.allocator, output_result, .{
+            .ignore_unknown_fields = true,
+        });
+        defer output_parsed.deinit();
+        const terminal_output = output_parsed.value.output;
+        const remote_truncated = output_parsed.value.truncated;
+        if (truncated or remote_truncated) {
+            log.warn("Terminal output truncated for {s} ({d} bytes)", .{ terminal_id, terminal_output.len });
+            self.sendPanelWarning(session_id, terminal_truncated_warning) catch |warn_err| {
+                log.warn("Failed to send terminal truncation warning: {}", .{warn_err});
+            };
+        }
+
         const release_id = try self.tool_proxy.releaseTerminal(session_id, terminal_id);
         var release_resp = try self.waitForResponse(session, .{ .number = release_id });
         defer release_resp.deinit();
         if (release_resp.message.response.@"error") |err_val| {
             self.tool_proxy.handleError(release_id, err_val);
-            return;
+            return error.TerminalRequestFailed;
         }
-        const release_result = release_resp.message.response.result orelse return;
+        const release_result = release_resp.message.response.result orelse {
+            _ = self.tool_proxy.handleResponse(release_id);
+            return error.InvalidTerminalResponse;
+        };
         _ = self.tool_proxy.handleResponse(release_id);
         const release_parsed = try std.json.parseFromValue(protocol.EmptyResponse, self.allocator, release_result, .{
             .ignore_unknown_fields = true,
         });
         defer release_parsed.deinit();
+        return terminal_id_copy;
     }
 
     fn handleEngineToolCall(
@@ -1846,12 +2036,23 @@ pub const Agent = struct {
         content: ?[]const u8,
         status: protocol.SessionUpdate.ToolCallStatus,
     ) !void {
-        try self.sendEngineToolResult(session_id, engine, tool_id, content, status);
+        var terminal_id: ?[]const u8 = null;
+        defer if (terminal_id) |tid| self.allocator.free(tid);
         if (try self.consumeExecuteTool(session, engine, tool_id)) {
             if (content) |text| {
-                try self.mirrorTerminalOutput(session, session_id, text);
+                terminal_id = self.mirrorTerminalOutput(session, session_id, text) catch |err| blk: {
+                    if (err == error.InvalidTerminalResponse) {
+                        return err;
+                    }
+                    log.warn("Terminal mirror failed: {}", .{err});
+                    self.sendPanelWarning(session_id, terminal_mirror_warning) catch |warn_err| {
+                        log.warn("Failed to send terminal mirror warning: {}", .{warn_err});
+                    };
+                    break :blk null;
+                };
             }
         }
+        try self.sendEngineToolResult(session_id, engine, tool_id, content, status, terminal_id);
     }
 
     fn requestPermission(
@@ -1955,11 +2156,9 @@ pub const Agent = struct {
 
     fn parsePermissionOutcome(self: *Agent, response: jsonrpc.Response) !protocol.PermissionOutcome {
         if (response.@"error" != null) {
-            return .{ .outcome = .cancelled, .optionId = null };
+            return error.PermissionRequestFailed;
         }
-        const result = response.result orelse {
-            return .{ .outcome = .cancelled, .optionId = null };
-        };
+        const result = response.result orelse return error.InvalidPermissionResponse;
         const parsed = try std.json.parseFromValue(protocol.PermissionResponse, self.allocator, result, .{
             .ignore_unknown_fields = true,
         });
@@ -2376,6 +2575,32 @@ pub const Agent = struct {
         self.clearPendingExecuteTools(session);
     }
 
+    fn handleRouteCommand(self: *Agent, request: jsonrpc.Request, session_id: []const u8, route: Route, has_args: bool) !void {
+        self.config_defaults.duet_default = route;
+        self.updateAllSessions(.duet_default, .{ .duet_default = route });
+
+        const msg = switch (route) {
+            .claude => if (has_args)
+                "Routing mode set to Claude. This command takes no arguments; send your prompt next."
+            else
+                "Routing mode set to Claude.",
+            .codex => if (has_args)
+                "Routing mode set to Codex. This command takes no arguments; send your prompt next."
+            else
+                "Routing mode set to Codex.",
+            .both => if (has_args)
+                "Routing mode set to Both. This command takes no arguments; send your prompt next."
+            else
+                "Routing mode set to Both.",
+        };
+
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .agent_message_chunk,
+            .content = .{ .type = "text", .text = msg },
+        });
+        try self.sendEndTurn(request);
+    }
+
     /// Handle /new command
     fn handleNewCommand(self: *Agent, request: jsonrpc.Request, session: *Session, session_id: []const u8) !void {
         self.prepareFreshSessions(session);
@@ -2430,6 +2655,24 @@ pub const Agent = struct {
         .{ "new", .new },
     });
 
+    const RouteCommand = struct {
+        name: []const u8,
+        route: Route,
+        description: []const u8,
+    };
+
+    const route_commands = [_]RouteCommand{
+        .{ .name = "claude", .route = .claude, .description = "Switch routing mode to Claude" },
+        .{ .name = "codex", .route = .codex, .description = "Switch routing mode to Codex" },
+        .{ .name = "both", .route = .both, .description = "Switch routing mode to Both" },
+    };
+
+    const route_command_map = std.StaticStringMap(Route).initComptime(.{
+        .{ "claude", .claude },
+        .{ "codex", .codex },
+        .{ "both", .both },
+    });
+
     /// Dispatch slash commands. Returns modified prompt to pass to CLI, or null if fully handled.
     fn dispatchCommand(self: *Agent, request: jsonrpc.Request, session: *Session, session_id: []const u8, text: []const u8, resource: ?ResourceData) ?[]const u8 {
         if (text.len == 0 or text[0] != '/') return text;
@@ -2438,20 +2681,39 @@ pub const Agent = struct {
         const space_idx = std.mem.indexOfScalar(u8, after_slash, ' ') orelse after_slash.len;
         const cmd_name = after_slash[0..space_idx];
 
+        if (route_command_map.get(cmd_name)) |route| {
+            const args = if (space_idx < after_slash.len)
+                std.mem.trimLeft(u8, after_slash[space_idx..], " \t")
+            else
+                "";
+            const has_args = args.len > 0;
+            self.handleRouteCommand(request, session_id, route, has_args) catch |err| {
+                log.err("Route command failed: {}", .{err});
+                self.sendErrorAndEnd(request, session_id, "Route command failed") catch |send_err| {
+                    log.warn("Failed to send route error: {}", .{send_err});
+                };
+            };
+            return null;
+        }
+
         const command = command_map.get(cmd_name) orelse return text; // Not our command, pass through to CLI
 
         switch (command) {
             .version => {
                 self.handleVersionCommand(request, session_id) catch |err| {
                     log.err("Version command failed: {}", .{err});
-                    self.sendErrorAndEnd(request, session_id, "Version command failed") catch {};
+                    self.sendErrorAndEnd(request, session_id, "Version command failed") catch |send_err| {
+                        log.warn("Failed to send version error: {}", .{send_err});
+                    };
                 };
                 return null; // Fully handled
             },
             .note, .notes, .setup => {
                 self.handleNotesCommand(request, session_id, session.cwd, text) catch |err| {
                     log.err("Notes command failed: {}", .{err});
-                    self.sendErrorAndEnd(request, session_id, "Notes command failed") catch {};
+                    self.sendErrorAndEnd(request, session_id, "Notes command failed") catch |send_err| {
+                        log.warn("Failed to send notes error: {}", .{send_err});
+                    };
                 };
                 return null; // Fully handled
             },
@@ -2460,7 +2722,9 @@ pub const Agent = struct {
                 if (resource) |r| {
                     self.handleExplainCommand(request, session, session_id, r) catch |err| {
                         log.err("Explain command failed: {}", .{err});
-                        self.sendErrorAndEnd(request, session_id, "Explain command failed") catch {};
+                        self.sendErrorAndEnd(request, session_id, "Explain command failed") catch |send_err| {
+                            log.warn("Failed to send explain error: {}", .{send_err});
+                        };
                     };
                     return null;
                 }
@@ -2479,7 +2743,9 @@ pub const Agent = struct {
             .new => {
                 self.handleNewCommand(request, session, session_id) catch |err| {
                     log.err("New command failed: {}", .{err});
-                    self.sendErrorAndEnd(request, session_id, "New command failed") catch {};
+                    self.sendErrorAndEnd(request, session_id, "New command failed") catch |send_err| {
+                        log.warn("Failed to send new error: {}", .{send_err});
+                    };
                 };
                 return null;
             },
@@ -2767,16 +3033,19 @@ pub const Agent = struct {
     }
 
     /// Agent slash commands (handled locally, not forwarded to CLI)
-    const slash_commands = [_]protocol.SlashCommand{
+    const agent_commands = [_]protocol.SlashCommand{
         .{ .name = "explain", .description = "Summarize selected code as a note comment" },
         .{ .name = "setup", .description = "Configure Zed for banjo LSP integration" },
         .{ .name = "notes", .description = "List all notes in the project" },
         .{ .name = "note", .description = "Note management commands" },
         .{ .name = "version", .description = "Show banjo version" },
         .{ .name = "new", .description = "Start fresh Claude Code and Codex sessions" },
-        .{ .name = "claude", .description = "Route prompt to Claude only" },
-        .{ .name = "codex", .description = "Route prompt to Codex only" },
-        .{ .name = "both", .description = "Route prompt to Claude then Codex" },
+    };
+
+    const slash_commands = agent_commands ++ [_]protocol.SlashCommand{
+        .{ .name = route_commands[0].name, .description = route_commands[0].description },
+        .{ .name = route_commands[1].name, .description = route_commands[1].description },
+        .{ .name = route_commands[2].name, .description = route_commands[2].description },
     };
 
     /// Commands filtered from CLI (unsupported in stream-json mode, handled via authMethods)
@@ -2838,7 +3107,7 @@ pub const Agent = struct {
             .{
                 .id = "duet_default",
                 .name = "Default engine",
-                .description = "Engine to use when prompt has no /claude or /codex prefix",
+                .description = "Engine to use for new prompts",
                 .type = .select,
                 .currentValue = @tagName(session.config.duet_default),
                 .options = duet_default_config_options[0..],
@@ -2922,6 +3191,13 @@ pub const Agent = struct {
             .content = .{ .type = "text", .text = msg },
         });
         try self.sendEndTurn(request);
+    }
+
+    fn sendPanelWarning(self: *Agent, session_id: []const u8, msg: []const u8) !void {
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .agent_message_chunk,
+            .content = .{ .type = "text", .text = msg },
+        });
     }
 
     /// Send plan progress update
@@ -3042,19 +3318,20 @@ const expected_commands_json =
     "{\"name\":\"note\",\"description\":\"Note management commands\"}," ++
     "{\"name\":\"version\",\"description\":\"Show banjo version\"}," ++
     "{\"name\":\"new\",\"description\":\"Start fresh Claude Code and Codex sessions\"}," ++
-    "{\"name\":\"claude\",\"description\":\"Route prompt to Claude only\"}," ++
-    "{\"name\":\"codex\",\"description\":\"Route prompt to Codex only\"}," ++
-    "{\"name\":\"both\",\"description\":\"Route prompt to Claude then Codex\"}," ++
+    "{\"name\":\"claude\",\"description\":\"Switch routing mode to Claude\"}," ++
+    "{\"name\":\"codex\",\"description\":\"Switch routing mode to Codex\"}," ++
+    "{\"name\":\"both\",\"description\":\"Switch routing mode to Both\"}," ++
     "{\"name\":\"model\",\"description\":\"Show current model\"}," ++
     "{\"name\":\"compact\",\"description\":\"Compact conversation\"}," ++
     "{\"name\":\"review\",\"description\":\"Code review\"}]";
 
-fn expectedInitializeResponse(comptime request_id: i64) []const u8 {
+fn expectedInitializeResponse(comptime request_id: i64, comptime image_capable: bool) []const u8 {
     const version_str = std.fmt.comptimePrint("{d}", .{protocol.ProtocolVersion});
     const request_id_str = std.fmt.comptimePrint("{d}", .{request_id});
+    const image_str = if (image_capable) "true" else "false";
     return "{\"jsonrpc\":\"2.0\",\"result\":{\"protocolVersion\":" ++ version_str ++
         ",\"agentInfo\":{\"name\":\"Banjo Duet\",\"title\":\"Banjo Duet\",\"version\":\"" ++ version ++
-        "\"},\"agentCapabilities\":{\"promptCapabilities\":{\"image\":true,\"audio\":false,\"embeddedContext\":true}," ++
+        "\"},\"agentCapabilities\":{\"promptCapabilities\":{\"image\":" ++ image_str ++ ",\"audio\":false,\"embeddedContext\":true}," ++
         "\"mcpCapabilities\":{\"http\":false,\"sse\":false}," ++
         "\"sessionCapabilities\":{}," ++
         "\"loadSession\":false},\"authMethods\":[{\"id\":\"claude-login\",\"name\":\"Log in with Claude Code\"," ++
@@ -3149,6 +3426,11 @@ test "Agent init/deinit" {
 }
 
 test "Agent handleRequest - initialize" {
+    var guard_path = try EnvVarGuard.set(testing.allocator, "PATH", "");
+    defer guard_path.deinit();
+    var guard_codex = try EnvVarGuard.set(testing.allocator, "CODEX_EXECUTABLE", "codex-hidden");
+    defer guard_codex.deinit();
+
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
 
@@ -3162,7 +3444,7 @@ test "Agent handleRequest - initialize" {
 
     try agent.handleRequest(request);
 
-    const expected = comptime expectedInitializeResponse(1);
+    const expected = comptime expectedInitializeResponse(1, false);
     try (ohsnap{}).snap(@src(), expected).diff(tw.getOutput(), true);
 }
 
@@ -3228,6 +3510,11 @@ test "Agent handleRequest - initialize rejects wrong protocol version" {
 }
 
 test "Agent handleRequest - initialize accepts correct protocol version" {
+    var guard_path = try EnvVarGuard.set(testing.allocator, "PATH", "");
+    defer guard_path.deinit();
+    var guard_codex = try EnvVarGuard.set(testing.allocator, "CODEX_EXECUTABLE", "codex-hidden");
+    defer guard_codex.deinit();
+
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
 
@@ -3247,7 +3534,7 @@ test "Agent handleRequest - initialize accepts correct protocol version" {
 
     try agent.handleRequest(request);
 
-    const expected = comptime expectedInitializeResponse(1);
+    const expected = comptime expectedInitializeResponse(1, false);
     try (ohsnap{}).snap(@src(), expected).diff(tw.getOutput(), true);
 }
 
@@ -3334,7 +3621,8 @@ test "Agent mirrorTerminalOutput sends terminal requests" {
     const response_json =
         \\{"jsonrpc":"2.0","id":1,"result":{"terminalId":"term-1"}}
         \\{"jsonrpc":"2.0","id":2,"result":{"exitCode":0}}
-        \\{"jsonrpc":"2.0","id":3,"result":{}}
+        \\{"jsonrpc":"2.0","id":3,"result":{"output":"hello","exitStatus":{"exitCode":0},"truncated":false}}
+        \\{"jsonrpc":"2.0","id":4,"result":{}}
         \\
     ;
     const input_buf = try testing.allocator.dupe(u8, response_json);
@@ -3359,12 +3647,14 @@ test "Agent mirrorTerminalOutput sends terminal requests" {
     };
     defer session.deinit(testing.allocator);
 
-    try agent.mirrorTerminalOutput(&session, session.id, "hello");
+    const terminal_id = try agent.mirrorTerminalOutput(&session, session.id, "hello");
+    defer if (terminal_id) |tid| testing.allocator.free(tid);
 
     try (ohsnap{}).snap(@src(),
-        \\{"jsonrpc":"2.0","method":"terminal/create","params":{"sessionId":"session-1","command":"/bin/sh","args":["-lc","printf '%s' 'hello'"],"cwd":"."},"id":1}
+        \\{"jsonrpc":"2.0","method":"terminal/create","params":{"sessionId":"session-1","command":"/bin/sh","args":["-lc","printf '%s' 'hello'"],"cwd":".","outputByteLimit":8192},"id":1}
         \\{"jsonrpc":"2.0","method":"terminal/wait_for_exit","params":{"sessionId":"session-1","terminalId":"term-1"},"id":2}
-        \\{"jsonrpc":"2.0","method":"terminal/release","params":{"sessionId":"session-1","terminalId":"term-1"},"id":3}
+        \\{"jsonrpc":"2.0","method":"terminal/output","params":{"sessionId":"session-1","terminalId":"term-1"},"id":3}
+        \\{"jsonrpc":"2.0","method":"terminal/release","params":{"sessionId":"session-1","terminalId":"term-1"},"id":4}
         \\
     ).diff(tw.getOutput(), true);
 }
@@ -3611,7 +3901,7 @@ test "Agent handleRequest - setConfig" {
     try agent.handleRequest(set_config_request);
 
     try (ohsnap{}).snap(@src(),
-        \\{"jsonrpc":"2.0","result":{"configOptions":[{"id":"auto_resume","name":"Auto-resume sessions","description":"Resume the last session on startup","type":"select","currentValue":"false","options":[{"value":"true","name":"On"},{"value":"false","name":"Off"}]},{"id":"duet_default","name":"Default engine","description":"Engine to use when prompt has no /claude or /codex prefix","type":"select","currentValue":"both","options":[{"value":"claude","name":"Claude"},{"value":"codex","name":"Codex"},{"value":"both","name":"Both"}]},{"id":"duet_primary","name":"Primary engine","description":"First engine to answer in /both mode","type":"select","currentValue":"claude","options":[{"value":"claude","name":"Claude"},{"value":"codex","name":"Codex"}]}]},"id":2}
+        \\{"jsonrpc":"2.0","result":{"configOptions":[{"id":"auto_resume","name":"Auto-resume sessions","description":"Resume the last session on startup","type":"select","currentValue":"false","options":[{"value":"true","name":"On"},{"value":"false","name":"Off"}]},{"id":"duet_default","name":"Default engine","description":"Engine to use for new prompts","type":"select","currentValue":"both","options":[{"value":"claude","name":"Claude"},{"value":"codex","name":"Codex"},{"value":"both","name":"Both"}]},{"id":"duet_primary","name":"Primary engine","description":"First engine to answer in /both mode","type":"select","currentValue":"claude","options":[{"value":"claude","name":"Claude"},{"value":"codex","name":"Codex"}]}]},"id":2}
         \\
     ).diff(tw.getOutput(), true);
 }
@@ -3796,47 +4086,52 @@ test "collectPromptParts handles empty blocks" {
     try testing.expect(parts.user_text == null);
 }
 
-test "property: parseRoutePrefix strips routing command and preserves payload" {
-    try quickcheck.check(struct {
-        fn prop(args: struct { prefix: u2, payload: [32]u8, len: u5 }) bool {
-            const prefix_str = switch (args.prefix) {
-                0 => "/claude",
-                1 => "/codex",
-                else => "/both",
-            };
-            const route = switch (args.prefix) {
-                0 => Route.claude,
-                1 => Route.codex,
-                else => Route.both,
-            };
+test "collectPromptParts skips codex image fallback when supported" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const fake_codex = try createFakeBinary(testing.allocator, &tmp, "fake-codex");
+    defer testing.allocator.free(fake_codex);
 
-            const payload_len = @as(usize, args.len) % args.payload.len;
-            var buf: [64]u8 = undefined;
-            var idx: usize = 0;
-            std.mem.copyForwards(u8, buf[idx..][0..prefix_str.len], prefix_str);
-            idx += prefix_str.len;
-            buf[idx] = ' ';
-            idx += 1;
-            std.mem.copyForwards(u8, buf[idx..][0..payload_len], args.payload[0..payload_len]);
-            idx += payload_len;
+    var guard_path = try EnvVarGuard.set(testing.allocator, "PATH", "");
+    defer guard_path.deinit();
+    var guard_codex = try EnvVarGuard.set(testing.allocator, "CODEX_EXECUTABLE", fake_codex);
+    defer guard_codex.deinit();
 
-            const input = buf[0..idx];
-            const result = parseRoutePrefix(input, .both);
-            var expected_start: usize = 0;
-            while (expected_start < payload_len and (args.payload[expected_start] == ' ' or args.payload[expected_start] == '\t')) {
-                expected_start += 1;
-            }
-            return result.consumed and result.route == route and std.mem.eql(u8, result.prompt, args.payload[expected_start..payload_len]);
-        }
-    }.prop, .{});
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
+    defer agent.deinit();
+
+    var session = Agent.Session{
+        .id = try testing.allocator.dupe(u8, "session"),
+        .cwd = try testing.allocator.dupe(u8, "."),
+        .config = .{ .auto_resume = true, .duet_default = .both, .duet_primary = .claude },
+        .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+    };
+    defer session.deinit(testing.allocator);
+
+    const blocks = [_]protocol.ContentBlock{
+        .{
+            .type = "image",
+            .data = "aGVsbG8=",
+            .mimeType = "image/png",
+        },
+    };
+
+    var parts = try agent.collectPromptParts(&session, session.id, blocks[0..]);
+    defer parts.deinit(testing.allocator);
+
+    try testing.expect(parts.codex_inputs != null);
+    try testing.expect(parts.codex_context == null);
+    try testing.expect(parts.context != null);
+    try testing.expect(std.mem.indexOf(u8, parts.context.?, "Image: image/png") != null);
 }
 
-test "parseRoutePrefix ignores non-command prefixes" {
-    const input = "/claudeX hello";
-    const result = parseRoutePrefix(input, .both);
-    try testing.expect(!result.consumed);
-    try testing.expectEqual(Route.both, result.route);
-    try testing.expectEqualStrings(input, result.prompt);
+test "route_command_map resolves routes" {
+    try testing.expectEqual(Route.claude, Agent.route_command_map.get("claude").?);
+    try testing.expectEqual(Route.codex, Agent.route_command_map.get("codex").?);
+    try testing.expectEqual(Route.both, Agent.route_command_map.get("both").?);
+    try testing.expect(Agent.route_command_map.get("claudeX") == null);
 }
 
 test "parseFileUri tolerates malformed percent encoding" {

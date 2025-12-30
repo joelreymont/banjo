@@ -4,6 +4,8 @@ const fs = std.fs;
 const Allocator = mem.Allocator;
 const comments = @import("comments.zig");
 
+const log = std.log.scoped(.notes);
+
 const NoteList = std.ArrayListUnmanaged(comments.ParsedNote);
 const NotesByFile = std.StringHashMap(NoteList);
 
@@ -181,7 +183,10 @@ fn listNotes(allocator: Allocator, project_root: []const u8) !CommandResult {
 
 /// Scan project recursively for note comments
 fn scanProjectForNotes(allocator: Allocator, dir_path: []const u8, notes_by_file: *NotesByFile) !void {
-    var dir = fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
+    var dir = fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| {
+        log.warn("Failed to open notes dir {s}: {}", .{ dir_path, err });
+        return;
+    };
     defer dir.close();
 
     var iter = dir.iterate();
@@ -201,13 +206,22 @@ fn scanProjectForNotes(allocator: Allocator, dir_path: []const u8, notes_by_file
             if (extension_to_language.get(ext) == null) continue;
 
             // Read and scan file for notes
-            const file = fs.openFileAbsolute(full_path, .{}) catch continue;
+            const file = fs.openFileAbsolute(full_path, .{}) catch |err| {
+                log.warn("Failed to open note file {s}: {}", .{ full_path, err });
+                continue;
+            };
             defer file.close();
 
-            const content = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch continue;
+            const content = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch |err| {
+                log.warn("Failed to read note file {s}: {}", .{ full_path, err });
+                continue;
+            };
             defer allocator.free(content);
 
-            const notes = comments.scanFileForNotes(allocator, content) catch continue;
+            const notes = comments.scanFileForNotes(allocator, content) catch |err| {
+                log.warn("Failed to scan note file {s}: {}", .{ full_path, err });
+                continue;
+            };
             if (notes.len > 0) {
                 const path_copy = try allocator.dupe(u8, full_path);
                 var note_list: std.ArrayListUnmanaged(comments.ParsedNote) = .empty;
@@ -322,7 +336,10 @@ fn setupLsp(allocator: Allocator, project_root: []const u8) !CommandResult {
 
 /// Recursively scan directory for source files and detect languages
 fn scanForLanguages(allocator: Allocator, dir_path: []const u8, detected: *std.StringHashMap(LanguageInfo)) !void {
-    var dir = fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
+    var dir = fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| {
+        log.warn("Failed to open language scan dir {s}: {}", .{ dir_path, err });
+        return;
+    };
     defer dir.close();
 
     var iter = dir.iterate();

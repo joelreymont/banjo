@@ -177,9 +177,11 @@ const ThreadStartResponse = struct {
     thread: ThreadRef,
 };
 
-const UserInput = struct {
+pub const UserInput = struct {
     type: []const u8,
-    text: []const u8,
+    text: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    path: ?[]const u8 = null,
 };
 
 const TurnStartParams = struct {
@@ -474,17 +476,13 @@ pub const CodexBridge = struct {
         }
     }
 
-    pub fn sendPrompt(self: *CodexBridge, prompt: []const u8) !void {
+    pub fn sendPrompt(self: *CodexBridge, inputs: []const UserInput) !void {
         const thread_id = self.thread_id orelse return error.NotStarted;
         const request_id = self.nextRequestId();
 
-        const inputs = [_]UserInput{
-            .{ .type = "text", .text = prompt },
-        };
-
         const params = TurnStartParams{
             .threadId = thread_id,
-            .input = inputs[0..],
+            .input = inputs,
             .approvalPolicy = self.approval_policy,
         };
 
@@ -1034,14 +1032,20 @@ fn parseRequestId(value: std.json.Value) ?i64 {
 fn extractThreadId(allocator: Allocator, value: std.json.Value) ?[]const u8 {
     const parsed = std.json.parseFromValueLeaky(ThreadStartResponse, allocator, value, .{
         .ignore_unknown_fields = true,
-    }) catch return null;
+    }) catch |err| {
+        log.warn("Failed to parse thread start response: {}", .{err});
+        return null;
+    };
     return parsed.thread.id;
 }
 
 fn extractTurnId(allocator: Allocator, value: std.json.Value) ?[]const u8 {
     const parsed = std.json.parseFromValueLeaky(TurnStartResponse, allocator, value, .{
         .ignore_unknown_fields = true,
-    }) catch return null;
+    }) catch |err| {
+        log.warn("Failed to parse turn start response: {}", .{err});
+        return null;
+    };
     if (parsed.turn) |turn| return turn.id;
     return parsed.turnId;
 }
@@ -1102,7 +1106,12 @@ fn notificationKind(method: []const u8) NotificationKind {
         .{ "item/reasoning/summaryTextDelta", .reasoning_summary_delta },
         .{ "item/reasoning/textDelta", .reasoning_text_delta },
         .{ "item/started", .item_started },
+        .{ "item/agentMessage/started", .item_started },
+        .{ "item/commandExecution/started", .item_started },
         .{ "item/completed", .item_completed },
+        .{ "item/agentMessage/completed", .item_completed },
+        .{ "item/reasoning/completed", .item_completed },
+        .{ "item/commandExecution/completed", .item_completed },
     });
     return map.get(method) orelse .unknown;
 }
@@ -1136,13 +1145,19 @@ fn parseServerRequestParams(allocator: Allocator, kind: ServerRequestKind, param
 }
 
 fn parseNotificationParams(arena: *std.heap.ArenaAllocator, comptime T: type, params: std.json.Value) ?T {
-    const parsed = std.json.parseFromValue(T, arena.allocator(), params, .{ .ignore_unknown_fields = true }) catch return null;
+    const parsed = std.json.parseFromValue(T, arena.allocator(), params, .{ .ignore_unknown_fields = true }) catch |err| {
+        log.warn("Failed to parse {s} params: {}", .{@typeName(T), err});
+        return null;
+    };
     defer parsed.deinit();
     return parsed.value;
 }
 
 fn parseParams(allocator: Allocator, comptime T: type, value: std.json.Value) bool {
-    const parsed = std.json.parseFromValue(T, allocator, value, .{ .ignore_unknown_fields = true }) catch return false;
+    const parsed = std.json.parseFromValue(T, allocator, value, .{ .ignore_unknown_fields = true }) catch |err| {
+        log.warn("Failed to parse {s} params: {}", .{@typeName(T), err});
+        return false;
+    };
     parsed.deinit();
     return true;
 }
@@ -1358,7 +1373,8 @@ fn collectCodexSnapshot(allocator: Allocator, prompt: []const u8) ![]u8 {
     try bridge.start(.{ .resume_session_id = null, .model = null, .approval_policy = "never" });
     defer bridge.stop();
 
-    try bridge.sendPrompt(prompt);
+    const inputs = [_]UserInput{ .{ .type = "text", .text = prompt } };
+    try bridge.sendPrompt(inputs[0..]);
 
     var text_buf: std.ArrayList(u8) = .empty;
     defer text_buf.deinit(allocator);
@@ -1454,9 +1470,11 @@ test "Codex app-server supports multi-turn prompts in one process" {
     try bridge.start(.{ .resume_session_id = null, .model = null, .approval_policy = "never" });
     defer bridge.stop();
 
-    try bridge.sendPrompt("say hello in one word");
+    const first_inputs = [_]UserInput{ .{ .type = "text", .text = "say hello in one word" } };
+    try bridge.sendPrompt(first_inputs[0..]);
     try waitForTurnCompleted(&bridge, 20000);
 
-    try bridge.sendPrompt("say goodbye in one word");
+    const second_inputs = [_]UserInput{ .{ .type = "text", .text = "say goodbye in one word" } };
+    try bridge.sendPrompt(second_inputs[0..]);
     try waitForTurnCompleted(&bridge, 20000);
 }
