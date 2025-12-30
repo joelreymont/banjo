@@ -33,6 +33,7 @@ const max_media_preview_bytes = 2048; // small preview for binary media captions
 const max_codex_image_bytes: usize = 8 * 1024 * 1024; // guard against massive base64 images
 const resource_line_limit: u32 = 200; // limit resource excerpt lines to reduce UI spam
 const max_terminal_output_bytes: usize = 8192; // cap terminal mirror output to keep commands manageable
+const max_tool_preview_bytes: usize = 1024; // keep tool call previews readable in the panel
 const default_model_id = "sonnet";
 const response_timeout_ms: i64 = 30_000;
 
@@ -1275,7 +1276,7 @@ pub const Agent = struct {
         session.bridge.?.start(buildClaudeStartOptions(session)) catch |err| {
             log.err("Failed to start Claude Code: {}", .{err});
             session.bridge = null;
-            try self.sendEngineText(session_id, .claude, "Failed to start Claude Code. Please ensure it is installed and in PATH.");
+            try self.sendEngineText(session, session_id, .claude, "Failed to start Claude Code. Please ensure it is installed and in PATH.");
             return error.BridgeStartFailed;
         };
         session.force_new_claude = false;
@@ -1304,7 +1305,7 @@ pub const Agent = struct {
         session.codex_bridge.?.start(buildCodexStartOptions(session)) catch |err| {
             log.err("Failed to start Codex: {}", .{err});
             session.codex_bridge = null;
-            try self.sendEngineText(session_id, .codex, "Failed to start Codex. Please ensure it is installed and in PATH.");
+            try self.sendEngineText(session, session_id, .codex, "Failed to start Codex. Please ensure it is installed and in PATH.");
             return error.BridgeStartFailed;
         };
         session.force_new_codex = false;
@@ -1370,7 +1371,7 @@ pub const Agent = struct {
                         if (first_response_ms == 0) {
                             first_response_ms = msg_time_ms;
                         }
-                        try self.sendEngineText(session_id, engine, content);
+                        try self.sendEngineText(session, session_id, engine, content);
                     }
 
                     if (msg.getToolUse()) |tool| {
@@ -1423,14 +1424,14 @@ pub const Agent = struct {
                             log.info("First Claude stream response at {d}ms", .{msg_time_ms});
                         }
                         if (stream_prefix_pending) {
-                            try self.sendEngineTextPrefix(session_id, engine);
+                            try self.sendEngineTextPrefix(session, session_id, engine);
                             stream_prefix_pending = false;
                         }
                         try self.sendEngineTextRaw(session_id, text);
                     }
                     if (msg.getStreamThinkingDelta()) |thinking| {
                         if (thought_prefix_pending) {
-                            try self.sendEngineThoughtPrefix(session_id, engine);
+                            try self.sendEngineThoughtPrefix(session, session_id, engine);
                             thought_prefix_pending = false;
                         }
                         try self.sendEngineThoughtRaw(session_id, thinking);
@@ -1467,7 +1468,7 @@ pub const Agent = struct {
                         }
                     } else {
                         if (msg.getContent()) |content| {
-                            try self.sendEngineText(session_id, engine, content);
+                            try self.sendEngineText(session, session_id, engine, content);
                         }
                     }
                 },
@@ -1557,7 +1558,7 @@ pub const Agent = struct {
                 if (msg.text) |text| {
                     if (first_response_ms == 0) first_response_ms = msg_time_ms;
                     if (stream_prefix_pending) {
-                        try self.sendEngineTextPrefix(session_id, engine);
+                        try self.sendEngineTextPrefix(session, session_id, engine);
                         stream_prefix_pending = false;
                     }
                     try self.sendEngineTextRaw(session_id, text);
@@ -1569,7 +1570,7 @@ pub const Agent = struct {
                 if (msg.text) |text| {
                     if (first_response_ms == 0) first_response_ms = msg_time_ms;
                     if (thought_prefix_pending) {
-                        try self.sendEngineThoughtPrefix(session_id, engine);
+                        try self.sendEngineThoughtPrefix(session, session_id, engine);
                         thought_prefix_pending = false;
                     }
                     try self.sendEngineThoughtRaw(session_id, text);
@@ -1630,13 +1631,13 @@ pub const Agent = struct {
 
             if (msg.getThought()) |text| {
                 if (first_response_ms == 0) first_response_ms = msg_time_ms;
-                try self.sendEngineThought(session_id, engine, text);
+                try self.sendEngineThought(session, session_id, engine, text);
                 continue;
             }
 
             if (msg.getText()) |text| {
                 if (first_response_ms == 0) first_response_ms = msg_time_ms;
-                try self.sendEngineText(session_id, engine, text);
+                try self.sendEngineText(session, session_id, engine, text);
                 continue;
             }
 
@@ -1670,7 +1671,10 @@ pub const Agent = struct {
         return generateSessionIdWithAllocator(self.allocator);
     }
 
-    fn sendEngineText(self: *Agent, session_id: []const u8, engine: Engine, text: []const u8) !void {
+    fn sendEngineText(self: *Agent, session: *Session, session_id: []const u8, engine: Engine, text: []const u8) !void {
+        if (!self.shouldTagEngine(session)) {
+            return self.sendEngineTextRaw(session_id, text);
+        }
         var buf: [4096]u8 = undefined;
         const tagged = self.formatTagged(&buf, engine, text) orelse blk: {
             const owned = try self.tagText(engine, text);
@@ -1690,7 +1694,8 @@ pub const Agent = struct {
         });
     }
 
-    fn sendEngineTextPrefix(self: *Agent, session_id: []const u8, engine: Engine) !void {
+    fn sendEngineTextPrefix(self: *Agent, session: *Session, session_id: []const u8, engine: Engine) !void {
+        if (!self.shouldTagEngine(session)) return;
         const prefix = enginePrefix(engine);
         try self.sendSessionUpdate(session_id, .{
             .sessionUpdate = .agent_message_chunk,
@@ -1705,7 +1710,8 @@ pub const Agent = struct {
         });
     }
 
-    fn sendEngineThoughtPrefix(self: *Agent, session_id: []const u8, engine: Engine) !void {
+    fn sendEngineThoughtPrefix(self: *Agent, session: *Session, session_id: []const u8, engine: Engine) !void {
+        if (!self.shouldTagEngine(session)) return;
         const prefix = enginePrefix(engine);
         try self.sendSessionUpdate(session_id, .{
             .sessionUpdate = .agent_thought_chunk,
@@ -1713,7 +1719,10 @@ pub const Agent = struct {
         });
     }
 
-    fn sendEngineThought(self: *Agent, session_id: []const u8, engine: Engine, text: []const u8) !void {
+    fn sendEngineThought(self: *Agent, session: *Session, session_id: []const u8, engine: Engine, text: []const u8) !void {
+        if (!self.shouldTagEngine(session)) {
+            return self.sendEngineThoughtRaw(session_id, text);
+        }
         var buf: [4096]u8 = undefined;
         const tagged = self.formatTagged(&buf, engine, text) orelse blk: {
             const owned = try self.tagText(engine, text);
@@ -1728,6 +1737,7 @@ pub const Agent = struct {
 
     fn sendEngineToolCall(
         self: *Agent,
+        session: *Session,
         session_id: []const u8,
         engine: Engine,
         tool_id: []const u8,
@@ -1735,18 +1745,26 @@ pub const Agent = struct {
         kind: protocol.SessionUpdate.ToolKind,
         raw_input: ?std.json.Value,
     ) !void {
+        const tag_engine = self.shouldTagEngine(session);
         var title_buf: [512]u8 = undefined;
-        const tagged_title = self.formatTagged(&title_buf, engine, tool_name) orelse blk: {
+        var title_owned: ?[]const u8 = null;
+        const tagged_title = if (!tag_engine) tool_name else blk: {
+            if (self.formatTagged(&title_buf, engine, tool_name)) |tagged| break :blk tagged;
             const owned = try self.tagText(engine, tool_name);
-            defer self.allocator.free(owned);
+            title_owned = owned;
             break :blk owned;
         };
+        defer if (title_owned) |owned| self.allocator.free(owned);
+
         var id_buf: [256]u8 = undefined;
-        const tagged_id = self.formatToolId(&id_buf, engine, tool_id) orelse blk: {
+        var id_owned: ?[]const u8 = null;
+        const tagged_id = if (!tag_engine) tool_id else blk: {
+            if (self.formatToolId(&id_buf, engine, tool_id)) |tagged| break :blk tagged;
             const owned = try self.tagToolId(engine, tool_id);
-            defer self.allocator.free(owned);
+            id_owned = owned;
             break :blk owned;
         };
+        defer if (id_owned) |owned| self.allocator.free(owned);
         try self.sendSessionUpdate(session_id, .{
             .sessionUpdate = .tool_call,
             .toolCallId = tagged_id,
@@ -1755,10 +1773,72 @@ pub const Agent = struct {
             .status = .pending,
             .rawInput = raw_input,
         });
+
+        self.maybeSendToolCallPreview(session, session_id, engine, tagged_id, kind, raw_input) catch |err| {
+            log.warn("Failed to send tool call preview: {}", .{err});
+        };
+    }
+
+    fn maybeSendToolCallPreview(
+        self: *Agent,
+        session: *Session,
+        session_id: []const u8,
+        engine: Engine,
+        tool_call_id: []const u8,
+        kind: protocol.SessionUpdate.ToolKind,
+        raw_input: ?std.json.Value,
+    ) !void {
+        if (kind != .execute) return;
+        const input_value = raw_input orelse return;
+
+        var command: ?[]const u8 = null;
+        var parsed: ?std.json.Parsed(ExecuteToolInput) = null;
+        switch (input_value) {
+            .string => |val| command = val,
+            .object => {
+                parsed = std.json.parseFromValue(ExecuteToolInput, self.allocator, input_value, .{
+                    .ignore_unknown_fields = true,
+                }) catch |err| {
+                    log.warn("Failed to parse execute tool input: {}", .{err});
+                    return;
+                };
+                const parsed_value = parsed.?.value;
+                command = parsed_value.command orelse parsed_value.cmd;
+            },
+            else => return,
+        }
+        defer if (parsed) |*val| val.deinit();
+
+        const raw_command = command orelse return;
+        if (raw_command.len == 0) return;
+
+        const preview = truncateUtf8(raw_command, max_tool_preview_bytes);
+
+        const tag_engine = self.shouldTagEngine(session);
+        var buf: [4096]u8 = undefined;
+        var owned: ?[]const u8 = null;
+        const display_text = if (!tag_engine) preview else blk: {
+            if (self.formatTagged(&buf, engine, preview)) |tagged| break :blk tagged;
+            const tagged_owned = try self.tagText(engine, preview);
+            owned = tagged_owned;
+            break :blk tagged_owned;
+        };
+        defer if (owned) |val| self.allocator.free(val);
+
+        const entries: [1]protocol.SessionUpdate.ToolCallContent = .{
+            .{ .type = "content", .content = .{ .type = "text", .text = display_text } },
+        };
+
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .tool_call_update,
+            .toolCallId = tool_call_id,
+            .toolContent = entries[0..],
+        });
     }
 
     fn sendEngineToolResult(
         self: *Agent,
+        session: *Session,
         session_id: []const u8,
         engine: Engine,
         tool_id: []const u8,
@@ -1766,18 +1846,27 @@ pub const Agent = struct {
         status: protocol.SessionUpdate.ToolCallStatus,
         terminal_id: ?[]const u8,
     ) !void {
+        const tag_engine = self.shouldTagEngine(session);
         var id_buf: [256]u8 = undefined;
-        const tagged_id = self.formatToolId(&id_buf, engine, tool_id) orelse blk: {
+        var id_owned: ?[]const u8 = null;
+        const tagged_id = if (!tag_engine) tool_id else blk: {
+            if (self.formatToolId(&id_buf, engine, tool_id)) |tagged| break :blk tagged;
             const owned = try self.tagToolId(engine, tool_id);
-            defer self.allocator.free(owned);
+            id_owned = owned;
             break :blk owned;
         };
+        defer if (id_owned) |owned| self.allocator.free(owned);
 
         var tagged_content: ?[]const u8 = null;
+        var content_owned: ?[]const u8 = null;
         if (content) |text| {
-            tagged_content = try self.tagText(engine, text);
+            tagged_content = if (!tag_engine) text else blk: {
+                const owned = try self.tagText(engine, text);
+                content_owned = owned;
+                break :blk owned;
+            };
         }
-        defer if (tagged_content) |text| self.allocator.free(text);
+        defer if (content_owned) |text| self.allocator.free(text);
 
         var entries: [2]protocol.SessionUpdate.ToolCallContent = undefined;
         var count: usize = 0;
@@ -1806,6 +1895,11 @@ pub const Agent = struct {
         text: ?[]const u8 = null,
     };
 
+    const ExecuteToolInput = struct {
+        command: ?[]const u8 = null,
+        cmd: ?[]const u8 = null,
+    };
+
     const WriteToolKind = enum { write, edit };
     const write_tool_map = std.StaticStringMap(WriteToolKind).initComptime(.{
         .{ "Write", .write },
@@ -1821,12 +1915,23 @@ pub const Agent = struct {
     };
 
     fn trackExecuteTool(self: *Agent, session: *Session, engine: Engine, tool_id: []const u8) !void {
-        const owned = try self.tagToolId(engine, tool_id);
+        const owned = if (self.shouldTagEngine(session))
+            try self.tagToolId(engine, tool_id)
+        else
+            try self.allocator.dupe(u8, tool_id);
         errdefer self.allocator.free(owned);
         try session.pending_execute_tools.put(owned, {});
     }
 
     fn consumeExecuteTool(self: *Agent, session: *Session, engine: Engine, tool_id: []const u8) !bool {
+        if (!self.shouldTagEngine(session)) {
+            if (session.pending_execute_tools.fetchRemove(tool_id)) |entry| {
+                self.allocator.free(entry.key);
+                return true;
+            }
+            return false;
+        }
+
         var id_buf: [512]u8 = undefined;
         if (self.formatToolId(&id_buf, engine, tool_id)) |key| {
             if (session.pending_execute_tools.fetchRemove(key)) |entry| {
@@ -2035,13 +2140,13 @@ pub const Agent = struct {
     ) !void {
         if (!session.isToolAllowed(permission_name)) {
             log.warn("Tool {s} denied by settings", .{permission_name});
-            try self.sendEngineText(session_id, engine, "Tool execution blocked by settings.");
+            try self.sendEngineText(session, session_id, engine, "Tool execution blocked by settings.");
             return;
         }
         if (kind == .execute and self.canUseTerminal()) {
             try self.trackExecuteTool(session, engine, tool_id);
         }
-        try self.sendEngineToolCall(session_id, engine, tool_id, display_name, kind, raw_input);
+        try self.sendEngineToolCall(session, session_id, engine, tool_id, display_name, kind, raw_input);
         try self.maybeSyncWriteTool(session, session_id, permission_name, raw_input);
     }
 
@@ -2070,7 +2175,7 @@ pub const Agent = struct {
                 };
             }
         }
-        try self.sendEngineToolResult(session_id, engine, tool_id, content, status, terminal_id);
+        try self.sendEngineToolResult(session, session_id, engine, tool_id, content, status, terminal_id);
     }
 
     fn requestPermission(
@@ -2234,6 +2339,26 @@ pub const Agent = struct {
         }
     }
 
+    fn shouldTagEngine(self: *Agent, session: *Session) bool {
+        _ = self;
+        return session.config.duet_default == .both;
+    }
+
+    fn truncateUtf8(input: []const u8, max_bytes: usize) []const u8 {
+        if (input.len <= max_bytes) return input;
+        var i: usize = 0;
+        var end: usize = 0;
+        while (i < input.len and i < max_bytes) {
+            const len = std.unicode.utf8ByteSequenceLength(input[i]) catch break;
+            if (i + len > max_bytes) break;
+            _ = std.unicode.utf8Decode(input[i..][0..len]) catch break;
+            i += len;
+            end = i;
+        }
+        if (end == 0) return input[0..max_bytes];
+        return input[0..end];
+    }
+
     fn tagText(self: *Agent, engine: Engine, text: []const u8) ![]const u8 {
         return std.fmt.allocPrint(self.allocator, "[{s}] {s}", .{ engineLabel(engine), text });
     }
@@ -2327,6 +2452,10 @@ pub const Agent = struct {
         log.info("Set mode for session {s} to {s}", .{ params.sessionId, mode_value });
         if (session.codex_bridge) |*codex_bridge| {
             codex_bridge.approval_policy = codexApprovalPolicy(session.permission_mode);
+        }
+        if (session.bridge) |*claude_bridge| {
+            claude_bridge.deinit();
+            session.bridge = null;
         }
 
         try self.sendSessionUpdate(params.sessionId, .{
@@ -2561,7 +2690,7 @@ pub const Agent = struct {
     /// Handle authentication required - notify user and stop bridge
     fn handleAuthRequired(self: *Agent, session_id: []const u8, session: *Session, engine: Engine) !protocol.StopReason {
         log.warn("Auth required for session {s}", .{session_id});
-        try self.sendEngineText(session_id, engine, "Authentication required. Please run `claude /login` in your terminal, then try again.");
+        try self.sendEngineText(session, session_id, engine, "Authentication required. Please run `claude /login` in your terminal, then try again.");
         if (session.bridge) |*b| {
             b.stop();
         }
@@ -3585,6 +3714,53 @@ test "Agent requestPermission sends request and parses response" {
     ).diff(tw.getOutput(), true);
 }
 
+test "Agent sendEngineText omits prefix in solo mode" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
+    defer agent.deinit();
+
+    var session = Agent.Session{
+        .id = try testing.allocator.dupe(u8, "session-1"),
+        .cwd = try testing.allocator.dupe(u8, "."),
+        .config = .{ .auto_resume = true, .duet_default = .claude, .duet_primary = .claude },
+        .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+    };
+    defer session.deinit(testing.allocator);
+
+    try agent.sendEngineText(&session, session.id, .claude, "hello");
+
+    try (ohsnap{}).snap(@src(),
+        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello"}}}}
+        \\
+    ).diff(tw.getOutput(), true);
+}
+
+test "Agent sendEngineToolCall omits prefix in solo mode" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
+    defer agent.deinit();
+
+    var session = Agent.Session{
+        .id = try testing.allocator.dupe(u8, "session-1"),
+        .cwd = try testing.allocator.dupe(u8, "."),
+        .config = .{ .auto_resume = true, .duet_default = .codex, .duet_primary = .claude },
+        .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+    };
+    defer session.deinit(testing.allocator);
+
+    try agent.sendEngineToolCall(&session, session.id, .codex, "tc-1", "Bash", .execute, .{ .string = "ls" });
+
+    try (ohsnap{}).snap(@src(),
+        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"tool_call","toolCallId":"tc-1","title":"Bash","kind":"execute","status":"pending","rawInput":"ls"}}}
+        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"tool_call_update","content":[{"type":"content","content":{"type":"text","text":"ls"}}],"toolCallId":"tc-1"}}}
+        \\
+    ).diff(tw.getOutput(), true);
+}
+
 test "Agent requestWriteTextFile sends request" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
@@ -3759,6 +3935,9 @@ test "Agent handleRequest - setMode" {
     try agent.handleRequest(create_request);
 
     const session_id = "session-test";
+    if (agent.sessions.get(session_id)) |session| {
+        session.bridge = Bridge.init(testing.allocator, session.cwd);
+    }
 
     // Clear output for next request
     tw.output.clearRetainingCapacity();
@@ -3781,6 +3960,7 @@ test "Agent handleRequest - setMode" {
         \\{"jsonrpc":"2.0","result":{},"id":2}
         \\
     ).diff(tw.getOutput(), true);
+    try testing.expect(agent.sessions.get(session_id).?.bridge == null);
 }
 
 test "Agent handleRequest - setMode session not found" {

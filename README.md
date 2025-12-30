@@ -98,7 +98,7 @@ zig build test                    # run tests
 zig build -Doptimize=ReleaseSafe  # build release
 ```
 
-Test locally: `Cmd+Shift+P` → `zed: install dev extension` → select this directory.
+Test locally: `Cmd+Shift+P` → `zed: install dev extension` → select this repo root (not `extension/`).
 
 ## License
 

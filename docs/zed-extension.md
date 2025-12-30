@@ -115,8 +115,10 @@ Environment variables in `settings.json` override those in `extension.toml`.
 ## Testing Locally
 
 1. Cmd+Shift+P → `zed: install dev extension`
-2. Select extension directory (contains `extension.toml`)
+2. Select the repo root (contains `extension.toml`)
 3. Agent appears in Agent Panel dropdown
+
+Note: `extension/` is only the WASM subproject and does not contain a manifest.
 
 ## Useful Zed Commands
 
