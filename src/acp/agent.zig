@@ -21,13 +21,13 @@ const log = std.log.scoped(.agent);
 
 const Engine = enum { claude, codex };
 
-const Route = enum { claude, codex, both };
+const Route = enum { claude, codex, duet };
 
 /// Banjo version with git hash
 pub const version = "0.5.0 (" ++ config.git_hash ++ ")";
 const no_engine_warning = "Banjo Duet could not find Claude Code or Codex. Install one (or set CLAUDE_CODE_EXECUTABLE/CODEX_EXECUTABLE) and restart the agent.";
-const terminal_mirror_warning = "Banjo warning: Terminal mirroring failed; tool output may be incomplete.";
-const terminal_truncated_warning = "Banjo warning: Terminal output truncated; view the terminal for full output.";
+const terminal_mirror_warning = "Banjo warning: Terminal mirroring failed; tool output may be incomplete.\n";
+const terminal_truncated_warning = "Banjo warning: Terminal output truncated; view the terminal for full output.\n";
 const max_context_bytes = 64 * 1024; // cap embedded resource text to keep prompts bounded
 const max_media_preview_bytes = 2048; // small preview for binary media captions
 const max_codex_image_bytes: usize = 8 * 1024 * 1024; // guard against massive base64 images
@@ -39,8 +39,8 @@ const response_timeout_ms: i64 = 30_000;
 
 const SessionConfig = struct {
     auto_resume: bool,
-    duet_default: Route,
-    duet_primary: Engine,
+    route: Route,
+    primary_agent: Engine,
 };
 
 /// Check if auto-resume is enabled (default: true)
@@ -73,31 +73,31 @@ fn elapsedMs(start_ms: i64) u64 {
     return @intCast(now - start_ms);
 }
 
-fn duetDefaultFromEnv() Route {
-    const val = std.posix.getenv("BANJO_DUET_DEFAULT") orelse return .claude;
+fn routeFromEnv() Route {
+    const val = std.posix.getenv("BANJO_ROUTE") orelse return .claude;
     return route_map.get(val) orelse .claude;
 }
 
-fn duetDefaultEnvValue() ?Route {
-    const val = std.posix.getenv("BANJO_DUET_DEFAULT") orelse return null;
+fn routeEnvValue() ?Route {
+    const val = std.posix.getenv("BANJO_ROUTE") orelse return null;
     return route_map.get(val);
 }
 
-fn duetPrimaryFromEnv() Engine {
-    const val = std.posix.getenv("BANJO_DUET_PRIMARY") orelse return .claude;
+fn primaryAgentFromEnv() Engine {
+    const val = std.posix.getenv("BANJO_PRIMARY_AGENT") orelse return .claude;
     return engine_map.get(val) orelse .claude;
 }
 
 fn configFromEnv() SessionConfig {
     return .{
         .auto_resume = autoResumeFromEnv(),
-        .duet_default = duetDefaultFromEnv(),
-        .duet_primary = duetPrimaryFromEnv(),
+        .route = routeFromEnv(),
+        .primary_agent = primaryAgentFromEnv(),
     };
 }
 
 fn resolveDefaultRoute(availability: EngineAvailability) Route {
-    if (duetDefaultEnvValue()) |route| return route;
+    if (routeEnvValue()) |route| return route;
     if (availability.claude and availability.codex) return .claude;
     if (availability.codex) return .codex;
     return .claude;
@@ -118,8 +118,7 @@ const falsey_env_values = std.StaticStringMap(void).initComptime(.{
 const route_map = std.StaticStringMap(Route).initComptime(.{
     .{ "claude", .claude },
     .{ "codex", .codex },
-    .{ "both", .both },
-    .{ "duet", .both },
+    .{ "duet", .duet },
 });
 
 const engine_map = std.StaticStringMap(Engine).initComptime(.{
@@ -129,20 +128,20 @@ const engine_map = std.StaticStringMap(Engine).initComptime(.{
 
 const ConfigOptionId = enum {
     auto_resume,
-    duet_default,
-    duet_primary,
+    route,
+    primary_agent,
 };
 
 const config_option_map = std.StaticStringMap(ConfigOptionId).initComptime(.{
     .{ "auto_resume", .auto_resume },
-    .{ "duet_default", .duet_default },
-    .{ "duet_primary", .duet_primary },
+    .{ "route", .route },
+    .{ "primary_agent", .primary_agent },
 });
 
 const SessionConfigUpdate = struct {
     auto_resume: ?bool = null,
-    duet_default: ?Route = null,
-    duet_primary: ?Engine = null,
+    route: ?Route = null,
+    primary_agent: ?Engine = null,
 };
 
 const allow_option_ids = std.StaticStringMap(void).initComptime(.{
@@ -221,7 +220,7 @@ fn routeLabel(route: Route) []const u8 {
     return switch (route) {
         .claude => "Claude",
         .codex => "Codex",
-        .both => "Duet",
+        .duet => "Duet",
     };
 }
 
@@ -325,6 +324,7 @@ pub const Agent = struct {
         cancelled: bool = false,
         permission_mode: protocol.PermissionMode = .default,
         config: SessionConfig,
+        availability: EngineAvailability,
         model: ?[]const u8 = null,
         bridge: ?Bridge = null,
         codex_bridge: ?CodexBridge = null,
@@ -555,6 +555,7 @@ pub const Agent = struct {
             .id = session_id,
             .cwd = cwd_copy,
             .config = self.config_defaults,
+            .availability = undefined,
             .model = model_copy,
             .settings = settings,
             .pending_execute_tools = std.StringHashMap(void).init(self.allocator),
@@ -567,20 +568,17 @@ pub const Agent = struct {
         const did_setup = self.autoSetupLspIfNeeded(cwd) catch false;
 
         const availability = detectEngines();
-        if (duetDefaultEnvValue() == null) {
+        session.availability = availability;
+        if (routeEnvValue() == null) {
             const default_route = resolveDefaultRoute(availability);
-            session.config.duet_default = default_route;
-            self.config_defaults.duet_default = default_route;
+            session.config.route = default_route;
+            self.config_defaults.route = default_route;
         }
 
         // Pre-start Claude Code for instant first response (auto-resume last session if enabled)
         if (availability.claude) {
             session.bridge = Bridge.init(self.allocator, session.cwd);
-            session.bridge.?.start(.{
-                .continue_last = session.config.auto_resume,
-                .permission_mode = @tagName(session.permission_mode),
-                .model = session.model,
-            }) catch |err| {
+            session.bridge.?.start(buildClaudeStartOptions(session)) catch |err| {
                 log.warn("Failed to pre-start Claude Code: {} - will retry on first prompt", .{err});
                 session.bridge = null;
             };
@@ -688,7 +686,7 @@ pub const Agent = struct {
         session.cancelled = false;
         log.info("Prompt received for session {s}: {s}", .{ session_id, prompt_text orelse "(empty)" });
 
-        const route = session.config.duet_default;
+        const route = session.config.route;
         var effective_prompt = prompt_text;
 
         if (prompt_text) |text| {
@@ -1187,7 +1185,7 @@ pub const Agent = struct {
         codex_inputs: ?[]const CodexUserInput,
     ) !protocol.StopReason {
         var stop_reason: protocol.StopReason = .end_turn;
-        const primary = session.config.duet_primary;
+        const primary = session.config.primary_agent;
 
         var engines: [2]Engine = .{ .claude, .codex };
         var count: usize = 0;
@@ -1200,7 +1198,7 @@ pub const Agent = struct {
                 engines[0] = .codex;
                 count = 1;
             },
-            .both => {
+            .duet => {
                 if (primary == .claude) {
                     engines[0] = .claude;
                     engines[1] = .codex;
@@ -1264,10 +1262,12 @@ pub const Agent = struct {
 
     fn buildClaudeStartOptions(session: *Session) Bridge.StartOptions {
         const allow_resume = !session.force_new_claude;
+        const mode = session.permission_mode;
         return .{
             .resume_session_id = if (allow_resume) session.cli_session_id else null,
             .continue_last = allow_resume and session.cli_session_id == null and session.config.auto_resume,
-            .permission_mode = @tagName(session.permission_mode),
+            .skip_permissions = mode == .bypassPermissions,
+            .permission_mode = if (mode == .bypassPermissions) null else @tagName(mode),
             .model = session.model,
         };
     }
@@ -1745,10 +1745,59 @@ pub const Agent = struct {
         kind: protocol.SessionUpdate.ToolKind,
         raw_input: ?std.json.Value,
     ) !void {
+        var execute_preview: ?[]const u8 = null;
+        var execute_parsed: ?std.json.Parsed(ExecuteToolInput) = null;
+        defer if (execute_parsed) |*val| val.deinit();
+
+        if (kind == .execute) {
+            if (raw_input) |input_value| {
+                switch (input_value) {
+                    .string => |val| execute_preview = truncateUtf8(val, max_tool_preview_bytes),
+                    .object => {
+                        execute_parsed = blk: {
+                            const parsed = std.json.parseFromValue(ExecuteToolInput, self.allocator, input_value, .{
+                                .ignore_unknown_fields = true,
+                            }) catch |err| {
+                                log.warn("Failed to parse execute tool input: {}", .{err});
+                                break :blk null;
+                            };
+                            break :blk parsed;
+                        };
+                        if (execute_parsed) |parsed| {
+                            const parsed_value = parsed.value;
+                            if (parsed_value.command) |cmd| {
+                                execute_preview = truncateUtf8(cmd, max_tool_preview_bytes);
+                            } else if (parsed_value.cmd) |cmd| {
+                                execute_preview = truncateUtf8(cmd, max_tool_preview_bytes);
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+
         const tag_engine = self.shouldTagEngine(session);
         var title_buf: [512]u8 = undefined;
         var title_owned: ?[]const u8 = null;
-        const tagged_title = if (!tag_engine) tool_name else blk: {
+        const tagged_title = blk: {
+            if (execute_preview) |preview| {
+                if (!tag_engine) {
+                    if (std.fmt.bufPrint(&title_buf, "{s}: {s}", .{ tool_name, preview }) catch null) |title| {
+                        break :blk title;
+                    }
+                    const owned = try std.fmt.allocPrint(self.allocator, "{s}: {s}", .{ tool_name, preview });
+                    title_owned = owned;
+                    break :blk owned;
+                }
+                if (std.fmt.bufPrint(&title_buf, "[{s}] {s}: {s}", .{ engineLabel(engine), tool_name, preview }) catch null) |title| {
+                    break :blk title;
+                }
+                const owned = try std.fmt.allocPrint(self.allocator, "[{s}] {s}: {s}", .{ engineLabel(engine), tool_name, preview });
+                title_owned = owned;
+                break :blk owned;
+            }
+            if (!tag_engine) break :blk tool_name;
             if (self.formatTagged(&title_buf, engine, tool_name)) |tagged| break :blk tagged;
             const owned = try self.tagText(engine, tool_name);
             title_owned = owned;
@@ -1774,66 +1823,29 @@ pub const Agent = struct {
             .rawInput = raw_input,
         });
 
-        self.maybeSendToolCallPreview(session, session_id, engine, tagged_id, kind, raw_input) catch |err| {
-            log.warn("Failed to send tool call preview: {}", .{err});
-        };
-    }
+        if (execute_preview) |preview| {
+            var buf: [4096]u8 = undefined;
+            var owned: ?[]const u8 = null;
+            const display_text = if (!tag_engine) preview else blk: {
+                if (self.formatTagged(&buf, engine, preview)) |tagged| break :blk tagged;
+                const tagged_owned = try self.tagText(engine, preview);
+                owned = tagged_owned;
+                break :blk tagged_owned;
+            };
+            defer if (owned) |val| self.allocator.free(val);
 
-    fn maybeSendToolCallPreview(
-        self: *Agent,
-        session: *Session,
-        session_id: []const u8,
-        engine: Engine,
-        tool_call_id: []const u8,
-        kind: protocol.SessionUpdate.ToolKind,
-        raw_input: ?std.json.Value,
-    ) !void {
-        if (kind != .execute) return;
-        const input_value = raw_input orelse return;
+            const entries: [1]protocol.SessionUpdate.ToolCallContent = .{
+                .{ .type = "content", .content = .{ .type = "text", .text = display_text } },
+            };
 
-        var command: ?[]const u8 = null;
-        var parsed: ?std.json.Parsed(ExecuteToolInput) = null;
-        switch (input_value) {
-            .string => |val| command = val,
-            .object => {
-                parsed = std.json.parseFromValue(ExecuteToolInput, self.allocator, input_value, .{
-                    .ignore_unknown_fields = true,
-                }) catch |err| {
-                    log.warn("Failed to parse execute tool input: {}", .{err});
-                    return;
-                };
-                const parsed_value = parsed.?.value;
-                command = parsed_value.command orelse parsed_value.cmd;
-            },
-            else => return,
+            self.sendSessionUpdate(session_id, .{
+                .sessionUpdate = .tool_call_update,
+                .toolCallId = tagged_id,
+                .toolContent = entries[0..],
+            }) catch |err| {
+                log.warn("Failed to send tool call preview: {}", .{err});
+            };
         }
-        defer if (parsed) |*val| val.deinit();
-
-        const raw_command = command orelse return;
-        if (raw_command.len == 0) return;
-
-        const preview = truncateUtf8(raw_command, max_tool_preview_bytes);
-
-        const tag_engine = self.shouldTagEngine(session);
-        var buf: [4096]u8 = undefined;
-        var owned: ?[]const u8 = null;
-        const display_text = if (!tag_engine) preview else blk: {
-            if (self.formatTagged(&buf, engine, preview)) |tagged| break :blk tagged;
-            const tagged_owned = try self.tagText(engine, preview);
-            owned = tagged_owned;
-            break :blk tagged_owned;
-        };
-        defer if (owned) |val| self.allocator.free(val);
-
-        const entries: [1]protocol.SessionUpdate.ToolCallContent = .{
-            .{ .type = "content", .content = .{ .type = "text", .text = display_text } },
-        };
-
-        try self.sendSessionUpdate(session_id, .{
-            .sessionUpdate = .tool_call_update,
-            .toolCallId = tool_call_id,
-            .toolContent = entries[0..],
-        });
     }
 
     fn sendEngineToolResult(
@@ -2341,7 +2353,7 @@ pub const Agent = struct {
 
     fn shouldTagEngine(self: *Agent, session: *Session) bool {
         _ = self;
-        return session.config.duet_default == .both;
+        return session.config.route == .duet and session.availability.claude and session.availability.codex;
     }
 
     fn truncateUtf8(input: []const u8, max_bytes: usize) []const u8 {
@@ -2581,29 +2593,29 @@ pub const Agent = struct {
                 self.config_defaults.auto_resume = value;
                 self.updateAllSessions(.auto_resume, .{ .auto_resume = value });
             },
-            .duet_default => {
+            .route => {
                 const route = route_map.get(params.value) orelse {
                     try self.writer.writeResponse(jsonrpc.Response.err(
                         request.id,
                         jsonrpc.Error.InvalidParams,
-                        "Invalid duet_default value",
+                        "Invalid route value",
                     ));
                     return;
                 };
-                self.config_defaults.duet_default = route;
-                self.updateAllSessions(.duet_default, .{ .duet_default = route });
+                self.config_defaults.route = route;
+                self.updateAllSessions(.route, .{ .route = route });
             },
-            .duet_primary => {
+            .primary_agent => {
                 const primary = engine_map.get(params.value) orelse {
                     try self.writer.writeResponse(jsonrpc.Response.err(
                         request.id,
                         jsonrpc.Error.InvalidParams,
-                        "Invalid duet_primary value",
+                        "Invalid primary_agent value",
                     ));
                     return;
                 };
-                self.config_defaults.duet_primary = primary;
-                self.updateAllSessions(.duet_primary, .{ .duet_primary = primary });
+                self.config_defaults.primary_agent = primary;
+                self.updateAllSessions(.primary_agent, .{ .primary_agent = primary });
             },
         }
 
@@ -2622,11 +2634,11 @@ pub const Agent = struct {
                 .auto_resume => if (update.auto_resume) |val| {
                     session.config.auto_resume = val;
                 },
-                .duet_default => if (update.duet_default) |val| {
-                    session.config.duet_default = val;
+                .route => if (update.route) |val| {
+                    session.config.route = val;
                 },
-                .duet_primary => if (update.duet_primary) |val| {
-                    session.config.duet_primary = val;
+                .primary_agent => if (update.primary_agent) |val| {
+                    session.config.primary_agent = val;
                 },
             }
         }
@@ -2676,10 +2688,19 @@ pub const Agent = struct {
             .id = sid_copy,
             .cwd = cwd_copy,
             .config = self.config_defaults,
+            .availability = undefined,
             .model = model_copy,
             .pending_execute_tools = std.StringHashMap(void).init(self.allocator),
         };
         try self.sessions.put(sid_copy, session);
+
+        const availability = detectEngines();
+        session.availability = availability;
+        if (routeEnvValue() == null) {
+            const default_route = resolveDefaultRoute(availability);
+            session.config.route = default_route;
+            self.config_defaults.route = default_route;
+        }
 
         log.info("Resumed session {s}", .{sid_copy});
 
@@ -2724,8 +2745,8 @@ pub const Agent = struct {
     }
 
     fn handleRouteCommand(self: *Agent, request: jsonrpc.Request, session_id: []const u8, route: Route, has_args: bool) !void {
-        self.config_defaults.duet_default = route;
-        self.updateAllSessions(.duet_default, .{ .duet_default = route });
+        self.config_defaults.route = route;
+        self.updateAllSessions(.route, .{ .route = route });
 
         const label = routeLabel(route);
         var buf: [160]u8 = undefined;
@@ -2804,13 +2825,13 @@ pub const Agent = struct {
     const route_commands = [_]RouteCommand{
         .{ .name = "claude", .route = .claude, .description = "Switch routing mode to Claude" },
         .{ .name = "codex", .route = .codex, .description = "Switch routing mode to Codex" },
-        .{ .name = "duet", .route = .both, .description = "Switch routing mode to Duet" },
+        .{ .name = "duet", .route = .duet, .description = "Switch routing mode to Duet" },
     };
 
     const route_command_map = std.StaticStringMap(Route).initComptime(.{
         .{ "claude", .claude },
         .{ "codex", .codex },
-        .{ "duet", .both },
+        .{ "duet", .duet },
     });
 
     /// Dispatch slash commands. Returns modified prompt to pass to CLI, or null if fully handled.
@@ -3222,13 +3243,13 @@ pub const Agent = struct {
         .{ .value = "false", .name = "Off" },
     };
 
-    const duet_default_config_options = [_]protocol.SessionConfigSelectOption{
+    const route_config_options = [_]protocol.SessionConfigSelectOption{
         .{ .value = "claude", .name = "Claude" },
         .{ .value = "codex", .name = "Codex" },
-        .{ .value = "both", .name = "Both" },
+        .{ .value = "duet", .name = "Duet" },
     };
 
-    const duet_primary_config_options = [_]protocol.SessionConfigSelectOption{
+    const primary_agent_config_options = [_]protocol.SessionConfigSelectOption{
         .{ .value = "claude", .name = "Claude" },
         .{ .value = "codex", .name = "Codex" },
     };
@@ -3245,20 +3266,20 @@ pub const Agent = struct {
                 .options = auto_resume_config_options[0..],
             },
             .{
-                .id = "duet_default",
-                .name = "Default engine",
-                .description = "Engine to use for new prompts",
+                .id = "route",
+                .name = "Default agent",
+                .description = "Agent to use for new prompts",
                 .type = .select,
-                .currentValue = @tagName(session.config.duet_default),
-                .options = duet_default_config_options[0..],
+                .currentValue = @tagName(session.config.route),
+                .options = route_config_options[0..],
             },
             .{
-                .id = "duet_primary",
-                .name = "Primary engine",
-                .description = "First engine to answer in duet mode",
+                .id = "primary_agent",
+                .name = "Primary agent",
+                .description = "First agent to answer in duet mode",
                 .type = .select,
-                .currentValue = @tagName(session.config.duet_primary),
-                .options = duet_primary_config_options[0..],
+                .currentValue = @tagName(session.config.primary_agent),
+                .options = primary_agent_config_options[0..],
             },
         };
     }
@@ -3593,10 +3614,10 @@ test "Agent newSession warns when no engines are available" {
     defer guard_session.deinit();
     var guard_resume = try EnvVarGuard.set(testing.allocator, "BANJO_AUTO_RESUME", "true");
     defer guard_resume.deinit();
-    var guard_duet_default = try EnvVarGuard.set(testing.allocator, "BANJO_DUET_DEFAULT", "both");
-    defer guard_duet_default.deinit();
-    var guard_duet_primary = try EnvVarGuard.set(testing.allocator, "BANJO_DUET_PRIMARY", "claude");
-    defer guard_duet_primary.deinit();
+    var guard_route = try EnvVarGuard.set(testing.allocator, "BANJO_ROUTE", "duet");
+    defer guard_route.deinit();
+    var guard_primary_agent = try EnvVarGuard.set(testing.allocator, "BANJO_PRIMARY_AGENT", "claude");
+    defer guard_primary_agent.deinit();
     var guard_path = try EnvVarGuard.set(testing.allocator, "PATH", "");
     defer guard_path.deinit();
     var guard_claude = try EnvVarGuard.set(testing.allocator, "CLAUDE_CODE_EXECUTABLE", "claude-hidden");
@@ -3699,7 +3720,8 @@ test "Agent requestPermission sends request and parses response" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session-1"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .duet_default = .both, .duet_primary = .claude },
+        .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
+        .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
@@ -3725,7 +3747,8 @@ test "Agent sendEngineText omits prefix in solo mode" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session-1"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .duet_default = .claude, .duet_primary = .claude },
+        .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
+        .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
@@ -3748,7 +3771,8 @@ test "Agent sendEngineToolCall omits prefix in solo mode" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session-1"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .duet_default = .codex, .duet_primary = .claude },
+        .config = .{ .auto_resume = true, .route = .codex, .primary_agent = .claude },
+        .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
@@ -3756,7 +3780,7 @@ test "Agent sendEngineToolCall omits prefix in solo mode" {
     try agent.sendEngineToolCall(&session, session.id, .codex, "tc-1", "Bash", .execute, .{ .string = "ls" });
 
     try (ohsnap{}).snap(@src(),
-        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"tool_call","toolCallId":"tc-1","title":"Bash","kind":"execute","status":"pending","rawInput":"ls"}}}
+        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"tool_call","toolCallId":"tc-1","title":"Bash: ls","kind":"execute","status":"pending","rawInput":"ls"}}}
         \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"tool_call_update","content":[{"type":"content","content":{"type":"text","text":"ls"}}],"toolCallId":"tc-1"}}}
         \\
     ).diff(tw.getOutput(), true);
@@ -3787,7 +3811,8 @@ test "Agent requestWriteTextFile sends request" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session-1"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .duet_default = .both, .duet_primary = .claude },
+        .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
+        .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
@@ -3829,7 +3854,8 @@ test "Agent mirrorTerminalOutput sends terminal requests" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session-1"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .duet_default = .both, .duet_primary = .claude },
+        .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
+        .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
@@ -3851,10 +3877,10 @@ test "Agent handleRequest - newSession" {
     defer guard_session.deinit();
     var guard_resume = try EnvVarGuard.set(testing.allocator, "BANJO_AUTO_RESUME", "true");
     defer guard_resume.deinit();
-    var guard_duet_default = try EnvVarGuard.set(testing.allocator, "BANJO_DUET_DEFAULT", "both");
-    defer guard_duet_default.deinit();
-    var guard_duet_primary = try EnvVarGuard.set(testing.allocator, "BANJO_DUET_PRIMARY", "claude");
-    defer guard_duet_primary.deinit();
+    var guard_route = try EnvVarGuard.set(testing.allocator, "BANJO_ROUTE", "duet");
+    defer guard_route.deinit();
+    var guard_primary_agent = try EnvVarGuard.set(testing.allocator, "BANJO_PRIMARY_AGENT", "claude");
+    defer guard_primary_agent.deinit();
     var guard_path = try EnvVarGuard.set(testing.allocator, "PATH", "");
     defer guard_path.deinit();
     var guard_claude = try EnvVarGuard.set(testing.allocator, "CLAUDE_CODE_EXECUTABLE", "claude-hidden");
@@ -3907,10 +3933,10 @@ test "Agent handleRequest - setMode" {
     defer guard_session.deinit();
     var guard_resume = try EnvVarGuard.set(testing.allocator, "BANJO_AUTO_RESUME", "true");
     defer guard_resume.deinit();
-    var guard_duet_default = try EnvVarGuard.set(testing.allocator, "BANJO_DUET_DEFAULT", "both");
-    defer guard_duet_default.deinit();
-    var guard_duet_primary = try EnvVarGuard.set(testing.allocator, "BANJO_DUET_PRIMARY", "claude");
-    defer guard_duet_primary.deinit();
+    var guard_route = try EnvVarGuard.set(testing.allocator, "BANJO_ROUTE", "duet");
+    defer guard_route.deinit();
+    var guard_primary_agent = try EnvVarGuard.set(testing.allocator, "BANJO_PRIMARY_AGENT", "claude");
+    defer guard_primary_agent.deinit();
     var guard_path = try EnvVarGuard.set(testing.allocator, "PATH", "");
     defer guard_path.deinit();
     var guard_claude = try EnvVarGuard.set(testing.allocator, "CLAUDE_CODE_EXECUTABLE", "claude-hidden");
@@ -3994,10 +4020,10 @@ test "Agent handleRequest - setModel" {
     defer guard_session.deinit();
     var guard_resume = try EnvVarGuard.set(testing.allocator, "BANJO_AUTO_RESUME", "true");
     defer guard_resume.deinit();
-    var guard_duet_default = try EnvVarGuard.set(testing.allocator, "BANJO_DUET_DEFAULT", "both");
-    defer guard_duet_default.deinit();
-    var guard_duet_primary = try EnvVarGuard.set(testing.allocator, "BANJO_DUET_PRIMARY", "claude");
-    defer guard_duet_primary.deinit();
+    var guard_route = try EnvVarGuard.set(testing.allocator, "BANJO_ROUTE", "duet");
+    defer guard_route.deinit();
+    var guard_primary_agent = try EnvVarGuard.set(testing.allocator, "BANJO_PRIMARY_AGENT", "claude");
+    defer guard_primary_agent.deinit();
     var guard_path = try EnvVarGuard.set(testing.allocator, "PATH", "");
     defer guard_path.deinit();
     var guard_claude = try EnvVarGuard.set(testing.allocator, "CLAUDE_CODE_EXECUTABLE", "claude-hidden");
@@ -4048,10 +4074,10 @@ test "Agent handleRequest - setConfig" {
     defer guard_session.deinit();
     var guard_resume = try EnvVarGuard.set(testing.allocator, "BANJO_AUTO_RESUME", "true");
     defer guard_resume.deinit();
-    var guard_duet_default = try EnvVarGuard.set(testing.allocator, "BANJO_DUET_DEFAULT", "both");
-    defer guard_duet_default.deinit();
-    var guard_duet_primary = try EnvVarGuard.set(testing.allocator, "BANJO_DUET_PRIMARY", "claude");
-    defer guard_duet_primary.deinit();
+    var guard_route = try EnvVarGuard.set(testing.allocator, "BANJO_ROUTE", "duet");
+    defer guard_route.deinit();
+    var guard_primary_agent = try EnvVarGuard.set(testing.allocator, "BANJO_PRIMARY_AGENT", "claude");
+    defer guard_primary_agent.deinit();
     var guard_path = try EnvVarGuard.set(testing.allocator, "PATH", "");
     defer guard_path.deinit();
     var guard_claude = try EnvVarGuard.set(testing.allocator, "CLAUDE_CODE_EXECUTABLE", "claude-hidden");
@@ -4092,7 +4118,7 @@ test "Agent handleRequest - setConfig" {
     try agent.handleRequest(set_config_request);
 
     try (ohsnap{}).snap(@src(),
-        \\{"jsonrpc":"2.0","result":{"configOptions":[{"id":"auto_resume","name":"Auto-resume sessions","description":"Resume the last session on startup","type":"select","currentValue":"false","options":[{"value":"true","name":"On"},{"value":"false","name":"Off"}]},{"id":"duet_default","name":"Default engine","description":"Engine to use for new prompts","type":"select","currentValue":"both","options":[{"value":"claude","name":"Claude"},{"value":"codex","name":"Codex"},{"value":"both","name":"Both"}]},{"id":"duet_primary","name":"Primary engine","description":"First engine to answer in duet mode","type":"select","currentValue":"claude","options":[{"value":"claude","name":"Claude"},{"value":"codex","name":"Codex"}]}]},"id":2}
+        \\{"jsonrpc":"2.0","result":{"configOptions":[{"id":"auto_resume","name":"Auto-resume sessions","description":"Resume the last session on startup","type":"select","currentValue":"false","options":[{"value":"true","name":"On"},{"value":"false","name":"Off"}]},{"id":"route","name":"Default agent","description":"Agent to use for new prompts","type":"select","currentValue":"duet","options":[{"value":"claude","name":"Claude"},{"value":"codex","name":"Codex"},{"value":"duet","name":"Duet"}]},{"id":"primary_agent","name":"Primary agent","description":"First agent to answer in duet mode","type":"select","currentValue":"claude","options":[{"value":"claude","name":"Claude"},{"value":"codex","name":"Codex"}]}]},"id":2}
         \\
     ).diff(tw.getOutput(), true);
 }
@@ -4214,7 +4240,8 @@ test "property: collectPromptParts finds text regardless of position" {
             var session = Agent.Session{
                 .id = testing.allocator.dupe(u8, "session") catch return false,
                 .cwd = testing.allocator.dupe(u8, ".") catch return false,
-                .config = .{ .auto_resume = true, .duet_default = .both, .duet_primary = .claude },
+                .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
+                .availability = .{ .claude = true, .codex = true },
                 .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
             };
             defer session.deinit(testing.allocator);
@@ -4241,7 +4268,8 @@ test "property: collectPromptParts returns null when no text block" {
             var session = Agent.Session{
                 .id = testing.allocator.dupe(u8, "session") catch return false,
                 .cwd = testing.allocator.dupe(u8, ".") catch return false,
-                .config = .{ .auto_resume = true, .duet_default = .both, .duet_primary = .claude },
+                .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
+                .availability = .{ .claude = true, .codex = true },
                 .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
             };
             defer session.deinit(testing.allocator);
@@ -4266,7 +4294,8 @@ test "collectPromptParts handles empty blocks" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .duet_default = .both, .duet_primary = .claude },
+        .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
+        .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
@@ -4296,7 +4325,8 @@ test "collectPromptParts skips codex image fallback when supported" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .duet_default = .both, .duet_primary = .claude },
+        .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
+        .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
@@ -4321,7 +4351,7 @@ test "collectPromptParts skips codex image fallback when supported" {
 test "route_command_map resolves routes" {
     try testing.expectEqual(Route.claude, Agent.route_command_map.get("claude").?);
     try testing.expectEqual(Route.codex, Agent.route_command_map.get("codex").?);
-    try testing.expectEqual(Route.both, Agent.route_command_map.get("duet").?);
+    try testing.expectEqual(Route.duet, Agent.route_command_map.get("duet").?);
     try testing.expect(Agent.route_command_map.get("both") == null);
     try testing.expect(Agent.route_command_map.get("claudeX") == null);
 }
@@ -4548,7 +4578,8 @@ test "buildClaudeStartOptions honors force_new" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .duet_default = .both, .duet_primary = .claude },
+        .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
+        .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
@@ -4570,7 +4601,8 @@ test "buildCodexStartOptions honors force_new" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .duet_default = .both, .duet_primary = .claude },
+        .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
+        .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
@@ -4596,7 +4628,8 @@ test "prepareFreshSessions clears resume state" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .duet_default = .both, .duet_primary = .claude },
+        .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
+        .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);

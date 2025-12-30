@@ -74,15 +74,15 @@ To start fresh sessions instead of auto-resuming:
 }
 ```
 
-Duet defaults (optional):
+Routing defaults (optional):
 
 ```json
 {
   "agent_servers": {
     "banjo": {
       "env": {
-        "BANJO_DUET_DEFAULT": "claude",
-        "BANJO_DUET_PRIMARY": "claude"
+        "BANJO_ROUTE": "claude",
+        "BANJO_PRIMARY_AGENT": "claude"
       }
     }
   }

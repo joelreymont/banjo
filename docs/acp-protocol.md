@@ -276,7 +276,7 @@ Banjo sends `current_model_update` when the model changes.
 ```zig
 const SetConfigOptionRequest = struct {
     sessionId: []const u8,
-    configId: []const u8, // "auto_resume", "duet_default", "duet_primary"
+    configId: []const u8, // "auto_resume", "route", "primary_agent"
     value: []const u8, // value ID (string)
 };
 ```

@@ -524,6 +524,10 @@ pub const Bridge = struct {
             try args.append(self.allocator, "--continue");
         }
 
+        if (opts.skip_permissions) {
+            try args.append(self.allocator, "--dangerously-skip-permissions");
+        }
+
         if (opts.permission_mode) |mode| {
             try args.append(self.allocator, "--permission-mode");
             try args.append(self.allocator, mode);
@@ -558,6 +562,7 @@ pub const Bridge = struct {
     pub const StartOptions = struct {
         resume_session_id: ?[]const u8 = null,
         continue_last: bool = false, // Use --continue to resume last session
+        skip_permissions: bool = false,
         permission_mode: ?[]const u8 = null,
         model: ?[]const u8 = null,
     };
