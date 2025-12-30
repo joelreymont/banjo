@@ -18,7 +18,7 @@ Banjo Duet is a Second Brain for your code — an ACP agent in Zig that runs [Cl
 - **Code notes** — attach notes to code as comments with `/explain`
 - **Auto-setup** — `/setup lsp` configures Zed settings automatically
 - Claude Code commands: `/version`, `/model`, `/compact`, `/review`, `/clear`
-- **Duet routing** — `/claude`, `/codex`, `/both` switch the active routing mode (default: `/both`, Claude responds first)
+- **Duet routing** — `/claude`, `/codex`, `/duet` switch the active routing mode (default: `/claude` when both engines are available)
 - **Codex support** — run Codex prompts side-by-side with Claude Code
 
 ## Notes
@@ -30,7 +30,7 @@ Banjo Duet lets you attach notes to code as `@banjo[id]` comments. Notes appear 
 1. Run `/setup lsp` in the agent panel — automatically configures Zed settings
 2. Write a comment, press `Cmd+.`, select "Create Banjo Note"
 3. Or select code, press `Cmd+>`, type `/explain` to have Claude summarize it
-4. Use `/claude`, `/codex`, or `/both` to switch routing mode for new prompts
+4. Use `/claude`, `/codex`, or `/duet` to switch routing mode for new prompts
 
 ### Creating Notes
 
@@ -81,7 +81,7 @@ Duet defaults (optional):
   "agent_servers": {
     "banjo": {
       "env": {
-        "BANJO_DUET_DEFAULT": "both",
+        "BANJO_DUET_DEFAULT": "claude",
         "BANJO_DUET_PRIMARY": "claude"
       }
     }

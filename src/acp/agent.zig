@@ -73,8 +73,13 @@ fn elapsedMs(start_ms: i64) u64 {
 }
 
 fn duetDefaultFromEnv() Route {
-    const val = std.posix.getenv("BANJO_DUET_DEFAULT") orelse return .both;
-    return route_map.get(val) orelse .both;
+    const val = std.posix.getenv("BANJO_DUET_DEFAULT") orelse return .claude;
+    return route_map.get(val) orelse .claude;
+}
+
+fn duetDefaultEnvValue() ?Route {
+    const val = std.posix.getenv("BANJO_DUET_DEFAULT") orelse return null;
+    return route_map.get(val);
 }
 
 fn duetPrimaryFromEnv() Engine {
@@ -88,6 +93,13 @@ fn configFromEnv() SessionConfig {
         .duet_default = duetDefaultFromEnv(),
         .duet_primary = duetPrimaryFromEnv(),
     };
+}
+
+fn resolveDefaultRoute(availability: EngineAvailability) Route {
+    if (duetDefaultEnvValue()) |route| return route;
+    if (availability.claude and availability.codex) return .claude;
+    if (availability.codex) return .codex;
+    return .claude;
 }
 
 fn codexApprovalPolicy(mode: protocol.PermissionMode) []const u8 {
@@ -106,6 +118,7 @@ const route_map = std.StaticStringMap(Route).initComptime(.{
     .{ "claude", .claude },
     .{ "codex", .codex },
     .{ "both", .both },
+    .{ "duet", .both },
 });
 
 const engine_map = std.StaticStringMap(Engine).initComptime(.{
@@ -207,7 +220,7 @@ fn routeLabel(route: Route) []const u8 {
     return switch (route) {
         .claude => "Claude",
         .codex => "Codex",
-        .both => "Both",
+        .both => "Duet",
     };
 }
 
@@ -553,6 +566,11 @@ pub const Agent = struct {
         const did_setup = self.autoSetupLspIfNeeded(cwd) catch false;
 
         const availability = detectEngines();
+        if (duetDefaultEnvValue() == null) {
+            const default_route = resolveDefaultRoute(availability);
+            session.config.duet_default = default_route;
+            self.config_defaults.duet_default = default_route;
+        }
 
         // Pre-start Claude Code for instant first response (auto-resume last session if enabled)
         if (availability.claude) {
@@ -2579,20 +2597,12 @@ pub const Agent = struct {
         self.config_defaults.duet_default = route;
         self.updateAllSessions(.duet_default, .{ .duet_default = route });
 
-        const msg = switch (route) {
-            .claude => if (has_args)
-                "Routing mode set to Claude. This command takes no arguments; send your prompt next."
-            else
-                "Routing mode set to Claude.",
-            .codex => if (has_args)
-                "Routing mode set to Codex. This command takes no arguments; send your prompt next."
-            else
-                "Routing mode set to Codex.",
-            .both => if (has_args)
-                "Routing mode set to Both. This command takes no arguments; send your prompt next."
-            else
-                "Routing mode set to Both.",
-        };
+        const label = routeLabel(route);
+        var buf: [160]u8 = undefined;
+        const msg = if (has_args)
+            (std.fmt.bufPrint(&buf, "Routing mode set to {s}. This command takes no arguments; send your prompt next.", .{label}) catch "Routing mode updated.")
+        else
+            (std.fmt.bufPrint(&buf, "Routing mode set to {s}.", .{label}) catch "Routing mode updated.");
 
         try self.sendSessionUpdate(session_id, .{
             .sessionUpdate = .agent_message_chunk,
@@ -2664,13 +2674,13 @@ pub const Agent = struct {
     const route_commands = [_]RouteCommand{
         .{ .name = "claude", .route = .claude, .description = "Switch routing mode to Claude" },
         .{ .name = "codex", .route = .codex, .description = "Switch routing mode to Codex" },
-        .{ .name = "both", .route = .both, .description = "Switch routing mode to Both" },
+        .{ .name = "duet", .route = .both, .description = "Switch routing mode to Duet" },
     };
 
     const route_command_map = std.StaticStringMap(Route).initComptime(.{
         .{ "claude", .claude },
         .{ "codex", .codex },
-        .{ "both", .both },
+        .{ "duet", .both },
     });
 
     /// Dispatch slash commands. Returns modified prompt to pass to CLI, or null if fully handled.
@@ -3115,7 +3125,7 @@ pub const Agent = struct {
             .{
                 .id = "duet_primary",
                 .name = "Primary engine",
-                .description = "First engine to answer in /both mode",
+                .description = "First engine to answer in duet mode",
                 .type = .select,
                 .currentValue = @tagName(session.config.duet_primary),
                 .options = duet_primary_config_options[0..],
@@ -3134,7 +3144,7 @@ pub const Agent = struct {
         .{ "new", {} },
         .{ "claude", {} },
         .{ "codex", {} },
-        .{ "both", {} },
+        .{ "duet", {} },
     });
 
     /// Check if command is unsupported
@@ -3320,7 +3330,7 @@ const expected_commands_json =
     "{\"name\":\"new\",\"description\":\"Start fresh Claude Code and Codex sessions\"}," ++
     "{\"name\":\"claude\",\"description\":\"Switch routing mode to Claude\"}," ++
     "{\"name\":\"codex\",\"description\":\"Switch routing mode to Codex\"}," ++
-    "{\"name\":\"both\",\"description\":\"Switch routing mode to Both\"}," ++
+    "{\"name\":\"duet\",\"description\":\"Switch routing mode to Duet\"}," ++
     "{\"name\":\"model\",\"description\":\"Show current model\"}," ++
     "{\"name\":\"compact\",\"description\":\"Compact conversation\"}," ++
     "{\"name\":\"review\",\"description\":\"Code review\"}]";
@@ -3901,7 +3911,7 @@ test "Agent handleRequest - setConfig" {
     try agent.handleRequest(set_config_request);
 
     try (ohsnap{}).snap(@src(),
-        \\{"jsonrpc":"2.0","result":{"configOptions":[{"id":"auto_resume","name":"Auto-resume sessions","description":"Resume the last session on startup","type":"select","currentValue":"false","options":[{"value":"true","name":"On"},{"value":"false","name":"Off"}]},{"id":"duet_default","name":"Default engine","description":"Engine to use for new prompts","type":"select","currentValue":"both","options":[{"value":"claude","name":"Claude"},{"value":"codex","name":"Codex"},{"value":"both","name":"Both"}]},{"id":"duet_primary","name":"Primary engine","description":"First engine to answer in /both mode","type":"select","currentValue":"claude","options":[{"value":"claude","name":"Claude"},{"value":"codex","name":"Codex"}]}]},"id":2}
+        \\{"jsonrpc":"2.0","result":{"configOptions":[{"id":"auto_resume","name":"Auto-resume sessions","description":"Resume the last session on startup","type":"select","currentValue":"false","options":[{"value":"true","name":"On"},{"value":"false","name":"Off"}]},{"id":"duet_default","name":"Default engine","description":"Engine to use for new prompts","type":"select","currentValue":"both","options":[{"value":"claude","name":"Claude"},{"value":"codex","name":"Codex"},{"value":"both","name":"Both"}]},{"id":"duet_primary","name":"Primary engine","description":"First engine to answer in duet mode","type":"select","currentValue":"claude","options":[{"value":"claude","name":"Claude"},{"value":"codex","name":"Codex"}]}]},"id":2}
         \\
     ).diff(tw.getOutput(), true);
 }
@@ -4130,7 +4140,8 @@ test "collectPromptParts skips codex image fallback when supported" {
 test "route_command_map resolves routes" {
     try testing.expectEqual(Route.claude, Agent.route_command_map.get("claude").?);
     try testing.expectEqual(Route.codex, Agent.route_command_map.get("codex").?);
-    try testing.expectEqual(Route.both, Agent.route_command_map.get("both").?);
+    try testing.expectEqual(Route.both, Agent.route_command_map.get("duet").?);
+    try testing.expect(Agent.route_command_map.get("both") == null);
     try testing.expect(Agent.route_command_map.get("claudeX") == null);
 }
 

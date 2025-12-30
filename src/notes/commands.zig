@@ -228,6 +228,7 @@ fn scanProjectForNotes(allocator: Allocator, dir_path: []const u8, notes_by_file
                 try note_list.appendSlice(allocator, notes);
                 try notes_by_file.put(path_copy, note_list);
             }
+            allocator.free(notes);
         }
     }
 }
