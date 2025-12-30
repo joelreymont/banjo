@@ -14,7 +14,8 @@ license = "MIT"
 # For release: uncomment and add valid archive URLs
 #
 # [agent_servers.banjo]
-# name = "Banjo (Claude Code + Codex)"
+# name = "Banjo Duet (Claude Code + Codex)"
+# icon = "icon/banjo.svg"
 # [agent_servers.banjo.targets.darwin-aarch64]
 # archive = "https://github.com/joelreymont/banjo/releases/download/vX.Y.Z/banjo-darwin-arm64.tar.gz"
 # cmd = "./banjo"

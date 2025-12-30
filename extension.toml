@@ -9,7 +9,8 @@ license = "MIT"
 
 # ACP Agent Server (Claude Code + Codex)
 [agent_servers.banjo]
-name = "Banjo (Claude Code + Codex)"
+name = "Banjo Duet (Claude Code + Codex)"
+icon = "icon/banjo.svg"
 
 [agent_servers.banjo.targets.darwin-aarch64]
 archive = "https://github.com/joelreymont/banjo/releases/download/v0.5.0/banjo-darwin-arm64.tar.gz"

@@ -12,8 +12,8 @@ JSON-RPC 2.0 over stdio between Zed and agents.
   "result": {
     "protocolVersion": 1,
     "agentInfo": {
-      "name": "Banjo (Claude Code + Codex)",
-      "title": "Banjo (Claude Code + Codex)",
+      "name": "Banjo Duet",
+      "title": "Banjo Duet",
       "version": "0.5.0 (hash)"
     },
     "agentCapabilities": {
