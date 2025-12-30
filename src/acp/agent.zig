@@ -1194,6 +1194,7 @@ pub const Agent = struct {
         const start_ms = std.time.milliTimestamp();
         const engine = Engine.claude;
         var stream_prefix_pending = true;
+        var thought_prefix_pending = true;
         defer self.clearPendingExecuteTools(session);
 
         const cli_bridge = try self.ensureClaudeBridge(session, session_id);
@@ -1282,8 +1283,14 @@ pub const Agent = struct {
                 .stream_event => {
                     if (msg.getStreamEventType()) |event_type| {
                         switch (event_type) {
-                            .message_start => stream_prefix_pending = true,
-                            .message_stop => stream_prefix_pending = false,
+                            .message_start => {
+                                stream_prefix_pending = true;
+                                thought_prefix_pending = true;
+                            },
+                            .message_stop => {
+                                stream_prefix_pending = false;
+                                thought_prefix_pending = false;
+                            },
                             else => {},
                         }
                     }
@@ -1299,7 +1306,11 @@ pub const Agent = struct {
                         try self.sendEngineTextRaw(session_id, text);
                     }
                     if (msg.getStreamThinkingDelta()) |thinking| {
-                        try self.sendEngineThought(session_id, engine, thinking);
+                        if (thought_prefix_pending) {
+                            try self.sendEngineThoughtPrefix(session_id, engine);
+                            thought_prefix_pending = false;
+                        }
+                        try self.sendEngineThoughtRaw(session_id, thinking);
                     }
                 },
                 .system => {
