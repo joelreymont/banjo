@@ -2454,6 +2454,7 @@ pub const Agent = struct {
             codex_bridge.approval_policy = codexApprovalPolicy(session.permission_mode);
         }
         if (session.bridge) |*claude_bridge| {
+            // Claude CLI does not accept control messages to change permission mode.
             claude_bridge.deinit();
             session.bridge = null;
         }

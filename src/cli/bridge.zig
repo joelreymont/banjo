@@ -188,6 +188,25 @@ pub const StreamInput = struct {
     }
 };
 
+pub const StreamControlInput = struct {
+    type: []const u8 = "control",
+    control: Control,
+
+    pub const Control = struct {
+        type: []const u8,
+        mode: []const u8,
+    };
+
+    pub fn setPermissionMode(mode: []const u8) StreamControlInput {
+        return .{
+            .control = .{
+                .type = "set_permission_mode",
+                .mode = mode,
+            },
+        };
+    }
+};
+
 /// Parsed stream message
 pub const StreamMessage = struct {
     type: MessageType,
@@ -844,6 +863,65 @@ fn readClaudeMessageWithTimeout(bridge: *Bridge, deadline_ms: i64) !?StreamMessa
     }
 }
 
+fn collectClaudeControlProbe(allocator: Allocator, input: StreamControlInput) ![]u8 {
+    var args: std.ArrayList([]const u8) = .empty;
+    defer args.deinit(allocator);
+
+    const claude_path = executable.choose("CLAUDE_CODE_EXECUTABLE", "claude", Bridge.claude_paths[0..]);
+    try args.appendSlice(allocator, &[_][]const u8{
+        claude_path,
+        "-p",
+        "--verbose",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+    });
+
+    var child = std.process.Child.init(args.items, allocator);
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    try child.spawn();
+    errdefer {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+    }
+
+    const stdin = child.stdin orelse return error.NoStdin;
+    var out: std.io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var jw: std.json.Stringify = .{ .writer = &out.writer };
+    try jw.write(input);
+    try out.writer.writeByte('\n');
+
+    const data = try out.toOwnedSlice();
+    defer allocator.free(data);
+    try stdin.writeAll(data);
+    stdin.close();
+    child.stdin = null;
+
+    const stdout = try child.stdout.?.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(stdout);
+    const stderr = try child.stderr.?.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(stderr);
+
+    const term = try child.wait();
+    const exit_code: i32 = switch (term) {
+        .Exited => |code| @intCast(code),
+        else => -1,
+    };
+
+    const stderr_trimmed = std.mem.trim(u8, stderr, "\r\n ");
+    const stdout_trimmed = std.mem.trim(u8, stdout, "\r\n ");
+    return std.fmt.allocPrint(allocator, "exit_code: {d}\nstderr:{s}\nstdout:{s}\n", .{
+        exit_code,
+        stderr_trimmed,
+        stdout_trimmed,
+    });
+}
+
 test "snapshot: Claude Code live prompt" {
     if (!config.live_cli_tests) return error.SkipZigTest;
     if (!Bridge.isAvailable()) return error.SkipZigTest;
@@ -857,6 +935,21 @@ test "snapshot: Claude Code live prompt" {
         \\stop_reason: success
         \\
     ).diff(snapshot, true);
+}
+
+test "snapshot: Claude Code control messages are rejected" {
+    if (!config.live_cli_tests) return error.SkipZigTest;
+    if (!Bridge.isAvailable()) return error.SkipZigTest;
+
+    const probe = try collectClaudeControlProbe(testing.allocator, StreamControlInput.setPermissionMode("acceptEdits"));
+    defer testing.allocator.free(probe);
+
+    try (ohsnap{}).snap(@src(),
+        \\exit_code: 1
+        \\stderr:Error: Expected message type 'user' or 'control', got 'control'
+        \\stdout:
+        \\
+    ).diff(probe, true);
 }
 
 // =============================================================================

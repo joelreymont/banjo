@@ -40,9 +40,10 @@ When using `--input-format stream-json`, send messages as:
 
 **IMPORTANT**:
 - Requires `--verbose` flag when using `-p` with `stream-json`
-- `type` must be "user" or "control" at top level
+- `type` must be "user" at top level (control is rejected in stream-json input as of 2.0.76)
 - `message.role` must be "user"
 - `message.content` is the prompt text
+- Live tests show Claude Code rejects `type:"control"` inputs (error: "Expected message type 'user' or 'control', got 'control'").
 
 The CLI reference does not document image/audio payloads for stream-json input.
 Our live tests with content blocks show:
@@ -113,6 +114,7 @@ This is equivalent functionality but at the ACP layer.
 
 - Node.js subprocess spawning has bugs (use Python or direct exec)
 - `--verbose` requires `--json` in print mode
+- Stream-json does not accept control messages for in-session permission mode changes; use `--permission-mode` at process start and restart to apply changes.
 
 ## Live Multimodal Tests (stream-json)
 
