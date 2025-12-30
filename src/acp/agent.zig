@@ -409,7 +409,7 @@ pub const Agent = struct {
         id: []const u8,
         cwd: []const u8,
         cancelled: bool = false,
-        permission_mode: protocol.PermissionMode = .default,
+        permission_mode: protocol.PermissionMode = .bypassPermissions,
         config: SessionConfig,
         availability: EngineAvailability,
         model: ?[]const u8 = null,
@@ -3475,12 +3475,12 @@ pub const Agent = struct {
         .{ .name = "review", .description = "Code review" },
     };
 
+    // Note: In stream-json mode, Claude Code can't request interactive permission.
+    // Only bypassPermissions (auto-approve all) and plan (no execution) work reliably.
+    // default/acceptEdits block waiting for input that never comes.
     const available_modes = [_]protocol.SessionMode{
-        .{ .id = "default", .name = "Default", .description = "Ask before executing tools" },
-        .{ .id = "acceptEdits", .name = "Accept edits", .description = "Auto-accept file edits" },
-        .{ .id = "bypassPermissions", .name = "Bypass permissions", .description = "Run tools without prompting" },
-        .{ .id = "dontAsk", .name = "Don't ask", .description = "Only run pre-approved tools" },
-        .{ .id = "plan", .name = "Plan", .description = "Plan only, no execution" },
+        .{ .id = "bypassPermissions", .name = "Auto-approve", .description = "Run all tools without prompting" },
+        .{ .id = "plan", .name = "Plan only", .description = "Plan without executing tools" },
     };
 
     const available_models = [_]protocol.SessionModel{
@@ -3716,12 +3716,10 @@ const TestWriter = struct {
 };
 
 const expected_modes_json =
-    "{\"availableModes\":[{\"id\":\"default\",\"name\":\"Default\",\"description\":\"Ask before executing tools\"}," ++
-    "{\"id\":\"acceptEdits\",\"name\":\"Accept edits\",\"description\":\"Auto-accept file edits\"}," ++
-    "{\"id\":\"bypassPermissions\",\"name\":\"Bypass permissions\",\"description\":\"Run tools without prompting\"}," ++
-    "{\"id\":\"dontAsk\",\"name\":\"Don't ask\",\"description\":\"Only run pre-approved tools\"}," ++
-    "{\"id\":\"plan\",\"name\":\"Plan\",\"description\":\"Plan only, no execution\"}]," ++
-    "\"currentModeId\":\"default\"}";
+    "{\"availableModes\":[" ++
+    "{\"id\":\"bypassPermissions\",\"name\":\"Auto-approve\",\"description\":\"Run all tools without prompting\"}," ++
+    "{\"id\":\"plan\",\"name\":\"Plan only\",\"description\":\"Plan without executing tools\"}]," ++
+    "\"currentModeId\":\"bypassPermissions\"}";
 
 const expected_commands_json =
     "[{\"name\":\"explain\",\"description\":\"Summarize selected code as a note comment\"}," ++
@@ -3766,7 +3764,7 @@ fn expectedNewSessionOutput(
             "\",\"update\":{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":" ++ expected_commands_json ++
             "}}}\n" ++
             "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"" ++ session_id ++
-            "\",\"update\":{\"sessionUpdate\":\"current_mode_update\",\"currentModeId\":\"default\"}}}\n" ++
+            "\",\"update\":{\"sessionUpdate\":\"current_mode_update\",\"currentModeId\":\"bypassPermissions\"}}}\n" ++
             "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"" ++ session_id ++
             "\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"" ++
             no_engine_warning ++ "\"}}}}\n";
@@ -3779,7 +3777,7 @@ fn expectedNewSessionOutput(
         "\",\"update\":{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":" ++ expected_commands_json ++
         "}}}\n" ++
         "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"" ++ session_id ++
-        "\",\"update\":{\"sessionUpdate\":\"current_mode_update\",\"currentModeId\":\"default\"}}}\n";
+        "\",\"update\":{\"sessionUpdate\":\"current_mode_update\",\"currentModeId\":\"bypassPermissions\"}}}\n";
 }
 
 test "configFromEnv returns defaults" {
