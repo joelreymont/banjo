@@ -333,6 +333,8 @@ pub const Agent = struct {
         settings: ?Settings = null,
         cli_session_id: ?[]const u8 = null, // Claude Code session ID for --resume
         codex_session_id: ?[]const u8 = null,
+        force_new_claude: bool = false,
+        force_new_codex: bool = false,
         pending_execute_tools: std.StringHashMap(void),
 
         pub fn deinit(self: *Session, allocator: Allocator) void {
@@ -1136,18 +1138,24 @@ pub const Agent = struct {
         return &session.bridge.?;
     }
 
-    fn startClaudeBridge(self: *Agent, session: *Session, session_id: []const u8) !void {
-        session.bridge.?.start(.{
-            .resume_session_id = session.cli_session_id,
-            .continue_last = session.cli_session_id == null and session.config.auto_resume,
+    fn buildClaudeStartOptions(session: *Session) Bridge.StartOptions {
+        const allow_resume = !session.force_new_claude;
+        return .{
+            .resume_session_id = if (allow_resume) session.cli_session_id else null,
+            .continue_last = allow_resume and session.cli_session_id == null and session.config.auto_resume,
             .permission_mode = @tagName(session.permission_mode),
             .model = session.model,
-        }) catch |err| {
+        };
+    }
+
+    fn startClaudeBridge(self: *Agent, session: *Session, session_id: []const u8) !void {
+        session.bridge.?.start(buildClaudeStartOptions(session)) catch |err| {
             log.err("Failed to start Claude Code: {}", .{err});
             session.bridge = null;
             try self.sendEngineText(session_id, .claude, "Failed to start Claude Code. Please ensure it is installed and in PATH.");
             return error.BridgeStartFailed;
         };
+        session.force_new_claude = false;
     }
 
     fn ensureCodexBridge(self: *Agent, session: *Session, session_id: []const u8) !*CodexBridge {
@@ -1161,17 +1169,22 @@ pub const Agent = struct {
         return &session.codex_bridge.?;
     }
 
-    fn startCodexBridge(self: *Agent, session: *Session, session_id: []const u8) !void {
-        session.codex_bridge.?.start(.{
-            .resume_session_id = session.codex_session_id,
+    fn buildCodexStartOptions(session: *Session) CodexBridge.StartOptions {
+        return .{
+            .resume_session_id = if (session.force_new_codex) null else session.codex_session_id,
             .model = null,
             .approval_policy = codexApprovalPolicy(session.permission_mode),
-        }) catch |err| {
+        };
+    }
+
+    fn startCodexBridge(self: *Agent, session: *Session, session_id: []const u8) !void {
+        session.codex_bridge.?.start(buildCodexStartOptions(session)) catch |err| {
             log.err("Failed to start Codex: {}", .{err});
             session.codex_bridge = null;
             try self.sendEngineText(session_id, .codex, "Failed to start Codex. Please ensure it is installed and in PATH.");
             return error.BridgeStartFailed;
         };
+        session.force_new_codex = false;
         const start_ms = std.time.milliTimestamp();
         log.info("Codex bridge started (start={d}ms)", .{start_ms});
         self.captureCodexSessionId(session);
@@ -1337,6 +1350,8 @@ pub const Agent = struct {
     fn runCodexPrompt(self: *Agent, session: *Session, session_id: []const u8, prompt: []const u8) !protocol.StopReason {
         const start_ms = std.time.milliTimestamp();
         const engine = Engine.codex;
+        var stream_prefix_pending = true;
+        var thought_prefix_pending = true;
         defer self.clearPendingExecuteTools(session);
 
         const codex_bridge = try self.ensureCodexBridge(session, session_id);
@@ -1378,6 +1393,36 @@ pub const Agent = struct {
             msg_count += 1;
             const msg_time_ms = elapsedMs(start_ms);
             if (first_response_ms == 0) first_response_ms = msg_time_ms;
+
+            if (msg.event_type == .turn_started) {
+                stream_prefix_pending = true;
+                thought_prefix_pending = true;
+                continue;
+            }
+
+            if (msg.event_type == .agent_message_delta) {
+                if (msg.text) |text| {
+                    if (first_response_ms == 0) first_response_ms = msg_time_ms;
+                    if (stream_prefix_pending) {
+                        try self.sendEngineTextPrefix(session_id, engine);
+                        stream_prefix_pending = false;
+                    }
+                    try self.sendEngineTextRaw(session_id, text);
+                }
+                continue;
+            }
+
+            if (msg.event_type == .reasoning_delta) {
+                if (msg.text) |text| {
+                    if (first_response_ms == 0) first_response_ms = msg_time_ms;
+                    if (thought_prefix_pending) {
+                        try self.sendEngineThoughtPrefix(session_id, engine);
+                        thought_prefix_pending = false;
+                    }
+                    try self.sendEngineThoughtRaw(session_id, text);
+                }
+                continue;
+            }
 
             if (msg.getSessionId()) |sid| {
                 self.captureSessionId(&session.codex_session_id, "Codex", sid);
@@ -1496,6 +1541,21 @@ pub const Agent = struct {
         const prefix = enginePrefix(engine);
         try self.sendSessionUpdate(session_id, .{
             .sessionUpdate = .agent_message_chunk,
+            .content = .{ .type = "text", .text = prefix },
+        });
+    }
+
+    fn sendEngineThoughtRaw(self: *Agent, session_id: []const u8, text: []const u8) !void {
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .agent_thought_chunk,
+            .content = .{ .type = "text", .text = text },
+        });
+    }
+
+    fn sendEngineThoughtPrefix(self: *Agent, session_id: []const u8, engine: Engine) !void {
+        const prefix = enginePrefix(engine);
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .agent_thought_chunk,
             .content = .{ .type = "text", .text = prefix },
         });
     }
@@ -2292,13 +2352,71 @@ pub const Agent = struct {
         try self.writer.writeTypedResponse(request.id, protocol.PromptResponse{ .stopReason = .end_turn });
     }
 
-    const Command = enum { version, note, notes, setup, explain };
+    fn clearSessionId(self: *Agent, slot: *?[]const u8) void {
+        if (slot.*) |sid| self.allocator.free(sid);
+        slot.* = null;
+    }
+
+    fn prepareFreshSessions(self: *Agent, session: *Session) void {
+        self.clearSessionId(&session.cli_session_id);
+        self.clearSessionId(&session.codex_session_id);
+        session.force_new_claude = true;
+        session.force_new_codex = true;
+        self.clearPendingExecuteTools(session);
+    }
+
+    /// Handle /new command
+    fn handleNewCommand(self: *Agent, request: jsonrpc.Request, session: *Session, session_id: []const u8) !void {
+        self.prepareFreshSessions(session);
+
+        var claude_ok = false;
+        var codex_ok = false;
+
+        if (session.bridge == null) {
+            session.bridge = Bridge.init(self.allocator, session.cwd);
+        }
+        if (session.bridge) |*b| {
+            b.stop();
+            self.startClaudeBridge(session, session_id) catch |err| {
+                log.err("Failed to start new Claude Code session: {}", .{err});
+            };
+            claude_ok = session.bridge != null and session.bridge.?.process != null;
+        }
+
+        if (session.codex_bridge == null) {
+            session.codex_bridge = CodexBridge.init(self.allocator, session.cwd);
+        }
+        if (session.codex_bridge) |*b| {
+            b.stop();
+            self.startCodexBridge(session, session_id) catch |err| {
+                log.err("Failed to start new Codex session: {}", .{err});
+            };
+            codex_ok = session.codex_bridge != null and session.codex_bridge.?.process != null;
+        }
+
+        const status_text = blk: {
+            if (claude_ok and codex_ok) break :blk "Started fresh Claude Code and Codex sessions (no resume).";
+            if (claude_ok and !codex_ok) break :blk "Started fresh Claude Code session (no resume). Codex unavailable or failed to start.";
+            if (!claude_ok and codex_ok) break :blk "Started fresh Codex session (no resume). Claude Code unavailable or failed to start.";
+            break :blk "Failed to start fresh sessions for Claude Code and Codex.";
+        };
+
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .agent_message_chunk,
+            .content = .{ .type = "text", .text = status_text },
+        });
+
+        try self.writer.writeTypedResponse(request.id, protocol.PromptResponse{ .stopReason = .end_turn });
+    }
+
+    const Command = enum { version, note, notes, setup, explain, new };
     const command_map = std.StaticStringMap(Command).initComptime(.{
         .{ "version", .version },
         .{ "note", .note },
         .{ "notes", .notes },
         .{ "setup", .setup },
         .{ "explain", .explain },
+        .{ "new", .new },
     });
 
     /// Dispatch slash commands. Returns modified prompt to pass to CLI, or null if fully handled.
@@ -2344,6 +2462,13 @@ pub const Agent = struct {
                 };
                 self.sendEndTurn(request) catch |err| {
                     log.err("Failed to send end turn: {}", .{err});
+                };
+                return null;
+            },
+            .new => {
+                self.handleNewCommand(request, session, session_id) catch |err| {
+                    log.err("New command failed: {}", .{err});
+                    self.sendErrorAndEnd(request, session_id, "New command failed") catch {};
                 };
                 return null;
             },
@@ -2637,6 +2762,7 @@ pub const Agent = struct {
         .{ .name = "notes", .description = "List all notes in the project" },
         .{ .name = "note", .description = "Note management commands" },
         .{ .name = "version", .description = "Show banjo version" },
+        .{ .name = "new", .description = "Start fresh Claude Code and Codex sessions" },
         .{ .name = "claude", .description = "Route prompt to Claude only" },
         .{ .name = "codex", .description = "Route prompt to Codex only" },
         .{ .name = "both", .description = "Route prompt to Claude then Codex" },
@@ -2725,6 +2851,7 @@ pub const Agent = struct {
         .{ "banjo", {} },
         .{ "notes", {} },
         .{ "version", {} },
+        .{ "new", {} },
         .{ "claude", {} },
         .{ "codex", {} },
         .{ "both", {} },
@@ -2903,6 +3030,7 @@ const expected_commands_json =
     "{\"name\":\"notes\",\"description\":\"List all notes in the project\"}," ++
     "{\"name\":\"note\",\"description\":\"Note management commands\"}," ++
     "{\"name\":\"version\",\"description\":\"Show banjo version\"}," ++
+    "{\"name\":\"new\",\"description\":\"Start fresh Claude Code and Codex sessions\"}," ++
     "{\"name\":\"claude\",\"description\":\"Route prompt to Claude only\"}," ++
     "{\"name\":\"codex\",\"description\":\"Route prompt to Codex only\"}," ++
     "{\"name\":\"both\",\"description\":\"Route prompt to Claude then Codex\"}," ++
@@ -3916,4 +4044,75 @@ test "isUnsupportedCommand filters correctly" {
     try testing.expect(!Agent.isUnsupportedCommand("compact"));
     try testing.expect(!Agent.isUnsupportedCommand("review"));
     try testing.expect(!Agent.isUnsupportedCommand("version"));
+}
+
+test "buildClaudeStartOptions honors force_new" {
+    var session = Agent.Session{
+        .id = try testing.allocator.dupe(u8, "session"),
+        .cwd = try testing.allocator.dupe(u8, "."),
+        .config = .{ .auto_resume = true, .duet_default = .both, .duet_primary = .claude },
+        .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+    };
+    defer session.deinit(testing.allocator);
+
+    session.cli_session_id = try testing.allocator.dupe(u8, "resume-id");
+    session.force_new_claude = true;
+
+    const forced = Agent.buildClaudeStartOptions(&session);
+    try testing.expect(forced.resume_session_id == null);
+    try testing.expect(!forced.continue_last);
+
+    session.force_new_claude = false;
+    const resume_opts = Agent.buildClaudeStartOptions(&session);
+    try testing.expect(resume_opts.resume_session_id != null);
+    try testing.expect(std.mem.eql(u8, resume_opts.resume_session_id.?, "resume-id"));
+}
+
+test "buildCodexStartOptions honors force_new" {
+    var session = Agent.Session{
+        .id = try testing.allocator.dupe(u8, "session"),
+        .cwd = try testing.allocator.dupe(u8, "."),
+        .config = .{ .auto_resume = true, .duet_default = .both, .duet_primary = .claude },
+        .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+    };
+    defer session.deinit(testing.allocator);
+
+    session.codex_session_id = try testing.allocator.dupe(u8, "thread-id");
+    session.force_new_codex = true;
+
+    const forced = Agent.buildCodexStartOptions(&session);
+    try testing.expect(forced.resume_session_id == null);
+
+    session.force_new_codex = false;
+    const resume_opts = Agent.buildCodexStartOptions(&session);
+    try testing.expect(resume_opts.resume_session_id != null);
+    try testing.expect(std.mem.eql(u8, resume_opts.resume_session_id.?, "thread-id"));
+}
+
+test "prepareFreshSessions clears resume state" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
+    defer agent.deinit();
+
+    var session = Agent.Session{
+        .id = try testing.allocator.dupe(u8, "session"),
+        .cwd = try testing.allocator.dupe(u8, "."),
+        .config = .{ .auto_resume = true, .duet_default = .both, .duet_primary = .claude },
+        .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+    };
+    defer session.deinit(testing.allocator);
+
+    session.cli_session_id = try testing.allocator.dupe(u8, "claude-id");
+    session.codex_session_id = try testing.allocator.dupe(u8, "codex-id");
+    const tool_key = try testing.allocator.dupe(u8, "tool");
+    try session.pending_execute_tools.put(tool_key, {});
+
+    agent.prepareFreshSessions(&session);
+
+    try testing.expect(session.cli_session_id == null);
+    try testing.expect(session.codex_session_id == null);
+    try testing.expect(session.force_new_claude);
+    try testing.expect(session.force_new_codex);
+    try testing.expect(session.pending_execute_tools.count() == 0);
 }
