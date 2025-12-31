@@ -410,6 +410,18 @@ pub const Agent = struct {
     pending_response_numbers: std.AutoHashMap(i64, jsonrpc.ParsedMessage),
     pending_response_strings: std.StringHashMap(jsonrpc.ParsedMessage),
 
+    const EditInfo = struct {
+        path: []const u8,
+        old_text: []const u8,
+        new_text: []const u8,
+
+        fn deinit(self: EditInfo, allocator: Allocator) void {
+            allocator.free(self.path);
+            allocator.free(self.old_text);
+            allocator.free(self.new_text);
+        }
+    };
+
     const Session = struct {
         id: []const u8,
         cwd: []const u8,
@@ -426,6 +438,7 @@ pub const Agent = struct {
         force_new_claude: bool = false,
         force_new_codex: bool = false,
         pending_execute_tools: std.StringHashMap(void),
+        pending_edit_tools: std.StringHashMap(EditInfo),
         always_allowed_tools: std.StringHashMap(void), // Tools granted "Always Allow"
         permission_socket: ?std.posix.socket_t = null,
         permission_socket_path: ?[]const u8 = null,
@@ -440,6 +453,12 @@ pub const Agent = struct {
                 allocator.free(entry.key_ptr.*);
             }
             self.pending_execute_tools.deinit();
+            var eit = self.pending_edit_tools.iterator();
+            while (eit.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                entry.value_ptr.deinit(allocator);
+            }
+            self.pending_edit_tools.deinit();
             var ait = self.always_allowed_tools.iterator();
             while (ait.next()) |entry| {
                 allocator.free(entry.key_ptr.*);
@@ -707,6 +726,7 @@ pub const Agent = struct {
             .model = model_copy,
             .settings = settings,
             .pending_execute_tools = std.StringHashMap(void).init(self.allocator),
+            .pending_edit_tools = std.StringHashMap(EditInfo).init(self.allocator),
             .always_allowed_tools = std.StringHashMap(void).init(self.allocator),
         };
         try self.sessions.put(session_id, session);
@@ -2142,6 +2162,7 @@ pub const Agent = struct {
         status: protocol.SessionUpdate.ToolCallStatus,
         terminal_id: ?[]const u8,
         raw_output: ?std.json.Value,
+        edit_info: ?EditInfo,
     ) !void {
         const tag_engine = self.shouldTagEngine(session);
         var id_buf: [256]u8 = undefined;
@@ -2165,7 +2186,7 @@ pub const Agent = struct {
         }
         defer if (content_owned) |text| self.allocator.free(text);
 
-        var entries: [2]protocol.SessionUpdate.ToolCallContent = undefined;
+        var entries: [3]protocol.SessionUpdate.ToolCallContent = undefined;
         var count: usize = 0;
 
         if (tagged_content) |text| {
@@ -2174,6 +2195,15 @@ pub const Agent = struct {
         }
         if (terminal_id) |tid| {
             entries[count] = .{ .type = "terminal", .terminalId = tid };
+            count += 1;
+        }
+        if (edit_info) |info| {
+            entries[count] = .{
+                .type = "edit",
+                .path = info.path,
+                .oldText = info.old_text,
+                .newText = info.new_text,
+            };
             count += 1;
         }
 
@@ -2207,9 +2237,8 @@ pub const Agent = struct {
     const EditToolInput = struct {
         file_path: ?[]const u8 = null,
         path: ?[]const u8 = null,
-        new_text: ?[]const u8 = null,
-        newText: ?[]const u8 = null,
-        content: ?[]const u8 = null,
+        old_string: ?[]const u8 = null,
+        new_string: ?[]const u8 = null,
     };
 
     fn trackExecuteTool(self: *Agent, session: *Session, engine: Engine, tool_id: []const u8) !void {
@@ -2248,6 +2277,61 @@ pub const Agent = struct {
         return false;
     }
 
+    fn trackEditTool(self: *Agent, session: *Session, engine: Engine, tool_id: []const u8, raw_input: ?std.json.Value) !void {
+        const input_value = raw_input orelse return;
+        const parsed = std.json.parseFromValue(EditToolInput, self.allocator, input_value, .{
+            .ignore_unknown_fields = true,
+        }) catch return;
+        defer parsed.deinit();
+
+        const input = parsed.value;
+        const path = input.file_path orelse input.path orelse return;
+        const old_text = input.old_string orelse return;
+        const new_text = input.new_string orelse return;
+
+        const owned_id = if (self.shouldTagEngine(session))
+            try self.tagToolId(engine, tool_id)
+        else
+            try self.allocator.dupe(u8, tool_id);
+        errdefer self.allocator.free(owned_id);
+
+        const edit_info = EditInfo{
+            .path = try self.allocator.dupe(u8, path),
+            .old_text = try self.allocator.dupe(u8, old_text),
+            .new_text = try self.allocator.dupe(u8, new_text),
+        };
+        errdefer edit_info.deinit(self.allocator);
+
+        try session.pending_edit_tools.put(owned_id, edit_info);
+    }
+
+    fn consumeEditTool(self: *Agent, session: *Session, engine: Engine, tool_id: []const u8) ?EditInfo {
+        if (!self.shouldTagEngine(session)) {
+            if (session.pending_edit_tools.fetchRemove(tool_id)) |entry| {
+                self.allocator.free(entry.key);
+                return entry.value;
+            }
+            return null;
+        }
+
+        var id_buf: [512]u8 = undefined;
+        if (self.formatToolId(&id_buf, engine, tool_id)) |key| {
+            if (session.pending_edit_tools.fetchRemove(key)) |entry| {
+                self.allocator.free(entry.key);
+                return entry.value;
+            }
+            return null;
+        }
+
+        const owned = self.tagToolId(engine, tool_id) catch return null;
+        defer self.allocator.free(owned);
+        if (session.pending_edit_tools.fetchRemove(owned)) |entry| {
+            self.allocator.free(entry.key);
+            return entry.value;
+        }
+        return null;
+    }
+
     fn maybeSyncWriteTool(
         self: *Agent,
         session: *Session,
@@ -2281,8 +2365,8 @@ pub const Agent = struct {
                 };
                 defer parsed.deinit();
                 const path = parsed.value.file_path orelse parsed.value.path orelse return;
-                const content = parsed.value.new_text orelse parsed.value.newText orelse parsed.value.content orelse return;
-                _ = try self.requestWriteTextFile(session, session_id, path, content);
+                const new_content = parsed.value.new_string orelse return;
+                _ = try self.requestWriteTextFile(session, session_id, path, new_content);
             },
         }
     }
@@ -2429,6 +2513,9 @@ pub const Agent = struct {
         if (kind == .execute and self.canUseTerminal()) {
             try self.trackExecuteTool(session, engine, tool_id);
         }
+        if (kind == .edit) {
+            try self.trackEditTool(session, engine, tool_id, raw_input);
+        }
         try self.sendEngineToolCall(session, session_id, engine, tool_id, display_name, kind, raw_input);
         try self.maybeSyncWriteTool(session, session_id, permission_name, raw_input);
     }
@@ -2459,8 +2546,14 @@ pub const Agent = struct {
                 };
             }
         }
+
+        // Check for edit tool diff info
+        var edit_info: ?EditInfo = null;
+        defer if (edit_info) |info| info.deinit(self.allocator);
+        edit_info = self.consumeEditTool(session, engine, tool_id);
+
         const raw = if (raw_output != .null) raw_output else null;
-        try self.sendEngineToolResult(session, session_id, engine, tool_id, content, status, terminal_id, raw);
+        try self.sendEngineToolResult(session, session_id, engine, tool_id, content, status, terminal_id, raw, edit_info);
     }
 
     fn requestPermission(
@@ -3305,6 +3398,7 @@ pub const Agent = struct {
             .availability = undefined,
             .model = model_copy,
             .pending_execute_tools = std.StringHashMap(void).init(self.allocator),
+            .pending_edit_tools = std.StringHashMap(EditInfo).init(self.allocator),
             .always_allowed_tools = std.StringHashMap(void).init(self.allocator),
         };
         try self.sessions.put(sid_copy, session);
@@ -4359,6 +4453,7 @@ test "Agent requestPermission sends request and parses response" {
         .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
@@ -4399,6 +4494,7 @@ test "Agent requestPermissionFromClient stores allow_always choice" {
         .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
@@ -4432,6 +4528,7 @@ test "Agent sendEngineText omits prefix in solo mode" {
         .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
@@ -4457,6 +4554,7 @@ test "Agent sendEngineToolCall omits prefix in solo mode" {
         .config = .{ .auto_resume = true, .route = .codex, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
@@ -4498,6 +4596,7 @@ test "Agent requestWriteTextFile sends request" {
         .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
@@ -4541,6 +4640,7 @@ test "Agent mirrorTerminalOutput sends terminal requests" {
         .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
@@ -4976,6 +5076,7 @@ test "property: collectPromptParts finds text regardless of position" {
                 .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
                 .availability = .{ .claude = true, .codex = true },
                 .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+                .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
                 .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
             };
             defer session.deinit(testing.allocator);
@@ -5005,6 +5106,7 @@ test "property: collectPromptParts returns null when no text block" {
                 .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
                 .availability = .{ .claude = true, .codex = true },
                 .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+                .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
                 .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
             };
             defer session.deinit(testing.allocator);
@@ -5032,6 +5134,7 @@ test "collectPromptParts handles empty blocks" {
         .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
@@ -5064,6 +5167,7 @@ test "collectPromptParts skips codex image fallback when supported" {
         .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
@@ -5318,6 +5422,7 @@ test "buildClaudeStartOptions honors force_new" {
         .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
@@ -5342,6 +5447,7 @@ test "buildCodexStartOptions honors force_new" {
         .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
@@ -5370,6 +5476,7 @@ test "prepareFreshSessions clears resume state" {
         .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
