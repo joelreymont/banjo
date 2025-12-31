@@ -4346,6 +4346,51 @@ test "Agent requestPermission sends request and parses response" {
     ).diff(tw.getOutput(), true);
 }
 
+test "Agent requestPermissionFromClient stores allow_always choice" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    // Mock response with "allow_always"
+    const response_json =
+        \\{"jsonrpc":"2.0","id":1,"result":{"outcome":{"outcome":"selected","optionId":"allow_always"}}}
+        \\
+    ;
+    const input_buf = try testing.allocator.dupe(u8, response_json);
+    defer testing.allocator.free(input_buf);
+
+    var input_stream = std.io.fixedBufferStream(input_buf);
+    var reader = jsonrpc.Reader.init(testing.allocator, input_stream.reader().any());
+    defer reader.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream, &reader);
+    defer agent.deinit();
+
+    var session = Agent.Session{
+        .id = try testing.allocator.dupe(u8, "session-1"),
+        .cwd = try testing.allocator.dupe(u8, "."),
+        .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
+        .availability = .{ .claude = true, .codex = true },
+        .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+        .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+    };
+    defer session.deinit(testing.allocator);
+
+    // First call - should prompt and store
+    const req = Agent.PermissionHookRequest{
+        .tool_name = "Bash",
+        .tool_use_id = "tc-1",
+        .tool_input = .{ .string = "echo hello" },
+        .session_id = "session-1",
+    };
+    const decision1 = try agent.requestPermissionFromClient(&session, req);
+    try testing.expectEqualStrings("allow", decision1.behavior);
+    try testing.expect(session.always_allowed_tools.contains("Bash"));
+
+    // Second call - should return immediately without prompting
+    const decision2 = try agent.requestPermissionFromClient(&session, req);
+    try testing.expectEqualStrings("allow", decision2.behavior);
+}
+
 test "Agent sendEngineText omits prefix in solo mode" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
