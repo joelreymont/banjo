@@ -1315,7 +1315,10 @@ pub const Agent = struct {
         _ = reader;
 
         const request_id = try self.tool_proxy.readFile(session_id, path, line, limit);
-        var response = try self.waitForResponse(session, .{ .number = request_id });
+        var response = self.waitForResponse(session, .{ .number = request_id }) catch |err| {
+            if (err == error.Cancelled) return null;
+            return err;
+        };
         defer response.deinit();
 
         const resp = response.message.response;
@@ -1348,7 +1351,10 @@ pub const Agent = struct {
         _ = reader;
 
         const request_id = try self.tool_proxy.writeFile(session_id, path, content);
-        var response = try self.waitForResponse(session, .{ .number = request_id });
+        var response = self.waitForResponse(session, .{ .number = request_id }) catch |err| {
+            if (err == error.Cancelled) return false;
+            return err;
+        };
         defer response.deinit();
 
         const resp = response.message.response;
