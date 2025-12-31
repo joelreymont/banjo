@@ -3,6 +3,121 @@ const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.settings);
 
+/// Result of ensuring hook is configured
+pub const HookConfigResult = enum {
+    already_configured,
+    configured,
+    failed,
+};
+
+/// Ensure the Banjo permission hook is configured in ~/.claude/settings.json
+/// Returns whether it was newly configured (user needs to restart Claude Code)
+pub fn ensurePermissionHook(allocator: Allocator) HookConfigResult {
+    const home = std.posix.getenv("HOME") orelse return .failed;
+    return ensurePermissionHookInDir(allocator, home);
+}
+
+/// Internal: ensure hook in specified home directory (for testing)
+fn ensurePermissionHookInDir(allocator: Allocator, home: []const u8) HookConfigResult {
+    // Use arena for all JSON allocations - cleaned up on return
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const settings_path = std.fs.path.join(aa, &.{ home, ".claude", "settings.json" }) catch return .failed;
+
+    // Read existing file or start with empty object
+    var root: std.json.Value = blk: {
+        const file = std.fs.cwd().openFile(settings_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => break :blk .{ .object = std.json.ObjectMap.init(aa) },
+            else => return .failed,
+        };
+        defer file.close();
+        const content = file.readToEndAlloc(aa, 1024 * 1024) catch return .failed;
+        const parsed = std.json.parseFromSlice(std.json.Value, aa, content, .{}) catch return .failed;
+        break :blk parsed.value;
+    };
+
+    const obj = switch (root) {
+        .object => |*o| o,
+        else => return .failed,
+    };
+
+    // Get or create hooks object
+    const hooks = if (obj.getPtr("hooks")) |h| switch (h.*) {
+        .object => |*ho| ho,
+        else => return .failed,
+    } else blk: {
+        const hooks_obj = std.json.ObjectMap.init(aa);
+        obj.put("hooks", .{ .object = hooks_obj }) catch return .failed;
+        break :blk &obj.getPtr("hooks").?.object;
+    };
+
+    // Check if PermissionRequest already has our hook
+    if (hooks.get("PermissionRequest")) |pr| {
+        if (pr == .array) {
+            for (pr.array.items) |item| {
+                if (item == .object) {
+                    if (item.object.get("hooks")) |item_hooks| {
+                        if (item_hooks == .array) {
+                            for (item_hooks.array.items) |hook| {
+                                if (hook == .object) {
+                                    if (hook.object.get("command")) |cmd| {
+                                        if (cmd == .string and std.mem.indexOf(u8, cmd.string, "banjo hook permission") != null) {
+                                            return .already_configured;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Build new hook entry: {"hooks": [{"type": "command", "command": "banjo hook permission"}]}
+    var hook_cmd = std.json.ObjectMap.init(aa);
+    hook_cmd.put("type", .{ .string = "command" }) catch return .failed;
+    hook_cmd.put("command", .{ .string = "banjo hook permission" }) catch return .failed;
+
+    var hooks_array = std.json.Array.init(aa);
+    hooks_array.append(.{ .object = hook_cmd }) catch return .failed;
+
+    var entry = std.json.ObjectMap.init(aa);
+    entry.put("hooks", .{ .array = hooks_array }) catch return .failed;
+
+    // Get or create PermissionRequest array
+    const pr_array = if (hooks.getPtr("PermissionRequest")) |pr| switch (pr.*) {
+        .array => |*a| a,
+        else => return .failed,
+    } else blk: {
+        const arr = std.json.Array.init(aa);
+        hooks.put("PermissionRequest", .{ .array = arr }) catch return .failed;
+        break :blk &hooks.getPtr("PermissionRequest").?.array;
+    };
+
+    // Add our hook entry
+    pr_array.append(.{ .object = entry }) catch return .failed;
+
+    // Ensure ~/.claude directory exists
+    const claude_dir = std.fs.path.join(aa, &.{ home, ".claude" }) catch return .failed;
+    std.fs.cwd().makePath(claude_dir) catch {};
+
+    // Write back with pretty-printing
+    const json = std.json.Stringify.valueAlloc(aa, root, .{
+        .whitespace = .indent_2,
+    }) catch return .failed;
+
+    const file = std.fs.cwd().createFile(settings_path, .{}) catch return .failed;
+    defer file.close();
+    file.writeAll(json) catch return .failed;
+    file.writeAll("\n") catch return .failed;
+
+    log.info("Configured Banjo permission hook in {s}", .{settings_path});
+    return .configured;
+}
+
 /// Claude Code settings from .claude/settings.json
 pub const Settings = struct {
     /// Tools that are always allowed
@@ -290,4 +405,44 @@ test "property: multiple tools can be allowed/denied" {
                 settings.denied_tools.count() <= args.num_denied;
         }
     }.prop, .{});
+}
+
+test "ensurePermissionHook with temp directory" {
+    // Create temp directory to act as HOME
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Create .claude subdirectory
+    tmp_dir.dir.makePath(".claude") catch |err| {
+        std.debug.print("Failed to create .claude: {}\n", .{err});
+        return err;
+    };
+
+    // Write initial settings file
+    const initial = "{\"model\": \"opus\", \"hooks\": {}}";
+    const settings_file = try tmp_dir.dir.createFile(".claude/settings.json", .{});
+    try settings_file.writeAll(initial);
+    settings_file.close();
+
+    // Get path to temp dir
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try tmp_dir.dir.realpath(".", &path_buf);
+
+    // Test ensurePermissionHookInDir (new helper we'll add)
+    const result = ensurePermissionHookInDir(testing.allocator, tmp_path);
+    try testing.expectEqual(HookConfigResult.configured, result);
+
+    // Verify file was updated
+    const updated_file = try tmp_dir.dir.openFile(".claude/settings.json", .{});
+    defer updated_file.close();
+    const content = try updated_file.readToEndAlloc(testing.allocator, 64 * 1024);
+    defer testing.allocator.free(content);
+
+    // Check that our hook is in there
+    try testing.expect(std.mem.indexOf(u8, content, "banjo hook permission") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "PermissionRequest") != null);
+
+    // Running again should return already_configured
+    const result2 = ensurePermissionHookInDir(testing.allocator, tmp_path);
+    try testing.expectEqual(HookConfigResult.already_configured, result2);
 }

@@ -713,7 +713,12 @@ pub const Agent = struct {
         }
 
         // Pre-start Claude Code for instant first response (auto-resume last session if enabled)
+        // Also ensure permission hook is configured in ~/.claude/settings.json
+        var hook_configured = false;
         if (availability.claude) {
+            const hook_result = settings_loader.ensurePermissionHook(self.allocator);
+            hook_configured = hook_result == .configured;
+
             session.bridge = Bridge.init(self.allocator, session.cwd);
             session.bridge.?.start(buildClaudeStartOptions(session)) catch |err| {
                 log.warn("Failed to pre-start Claude Code: {} - will retry on first prompt", .{err});
@@ -761,7 +766,18 @@ pub const Agent = struct {
                 .sessionUpdate = .agent_message_chunk,
                 .content = .{
                     .type = "text",
-                    .text = "✨ Created `.zed/settings.json` to enable banjo-notes LSP.\n\n**Reload workspace** (Cmd+Shift+P → \"workspace: reload\") to activate note features.",
+                    .text = "Created `.zed/settings.json` to enable banjo-notes LSP.\n\n**Reload workspace** (Cmd+Shift+P → \"workspace: reload\") to activate note features.",
+                },
+            });
+        }
+
+        // Notify user if permission hook was configured
+        if (hook_configured) {
+            try self.sendSessionUpdate(session_id, .{
+                .sessionUpdate = .agent_message_chunk,
+                .content = .{
+                    .type = "text",
+                    .text = "Configured Banjo permission hook in `~/.claude/settings.json`.\n\n**Restart Claude Code** for interactive permission prompts in Zed.",
                 },
             });
         }
