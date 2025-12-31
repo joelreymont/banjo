@@ -4498,6 +4498,44 @@ test "Agent sendEngineToolCall omits prefix in solo mode" {
     ).diff(tw.getOutput(), true);
 }
 
+test "Agent sendEngineToolCall skips quiet tools and tracks ID" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
+    defer agent.deinit();
+
+    var session = Agent.Session{
+        .id = try testing.allocator.dupe(u8, "session-1"),
+        .cwd = try testing.allocator.dupe(u8, "."),
+        .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
+        .availability = .{ .claude = true, .codex = true },
+        .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
+        .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+        .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
+    };
+    defer session.deinit(testing.allocator);
+
+    // Send a quiet tool (Read) - should produce no output and track ID
+    try agent.sendEngineToolCall(&session, session.id, .claude, "tc-quiet", "Read", .read, null);
+
+    // Verify no output was produced
+    try testing.expectEqualStrings("", tw.getOutput());
+
+    // Verify the tool ID was tracked
+    try testing.expect(session.quiet_tool_ids.contains("tc-quiet"));
+
+    // Send result for the quiet tool - should also produce no output
+    try agent.sendEngineToolResult(&session, session.id, .claude, "tc-quiet", "file contents", .completed, null, null, null);
+
+    // Still no output
+    try testing.expectEqualStrings("", tw.getOutput());
+
+    // ID should be consumed
+    try testing.expect(!session.quiet_tool_ids.contains("tc-quiet"));
+}
+
 test "Agent requestWriteTextFile sends request" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
