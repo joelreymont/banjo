@@ -2022,6 +2022,7 @@ pub const Agent = struct {
         .{ "TodoRead", {} },
         .{ "Task", {} },
         .{ "TaskOutput", {} },
+        .{ "Skill", {} },
         .{ "Read", {} },
         .{ "Grep", {} },
         .{ "Glob", {} },
