@@ -437,6 +437,7 @@ pub const Agent = struct {
         pending_execute_tools: std.StringHashMap(void),
         pending_edit_tools: std.StringHashMap(EditInfo),
         always_allowed_tools: std.StringHashMap(void), // Tools granted "Always Allow"
+        quiet_tool_ids: std.StringHashMap(void), // Tool IDs that were silenced (no UI update sent)
         permission_socket: ?std.posix.socket_t = null,
         permission_socket_path: ?[]const u8 = null,
 
@@ -461,6 +462,11 @@ pub const Agent = struct {
                 allocator.free(entry.key_ptr.*);
             }
             self.always_allowed_tools.deinit();
+            var qit = self.quiet_tool_ids.iterator();
+            while (qit.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+            }
+            self.quiet_tool_ids.deinit();
             allocator.free(self.id);
             allocator.free(self.cwd);
             if (self.model) |m| allocator.free(m);
@@ -725,6 +731,7 @@ pub const Agent = struct {
             .pending_execute_tools = std.StringHashMap(void).init(self.allocator),
             .pending_edit_tools = std.StringHashMap(EditInfo).init(self.allocator),
             .always_allowed_tools = std.StringHashMap(void).init(self.allocator),
+            .quiet_tool_ids = std.StringHashMap(void).init(self.allocator),
         };
         try self.sessions.put(session_id, session);
 
@@ -2032,8 +2039,11 @@ pub const Agent = struct {
         kind: protocol.SessionUpdate.ToolKind,
         raw_input: ?std.json.Value,
     ) !void {
-        // Skip UI updates for internal service tools
-        if (quiet_tools.has(tool_name)) return;
+        // Skip UI updates for internal service tools, track ID to also skip result
+        if (quiet_tools.has(tool_name)) {
+            try self.trackQuietTool(session, engine, tool_id);
+            return;
+        }
 
         var execute_preview: ?[]const u8 = null;
         var execute_parsed: ?std.json.Parsed(ExecuteToolInput) = null;
@@ -2177,6 +2187,9 @@ pub const Agent = struct {
         raw_output: ?std.json.Value,
         edit_info: ?EditInfo,
     ) !void {
+        // Skip result for tools that were silenced at call time
+        if (try self.consumeQuietTool(session, engine, tool_id)) return;
+
         const tag_engine = self.shouldTagEngine(session);
         var id_buf: [256]u8 = undefined;
         var id_owned: ?[]const u8 = null;
@@ -2284,6 +2297,42 @@ pub const Agent = struct {
         const owned = try self.tagToolId(engine, tool_id);
         defer self.allocator.free(owned);
         if (session.pending_execute_tools.fetchRemove(owned)) |entry| {
+            self.allocator.free(entry.key);
+            return true;
+        }
+        return false;
+    }
+
+    fn trackQuietTool(self: *Agent, session: *Session, engine: Engine, tool_id: []const u8) !void {
+        const owned = if (self.shouldTagEngine(session))
+            try self.tagToolId(engine, tool_id)
+        else
+            try self.allocator.dupe(u8, tool_id);
+        errdefer self.allocator.free(owned);
+        try session.quiet_tool_ids.put(owned, {});
+    }
+
+    fn consumeQuietTool(self: *Agent, session: *Session, engine: Engine, tool_id: []const u8) !bool {
+        if (!self.shouldTagEngine(session)) {
+            if (session.quiet_tool_ids.fetchRemove(tool_id)) |entry| {
+                self.allocator.free(entry.key);
+                return true;
+            }
+            return false;
+        }
+
+        var id_buf: [512]u8 = undefined;
+        if (self.formatToolId(&id_buf, engine, tool_id)) |key| {
+            if (session.quiet_tool_ids.fetchRemove(key)) |entry| {
+                self.allocator.free(entry.key);
+                return true;
+            }
+            return false;
+        }
+
+        const owned = try self.tagToolId(engine, tool_id);
+        defer self.allocator.free(owned);
+        if (session.quiet_tool_ids.fetchRemove(owned)) |entry| {
             self.allocator.free(entry.key);
             return true;
         }
@@ -3276,6 +3325,7 @@ pub const Agent = struct {
             .pending_execute_tools = std.StringHashMap(void).init(self.allocator),
             .pending_edit_tools = std.StringHashMap(EditInfo).init(self.allocator),
             .always_allowed_tools = std.StringHashMap(void).init(self.allocator),
+            .quiet_tool_ids = std.StringHashMap(void).init(self.allocator),
         };
         try self.sessions.put(sid_copy, session);
 
@@ -4331,6 +4381,7 @@ test "Agent requestPermission sends request and parses response" {
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+        .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
 
@@ -4372,6 +4423,7 @@ test "Agent requestPermissionFromClient stores allow_always choice" {
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+        .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
 
@@ -4406,6 +4458,7 @@ test "Agent sendEngineText omits prefix in solo mode" {
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+        .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
 
@@ -4432,6 +4485,7 @@ test "Agent sendEngineToolCall omits prefix in solo mode" {
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+        .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
 
@@ -4474,6 +4528,7 @@ test "Agent requestWriteTextFile sends request" {
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+        .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
 
@@ -4908,6 +4963,7 @@ test "property: collectPromptParts finds text regardless of position" {
                 .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
                 .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
                 .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+                .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
             };
             defer session.deinit(testing.allocator);
 
@@ -4938,6 +4994,7 @@ test "property: collectPromptParts returns null when no text block" {
                 .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
                 .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
                 .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+                .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
             };
             defer session.deinit(testing.allocator);
 
@@ -4966,6 +5023,7 @@ test "collectPromptParts handles empty blocks" {
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+        .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
 
@@ -4999,6 +5057,7 @@ test "collectPromptParts skips codex image fallback when supported" {
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+        .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
 
@@ -5254,6 +5313,7 @@ test "buildClaudeStartOptions honors force_new" {
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+        .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
 
@@ -5279,6 +5339,7 @@ test "buildCodexStartOptions honors force_new" {
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+        .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
 
@@ -5308,6 +5369,7 @@ test "prepareFreshSessions clears resume state" {
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+        .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
     };
     defer session.deinit(testing.allocator);
 
