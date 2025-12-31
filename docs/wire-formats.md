@@ -543,15 +543,11 @@ Notes:
 | user_message_chunk | ✅ | For nudge prompts |
 | agent_thought_chunk | ✅ | Extended thinking |
 | tool_call | ✅ | With locations for follow-agent |
-| tool_call_update | ⚠️ | Missing edit diffs |
+| tool_call_update | ✅ | With rawOutput and edit diffs |
 | plan | ✅ | For todo/plan entries |
 | available_commands_update | ✅ | Slash commands |
 | current_mode_update | ✅ | Mode changes |
 | current_model_update | ✅ | Model changes |
-
-### Known Gaps
-
-1. **Edit diff content**: Should send `path`/`oldText`/`newText` for edits
 
 ## Sources
 
