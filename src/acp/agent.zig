@@ -1647,8 +1647,8 @@ pub const Agent = struct {
                                 std.mem.eql(u8, reason, "end_turn"));
 
                         if (should_nudge) {
-                            log.info("Claude Code stopped ({s}); dot tasks pending, nudging to continue", .{reason});
-                            const nudge_msg = "[auto-continue: pending dot tasks]";
+                            log.info("Claude Code stopped ({s}); pending dots, nudging to continue", .{reason});
+                            const nudge_msg = "🔄 auto-continue: pending dots";
                             try self.sendUserMessage(session_id, nudge_msg);
                             _ = try self.sendClaudePromptWithRestart(session, session_id, "continue with the next dot task");
                             stream_prefix_pending = true;
@@ -1895,8 +1895,8 @@ pub const Agent = struct {
                     (has_max_turn_error or msg.turn_error == null);
 
                 if (should_nudge) {
-                    log.info("Codex turn completed; dot tasks pending, nudging to continue", .{});
-                    const nudge_msg = "[auto-continue: pending dot tasks]";
+                    log.info("Codex turn completed; pending dots, nudging to continue", .{});
+                    const nudge_msg = "🔄 auto-continue: pending dots";
                     try self.sendUserMessage(session_id, nudge_msg);
                     const continue_inputs = [_]CodexUserInput{
                         .{ .type = "text", .text = "continue with the next dot task" },
@@ -2009,6 +2009,19 @@ pub const Agent = struct {
         });
     }
 
+    // Tools that run silently without UI updates (internal housekeeping)
+    const quiet_tools = std.StaticStringMap(void).initComptime(.{
+        .{ "TodoWrite", {} },
+        .{ "TodoRead", {} },
+        .{ "Task", {} },
+        .{ "TaskOutput", {} },
+        .{ "Read", {} },
+        .{ "Grep", {} },
+        .{ "Glob", {} },
+        .{ "LSP", {} },
+        .{ "KillShell", {} },
+    });
+
     fn sendEngineToolCall(
         self: *Agent,
         session: *Session,
@@ -2019,6 +2032,9 @@ pub const Agent = struct {
         kind: protocol.SessionUpdate.ToolKind,
         raw_input: ?std.json.Value,
     ) !void {
+        // Skip UI updates for internal service tools
+        if (quiet_tools.has(tool_name)) return;
+
         var execute_preview: ?[]const u8 = null;
         var execute_parsed: ?std.json.Parsed(ExecuteToolInput) = null;
         defer if (execute_parsed) |*val| val.deinit();
