@@ -7,6 +7,10 @@ Banjo Duet is a Second Brain for your code — an ACP agent in Zig that runs [Cl
 > **Requires Claude Code or Codex installed.**
 > Run `claude /login` if you haven't already.
 
+### 🔄 Smart Auto-Continue with Dots
+
+Banjo integrates with [Dots](https://github.com/joelreymont/dots) to automatically continue work when Claude Code or Codex hit turn limits. When pending tasks exist, Banjo sends "🔄 continue working on pending dots" to keep the AI going.
+
 ## Installation
 
 1. Open Zed → Extensions → Search "Banjo Duet" → Install
@@ -14,8 +18,8 @@ Banjo Duet is a Second Brain for your code — an ACP agent in Zig that runs [Cl
 
 ## Features
 
+- **🔄 Auto-continue with Dots** — when Claude pauses at turn limits, Banjo checks for pending [Dots](https://github.com/joelreymont/dots) tasks and automatically continues
 - **Auto-resume sessions** — automatically continues your last conversation
-- **Auto-continue turns** — when Claude Code or Codex hit max-turn limits, Banjo can continue automatically
 - **Code notes** — attach notes to code as comments with `/explain`
 - **Auto-setup** — `/setup lsp` configures Zed settings automatically
 - Claude Code commands: `/version`, `/model`, `/compact`, `/review`, `/clear`
@@ -90,11 +94,16 @@ Routing defaults (optional):
 }
 ```
 
-## Dots Integration (Optional)
+## Dots Integration
 
-Banjo can auto-continue when Claude Code or Codex pause at max-turn limits by
-checking for pending tasks with [Dots](http://github.com/joelreymont/dots).
-Install `dot` and keep tasks in `dot ls --json` so Banjo knows when to continue.
+Banjo's killer feature: **automatic continuation** when Claude hits turn limits.
+
+1. Install [Dots](https://github.com/joelreymont/dots) from [releases](https://github.com/joelreymont/dots/releases)
+2. Track tasks with `dot add "task description"`
+3. When Claude pauses at max turns, Banjo checks `dot ls --json`
+4. If pending tasks exist, Banjo sends "🔄 continue working on pending dots"
+
+This keeps Claude working autonomously on complex multi-step tasks without manual intervention.
 
 ## Development
 
