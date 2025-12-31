@@ -461,10 +461,10 @@ pub const Agent = struct {
             // Remove existing socket file if present
             std.fs.cwd().deleteFile(path) catch {};
 
-            // Create non-blocking Unix domain socket
+            // Create non-blocking Unix domain socket with CLOEXEC to prevent fd inheritance
             const sock = try std.posix.socket(
                 std.posix.AF.UNIX,
-                std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK,
+                std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC,
                 0,
             );
             errdefer std.posix.close(sock);
