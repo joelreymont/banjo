@@ -543,7 +543,7 @@ Notes:
 | user_message_chunk | ✅ | For nudge prompts |
 | agent_thought_chunk | ✅ | Extended thinking |
 | tool_call | ✅ | With locations for follow-agent |
-| tool_call_update | ⚠️ | Missing rawOutput, edit diffs |
+| tool_call_update | ⚠️ | Missing edit diffs |
 | plan | ✅ | For todo/plan entries |
 | available_commands_update | ✅ | Slash commands |
 | current_mode_update | ✅ | Mode changes |
@@ -551,8 +551,7 @@ Notes:
 
 ### Known Gaps
 
-1. **tool_call_update.rawOutput**: Not sending full JSON tool result
-2. **Edit diff content**: Should send `path`/`oldText`/`newText` for edits
+1. **Edit diff content**: Should send `path`/`oldText`/`newText` for edits
 
 ## Sources
 
