@@ -533,7 +533,7 @@ Notes:
 | terminal/wait_for_exit | ✅ | Wait for completion |
 | terminal/release | ⚠️ | Skipped to keep terminals visible |
 | session/load | ❌ | loadSession=false |
-| terminal/kill | ❌ | Not implemented |
+| terminal/kill | ✅ | In ToolProxy |
 
 ### Session Update Types
 
@@ -553,8 +553,6 @@ Notes:
 
 1. **tool_call_update.rawOutput**: Not sending full JSON tool result
 2. **Edit diff content**: Should send `path`/`oldText`/`newText` for edits
-3. **locations.line**: Only sending path, not line numbers
-4. **terminalId in content**: Terminal output not linked to tool calls
 
 ## Sources
 
