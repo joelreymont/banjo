@@ -2532,7 +2532,9 @@ pub const Agent = struct {
     ) !void {
         var terminal_id: ?[]const u8 = null;
         defer if (terminal_id) |tid| self.allocator.free(tid);
-        if (try self.consumeExecuteTool(session, engine, tool_id)) {
+        const is_execute_tool = try self.consumeExecuteTool(session, engine, tool_id);
+        // Only mirror terminal output for completed commands, not permission denials
+        if (is_execute_tool and status == .completed) {
             if (content) |text| {
                 terminal_id = self.mirrorTerminalOutput(session, session_id, text) catch |err| blk: {
                     if (err == error.InvalidTerminalResponse) {
