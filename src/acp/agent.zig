@@ -2630,9 +2630,55 @@ pub const Agent = struct {
         _ = std.posix.write(fd, response) catch {};
     }
 
+    /// Build a descriptive title for permission prompts from tool name and input
+    fn buildPermissionTitle(self: *Agent, tool_name: []const u8, tool_input: std.json.Value) []const u8 {
+        // Extract the key detail from tool_input based on tool type
+        if (tool_input != .object) return tool_name;
+
+        const obj = tool_input.object;
+
+        // Map tool names to their primary input field
+        const field_map = std.StaticStringMap([]const u8).initComptime(.{
+            .{ "Read", "file_path" },
+            .{ "Write", "file_path" },
+            .{ "Edit", "file_path" },
+            .{ "Bash", "command" },
+            .{ "Grep", "pattern" },
+            .{ "Glob", "pattern" },
+            .{ "WebFetch", "url" },
+            .{ "WebSearch", "query" },
+        });
+
+        const field_name = field_map.get(tool_name) orelse return tool_name;
+        const field_value = obj.get(field_name) orelse return tool_name;
+
+        const detail = switch (field_value) {
+            .string => |s| s,
+            else => return tool_name,
+        };
+
+        // Truncate long details
+        const max_len: usize = 60;
+        const truncated = if (detail.len > max_len)
+            detail[0..max_len]
+        else
+            detail;
+
+        // Format: "Tool: detail"
+        return std.fmt.allocPrint(self.allocator, "{s}: {s}{s}", .{
+            tool_name,
+            truncated,
+            if (detail.len > max_len) "..." else "",
+        }) catch tool_name;
+    }
+
     fn requestPermissionFromClient(self: *Agent, session: *Session, req: PermissionHookRequest) !PermissionDecision {
         // Map tool name to kind
         const kind = mapToolKind(req.tool_name);
+
+        // Build descriptive title including tool details
+        const title = self.buildPermissionTitle(req.tool_name, req.tool_input);
+        defer if (title.ptr != req.tool_name.ptr) self.allocator.free(title);
 
         // Build ACP permission request
         const request_id = self.next_request_id;
@@ -2644,7 +2690,7 @@ pub const Agent = struct {
             .sessionId = session.id,
             .toolCall = .{
                 .toolCallId = tool_call_id,
-                .title = req.tool_name,
+                .title = title,
                 .kind = kind,
                 .status = .pending,
                 .rawInput = req.tool_input,
