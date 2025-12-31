@@ -158,12 +158,14 @@ fn printHelp() void {
     ) catch {};
 }
 
-// Hook input/output types for Claude Code PermissionRequest hook
+// Hook input/output types for Claude Code PreToolUse hook
 const HookInput = struct {
     tool_name: []const u8 = "",
     tool_input: std.json.Value = .null,
     tool_use_id: []const u8 = "",
     session_id: []const u8 = "",
+    hook_event_name: []const u8 = "",
+    permission_mode: []const u8 = "",
 };
 
 const HookSocketRequest = struct {
@@ -175,35 +177,39 @@ const HookSocketRequest = struct {
 
 const HookSocketResponse = struct {
     decision: []const u8 = "ask",
-    message: ?[]const u8 = null,
+    reason: ?[]const u8 = null,
 };
 
-const HookDecision = struct {
-    behavior: []const u8,
-    message: ?[]const u8 = null,
-};
-
-const HookSpecificOutput = struct {
-    hookEventName: []const u8 = "PermissionRequest",
-    decision: HookDecision,
-};
-
-const HookOutput = struct {
-    hookSpecificOutput: HookSpecificOutput,
-};
+/// Debug log to file (hooks stderr may not be visible)
+fn hookDebugLog(comptime fmt: []const u8, args: anytype) void {
+    const file = std.fs.cwd().createFile("/tmp/banjo-hook-debug.log", .{ .truncate = false }) catch return;
+    defer file.close();
+    file.seekFromEnd(0) catch return;
+    var buf: [1024]u8 = undefined;
+    const now = std.time.timestamp();
+    const prefix_len = std.fmt.bufPrint(&buf, "[{d}] ", .{now}) catch return;
+    file.writeAll(prefix_len) catch return;
+    const msg_len = std.fmt.bufPrint(&buf, fmt ++ "\n", args) catch return;
+    file.writeAll(msg_len) catch return;
+}
 
 /// Run the permission hook - reads from stdin, connects to Banjo socket, returns decision
 fn runPermissionHook(allocator: std.mem.Allocator) !void {
+    hookDebugLog("Hook invoked", .{});
+
     const max_input = 64 * 1024;
     const stdin = std.fs.File.stdin();
     const stdout = std.fs.File.stdout().deprecatedWriter();
 
     // Read JSON from stdin
     const input = stdin.readToEndAlloc(allocator, max_input) catch |err| {
+        hookDebugLog("Failed to read stdin: {}", .{err});
         log.warn("Failed to read stdin: {}", .{err});
         return;
     };
     defer allocator.free(input);
+
+    hookDebugLog("Read {d} bytes from stdin", .{input.len});
 
     if (input.len == 0) return;
 
@@ -211,21 +217,26 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
     var parsed = std.json.parseFromSlice(HookInput, allocator, input, .{
         .ignore_unknown_fields = true,
     }) catch |err| {
+        hookDebugLog("Failed to parse hook input: {}", .{err});
         log.warn("Failed to parse hook input: {}", .{err});
         return;
     };
     defer parsed.deinit();
 
     const hook_input = parsed.value;
+    hookDebugLog("Parsed hook: tool={s} session={s}", .{ hook_input.tool_name, hook_input.session_id });
 
     // Get socket path from environment
     const socket_path = std.posix.getenv("BANJO_PERMISSION_SOCKET") orelse {
+        hookDebugLog("No BANJO_PERMISSION_SOCKET env var", .{});
         // No socket configured - defer to default behavior
         return;
     };
+    hookDebugLog("Socket path: {s}", .{socket_path});
 
     // Connect to Banjo socket
     const sock = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch |err| {
+        hookDebugLog("Failed to create socket: {}", .{err});
         log.warn("Failed to create socket: {}", .{err});
         return;
     };
@@ -242,10 +253,13 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
     const path_len = @min(socket_path.len, addr.path.len - 1);
     @memcpy(addr.path[0..path_len], socket_path[0..path_len]);
 
+    hookDebugLog("Connecting to socket...", .{});
     std.posix.connect(sock, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un)) catch |err| {
+        hookDebugLog("Failed to connect to socket: {}", .{err});
         log.warn("Failed to connect to socket: {}", .{err});
         return;
     };
+    hookDebugLog("Connected to socket", .{});
 
     // Send request as JSON
     var out: std.io.Writer.Allocating = .init(allocator);
@@ -289,7 +303,7 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
 
     const resp = resp_parsed.value;
 
-    // Output Claude Code hook format (static JSON strings for simplicity)
+    // Output Claude Code hook format for PreToolUse
     const Decision = enum { allow, deny };
     const decision_map = std.StaticStringMap(Decision).initComptime(.{
         .{ "allow", .allow },
@@ -297,16 +311,28 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
     });
 
     if (decision_map.get(resp.decision)) |decision| {
+        hookDebugLog("Outputting decision: {s}", .{resp.decision});
         switch (decision) {
             .allow => stdout.writeAll(
-                \\{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}
+                \\{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}
             ) catch return,
-            .deny => stdout.writeAll(
-                \\{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"Permission denied"}}}
-            ) catch return,
+            .deny => {
+                // Include reason if provided
+                if (resp.reason) |reason| {
+                    var buf: [512]u8 = undefined;
+                    const output = std.fmt.bufPrint(&buf, "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"{s}\"}}}}", .{reason}) catch return;
+                    stdout.writeAll(output) catch return;
+                } else {
+                    stdout.writeAll(
+                        \\{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Permission denied by Banjo"}}
+                    ) catch return;
+                }
+            },
         }
+    } else {
+        hookDebugLog("Unknown decision: {s}, deferring to default", .{resp.decision});
     }
-    // For "ask" or unknown, output nothing - defer to default behavior
+    // For "ask" or unknown, output nothing - defer to default permission flow
 }
 
 pub fn main() !void {

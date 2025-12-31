@@ -2559,7 +2559,10 @@ pub const Agent = struct {
     }
 
     fn pollPermissionSocket(self: *Agent, session: *Session) void {
-        const sock = session.permission_socket orelse return;
+        const sock = session.permission_socket orelse {
+            log.debug("No permission socket to poll", .{});
+            return;
+        };
 
         // Try to accept a connection (non-blocking)
         var client_addr: std.posix.sockaddr.un = undefined;
@@ -2570,6 +2573,7 @@ pub const Agent = struct {
             return;
         };
         defer std.posix.close(client_fd);
+        log.info("Accepted permission socket connection", .{});
 
         // Read request from hook
         var buf: [4096]u8 = undefined;

@@ -53,10 +53,12 @@ fn ensurePermissionHookInDir(allocator: Allocator, home: []const u8) HookConfigR
         break :blk &obj.getPtr("hooks").?.object;
     };
 
-    // Check if PermissionRequest already has our hook
+    // Check if PreToolUse already has our hook
     // NOTE: Using raw JSON navigation here (not typed structs) to preserve unknown fields
     // in the user's settings.json when we modify it. Typed parsing would lose user's custom settings.
-    if (hooks.get("PermissionRequest")) |pr| {
+    // PreToolUse is used instead of PermissionRequest because PermissionRequest only fires
+    // when a permission dialog is shown - but in SDK/API mode there's no dialog.
+    if (hooks.get("PreToolUse")) |pr| {
         if (pr == .array) {
             for (pr.array.items) |item| {
                 if (item == .object) {
@@ -89,14 +91,14 @@ fn ensurePermissionHookInDir(allocator: Allocator, home: []const u8) HookConfigR
     var entry = std.json.ObjectMap.init(aa);
     entry.put("hooks", .{ .array = hooks_array }) catch return .failed;
 
-    // Get or create PermissionRequest array
-    const pr_array = if (hooks.getPtr("PermissionRequest")) |pr| switch (pr.*) {
+    // Get or create PreToolUse array
+    const pr_array = if (hooks.getPtr("PreToolUse")) |pr| switch (pr.*) {
         .array => |*a| a,
         else => return .failed,
     } else blk: {
         const arr = std.json.Array.init(aa);
-        hooks.put("PermissionRequest", .{ .array = arr }) catch return .failed;
-        break :blk &hooks.getPtr("PermissionRequest").?.array;
+        hooks.put("PreToolUse", .{ .array = arr }) catch return .failed;
+        break :blk &hooks.getPtr("PreToolUse").?.array;
     };
 
     // Add our hook entry
@@ -442,7 +444,7 @@ test "ensurePermissionHook with temp directory" {
 
     // Check that our hook is in there
     try testing.expect(std.mem.indexOf(u8, content, "banjo hook permission") != null);
-    try testing.expect(std.mem.indexOf(u8, content, "PermissionRequest") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "PreToolUse") != null);
 
     // Running again should return already_configured
     const result2 = ensurePermissionHookInDir(testing.allocator, tmp_path);
