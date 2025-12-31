@@ -5431,3 +5431,62 @@ test "prepareFreshSessions clears resume state" {
     try testing.expect(session.force_new_codex);
     try testing.expect(session.pending_execute_tools.count() == 0);
 }
+
+test "requestWriteTextFile returns false when cancelled" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    // No reader - waitForResponse will fail, but cancelled check comes first
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
+    defer agent.deinit();
+    agent.client_capabilities = .{
+        .fs = .{ .readTextFile = true, .writeTextFile = true },
+        .terminal = false,
+    };
+
+    var session = Agent.Session{
+        .id = try testing.allocator.dupe(u8, "session-cancel"),
+        .cwd = try testing.allocator.dupe(u8, "."),
+        .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
+        .availability = .{ .claude = true, .codex = false },
+        .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
+        .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+        .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
+        .cancelled = true, // Session is cancelled
+    };
+    defer session.deinit(testing.allocator);
+
+    // Should return false (not error) when cancelled
+    const result = try agent.requestWriteTextFile(&session, session.id, "test.txt", "content");
+    try testing.expect(!result);
+}
+
+test "requestReadTextFile returns null when cancelled" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
+    defer agent.deinit();
+    agent.client_capabilities = .{
+        .fs = .{ .readTextFile = true, .writeTextFile = true },
+        .terminal = false,
+    };
+
+    var session = Agent.Session{
+        .id = try testing.allocator.dupe(u8, "session-cancel"),
+        .cwd = try testing.allocator.dupe(u8, "."),
+        .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
+        .availability = .{ .claude = true, .codex = false },
+        .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
+        .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+        .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
+        .cancelled = true, // Session is cancelled
+    };
+    defer session.deinit(testing.allocator);
+
+    // Should return null (not error) when cancelled
+    const result = try agent.requestReadTextFile(&session, session.id, "test.txt", null, null);
+    try testing.expect(result == null);
+}
