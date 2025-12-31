@@ -1655,7 +1655,7 @@ pub const Agent = struct {
 
                         if (should_nudge) {
                             log.info("Claude Code stopped ({s}); pending dots, nudging to continue", .{reason});
-                            const nudge_msg = "🔄 auto-continue: pending dots";
+                            const nudge_msg = "🔄 continue working on pending dots";
                             try self.sendUserMessage(session_id, nudge_msg);
                             _ = try self.sendClaudePromptWithRestart(session, session_id, "continue with the next dot task");
                             stream_prefix_pending = true;
@@ -1903,7 +1903,7 @@ pub const Agent = struct {
 
                 if (should_nudge) {
                     log.info("Codex turn completed; pending dots, nudging to continue", .{});
-                    const nudge_msg = "🔄 auto-continue: pending dots";
+                    const nudge_msg = "🔄 continue working on pending dots";
                     try self.sendUserMessage(session_id, nudge_msg);
                     const continue_inputs = [_]CodexUserInput{
                         .{ .type = "text", .text = "continue with the next dot task" },
@@ -2225,7 +2225,7 @@ pub const Agent = struct {
         }
         if (edit_info) |info| {
             entries[count] = .{
-                .type = "edit",
+                .type = "diff",
                 .path = info.path,
                 .oldText = info.old_text,
                 .newText = info.new_text,
