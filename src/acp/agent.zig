@@ -1631,6 +1631,8 @@ pub const Agent = struct {
 
                         if (should_nudge) {
                             log.info("Claude Code stopped ({s}); dot tasks pending, nudging to continue", .{reason});
+                            const nudge_msg = "[auto-continue: pending dot tasks]";
+                            try self.sendUserMessage(session_id, nudge_msg);
                             _ = try self.sendClaudePromptWithRestart(session, session_id, "continue with the next dot task");
                             stream_prefix_pending = true;
                             thought_prefix_pending = true;
@@ -1877,6 +1879,8 @@ pub const Agent = struct {
 
                 if (should_nudge) {
                     log.info("Codex turn completed; dot tasks pending, nudging to continue", .{});
+                    const nudge_msg = "[auto-continue: pending dot tasks]";
+                    try self.sendUserMessage(session_id, nudge_msg);
                     const continue_inputs = [_]CodexUserInput{
                         .{ .type = "text", .text = "continue with the next dot task" },
                     };
@@ -1952,6 +1956,13 @@ pub const Agent = struct {
     fn sendEngineThoughtRaw(self: *Agent, session_id: []const u8, text: []const u8) !void {
         try self.sendSessionUpdate(session_id, .{
             .sessionUpdate = .agent_thought_chunk,
+            .content = .{ .type = "text", .text = text },
+        });
+    }
+
+    fn sendUserMessage(self: *Agent, session_id: []const u8, text: []const u8) !void {
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .user_message_chunk,
             .content = .{ .type = "text", .text = text },
         });
     }
