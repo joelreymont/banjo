@@ -2077,9 +2077,20 @@ pub const Agent = struct {
         var locations_slice: ?[]const protocol.SessionUpdate.ToolCallLocation = null;
         if (raw_input) |input| {
             if (input == .object) {
-                if (input.object.get("file_path")) |fp| {
+                const obj = input.object;
+                if (obj.get("file_path")) |fp| {
                     if (fp == .string) {
-                        locations[0] = .{ .path = fp.string, .line = null };
+                        // Extract line number from offset/line fields
+                        const line: ?u32 = blk: {
+                            if (obj.get("offset")) |off| {
+                                if (off == .integer) break :blk @intCast(off.integer);
+                            }
+                            if (obj.get("line")) |ln| {
+                                if (ln == .integer) break :blk @intCast(ln.integer);
+                            }
+                            break :blk null;
+                        };
+                        locations[0] = .{ .path = fp.string, .line = line };
                         locations_slice = locations[0..1];
                     }
                 }

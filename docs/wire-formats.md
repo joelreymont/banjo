@@ -513,6 +513,49 @@ Notes:
 - Item types are camelCase (e.g., `agentMessage`, `commandExecution`).
 - `exit_code` is null until completion
 
+## ACP Implementation Status
+
+### Implemented Methods
+
+| Method | Status | Notes |
+|--------|--------|-------|
+| initialize | ✅ | Full capability negotiation |
+| session/new | ✅ | With modes, models, config |
+| session/prompt | ✅ | Streaming via Claude/Codex bridges |
+| session/cancel | ✅ | Notification handler |
+| session/set_mode | ✅ | Mode switching |
+| session/set_model | ✅ | Model switching |
+| session/request_permission | ✅ | With Always Allow persistence |
+| fs/read_text_file | ✅ | Client capability |
+| fs/write_text_file | ✅ | Client capability |
+| terminal/create | ✅ | For output mirroring |
+| terminal/output | ✅ | Get terminal output |
+| terminal/wait_for_exit | ✅ | Wait for completion |
+| terminal/release | ⚠️ | Skipped to keep terminals visible |
+| session/load | ❌ | loadSession=false |
+| terminal/kill | ❌ | Not implemented |
+
+### Session Update Types
+
+| Update Type | Status | Notes |
+|-------------|--------|-------|
+| agent_message_chunk | ✅ | Streaming text |
+| user_message_chunk | ✅ | For nudge prompts |
+| agent_thought_chunk | ✅ | Extended thinking |
+| tool_call | ✅ | With locations for follow-agent |
+| tool_call_update | ⚠️ | Missing rawOutput, edit diffs |
+| plan | ✅ | For todo/plan entries |
+| available_commands_update | ✅ | Slash commands |
+| current_mode_update | ✅ | Mode changes |
+| current_model_update | ✅ | Model changes |
+
+### Known Gaps
+
+1. **tool_call_update.rawOutput**: Not sending full JSON tool result
+2. **Edit diff content**: Should send `path`/`oldText`/`newText` for edits
+3. **locations.line**: Only sending path, not line numbers
+4. **terminalId in content**: Terminal output not linked to tool calls
+
 ## Sources
 
 - [ACP Schema](https://agentclientprotocol.com/protocol/schema)
