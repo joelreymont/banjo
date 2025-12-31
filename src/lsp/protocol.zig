@@ -401,7 +401,7 @@ pub const Transport = struct {
     pub fn writeMessage(self: *Transport, json: []const u8) !void {
         // Write header
         var header_buf: [64]u8 = undefined;
-        const header = std.fmt.bufPrint(&header_buf, "Content-Length: {d}\r\n\r\n", .{json.len}) catch unreachable;
+        const header = try std.fmt.bufPrint(&header_buf, "Content-Length: {d}\r\n\r\n", .{json.len});
         try self.writer.writeAll(header);
 
         // Write content

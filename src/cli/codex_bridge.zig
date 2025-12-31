@@ -10,11 +10,19 @@ const test_utils = @import("test_utils.zig");
 const max_json_line_bytes: usize = 4 * 1024 * 1024;
 const rpc_timeout_ms: i64 = 30_000;
 
+pub const TurnError = struct {
+    code: ?[]const u8 = null,
+    message: ?[]const u8 = null,
+    type: ?[]const u8 = null,
+};
+
 pub const CodexMessage = struct {
     event_type: EventType,
     thread_id: ?[]const u8 = null,
     item: ?Item = null,
     text: ?[]const u8 = null,
+    turn_status: ?[]const u8 = null,
+    turn_error: ?TurnError = null,
     approval_request: ?ApprovalRequest = null,
     arena: std.heap.ArenaAllocator,
 
@@ -197,6 +205,8 @@ const TurnStartParams = struct {
 
 const TurnRef = struct {
     id: []const u8,
+    status: ?[]const u8 = null,
+    @"error": ?TurnError = null,
 };
 
 const TurnStartResponse = struct {
@@ -353,6 +363,16 @@ const ExecCommandApprovalParams = struct {
     parsedCmd: std.json.Value,
 };
 
+const ResponsePayload = struct {
+    arena: std.heap.ArenaAllocator,
+    value: std.json.Value,
+};
+
+const ResponseEntry = union(enum) {
+    ok: ResponsePayload,
+    err: void,
+};
+
 pub const CodexBridge = struct {
     allocator: Allocator,
     process: ?std.process.Child = null,
@@ -367,11 +387,19 @@ pub const CodexBridge = struct {
     pending_messages: std.ArrayList(CodexMessage) = .empty,
     pending_head: usize = 0,
     line_buffer: std.ArrayList(u8) = .empty,
+    response_map: std.AutoHashMap(i64, ResponseEntry),
+    queue_mutex: std.Thread.Mutex = .{},
+    queue_cond: std.Thread.Condition = .{},
+    write_mutex: std.Thread.Mutex = .{},
+    reader_thread: ?std.Thread = null,
+    reader_closed: bool = false,
+    stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(allocator: Allocator, cwd: []const u8) CodexBridge {
         return .{
             .allocator = allocator,
             .cwd = cwd,
+            .response_map = std.AutoHashMap(i64, ResponseEntry).init(allocator),
         };
     }
 
@@ -386,16 +414,35 @@ pub const CodexBridge = struct {
             self.current_turn_id = null;
         }
         self.clearPendingMessages();
+        self.clearResponses();
         self.pending_messages.deinit(self.allocator);
         self.line_buffer.deinit(self.allocator);
+        self.response_map.deinit();
     }
 
     fn clearPendingMessages(self: *CodexBridge) void {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+
         for (self.pending_messages.items[self.pending_head..]) |*msg| {
             msg.deinit();
         }
         self.pending_messages.clearRetainingCapacity();
         self.pending_head = 0;
+    }
+
+    fn clearResponses(self: *CodexBridge) void {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+
+        var it = self.response_map.iterator();
+        while (it.next()) |entry| {
+            switch (entry.value_ptr.*) {
+                .ok => |payload| payload.arena.deinit(),
+                .err => {},
+            }
+        }
+        self.response_map.clearRetainingCapacity();
     }
 
     fn findCodexBinary() []const u8 {
@@ -417,7 +464,9 @@ pub const CodexBridge = struct {
         approval_policy: ?[]const u8 = null,
     };
 
-    pub fn getThreadId(self: *const CodexBridge) ?[]const u8 {
+    pub fn getThreadId(self: *CodexBridge) ?[]const u8 {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
         return self.thread_id;
     }
 
@@ -447,6 +496,16 @@ pub const CodexBridge = struct {
         self.process = child;
         self.stdout_file = self.process.?.stdout;
         self.line_buffer.clearRetainingCapacity();
+        self.queue_mutex.lock();
+        self.reader_closed = false;
+        self.queue_mutex.unlock();
+        self.stop_requested.store(false, .release);
+        self.clearPendingMessages();
+        self.clearResponses();
+        self.startReaderThread() catch |err| {
+            self.stop();
+            return err;
+        };
 
         self.approval_policy = opts.approval_policy;
         try self.initialize();
@@ -462,18 +521,33 @@ pub const CodexBridge = struct {
         }
     }
 
+    fn startReaderThread(self: *CodexBridge) !void {
+        if (self.reader_thread != null) return;
+        self.reader_thread = try std.Thread.spawn(.{}, readerMain, .{self});
+    }
+
     pub fn stop(self: *CodexBridge) void {
+        self.stop_requested.store(true, .release);
         if (self.process) |*proc| {
             _ = proc.kill() catch {};
             _ = proc.wait() catch {};
             self.process = null;
             self.stdout_file = null;
-            self.saw_agent_delta = false;
-            self.saw_reasoning_delta = false;
-            self.clearPendingMessages();
-            self.line_buffer.clearRetainingCapacity();
-            log.info("Stopped Codex", .{});
         }
+        if (self.reader_thread) |thread| {
+            thread.join();
+            self.reader_thread = null;
+        }
+        self.queue_mutex.lock();
+        self.reader_closed = true;
+        self.queue_mutex.unlock();
+        self.queue_cond.broadcast();
+        self.saw_agent_delta = false;
+        self.saw_reasoning_delta = false;
+        self.clearPendingMessages();
+        self.clearResponses();
+        self.line_buffer.clearRetainingCapacity();
+        log.info("Stopped Codex", .{});
     }
 
     pub fn sendPrompt(self: *CodexBridge, inputs: []const UserInput) !void {
@@ -494,88 +568,135 @@ pub const CodexBridge = struct {
             return error.InvalidResponse;
         };
         try self.setTurnId(turn_id);
+        self.queue_mutex.lock();
         self.saw_agent_delta = false;
         self.saw_reasoning_delta = false;
+        self.queue_mutex.unlock();
     }
 
     pub fn readMessage(self: *CodexBridge) !?CodexMessage {
-        if (self.pending_head < self.pending_messages.items.len) {
-            const msg = self.pending_messages.items[self.pending_head];
-            self.pending_head += 1;
-            if (self.pending_head >= self.pending_messages.items.len) {
-                self.pending_messages.clearRetainingCapacity();
-                self.pending_head = 0;
-            }
-            return msg;
-        }
+        return self.popMessage(null);
+    }
+
+    pub fn readMessageWithTimeout(self: *CodexBridge, deadline_ms: i64) !?CodexMessage {
+        return self.popMessage(deadline_ms);
+    }
+
+    fn popMessage(self: *CodexBridge, deadline_ms: ?i64) !?CodexMessage {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
 
         while (true) {
-            var rpc_message = (try self.readRpcMessage()) orelse return null;
-            var keep_arena = false;
-            defer if (!keep_arena) rpc_message.arena.deinit();
+            if (self.pending_head < self.pending_messages.items.len) {
+                const msg = self.pending_messages.items[self.pending_head];
+                self.pending_head += 1;
+                if (self.pending_head >= self.pending_messages.items.len) {
+                    self.pending_messages.clearRetainingCapacity();
+                    self.pending_head = 0;
+                }
+                return msg;
+            }
 
-            switch (rpc_message.kind) {
-                .notification => {
-                    const method = rpc_message.method orelse {
-                        continue;
-                    };
-                    const params = rpc_message.params orelse {
-                        continue;
-                    };
-                    if (self.mapNotification(&rpc_message.arena, method, params)) |msg| {
-                        keep_arena = true;
-                        return msg;
-                    }
-                },
-                .request => {
-                    if (self.mapServerRequest(&rpc_message.arena, rpc_message)) |msg| {
-                        keep_arena = true;
-                        return msg;
-                    }
-                },
-                .response, .err, .unknown => {},
+            if (self.reader_closed) return null;
+
+            if (deadline_ms) |deadline| {
+                const now = std.time.milliTimestamp();
+                if (now >= deadline) return error.Timeout;
+                const slice_ms = io_utils.pollSliceMs(deadline, now);
+                const timeout_ns: u64 = @as(u64, @intCast(slice_ms)) * std.time.ns_per_ms;
+                self.queue_cond.timedWait(&self.queue_mutex, timeout_ns) catch |err| switch (err) {
+                    error.Timeout => continue,
+                };
+            } else {
+                self.queue_cond.wait(&self.queue_mutex);
             }
         }
     }
 
-    pub fn readMessageWithTimeout(self: *CodexBridge, deadline_ms: i64) !?CodexMessage {
-        if (self.pending_head < self.pending_messages.items.len) {
-            const msg = self.pending_messages.items[self.pending_head];
-            self.pending_head += 1;
-            if (self.pending_head >= self.pending_messages.items.len) {
-                self.pending_messages.clearRetainingCapacity();
-                self.pending_head = 0;
+    fn enqueueMessage(self: *CodexBridge, msg: CodexMessage) void {
+        self.queue_mutex.lock();
+        self.pending_messages.append(self.allocator, msg) catch |err| {
+            log.err("Failed to queue Codex message: {}", .{err});
+            var owned = msg;
+            owned.deinit();
+            self.queue_mutex.unlock();
+            return;
+        };
+        self.queue_mutex.unlock();
+        self.queue_cond.signal();
+    }
+
+    fn storeResponse(self: *CodexBridge, request_id: i64, entry: ResponseEntry) void {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+
+        if (self.response_map.fetchRemove(request_id)) |existing| {
+            switch (existing.value) {
+                .ok => |payload| payload.arena.deinit(),
+                .err => {},
             }
-            return msg;
         }
 
+        self.response_map.put(request_id, entry) catch |err| {
+            switch (entry) {
+                .ok => |payload| payload.arena.deinit(),
+                .err => {},
+            }
+            log.err("Failed to store Codex response: {}", .{err});
+            return;
+        };
+        self.queue_cond.broadcast();
+    }
+
+    fn readerMain(self: *CodexBridge) void {
         while (true) {
-            var rpc_message = (try self.readRpcMessageWithTimeout(deadline_ms)) orelse return null;
+            if (self.stop_requested.load(.acquire)) break;
+            var rpc_message = self.readRpcMessage() catch |err| {
+                log.err("Codex reader failed: {}", .{err});
+                break;
+            } orelse break;
             var keep_arena = false;
             defer if (!keep_arena) rpc_message.arena.deinit();
 
             switch (rpc_message.kind) {
                 .notification => {
-                    const method = rpc_message.method orelse {
-                        continue;
-                    };
-                    const params = rpc_message.params orelse {
-                        continue;
-                    };
+                    const method = rpc_message.method orelse continue;
+                    const params = rpc_message.params orelse continue;
                     if (self.mapNotification(&rpc_message.arena, method, params)) |msg| {
                         keep_arena = true;
-                        return msg;
+                        self.enqueueMessage(msg);
                     }
                 },
                 .request => {
                     if (self.mapServerRequest(&rpc_message.arena, rpc_message)) |msg| {
                         keep_arena = true;
-                        return msg;
+                        self.enqueueMessage(msg);
                     }
                 },
-                .response, .err, .unknown => {},
+                .response => {
+                    const id_value = rpc_message.id orelse continue;
+                    const id = parseRequestId(id_value) orelse continue;
+                    const result = rpc_message.result orelse {
+                        log.warn("Codex response missing result for request {d}", .{id});
+                        continue;
+                    };
+                    keep_arena = true;
+                    self.storeResponse(id, .{ .ok = .{ .arena = rpc_message.arena, .value = result } });
+                },
+                .err => {
+                    const id_value = rpc_message.id orelse continue;
+                    const id = parseRequestId(id_value) orelse continue;
+                    log.err("Codex app-server error response for request {d}", .{id});
+                    self.storeResponse(id, .{ .err = {} });
+                },
+                .unknown => {},
             }
         }
+
+        self.queue_mutex.lock();
+        self.reader_closed = true;
+        self.queue_mutex.unlock();
+        self.queue_cond.broadcast();
     }
 
     fn initialize(self: *CodexBridge) !void {
@@ -628,6 +749,8 @@ pub const CodexBridge = struct {
     }
 
     fn setThreadId(self: *CodexBridge, thread_id: []const u8) !void {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
         if (self.thread_id) |existing| {
             self.allocator.free(existing);
         }
@@ -635,6 +758,8 @@ pub const CodexBridge = struct {
     }
 
     fn setTurnId(self: *CodexBridge, turn_id: []const u8) !void {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
         if (self.current_turn_id) |existing| {
             self.allocator.free(existing);
         }
@@ -679,66 +804,38 @@ pub const CodexBridge = struct {
             .emit_null_optional_fields = false,
         });
         defer self.allocator.free(json);
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
         try stdin.writeAll(json);
         try stdin.writeAll("\n");
     }
 
-    const ResponsePayload = struct {
-        arena: std.heap.ArenaAllocator,
-        value: std.json.Value,
-    };
-
     fn waitForResponse(self: *CodexBridge, request_id: i64) !ResponsePayload {
         const deadline = std.time.milliTimestamp() + rpc_timeout_ms;
-        while (true) {
-            var rpc_message = (try self.readRpcMessageWithTimeout(deadline)) orelse return error.UnexpectedEof;
-            var keep_arena = false;
-            defer if (!keep_arena) rpc_message.arena.deinit();
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
 
-            switch (rpc_message.kind) {
-                .response => {
-                    const id_value = rpc_message.id orelse {
-                        continue;
-                    };
-                    if (parseRequestId(id_value)) |id| {
-                        if (id == request_id) {
-                            const result = rpc_message.result orelse return error.InvalidResponse;
-                            keep_arena = true;
-                            return .{ .arena = rpc_message.arena, .value = result };
-                        }
-                    }
-                },
-                .err => {
-                    const id_value = rpc_message.id orelse {
-                        continue;
-                    };
-                    if (parseRequestId(id_value)) |id| {
-                        if (id == request_id) {
-                            log.err("Codex app-server error response for request {d}", .{request_id});
-                            return error.RequestFailed;
-                        }
-                    }
-                },
-                .notification => {
-                    const method = rpc_message.method orelse {
-                        continue;
-                    };
-                    const params = rpc_message.params orelse {
-                        continue;
-                    };
-                    if (self.mapNotification(&rpc_message.arena, method, params)) |msg| {
-                        keep_arena = true;
-                        try self.pending_messages.append(self.allocator, msg);
-                    }
-                },
-                .request => {
-                    if (self.mapServerRequest(&rpc_message.arena, rpc_message)) |msg| {
-                        keep_arena = true;
-                        try self.pending_messages.append(self.allocator, msg);
-                    }
-                },
-                .unknown => {},
+        while (true) {
+            if (self.response_map.fetchRemove(request_id)) |entry| {
+                switch (entry.value) {
+                    .ok => |payload| {
+                        return payload;
+                    },
+                    .err => {
+                        return error.RequestFailed;
+                    },
+                }
             }
+
+            if (self.reader_closed) return error.UnexpectedEof;
+
+            const now = std.time.milliTimestamp();
+            if (now >= deadline) return error.Timeout;
+            const slice_ms = io_utils.pollSliceMs(deadline, now);
+            const timeout_ns: u64 = @as(u64, @intCast(slice_ms)) * std.time.ns_per_ms;
+            self.queue_cond.timedWait(&self.queue_mutex, timeout_ns) catch |err| switch (err) {
+                error.Timeout => {},
+            };
         }
     }
 
@@ -854,6 +951,10 @@ pub const CodexBridge = struct {
     }
 
     fn discardLinePrefix(self: *CodexBridge, count: usize) void {
+        if (count >= self.line_buffer.items.len) {
+            self.line_buffer.clearRetainingCapacity();
+            return;
+        }
         const remaining = self.line_buffer.items.len - count;
         if (remaining > 0) {
             std.mem.copyForwards(u8, self.line_buffer.items[0..remaining], self.line_buffer.items[count..]);
@@ -921,7 +1022,8 @@ pub const CodexBridge = struct {
                     log.warn("Codex turn_completed parse failed", .{});
                     return null;
                 };
-                const turn_id = if (parsed.turn) |turn|
+                const turn_info = parsed.turn;
+                const turn_id = if (turn_info) |turn|
                     turn.id
                 else
                     parsed.turnId orelse {
@@ -935,6 +1037,8 @@ pub const CodexBridge = struct {
                 return CodexMessage{
                     .event_type = .turn_completed,
                     .thread_id = parsed.threadId,
+                    .turn_status = if (turn_info) |turn| turn.status else null,
+                    .turn_error = if (turn_info) |turn| turn.@"error" else null,
                     .arena = arena.*,
                 };
             },
@@ -942,7 +1046,9 @@ pub const CodexBridge = struct {
                 const parsed = parseNotificationParams(arena, ItemDeltaParams, params) orelse return null;
                 if (!self.matchesCurrentTurn(parsed.turnId)) return null;
                 const delta = parsed.delta orelse return null;
+                self.queue_mutex.lock();
                 self.saw_agent_delta = true;
+                self.queue_mutex.unlock();
                 return CodexMessage{
                     .event_type = .agent_message_delta,
                     .text = delta,
@@ -953,7 +1059,9 @@ pub const CodexBridge = struct {
                 const parsed = parseNotificationParams(arena, ItemDeltaParams, params) orelse return null;
                 if (!self.matchesCurrentTurn(parsed.turnId)) return null;
                 const delta = parsed.delta orelse return null;
+                self.queue_mutex.lock();
                 self.saw_reasoning_delta = true;
+                self.queue_mutex.unlock();
                 return CodexMessage{
                     .event_type = .reasoning_delta,
                     .text = delta,
@@ -961,11 +1069,16 @@ pub const CodexBridge = struct {
                 };
             },
             .reasoning_text_delta => {
-                if (self.saw_reasoning_delta) return null;
                 const parsed = parseNotificationParams(arena, ItemDeltaParams, params) orelse return null;
                 if (!self.matchesCurrentTurn(parsed.turnId)) return null;
                 const delta = parsed.delta orelse return null;
+                self.queue_mutex.lock();
+                if (self.saw_reasoning_delta) {
+                    self.queue_mutex.unlock();
+                    return null;
+                }
                 self.saw_reasoning_delta = true;
+                self.queue_mutex.unlock();
                 return CodexMessage{
                     .event_type = .reasoning_delta,
                     .text = delta,
@@ -978,12 +1091,18 @@ pub const CodexBridge = struct {
                 const item = parseItem(arena.allocator(), parsed.item) orelse return null;
                 const event_type: CodexMessage.EventType = if (kind == .item_started) .item_started else .item_completed;
 
-                if (event_type == .item_completed and item.kind == .agent_message and self.saw_agent_delta) {
-                    return null;
+                if (event_type == .item_completed and item.kind == .agent_message) {
+                    self.queue_mutex.lock();
+                    const saw_agent = self.saw_agent_delta;
+                    self.queue_mutex.unlock();
+                    if (saw_agent) return null;
                 }
 
-                if (event_type == .item_completed and item.kind == .reasoning and self.saw_reasoning_delta) {
-                    return null;
+                if (event_type == .item_completed and item.kind == .reasoning) {
+                    self.queue_mutex.lock();
+                    const saw_reasoning = self.saw_reasoning_delta;
+                    self.queue_mutex.unlock();
+                    if (saw_reasoning) return null;
                 }
 
                 if (event_type == .item_started and item.kind != .command_execution) {
@@ -1007,10 +1126,12 @@ pub const CodexBridge = struct {
     }
 
     fn matchesCurrentTurn(self: *CodexBridge, turn_id: ?[]const u8) bool {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
         if (self.current_turn_id) |current| {
             const id = turn_id orelse {
                 log.warn("Codex event missing turnId (expected {s})", .{current});
-                return true;
+                return false;
             };
             if (!std.mem.eql(u8, current, id)) {
                 log.warn("Codex turn ID mismatch: expected {s}, got {s}", .{ current, id });
@@ -1146,7 +1267,7 @@ fn parseServerRequestParams(allocator: Allocator, kind: ServerRequestKind, param
 
 fn parseNotificationParams(arena: *std.heap.ArenaAllocator, comptime T: type, params: std.json.Value) ?T {
     const parsed = std.json.parseFromValue(T, arena.allocator(), params, .{ .ignore_unknown_fields = true }) catch |err| {
-        log.warn("Failed to parse {s} params: {}", .{@typeName(T), err});
+        log.warn("Failed to parse {s} params: {}", .{ @typeName(T), err });
         return null;
     };
     defer parsed.deinit();
@@ -1155,7 +1276,7 @@ fn parseNotificationParams(arena: *std.heap.ArenaAllocator, comptime T: type, pa
 
 fn parseParams(allocator: Allocator, comptime T: type, value: std.json.Value) bool {
     const parsed = std.json.parseFromValue(T, allocator, value, .{ .ignore_unknown_fields = true }) catch |err| {
-        log.warn("Failed to parse {s} params: {}", .{@typeName(T), err});
+        log.warn("Failed to parse {s} params: {}", .{ @typeName(T), err });
         return false;
     };
     parsed.deinit();
@@ -1373,7 +1494,7 @@ fn collectCodexSnapshot(allocator: Allocator, prompt: []const u8) ![]u8 {
     try bridge.start(.{ .resume_session_id = null, .model = null, .approval_policy = "never" });
     defer bridge.stop();
 
-    const inputs = [_]UserInput{ .{ .type = "text", .text = prompt } };
+    const inputs = [_]UserInput{.{ .type = "text", .text = prompt }};
     try bridge.sendPrompt(inputs[0..]);
 
     var text_buf: std.ArrayList(u8) = .empty;
@@ -1470,11 +1591,11 @@ test "Codex app-server supports multi-turn prompts in one process" {
     try bridge.start(.{ .resume_session_id = null, .model = null, .approval_policy = "never" });
     defer bridge.stop();
 
-    const first_inputs = [_]UserInput{ .{ .type = "text", .text = "say hello in one word" } };
+    const first_inputs = [_]UserInput{.{ .type = "text", .text = "say hello in one word" }};
     try bridge.sendPrompt(first_inputs[0..]);
     try waitForTurnCompleted(&bridge, 20000);
 
-    const second_inputs = [_]UserInput{ .{ .type = "text", .text = "say goodbye in one word" } };
+    const second_inputs = [_]UserInput{.{ .type = "text", .text = "say goodbye in one word" }};
     try bridge.sendPrompt(second_inputs[0..]);
     try waitForTurnCompleted(&bridge, 20000);
 }

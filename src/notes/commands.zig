@@ -68,6 +68,8 @@ const skip_dirs = std.StaticStringMap(void).initComptime(.{
     .{ "__pycache__", {} },
 });
 
+const max_scan_depth: usize = 64;
+
 const CommandHandler = *const fn (Allocator, []const u8, []const u8) anyerror!CommandResult;
 
 const command_handlers = std.StaticStringMap(CommandHandler).initComptime(.{
@@ -140,7 +142,7 @@ fn listNotes(allocator: Allocator, project_root: []const u8) !CommandResult {
     }
 
     // Scan project for notes
-    try scanProjectForNotes(allocator, project_root, &notes_by_file);
+    try scanProjectForNotes(allocator, project_root, &notes_by_file, 0);
 
     if (notes_by_file.count() == 0) {
         return makeResult(
@@ -182,7 +184,8 @@ fn listNotes(allocator: Allocator, project_root: []const u8) !CommandResult {
 }
 
 /// Scan project recursively for note comments
-fn scanProjectForNotes(allocator: Allocator, dir_path: []const u8, notes_by_file: *NotesByFile) !void {
+fn scanProjectForNotes(allocator: Allocator, dir_path: []const u8, notes_by_file: *NotesByFile, depth: usize) !void {
+    if (depth > max_scan_depth) return;
     var dir = fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| {
         log.warn("Failed to open notes dir {s}: {}", .{ dir_path, err });
         return;
@@ -192,14 +195,16 @@ fn scanProjectForNotes(allocator: Allocator, dir_path: []const u8, notes_by_file
     var iter = dir.iterate();
     while (try iter.next()) |entry| {
         // Skip hidden and common non-source dirs
+        if (entry.name.len == 0) continue;
         if (entry.name[0] == '.') continue;
         if (skip_dirs.has(entry.name)) continue;
 
         const full_path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
         defer allocator.free(full_path);
 
+        if (entry.kind == .sym_link) continue;
         if (entry.kind == .directory) {
-            try scanProjectForNotes(allocator, full_path, notes_by_file);
+            try scanProjectForNotes(allocator, full_path, notes_by_file, depth + 1);
         } else if (entry.kind == .file) {
             // Check if it's a source file we care about
             const ext = std.fs.path.extension(entry.name);
@@ -296,7 +301,7 @@ fn setupLsp(allocator: Allocator, project_root: []const u8) !CommandResult {
         }
     }
 
-    try writer.writeAll("\n  }\n}\n");  // close languages and root
+    try writer.writeAll("\n  }\n}\n"); // close languages and root
 
     // Create .zed directory if needed
     const zed_dir_path = try std.fs.path.join(allocator, &.{ project_root, ".zed" });

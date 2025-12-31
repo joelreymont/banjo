@@ -15,6 +15,7 @@ Banjo Duet is a Second Brain for your code — an ACP agent in Zig that runs [Cl
 ## Features
 
 - **Auto-resume sessions** — automatically continues your last conversation
+- **Auto-continue turns** — when Claude Code or Codex hit max-turn limits, Banjo can continue automatically
 - **Code notes** — attach notes to code as comments with `/explain`
 - **Auto-setup** — `/setup lsp` configures Zed settings automatically
 - Claude Code commands: `/version`, `/model`, `/compact`, `/review`, `/clear`
@@ -88,6 +89,12 @@ Routing defaults (optional):
   }
 }
 ```
+
+## Dots Integration (Optional)
+
+Banjo can auto-continue when Claude Code or Codex pause at max-turn limits by
+checking for pending tasks with [Dots](http://github.com/joelreymont/dots).
+Install `dot` and keep tasks in `dot ls --json` so Banjo knows when to continue.
 
 ## Development
 

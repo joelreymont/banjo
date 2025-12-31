@@ -248,6 +248,9 @@ Response to `session/prompt`:
 | `error_max_turns` | `max_turn_requests` |
 | `error_max_budget_usd` | `max_turn_requests` |
 
+Banjo treats `error_max_turns` as a continue signal and will auto-send
+`continue` when Dots reports pending tasks (`dot ls --json`).
+
 ## Claude Code Stream JSON
 
 Communication between banjo and Claude Code.

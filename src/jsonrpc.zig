@@ -1,6 +1,7 @@
 const std = @import("std");
 const io_utils = @import("cli/io_utils.zig");
 const Allocator = std.mem.Allocator;
+const max_jsonrpc_line_bytes: usize = 4 * 1024 * 1024;
 
 /// JSON-RPC 2.0 Request
 pub const Request = struct {
@@ -380,6 +381,7 @@ pub const Reader = struct {
 
             if (byte == '\n') break;
             try self.buffer.append(self.allocator, byte);
+            if (self.buffer.items.len > max_jsonrpc_line_bytes) return error.LineTooLong;
         }
 
         if (self.buffer.items.len == 0) return null;
@@ -403,6 +405,7 @@ pub const Reader = struct {
 
             if (byte == '\n') break;
             try self.buffer.append(self.allocator, byte);
+            if (self.buffer.items.len > max_jsonrpc_line_bytes) return error.LineTooLong;
         }
 
         if (self.buffer.items.len == 0) return null;
@@ -434,6 +437,7 @@ pub const Reader = struct {
 
             if (byte == '\n') break;
             try self.buffer.append(self.allocator, byte);
+            if (self.buffer.items.len > max_jsonrpc_line_bytes) return error.LineTooLong;
         }
 
         if (self.buffer.items.len == 0) return null;

@@ -201,23 +201,24 @@ Banjo uses a PermissionRequest hook to forward tool approvals to Zed via ACP:
 
 This enables interactive permission control even in stream-json mode.
 
-**Setup (manual for now):**
+**Setup:**
 
-1. Copy `scripts/permission-hook.py` to a known location (e.g., `~/.local/bin/banjo-permission-hook.py`)
-2. Make it executable: `chmod +x ~/.local/bin/banjo-permission-hook.py`
-3. Add to `~/.claude/settings.json`:
+Add to `~/.claude/settings.json`:
 
 ```json
 {
   "hooks": {
     "PermissionRequest": [
       {
-        "hooks": [{ "type": "command", "command": "~/.local/bin/banjo-permission-hook.py" }]
+        "hooks": [{ "type": "command", "command": "banjo hook permission" }]
       }
     ]
   }
 }
 ```
+
+The `banjo hook permission` subcommand reads the PermissionRequest JSON from stdin,
+forwards it to the Banjo agent via Unix socket, and outputs the decision JSON.
 
 Existing user hooks in `~/.claude/settings.json` continue to work alongside the Banjo hook.
 

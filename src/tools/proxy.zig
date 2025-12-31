@@ -37,7 +37,7 @@ pub const ToolProxy = struct {
     /// Request to read a file via Zed
     pub fn readFile(self: *ToolProxy, session_id: []const u8, path: []const u8, line: ?u32, limit: ?u32) !i64 {
         const request_id = self.next_request_id;
-        self.next_request_id +%= 1;
+        self.next_request_id += 1;
 
         try self.writer.writeTypedRequest(
             .{ .number = request_id },
@@ -59,7 +59,7 @@ pub const ToolProxy = struct {
     /// Request to write a file via Zed
     pub fn writeFile(self: *ToolProxy, session_id: []const u8, path: []const u8, content: []const u8) !i64 {
         const request_id = self.next_request_id;
-        self.next_request_id +%= 1;
+        self.next_request_id += 1;
 
         try self.writer.writeTypedRequest(
             .{ .number = request_id },
@@ -88,7 +88,7 @@ pub const ToolProxy = struct {
         output_byte_limit: ?u64,
     ) !i64 {
         const request_id = self.next_request_id;
-        self.next_request_id +%= 1;
+        self.next_request_id += 1;
 
         try self.writer.writeTypedRequest(
             .{ .number = request_id },
@@ -112,7 +112,7 @@ pub const ToolProxy = struct {
     /// Request terminal output from Zed
     pub fn terminalOutput(self: *ToolProxy, session_id: []const u8, terminal_id: []const u8) !i64 {
         const request_id = self.next_request_id;
-        self.next_request_id +%= 1;
+        self.next_request_id += 1;
 
         try self.writer.writeTypedRequest(
             .{ .number = request_id },
@@ -131,7 +131,7 @@ pub const ToolProxy = struct {
     /// Wait for a terminal to exit
     pub fn waitForExit(self: *ToolProxy, session_id: []const u8, terminal_id: []const u8) !i64 {
         const request_id = self.next_request_id;
-        self.next_request_id +%= 1;
+        self.next_request_id += 1;
 
         try self.writer.writeTypedRequest(
             .{ .number = request_id },
@@ -150,7 +150,7 @@ pub const ToolProxy = struct {
     /// Kill a terminal command without releasing it
     pub fn killTerminal(self: *ToolProxy, session_id: []const u8, terminal_id: []const u8) !i64 {
         const request_id = self.next_request_id;
-        self.next_request_id +%= 1;
+        self.next_request_id += 1;
 
         try self.writer.writeTypedRequest(
             .{ .number = request_id },
@@ -169,7 +169,7 @@ pub const ToolProxy = struct {
     /// Release a terminal and free its resources
     pub fn releaseTerminal(self: *ToolProxy, session_id: []const u8, terminal_id: []const u8) !i64 {
         const request_id = self.next_request_id;
-        self.next_request_id +%= 1;
+        self.next_request_id += 1;
 
         try self.writer.writeTypedRequest(
             .{ .number = request_id },

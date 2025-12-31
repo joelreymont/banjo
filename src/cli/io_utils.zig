@@ -10,7 +10,12 @@ pub fn waitForReadable(fd: std.posix.fd_t, timeout_ms: i32) !bool {
     };
     const count = try std.posix.poll(&fds, timeout_ms);
     if (count == 0) return false;
-    if ((fds[0].revents & std.posix.POLL.HUP) != 0) return error.UnexpectedEof;
+    if ((fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) {
+        return error.UnexpectedEof;
+    }
+    if ((fds[0].revents & std.posix.POLL.HUP) != 0 and (fds[0].revents & std.posix.POLL.IN) == 0) {
+        return error.UnexpectedEof;
+    }
     return (fds[0].revents & std.posix.POLL.IN) != 0;
 }
 

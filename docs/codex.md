@@ -21,6 +21,26 @@ In `v2/TurnStartParams.json`, `input` supports the following `UserInput` variant
 
 No audio input variant appears in the schema.
 
+## Turn Completion Errors
+
+`turn/completed` can include a `turn.error` object:
+
+```json
+{
+  "method": "turn/completed",
+  "params": {
+    "turn": {
+      "id": "turn_1",
+      "status": "completed",
+      "error": { "code": "max_turns", "message": "Max turns reached", "type": "max_turns" }
+    }
+  }
+}
+```
+
+Banjo inspects `turn.error` for max-turn markers and, when Dots reports pending
+tasks via `dot ls --json`, automatically sends a follow-up `continue` turn.
+
 ## Implications for Banjo
 
 - Codex app-server can accept images directly (URL or local path).

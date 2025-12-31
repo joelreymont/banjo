@@ -42,7 +42,8 @@ fn isOnPath(program: []const u8) bool {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     var it = std.mem.splitScalar(u8, path_env, path_delim);
     while (it.next()) |dir| {
-        const dir_path = if (dir.len == 0) "." else dir;
+        if (dir.len == 0) continue;
+        const dir_path = dir;
         const full = std.fmt.bufPrint(&buf, "{s}{s}{s}", .{ dir_path, sep, program }) catch continue;
         if (pathExists(full)) return true;
     }

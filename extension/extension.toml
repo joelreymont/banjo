@@ -12,6 +12,7 @@ license = "MIT"
 name = "Banjo Duet (Claude Code + Codex)"
 icon = "icon/banjo.svg"
 
+# Local dev target uses the repo build via the extension/banjo symlink.
 [agent_servers.banjo.targets.darwin-aarch64]
 archive = "https://github.com/joelreymont/banjo/releases/download/v0.5.0/banjo-darwin-arm64.tar.gz"
 cmd = "./banjo"

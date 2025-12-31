@@ -256,9 +256,17 @@ pub fn intRange(comptime T: type, random: std.Random, min: T, max: T) T {
     std.debug.assert(min <= max);
     if (min == max) return min;
 
-    const range: u64 = @intCast(@as(i128, max) - @as(i128, min) + 1);
-    const offset: T = @intCast(random.uintLessThan(u64, range));
-    return min + offset;
+    const max_i128 = std.math.cast(i128, max) orelse return min;
+    const min_i128 = std.math.cast(i128, min) orelse return min;
+    const range_i128 = max_i128 - min_i128 + 1;
+    if (range_i128 <= 0) return min;
+    const range_u64 = std.math.cast(u64, range_i128) orelse {
+        const candidate: T = random.int(T);
+        if (candidate < min or candidate > max) return min;
+        return candidate;
+    };
+    const offset_i128: i128 = @intCast(random.uintLessThan(u64, range_u64));
+    return @intCast(min_i128 + offset_i128);
 }
 
 /// Generate an array of random bytes.
