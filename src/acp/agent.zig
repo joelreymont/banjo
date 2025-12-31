@@ -719,6 +719,13 @@ pub const Agent = struct {
             const hook_result = settings_loader.ensurePermissionHook(self.allocator);
             hook_configured = hook_result == .configured;
 
+            // Create permission socket for non-bypass modes
+            if (session.permission_mode != .bypassPermissions and session.permission_socket == null) {
+                session.createPermissionSocket(self.allocator) catch |err| {
+                    log.warn("Failed to create permission socket: {}", .{err});
+                };
+            }
+
             session.bridge = Bridge.init(self.allocator, session.cwd);
             session.bridge.?.start(buildClaudeStartOptions(session)) catch |err| {
                 log.warn("Failed to pre-start Claude Code: {} - will retry on first prompt", .{err});
