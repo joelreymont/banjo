@@ -1612,13 +1612,13 @@ pub const Agent = struct {
 
                     if (msg.getToolResult()) |tool_result| {
                         const status = toolResultStatus(tool_result.is_error);
-                        try self.handleEngineToolResult(session, session_id, engine, tool_result.id, tool_result.content, status);
+                        try self.handleEngineToolResult(session, session_id, engine, tool_result.id, tool_result.content, status, tool_result.raw);
                     }
                 },
                 .user => {
                     if (msg.getToolResult()) |tool_result| {
                         const status = toolResultStatus(tool_result.is_error);
-                        try self.handleEngineToolResult(session, session_id, engine, tool_result.id, tool_result.content, status);
+                        try self.handleEngineToolResult(session, session_id, engine, tool_result.id, tool_result.content, status, tool_result.raw);
                     }
                 },
                 .result => {
@@ -1855,7 +1855,7 @@ pub const Agent = struct {
 
             if (msg.getToolResult()) |tool_result| {
                 const status = exitCodeStatus(tool_result.exit_code);
-                try self.handleEngineToolResult(session, session_id, engine, tool_result.id, tool_result.content, status);
+                try self.handleEngineToolResult(session, session_id, engine, tool_result.id, tool_result.content, status, tool_result.raw);
                 continue;
             }
 
@@ -2441,6 +2441,7 @@ pub const Agent = struct {
         tool_id: []const u8,
         content: ?[]const u8,
         status: protocol.SessionUpdate.ToolCallStatus,
+        raw_output: std.json.Value,
     ) !void {
         var terminal_id: ?[]const u8 = null;
         defer if (terminal_id) |tid| self.allocator.free(tid);
@@ -2458,7 +2459,8 @@ pub const Agent = struct {
                 };
             }
         }
-        try self.sendEngineToolResult(session, session_id, engine, tool_id, content, status, terminal_id, null);
+        const raw = if (raw_output != .null) raw_output else null;
+        try self.sendEngineToolResult(session, session_id, engine, tool_id, content, status, terminal_id, raw);
     }
 
     fn requestPermission(

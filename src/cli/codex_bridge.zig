@@ -86,6 +86,7 @@ pub const CodexMessage = struct {
         id: []const u8,
         content: ?[]const u8 = null,
         exit_code: ?i64 = null,
+        raw: std.json.Value = .null,
     };
 
     pub fn getText(self: *const CodexMessage) ?[]const u8 {

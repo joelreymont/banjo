@@ -268,6 +268,7 @@ pub const StreamMessage = struct {
         id: []const u8,
         content: ?[]const u8 = null,
         is_error: bool = false,
+        raw: std.json.Value = .null,
     };
 
     /// Check if this is a tool use event
@@ -298,7 +299,11 @@ pub const StreamMessage = struct {
         const env = self.getEnvelope() orelse return null;
         const message = env.message orelse return null;
         const content = message.content orelse return null;
-        for (content) |item| {
+
+        // Navigate raw JSON to get corresponding raw items
+        const raw_items = self.getRawContentItems();
+
+        for (content, 0..) |item, i| {
             const item_type = item.type orelse continue;
             const block_type = ContentBlockType.fromString(item_type) orelse continue;
             if (block_type != .tool_result) continue;
@@ -310,13 +315,38 @@ pub const StreamMessage = struct {
                 if (err.len > 0) is_error = true;
             }
             const content_val = item.content;
+
+            // Get corresponding raw item if available
+            const raw_item = if (raw_items) |items|
+                (if (i < items.len) items[i] else .null)
+            else
+                .null;
+
             return .{
                 .id = id,
                 .content = if (content_val) |val| extractToolResultText(val) else null,
                 .is_error = is_error,
+                .raw = raw_item,
             };
         }
         return null;
+    }
+
+    fn getRawContentItems(self: *const StreamMessage) ?[]const std.json.Value {
+        const raw_obj = switch (self.raw) {
+            .object => |obj| obj,
+            else => return null,
+        };
+        const message_val = raw_obj.get("message") orelse return null;
+        const message_obj = switch (message_val) {
+            .object => |obj| obj,
+            else => return null,
+        };
+        const content_val = message_obj.get("content") orelse return null;
+        return switch (content_val) {
+            .array => |arr| arr.items,
+            else => null,
+        };
     }
 
     fn extractToolResultText(content: ToolResultContent) ?[]const u8 {
@@ -870,6 +900,12 @@ test "StreamMessage tool result parsing" {
     try testing.expectEqualStrings("tool_2", result.id);
     try testing.expectEqualStrings("ok", result.content.?);
     try testing.expect(!result.is_error);
+
+    // Verify raw JSON is captured
+    try testing.expect(result.raw != .null);
+    const raw_obj = result.raw.object;
+    try testing.expectEqualStrings("tool_result", raw_obj.get("type").?.string);
+    try testing.expectEqualStrings("tool_2", raw_obj.get("tool_use_id").?.string);
 }
 
 test "StreamMessage tool result parsing from user message" {
