@@ -2681,8 +2681,8 @@ pub const Agent = struct {
         }) catch tool_name;
     }
 
-    // Tools that are always safe and should be auto-approved
-    const auto_approve_tools = std.StaticStringMap(void).initComptime(.{
+    // Tools that are always safe and should be auto-approved regardless of mode
+    const always_approve_tools = std.StaticStringMap(void).initComptime(.{
         .{ "TodoWrite", {} },
         .{ "TodoRead", {} },
         .{ "Task", {} },
@@ -2695,9 +2695,22 @@ pub const Agent = struct {
         .{ "LSP", {} },
     });
 
+    // Edit tools auto-approved in acceptEdits mode
+    const edit_tools = std.StaticStringMap(void).initComptime(.{
+        .{ "Write", {} },
+        .{ "Edit", {} },
+        .{ "MultiEdit", {} },
+        .{ "NotebookEdit", {} },
+    });
+
     fn requestPermissionFromClient(self: *Agent, session: *Session, req: PermissionHookRequest) !PermissionDecision {
-        // Auto-approve safe internal tools
-        if (auto_approve_tools.has(req.tool_name)) {
+        // Auto-approve safe internal and read-only tools
+        if (always_approve_tools.has(req.tool_name)) {
+            return .{ .behavior = "allow", .message = null };
+        }
+
+        // In acceptEdits mode, also auto-approve edit tools
+        if (session.permission_mode == .acceptEdits and edit_tools.has(req.tool_name)) {
             return .{ .behavior = "allow", .message = null };
         }
 
