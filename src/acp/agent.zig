@@ -2672,7 +2672,21 @@ pub const Agent = struct {
         }) catch tool_name;
     }
 
+    // Tools that are always safe and should be auto-approved
+    const auto_approve_tools = std.StaticStringMap(void).initComptime(.{
+        .{ "TodoWrite", {} },
+        .{ "TodoRead", {} },
+        .{ "Task", {} },
+        .{ "TaskOutput", {} },
+        .{ "AskUserQuestion", {} },
+    });
+
     fn requestPermissionFromClient(self: *Agent, session: *Session, req: PermissionHookRequest) !PermissionDecision {
+        // Auto-approve safe internal tools
+        if (auto_approve_tools.has(req.tool_name)) {
+            return .{ .behavior = "allow", .message = null };
+        }
+
         // Map tool name to kind
         const kind = mapToolKind(req.tool_name);
 
