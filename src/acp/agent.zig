@@ -2710,6 +2710,13 @@ pub const Agent = struct {
         .{ "NotebookEdit", {} },
     });
 
+    const PermissionAction = enum { allow_once, allow_always, deny };
+    const permission_option_map = std.StaticStringMap(PermissionAction).initComptime(.{
+        .{ "allow_once", .allow_once },
+        .{ "allow_always", .allow_always },
+        .{ "reject_once", .deny },
+    });
+
     fn requestPermissionFromClient(self: *Agent, session: *Session, req: PermissionHookRequest) !PermissionDecision {
         // Auto-approve safe internal and read-only tools
         if (always_approve_tools.has(req.tool_name)) {
@@ -2783,19 +2790,19 @@ pub const Agent = struct {
 
             if (outcome.value.outcome.outcome == .selected) {
                 if (outcome.value.outcome.optionId) |opt_id| {
-                    if (std.mem.eql(u8, opt_id, "allow_always")) {
-                        // Store this tool as always-allowed for future calls
-                        const key = self.allocator.dupe(u8, req.tool_name) catch {
+                    const action = permission_option_map.get(opt_id) orelse .deny;
+                    switch (action) {
+                        .allow_always => {
+                            const key = self.allocator.dupe(u8, req.tool_name) catch {
+                                return .{ .behavior = "allow", .message = null };
+                            };
+                            session.always_allowed_tools.put(key, {}) catch {
+                                self.allocator.free(key);
+                            };
                             return .{ .behavior = "allow", .message = null };
-                        };
-                        session.always_allowed_tools.put(key, {}) catch {
-                            self.allocator.free(key);
-                        };
-                        return .{ .behavior = "allow", .message = null };
-                    } else if (std.mem.eql(u8, opt_id, "allow_once")) {
-                        return .{ .behavior = "allow", .message = null };
-                    } else {
-                        return .{ .behavior = "deny", .message = "Permission denied" };
+                        },
+                        .allow_once => return .{ .behavior = "allow", .message = null },
+                        .deny => return .{ .behavior = "deny", .message = "Permission denied" },
                     }
                 }
             } else if (outcome.value.outcome.outcome == .cancelled) {
