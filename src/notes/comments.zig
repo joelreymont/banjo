@@ -749,3 +749,100 @@ test "generateNoteId returns 12 char hex string" {
         try testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
     }
 }
+
+//
+// Property tests
+//
+
+const quickcheck = @import("../util/quickcheck.zig");
+
+test "lexer never crashes on arbitrary bytes" {
+    try quickcheck.check(struct {
+        fn prop(args: struct { bytes: [64]u8 }) bool {
+            var lexer = Lexer.init(&args.bytes);
+            // Consume all tokens - should never crash
+            while (true) {
+                const tok = lexer.next();
+                if (tok.tag == .eof or tok.tag == .not_comment) break;
+                // Bounds check
+                if (tok.end > args.bytes.len) return false;
+                if (tok.start > tok.end) return false;
+            }
+            return true;
+        }
+    }.prop, .{ .iterations = 1000 });
+}
+
+test "lexer terminates on any input" {
+    try quickcheck.check(struct {
+        fn prop(args: struct { bytes: [32]u8 }) bool {
+            var lexer = Lexer.init(&args.bytes);
+            var count: usize = 0;
+            while (count < 1000) : (count += 1) {
+                const tok = lexer.next();
+                if (tok.tag == .eof or tok.tag == .not_comment) return true;
+            }
+            return false; // Didn't terminate
+        }
+    }.prop, .{ .iterations = 500 });
+}
+
+test "round-trip: formatNoteComment then parseNoteLine" {
+    try quickcheck.check(struct {
+        fn prop(args: struct { id_bytes: [8]u8, content_seed: u32 }) bool {
+            // Generate hex ID from bytes
+            var id: [16]u8 = undefined;
+            const hex = "0123456789abcdef";
+            for (args.id_bytes, 0..) |b, i| {
+                id[i * 2] = hex[b >> 4];
+                id[i * 2 + 1] = hex[b & 0xf];
+            }
+
+            // Simple content without special chars
+            var content: [8]u8 = undefined;
+            var prng = std.Random.DefaultPrng.init(args.content_seed);
+            const random = prng.random();
+            for (&content) |*c| {
+                c.* = 'a' + random.uintLessThan(u8, 26);
+            }
+
+            // Format and parse
+            var buf: [128]u8 = undefined;
+            const formatted = std.fmt.bufPrint(&buf, "// @banjo[{s}] {s}", .{ id[0..16], content[0..8] }) catch return true;
+
+            const alloc = testing.allocator;
+            var note = parseNoteLine(alloc, formatted, 1) catch return true;
+            if (note) |*n| {
+                defer n.deinit(alloc);
+                // ID should match
+                if (!mem.eql(u8, n.id, id[0..16])) return false;
+                // Content should contain our text
+                if (mem.indexOf(u8, n.content, content[0..8]) == null) return false;
+            } else {
+                return false; // Should have parsed
+            }
+            return true;
+        }
+    }.prop, .{ .iterations = 200 });
+}
+
+test "lexer slice bounds are always valid" {
+    try quickcheck.check(struct {
+        fn prop(args: struct { bytes: [48]u8 }) bool {
+            var lexer = Lexer.init(&args.bytes);
+            while (true) {
+                const tok = lexer.next();
+                switch (tok.tag) {
+                    .eof, .not_comment => break,
+                    .content, .banjo_marker, .link => {
+                        // Verify slice is safe
+                        if (tok.start > tok.end) return false;
+                        if (tok.end > args.bytes.len) return false;
+                        _ = lexer.slice(tok); // Should not panic
+                    },
+                }
+            }
+            return true;
+        }
+    }.prop, .{ .iterations = 500 });
+}
