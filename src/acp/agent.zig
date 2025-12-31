@@ -2663,6 +2663,7 @@ pub const Agent = struct {
             .{ "Glob", "pattern" },
             .{ "WebFetch", "url" },
             .{ "WebSearch", "query" },
+            .{ "Skill", "skill" },
         });
 
         const field_name = field_map.get(tool_name) orelse return tool_name;
