@@ -2688,6 +2688,11 @@ pub const Agent = struct {
         .{ "Task", {} },
         .{ "TaskOutput", {} },
         .{ "AskUserQuestion", {} },
+        // Read-only tools
+        .{ "Read", {} },
+        .{ "Grep", {} },
+        .{ "Glob", {} },
+        .{ "LSP", {} },
     });
 
     fn requestPermissionFromClient(self: *Agent, session: *Session, req: PermissionHookRequest) !PermissionDecision {
