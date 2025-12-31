@@ -26,13 +26,10 @@ const Route = enum { claude, codex, duet };
 /// Banjo version with git hash
 pub const version = "0.5.0 (" ++ config.git_hash ++ ")";
 const no_engine_warning = "Banjo Duet could not find Claude Code or Codex. Install one (or set CLAUDE_CODE_EXECUTABLE/CODEX_EXECUTABLE) and restart the agent.";
-const terminal_mirror_warning = "Banjo warning: Terminal mirroring failed; tool output may be incomplete.\n";
-const terminal_truncated_warning = "Banjo warning: Terminal output truncated; view the terminal for full output.\n";
 const max_context_bytes = 64 * 1024; // cap embedded resource text to keep prompts bounded
 const max_media_preview_bytes = 2048; // small preview for binary media captions
 const max_codex_image_bytes: usize = 8 * 1024 * 1024; // guard against massive base64 images
 const resource_line_limit: u32 = 200; // limit resource excerpt lines to reduce UI spam
-const max_terminal_output_bytes: usize = 8192; // cap terminal mirror output to keep commands manageable
 const max_tool_preview_bytes: usize = 1024; // keep tool call previews readable in the panel
 const max_dot_output_bytes: usize = 128 * 1024; // dot task list output cap
 const default_model_id = "sonnet";
@@ -2371,129 +2368,6 @@ pub const Agent = struct {
         }
     }
 
-    fn escapeSingleQuotes(self: *Agent, input: []const u8) ![]const u8 {
-        var out: std.ArrayListUnmanaged(u8) = .empty;
-        defer out.deinit(self.allocator);
-        for (input) |ch| {
-            if (ch == '\'') {
-                try out.appendSlice(self.allocator, "'\"'\"'");
-            } else {
-                try out.append(self.allocator, ch);
-            }
-        }
-        return try out.toOwnedSlice(self.allocator);
-    }
-
-    const TerminalMirrorError = error{
-        TerminalRequestFailed,
-        InvalidTerminalResponse,
-    };
-
-    fn mirrorTerminalOutput(
-        self: *Agent,
-        session: *Session,
-        session_id: []const u8,
-        output: []const u8,
-    ) !?[]const u8 {
-        if (!self.canUseTerminal()) return null;
-        if (output.len == 0) return null;
-
-        var snippet = output;
-        var truncated = false;
-        if (snippet.len > max_terminal_output_bytes) {
-            snippet = output[0..max_terminal_output_bytes];
-            truncated = true;
-        }
-
-        var display_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer display_buf.deinit(self.allocator);
-        try display_buf.appendSlice(self.allocator, snippet);
-        if (truncated) {
-            try display_buf.appendSlice(self.allocator, "\n[banjo] Output truncated\n");
-        }
-
-        const escaped = try self.escapeSingleQuotes(display_buf.items);
-        defer self.allocator.free(escaped);
-        const shell_cmd = try std.fmt.allocPrint(self.allocator, "printf '%s' '{s}'", .{escaped});
-        defer self.allocator.free(shell_cmd);
-
-        var args = [_][]const u8{ "-lc", shell_cmd };
-        const create_id = try self.tool_proxy.createTerminal(
-            session_id,
-            "/bin/sh",
-            args[0..],
-            null,
-            session.cwd,
-            @as(u64, max_terminal_output_bytes),
-        );
-        var response = try self.waitForResponse(session, .{ .number = create_id });
-        defer response.deinit();
-
-        const resp = response.message.response;
-        if (resp.@"error") |err_val| {
-            self.tool_proxy.handleError(create_id, err_val);
-            return error.TerminalRequestFailed;
-        }
-
-        const result = resp.result orelse {
-            _ = self.tool_proxy.handleResponse(create_id);
-            return error.InvalidTerminalResponse;
-        };
-        _ = self.tool_proxy.handleResponse(create_id);
-        const parsed = try std.json.parseFromValue(protocol.CreateTerminalResponse, self.allocator, result, .{
-            .ignore_unknown_fields = true,
-        });
-        defer parsed.deinit();
-
-        const terminal_id = parsed.value.terminalId;
-        const terminal_id_copy = try self.allocator.dupe(u8, terminal_id);
-        errdefer self.allocator.free(terminal_id_copy);
-        const wait_id = try self.tool_proxy.waitForExit(session_id, terminal_id);
-        var wait_resp = try self.waitForResponse(session, .{ .number = wait_id });
-        defer wait_resp.deinit();
-        if (wait_resp.message.response.@"error") |err_val| {
-            self.tool_proxy.handleError(wait_id, err_val);
-            return error.TerminalRequestFailed;
-        }
-        const wait_result = wait_resp.message.response.result orelse {
-            _ = self.tool_proxy.handleResponse(wait_id);
-            return error.InvalidTerminalResponse;
-        };
-        _ = self.tool_proxy.handleResponse(wait_id);
-        const wait_parsed = try std.json.parseFromValue(protocol.WaitForTerminalExitResponse, self.allocator, wait_result, .{
-            .ignore_unknown_fields = true,
-        });
-        defer wait_parsed.deinit();
-
-        const output_id = try self.tool_proxy.terminalOutput(session_id, terminal_id);
-        var output_resp = try self.waitForResponse(session, .{ .number = output_id });
-        defer output_resp.deinit();
-        if (output_resp.message.response.@"error") |err_val| {
-            self.tool_proxy.handleError(output_id, err_val);
-            return error.TerminalRequestFailed;
-        }
-        const output_result = output_resp.message.response.result orelse {
-            _ = self.tool_proxy.handleResponse(output_id);
-            return error.InvalidTerminalResponse;
-        };
-        _ = self.tool_proxy.handleResponse(output_id);
-        const output_parsed = try std.json.parseFromValue(protocol.TerminalOutputResponse, self.allocator, output_result, .{
-            .ignore_unknown_fields = true,
-        });
-        defer output_parsed.deinit();
-        const terminal_output = output_parsed.value.output;
-        const remote_truncated = output_parsed.value.truncated;
-        if (truncated or remote_truncated) {
-            log.warn("Terminal output truncated for {s} ({d} bytes)", .{ terminal_id, terminal_output.len });
-            self.sendPanelWarning(session_id, terminal_truncated_warning) catch |warn_err| {
-                log.warn("Failed to send terminal truncation warning: {}", .{warn_err});
-            };
-        }
-
-        // Don't release terminal - keep it open so user can see the output
-        return terminal_id_copy;
-    }
-
     fn handleEngineToolCall(
         self: *Agent,
         session: *Session,
@@ -2530,24 +2404,8 @@ pub const Agent = struct {
         status: protocol.SessionUpdate.ToolCallStatus,
         raw_output: std.json.Value,
     ) !void {
-        var terminal_id: ?[]const u8 = null;
-        defer if (terminal_id) |tid| self.allocator.free(tid);
-        const is_execute_tool = try self.consumeExecuteTool(session, engine, tool_id);
-        // Only mirror terminal output for completed commands, not permission denials
-        if (is_execute_tool and status == .completed) {
-            if (content) |text| {
-                terminal_id = self.mirrorTerminalOutput(session, session_id, text) catch |err| blk: {
-                    if (err == error.InvalidTerminalResponse) {
-                        return err;
-                    }
-                    log.warn("Terminal mirror failed: {}", .{err});
-                    self.sendPanelWarning(session_id, terminal_mirror_warning) catch |warn_err| {
-                        log.warn("Failed to send terminal mirror warning: {}", .{warn_err});
-                    };
-                    break :blk null;
-                };
-            }
-        }
+        _ = try self.consumeExecuteTool(session, engine, tool_id);
+        // Terminal mirroring disabled - output is already visible in tool_call_update
 
         // Check for edit tool diff info
         var edit_info: ?EditInfo = null;
@@ -2555,7 +2413,7 @@ pub const Agent = struct {
         edit_info = self.consumeEditTool(session, engine, tool_id);
 
         const raw = if (raw_output != .null) raw_output else null;
-        try self.sendEngineToolResult(session, session_id, engine, tool_id, content, status, terminal_id, raw, edit_info);
+        try self.sendEngineToolResult(session, session_id, engine, tool_id, content, status, null, raw, edit_info);
     }
 
     fn requestPermission(
@@ -4608,52 +4466,6 @@ test "Agent requestWriteTextFile sends request" {
 
     try (ohsnap{}).snap(@src(),
         \\{"jsonrpc":"2.0","method":"fs/write_text_file","params":{"sessionId":"session-1","path":"foo.txt","content":"hello"},"id":1}
-        \\
-    ).diff(tw.getOutput(), true);
-}
-
-test "Agent mirrorTerminalOutput sends terminal requests" {
-    var tw = try TestWriter.init(testing.allocator);
-    defer tw.deinit();
-
-    const response_json =
-        \\{"jsonrpc":"2.0","id":1,"result":{"terminalId":"term-1"}}
-        \\{"jsonrpc":"2.0","id":2,"result":{"exitCode":0}}
-        \\{"jsonrpc":"2.0","id":3,"result":{"output":"hello","exitStatus":{"exitCode":0},"truncated":false}}
-        \\
-    ;
-    const input_buf = try testing.allocator.dupe(u8, response_json);
-    defer testing.allocator.free(input_buf);
-
-    var input_stream = std.io.fixedBufferStream(input_buf);
-    var reader = jsonrpc.Reader.init(testing.allocator, input_stream.reader().any());
-    defer reader.deinit();
-
-    var agent = Agent.init(testing.allocator, tw.writer.stream, &reader);
-    defer agent.deinit();
-    agent.client_capabilities = .{
-        .fs = null,
-        .terminal = true,
-    };
-
-    var session = Agent.Session{
-        .id = try testing.allocator.dupe(u8, "session-1"),
-        .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
-        .availability = .{ .claude = true, .codex = true },
-        .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
-        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
-        .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
-    };
-    defer session.deinit(testing.allocator);
-
-    const terminal_id = try agent.mirrorTerminalOutput(&session, session.id, "hello");
-    defer if (terminal_id) |tid| testing.allocator.free(tid);
-
-    try (ohsnap{}).snap(@src(),
-        \\{"jsonrpc":"2.0","method":"terminal/create","params":{"sessionId":"session-1","command":"/bin/sh","args":["-lc","printf '%s' 'hello'"],"cwd":".","outputByteLimit":8192},"id":1}
-        \\{"jsonrpc":"2.0","method":"terminal/wait_for_exit","params":{"sessionId":"session-1","terminalId":"term-1"},"id":2}
-        \\{"jsonrpc":"2.0","method":"terminal/output","params":{"sessionId":"session-1","terminalId":"term-1"},"id":3}
         \\
     ).diff(tw.getOutput(), true);
 }

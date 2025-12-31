@@ -201,14 +201,22 @@ Banjo uses a PermissionRequest hook to forward tool approvals to Zed via ACP:
 
 This enables interactive permission control even in stream-json mode.
 
+**Settings File Hierarchy (highest to lowest precedence):**
+
+| Scope | Location | Shared? |
+|-------|----------|---------|
+| Local | `.claude/settings.local.json` | No |
+| Project | `.claude/settings.json` | Yes |
+| User | `~/.claude/settings.json` | No |
+
 **Setup:**
 
-Add to `~/.claude/settings.json`:
+Add to `~/.claude/settings.json` (or project-level for dev builds):
 
 ```json
 {
   "hooks": {
-    "PermissionRequest": [
+    "PreToolUse": [
       {
         "hooks": [{ "type": "command", "command": "banjo hook permission" }]
       }
@@ -217,10 +225,9 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
-The `banjo hook permission` subcommand reads the PermissionRequest JSON from stdin,
-forwards it to the Banjo agent via Unix socket, and outputs the decision JSON.
+For dev builds, use the full path: `/path/to/banjo/zig-out/bin/banjo hook permission`
 
-Existing user hooks in `~/.claude/settings.json` continue to work alongside the Banjo hook.
+The hook reads PreToolUse JSON from stdin, forwards to Banjo via Unix socket, and outputs the decision.
 
 ## Known Issues
 

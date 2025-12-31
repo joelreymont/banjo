@@ -195,24 +195,23 @@ fn hookDebugLog(comptime fmt: []const u8, args: anytype) void {
 
 /// Run the permission hook - reads from stdin, connects to Banjo socket, returns decision
 fn runPermissionHook(allocator: std.mem.Allocator) !void {
-    // Check for Banjo socket FIRST - if not set, exit immediately without any I/O.
-    // This makes the hook a true no-op when running Claude Code without Banjo,
-    // avoiding any interference with normal permission handling.
-    const socket_path = std.posix.getenv("BANJO_PERMISSION_SOCKET") orelse return;
-
-    hookDebugLog("Hook invoked, socket={s}", .{socket_path});
-
     const max_input = 64 * 1024;
     const stdin = std.fs.File.stdin();
-    const stdout = std.fs.File.stdout().deprecatedWriter();
 
-    // Read JSON from stdin
+    // Always read stdin first to avoid broken pipe errors
     const input = stdin.readToEndAlloc(allocator, max_input) catch |err| {
         hookDebugLog("Failed to read stdin: {}", .{err});
         log.warn("Failed to read stdin: {}", .{err});
         return;
     };
     defer allocator.free(input);
+
+    // Check for Banjo socket - if not set, exit silently (defer to default permission handling)
+    const socket_path = std.posix.getenv("BANJO_PERMISSION_SOCKET") orelse return;
+
+    hookDebugLog("Hook invoked, socket={s}", .{socket_path});
+
+    const stdout = std.fs.File.stdout().deprecatedWriter();
 
     hookDebugLog("Read {d} bytes from stdin", .{input.len});
 
