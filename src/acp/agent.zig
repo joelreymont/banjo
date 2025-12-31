@@ -2377,22 +2377,7 @@ pub const Agent = struct {
             };
         }
 
-        const release_id = try self.tool_proxy.releaseTerminal(session_id, terminal_id);
-        var release_resp = try self.waitForResponse(session, .{ .number = release_id });
-        defer release_resp.deinit();
-        if (release_resp.message.response.@"error") |err_val| {
-            self.tool_proxy.handleError(release_id, err_val);
-            return error.TerminalRequestFailed;
-        }
-        const release_result = release_resp.message.response.result orelse {
-            _ = self.tool_proxy.handleResponse(release_id);
-            return error.InvalidTerminalResponse;
-        };
-        _ = self.tool_proxy.handleResponse(release_id);
-        const release_parsed = try std.json.parseFromValue(protocol.EmptyResponse, self.allocator, release_result, .{
-            .ignore_unknown_fields = true,
-        });
-        defer release_parsed.deinit();
+        // Don't release terminal - keep it open so user can see the output
         return terminal_id_copy;
     }
 
@@ -4503,7 +4488,6 @@ test "Agent mirrorTerminalOutput sends terminal requests" {
         \\{"jsonrpc":"2.0","id":1,"result":{"terminalId":"term-1"}}
         \\{"jsonrpc":"2.0","id":2,"result":{"exitCode":0}}
         \\{"jsonrpc":"2.0","id":3,"result":{"output":"hello","exitStatus":{"exitCode":0},"truncated":false}}
-        \\{"jsonrpc":"2.0","id":4,"result":{}}
         \\
     ;
     const input_buf = try testing.allocator.dupe(u8, response_json);
@@ -4537,7 +4521,6 @@ test "Agent mirrorTerminalOutput sends terminal requests" {
         \\{"jsonrpc":"2.0","method":"terminal/create","params":{"sessionId":"session-1","command":"/bin/sh","args":["-lc","printf '%s' 'hello'"],"cwd":".","outputByteLimit":8192},"id":1}
         \\{"jsonrpc":"2.0","method":"terminal/wait_for_exit","params":{"sessionId":"session-1","terminalId":"term-1"},"id":2}
         \\{"jsonrpc":"2.0","method":"terminal/output","params":{"sessionId":"session-1","terminalId":"term-1"},"id":3}
-        \\{"jsonrpc":"2.0","method":"terminal/release","params":{"sessionId":"session-1","terminalId":"term-1"},"id":4}
         \\
     ).diff(tw.getOutput(), true);
 }
