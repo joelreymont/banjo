@@ -22,110 +22,397 @@ pub const ParsedNote = struct {
     }
 };
 
-/// Comment prefix patterns for different languages
-const CommentPrefix = struct {
-    start: []const u8,
-    end: ?[]const u8 = null, // For block comments like <!-- -->
+/// Token types produced by the comment lexer
+pub const Token = struct {
+    tag: Tag,
+    start: usize,
+    end: usize,
+
+    pub const Tag = enum {
+        /// Comment content (after prefix stripped)
+        content,
+        /// @banjo[id] marker - slice is the ID
+        banjo_marker,
+        /// @[display](target) link - slice is the target ID
+        link,
+        /// End of input
+        eof,
+        /// Line is not a comment
+        not_comment,
+    };
 };
 
-const comment_prefixes = [_]CommentPrefix{
-    .{ .start = "//" }, // C, C++, Zig, Rust, Go, Java, JS, TS
-    .{ .start = "#" }, // Python, Ruby, Shell, YAML
-    .{ .start = "--" }, // Lua, SQL, Haskell
-    .{ .start = ";" }, // Lisp, Clojure, Assembly
-    .{ .start = "<!--", .end = "-->" }, // HTML, XML, Markdown
+/// Single-pass lexer for comment lines using labeled switch state machine
+pub const Lexer = struct {
+    buffer: []const u8,
+    index: usize = 0,
+    content_start: usize = 0,
+
+    const State = enum {
+        start,
+        slash,
+        slash_slash,
+        hash,
+        dash,
+        dash_dash,
+        semicolon,
+        angle_open,
+        angle_excl,
+        angle_excl_dash,
+        angle_excl_dash_dash,
+        comment_content,
+        at_sign,
+        banjo_b,
+        banjo_a,
+        banjo_n,
+        banjo_j,
+        banjo_o,
+        banjo_id,
+        link_display,
+        link_paren,
+        link_target,
+        html_end_dash1,
+        html_end_dash2,
+    };
+
+    pub fn init(buffer: []const u8) Lexer {
+        return .{ .buffer = buffer };
+    }
+
+    pub fn next(self: *Lexer) Token {
+        var result = Token{ .tag = .eof, .start = self.index, .end = self.index };
+        var state: State = .start;
+        var html_comment = false;
+
+        state: while (self.index < self.buffer.len) : (self.index += 1) {
+            const c = self.buffer[self.index];
+            switch (state) {
+                .start => switch (c) {
+                    ' ', '\t' => continue :state,
+                    '/' => state = .slash,
+                    '#' => state = .hash,
+                    '-' => state = .dash,
+                    ';' => state = .semicolon,
+                    '<' => state = .angle_open,
+                    else => {
+                        result.tag = .not_comment;
+                        return result;
+                    },
+                },
+
+                .slash => switch (c) {
+                    '/' => state = .slash_slash,
+                    else => {
+                        result.tag = .not_comment;
+                        return result;
+                    },
+                },
+
+                .slash_slash => switch (c) {
+                    '/', '!' => continue :state, // Skip /// or //!
+                    ' ', '\t' => {
+                        self.content_start = self.index + 1;
+                        state = .comment_content;
+                    },
+                    '@' => {
+                        self.content_start = self.index;
+                        state = .at_sign;
+                    },
+                    else => {
+                        self.content_start = self.index;
+                        state = .comment_content;
+                    },
+                },
+
+                .hash => switch (c) {
+                    '#' => continue :state, // Skip ###
+                    ' ', '\t' => {
+                        self.content_start = self.index + 1;
+                        state = .comment_content;
+                    },
+                    '@' => {
+                        self.content_start = self.index;
+                        state = .at_sign;
+                    },
+                    else => {
+                        self.content_start = self.index;
+                        state = .comment_content;
+                    },
+                },
+
+                .dash => switch (c) {
+                    '-' => state = .dash_dash,
+                    else => {
+                        result.tag = .not_comment;
+                        return result;
+                    },
+                },
+
+                .dash_dash => switch (c) {
+                    '-' => continue :state, // Skip ---
+                    ' ', '\t' => {
+                        self.content_start = self.index + 1;
+                        state = .comment_content;
+                    },
+                    '@' => {
+                        self.content_start = self.index;
+                        state = .at_sign;
+                    },
+                    else => {
+                        self.content_start = self.index;
+                        state = .comment_content;
+                    },
+                },
+
+                .semicolon => switch (c) {
+                    ';' => continue :state, // Skip ;;;
+                    ' ', '\t' => {
+                        self.content_start = self.index + 1;
+                        state = .comment_content;
+                    },
+                    '@' => {
+                        self.content_start = self.index;
+                        state = .at_sign;
+                    },
+                    else => {
+                        self.content_start = self.index;
+                        state = .comment_content;
+                    },
+                },
+
+                .angle_open => switch (c) {
+                    '!' => state = .angle_excl,
+                    else => {
+                        result.tag = .not_comment;
+                        return result;
+                    },
+                },
+
+                .angle_excl => switch (c) {
+                    '-' => state = .angle_excl_dash,
+                    else => {
+                        result.tag = .not_comment;
+                        return result;
+                    },
+                },
+
+                .angle_excl_dash => switch (c) {
+                    '-' => {
+                        html_comment = true;
+                        state = .angle_excl_dash_dash;
+                    },
+                    else => {
+                        result.tag = .not_comment;
+                        return result;
+                    },
+                },
+
+                .angle_excl_dash_dash => switch (c) {
+                    ' ', '\t' => {
+                        self.content_start = self.index + 1;
+                        state = .comment_content;
+                    },
+                    '@' => {
+                        self.content_start = self.index;
+                        state = .at_sign;
+                    },
+                    else => {
+                        self.content_start = self.index;
+                        state = .comment_content;
+                    },
+                },
+
+                .comment_content => switch (c) {
+                    '@' => state = .at_sign,
+                    '-' => if (html_comment) {
+                        state = .html_end_dash1;
+                    },
+                    else => continue :state,
+                },
+
+                .html_end_dash1 => switch (c) {
+                    '-' => state = .html_end_dash2,
+                    '@' => state = .at_sign,
+                    else => state = .comment_content,
+                },
+
+                .html_end_dash2 => switch (c) {
+                    '>' => {
+                        // End of HTML comment, return content without -->
+                        result.tag = .content;
+                        result.start = self.content_start;
+                        result.end = self.index - 2;
+                        self.index += 1;
+                        return result;
+                    },
+                    '-' => continue :state,
+                    '@' => state = .at_sign,
+                    else => state = .comment_content,
+                },
+
+                .at_sign => switch (c) {
+                    'b' => state = .banjo_b,
+                    '[' => {
+                        result.start = self.index + 1;
+                        state = .link_display;
+                    },
+                    else => state = .comment_content,
+                },
+
+                .banjo_b => switch (c) {
+                    'a' => state = .banjo_a,
+                    else => state = .comment_content,
+                },
+
+                .banjo_a => switch (c) {
+                    'n' => state = .banjo_n,
+                    else => state = .comment_content,
+                },
+
+                .banjo_n => switch (c) {
+                    'j' => state = .banjo_j,
+                    else => state = .comment_content,
+                },
+
+                .banjo_j => switch (c) {
+                    'o' => state = .banjo_o,
+                    else => state = .comment_content,
+                },
+
+                .banjo_o => switch (c) {
+                    '[' => {
+                        result.start = self.index + 1;
+                        state = .banjo_id;
+                    },
+                    else => state = .comment_content,
+                },
+
+                .banjo_id => switch (c) {
+                    ']' => {
+                        result.tag = .banjo_marker;
+                        result.end = self.index;
+                        self.index += 1;
+                        self.content_start = self.index;
+                        return result;
+                    },
+                    else => continue :state,
+                },
+
+                .link_display => switch (c) {
+                    ']' => state = .link_paren,
+                    else => continue :state,
+                },
+
+                .link_paren => switch (c) {
+                    '(' => {
+                        result.start = self.index + 1;
+                        state = .link_target;
+                    },
+                    else => state = .comment_content,
+                },
+
+                .link_target => switch (c) {
+                    ')' => {
+                        result.tag = .link;
+                        result.end = self.index;
+                        self.index += 1;
+                        return result;
+                    },
+                    else => continue :state,
+                },
+            }
+        }
+
+        // End of buffer
+        switch (state) {
+            .comment_content, .html_end_dash1, .html_end_dash2 => {
+                result.tag = .content;
+                result.start = self.content_start;
+                result.end = self.buffer.len;
+            },
+            .banjo_id, .link_display, .link_paren, .link_target => {
+                // Incomplete token at end
+                result.tag = .eof;
+            },
+            else => {
+                result.tag = .eof;
+            },
+        }
+        return result;
+    }
+
+    pub fn slice(self: *const Lexer, tok: Token) []const u8 {
+        return self.buffer[tok.start..tok.end];
+    }
 };
 
 const banjo_marker = "@banjo[";
 
+/// Extract comment content from a line using the lexer.
+/// Returns null if line is not a comment.
 fn stripCommentPrefix(line: []const u8) ?[]const u8 {
-    const trimmed = mem.trimLeft(u8, line, " \t");
-    if (trimmed.len == 0) return null;
-
-    if (mem.startsWith(u8, trimmed, "<!--")) {
-        var pos: usize = 4;
-        while (pos < trimmed.len and (trimmed[pos] == ' ' or trimmed[pos] == '\t')) pos += 1;
-        var end = trimmed.len;
-        if (mem.endsWith(u8, trimmed, "-->")) {
-            end -= 3;
-        }
-        return mem.trim(u8, trimmed[pos..end], " \t");
-    }
-
-    if (mem.startsWith(u8, trimmed, "//")) {
-        var pos: usize = 2;
-        while (pos < trimmed.len and (trimmed[pos] == '/' or trimmed[pos] == '!')) pos += 1;
-        while (pos < trimmed.len and (trimmed[pos] == ' ' or trimmed[pos] == '\t')) pos += 1;
-        return trimmed[pos..];
-    }
-
-    if (mem.startsWith(u8, trimmed, "--")) {
-        var pos: usize = 2;
-        while (pos < trimmed.len and trimmed[pos] == '-') pos += 1;
-        while (pos < trimmed.len and (trimmed[pos] == ' ' or trimmed[pos] == '\t')) pos += 1;
-        return trimmed[pos..];
-    }
-
-    if (mem.startsWith(u8, trimmed, "#")) {
-        var pos: usize = 1;
-        while (pos < trimmed.len and trimmed[pos] == '#') pos += 1;
-        while (pos < trimmed.len and (trimmed[pos] == ' ' or trimmed[pos] == '\t')) pos += 1;
-        return trimmed[pos..];
-    }
-
-    if (mem.startsWith(u8, trimmed, ";")) {
-        var pos: usize = 1;
-        while (pos < trimmed.len and trimmed[pos] == ';') pos += 1;
-        while (pos < trimmed.len and (trimmed[pos] == ' ' or trimmed[pos] == '\t')) pos += 1;
-        return trimmed[pos..];
-    }
-
-    return null;
+    var lexer = Lexer.init(line);
+    const tok = lexer.next();
+    return switch (tok.tag) {
+        .content => lexer.slice(tok),
+        .banjo_marker => line[tok.end + 1 ..], // Everything after ]
+        .link => line[lexer.content_start..],
+        .not_comment, .eof => null,
+    };
 }
 
+/// Scan content for @[display](target) links using simple string matching.
+/// This is used for content that has already been stripped of comment prefixes.
 fn parseLinksInto(allocator: Allocator, links: *std.ArrayListUnmanaged([]const u8), content: []const u8) !void {
     var pos: usize = 0;
     while (pos < content.len) {
         const link_start = mem.indexOfPos(u8, content, pos, link_prefix) orelse break;
-        const mid = mem.indexOfPos(u8, content, link_start + 2, "](") orelse {
-            pos = link_start + 2;
+        const mid = mem.indexOfPos(u8, content, link_start + link_prefix.len, "](") orelse {
+            pos = link_start + link_prefix.len;
             continue;
         };
         const link_end = mem.indexOfPos(u8, content, mid + 2, ")") orelse {
             pos = mid + 2;
             continue;
         };
-
         const target_id = content[mid + 2 .. link_end];
         try links.append(allocator, try allocator.dupe(u8, target_id));
         pos = link_end + 1;
     }
 }
 
-/// Parse a single line for a @banjo note comment
+/// Parse a single line for a @banjo note comment using the lexer
 /// Returns null if line doesn't contain a banjo note
 pub fn parseNoteLine(allocator: Allocator, line: []const u8, line_number: u32) !?ParsedNote {
-    // Find @banjo[ marker
-    const marker_start = mem.indexOf(u8, line, banjo_marker) orelse return null;
+    var lexer = Lexer.init(line);
+    var note_id: ?[]const u8 = null;
+    var content_start_pos: usize = 0;
 
-    // Find the note ID (between [ and ])
-    const id_start = marker_start + banjo_marker.len;
-    const id_end = mem.indexOfPos(u8, line, id_start, "]") orelse return null;
+    // First pass: find @banjo marker
+    while (true) {
+        const tok = lexer.next();
+        switch (tok.tag) {
+            .banjo_marker => {
+                if (tok.end > tok.start) {
+                    note_id = lexer.slice(tok);
+                    content_start_pos = lexer.content_start;
+                }
+            },
+            .not_comment, .eof => break,
+            .content, .link => continue,
+        }
+    }
 
-    if (id_end <= id_start) return null;
-
-    const id = try allocator.dupe(u8, line[id_start..id_end]);
+    const id_slice = note_id orelse return null;
+    const id = try allocator.dupe(u8, id_slice);
     errdefer allocator.free(id);
 
-    // Content is after "]" - skip whitespace
-    var cs = id_end + 1;
-    while (cs < line.len and (line[cs] == ' ' or line[cs] == '\t')) cs += 1;
-    const content = line[cs..];
-
-    const duped_content = try allocator.dupe(u8, content);
+    // Content is everything after the note ID marker
+    const content = if (content_start_pos < line.len) line[content_start_pos..] else "";
+    const duped_content = try allocator.dupe(u8, mem.trim(u8, content, " \t"));
     errdefer allocator.free(duped_content);
 
-    // Parse links from content
+    // Parse links from the content
     const links = try parseLinks(allocator, duped_content);
 
     return ParsedNote{
@@ -225,11 +512,19 @@ pub fn generateNoteId() [12]u8 {
     std.crypto.random.bytes(&random_bytes);
     const random = std.mem.readInt(u16, &random_bytes, .little);
     var buf: [12]u8 = undefined;
-    _ = std.fmt.bufPrint(&buf, "{x:0>8}{x:0>4}", .{
-        timestamp_low,
-        random,
-    }) catch unreachable;
+    writeHexLower(buf[0..8], timestamp_low);
+    writeHexLower(buf[8..12], random);
     return buf;
+}
+
+fn writeHexLower(buf: []u8, value: u64) void {
+    const hex = "0123456789abcdef";
+    var i: usize = 0;
+    while (i < buf.len) : (i += 1) {
+        const shift: u6 = @intCast((buf.len - 1 - i) * 4);
+        const nibble: u8 = @intCast((value >> shift) & 0xF);
+        buf[i] = hex[nibble];
+    }
 }
 
 /// Format a note comment for insertion

@@ -242,10 +242,14 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
     };
     defer std.posix.close(sock);
 
-    // Set timeout
+    // Set timeout (non-critical, socket works without it)
     const timeout = std.posix.timeval{ .sec = 60, .usec = 0 };
-    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
-    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
+    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch |err| {
+        hookDebugLog("setsockopt RCVTIMEO failed: {}", .{err});
+    };
+    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch |err| {
+        hookDebugLog("setsockopt SNDTIMEO failed: {}", .{err});
+    };
 
     // Connect
     var addr: std.posix.sockaddr.un = .{ .path = undefined };
