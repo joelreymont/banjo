@@ -54,6 +54,8 @@ fn ensurePermissionHookInDir(allocator: Allocator, home: []const u8) HookConfigR
     };
 
     // Check if PermissionRequest already has our hook
+    // NOTE: Using raw JSON navigation here (not typed structs) to preserve unknown fields
+    // in the user's settings.json when we modify it. Typed parsing would lose user's custom settings.
     if (hooks.get("PermissionRequest")) |pr| {
         if (pr == .array) {
             for (pr.array.items) |item| {

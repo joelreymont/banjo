@@ -196,6 +196,11 @@ const falsey_env_values = std.StaticStringMap(void).initComptime(.{
     .{ "0", {} },
 });
 
+const bool_str_map = std.StaticStringMap(bool).initComptime(.{
+    .{ "true", true },
+    .{ "false", false },
+});
+
 const DotTask = struct {
     status: []const u8,
 };
@@ -3042,11 +3047,7 @@ pub const Agent = struct {
 
         switch (config_id) {
             .auto_resume => {
-                const value = if (std.mem.eql(u8, params.value, "true"))
-                    true
-                else if (std.mem.eql(u8, params.value, "false"))
-                    false
-                else {
+                const value = bool_str_map.get(params.value) orelse {
                     try self.writer.writeResponse(jsonrpc.Response.err(
                         request.id,
                         jsonrpc.Error.InvalidParams,

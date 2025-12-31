@@ -290,14 +290,21 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
     const resp = resp_parsed.value;
 
     // Output Claude Code hook format (static JSON strings for simplicity)
-    if (std.mem.eql(u8, resp.decision, "allow")) {
-        stdout.writeAll(
-            \\{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}
-        ) catch return;
-    } else if (std.mem.eql(u8, resp.decision, "deny")) {
-        stdout.writeAll(
-            \\{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"Permission denied"}}}
-        ) catch return;
+    const Decision = enum { allow, deny };
+    const decision_map = std.StaticStringMap(Decision).initComptime(.{
+        .{ "allow", .allow },
+        .{ "deny", .deny },
+    });
+
+    if (decision_map.get(resp.decision)) |decision| {
+        switch (decision) {
+            .allow => stdout.writeAll(
+                \\{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}
+            ) catch return,
+            .deny => stdout.writeAll(
+                \\{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"Permission denied"}}}
+            ) catch return,
+        }
     }
     // For "ask" or unknown, output nothing - defer to default behavior
 }
