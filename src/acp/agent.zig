@@ -2071,6 +2071,21 @@ pub const Agent = struct {
             break :blk owned;
         };
         defer if (id_owned) |owned| self.allocator.free(owned);
+
+        // Extract file location for "follow agent" feature
+        var locations: [1]protocol.SessionUpdate.ToolCallLocation = undefined;
+        var locations_slice: ?[]const protocol.SessionUpdate.ToolCallLocation = null;
+        if (raw_input) |input| {
+            if (input == .object) {
+                if (input.object.get("file_path")) |fp| {
+                    if (fp == .string) {
+                        locations[0] = .{ .path = fp.string, .line = null };
+                        locations_slice = locations[0..1];
+                    }
+                }
+            }
+        }
+
         try self.sendSessionUpdate(session_id, .{
             .sessionUpdate = .tool_call,
             .toolCallId = tagged_id,
@@ -2078,6 +2093,7 @@ pub const Agent = struct {
             .kind = kind,
             .status = .pending,
             .rawInput = raw_input,
+            .locations = locations_slice,
         });
 
         if (execute_preview) |preview| {
