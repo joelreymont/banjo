@@ -1616,9 +1616,15 @@ pub const Agent = struct {
                 },
                 .result => {
                     if (msg.getStopReason()) |reason| {
-                        if (std.mem.eql(u8, reason, "error_max_turns") and dotHasPendingTasks(self.allocator, session.cwd)) {
-                            log.info("Claude Code hit max turns; dot tasks pending, continuing", .{});
-                            _ = try self.sendClaudePromptWithRestart(session, session_id, "continue");
+                        // Check if we should auto-continue (nudge) due to pending dot tasks
+                        const should_nudge = dotHasPendingTasks(self.allocator, session.cwd) and
+                            (std.mem.eql(u8, reason, "error_max_turns") or
+                            std.mem.eql(u8, reason, "success") or
+                            std.mem.eql(u8, reason, "end_turn"));
+
+                        if (should_nudge) {
+                            log.info("Claude Code stopped ({s}); dot tasks pending, nudging to continue", .{reason});
+                            _ = try self.sendClaudePromptWithRestart(session, session_id, "continue with the next dot task");
                             stream_prefix_pending = true;
                             thought_prefix_pending = true;
                             continue;
@@ -1857,17 +1863,20 @@ pub const Agent = struct {
             }
 
             if (msg.event_type == .turn_completed) {
-                if (msg.turn_error) |err| {
-                    if (isCodexMaxTurnError(err) and dotHasPendingTasks(self.allocator, session.cwd)) {
-                        log.info("Codex hit max turns; dot tasks pending, continuing", .{});
-                        const continue_inputs = [_]CodexUserInput{
-                            .{ .type = "text", .text = "continue" },
-                        };
-                        _ = try self.sendCodexPromptWithRestart(session, session_id, continue_inputs[0..]);
-                        stream_prefix_pending = true;
-                        thought_prefix_pending = true;
-                        continue;
-                    }
+                // Check if we should nudge due to pending dot tasks
+                const has_max_turn_error = if (msg.turn_error) |err| isCodexMaxTurnError(err) else false;
+                const should_nudge = dotHasPendingTasks(self.allocator, session.cwd) and
+                    (has_max_turn_error or msg.turn_error == null);
+
+                if (should_nudge) {
+                    log.info("Codex turn completed; dot tasks pending, nudging to continue", .{});
+                    const continue_inputs = [_]CodexUserInput{
+                        .{ .type = "text", .text = "continue with the next dot task" },
+                    };
+                    _ = try self.sendCodexPromptWithRestart(session, session_id, continue_inputs[0..]);
+                    stream_prefix_pending = true;
+                    thought_prefix_pending = true;
+                    continue;
                 }
             }
 
