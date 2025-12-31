@@ -2141,6 +2141,7 @@ pub const Agent = struct {
         content: ?[]const u8,
         status: protocol.SessionUpdate.ToolCallStatus,
         terminal_id: ?[]const u8,
+        raw_output: ?std.json.Value,
     ) !void {
         const tag_engine = self.shouldTagEngine(session);
         var id_buf: [256]u8 = undefined;
@@ -2181,6 +2182,7 @@ pub const Agent = struct {
             .toolCallId = tagged_id,
             .status = status,
             .toolContent = if (count > 0) entries[0..count] else null,
+            .rawOutput = raw_output,
         });
     }
 
@@ -2456,7 +2458,7 @@ pub const Agent = struct {
                 };
             }
         }
-        try self.sendEngineToolResult(session, session_id, engine, tool_id, content, status, terminal_id);
+        try self.sendEngineToolResult(session, session_id, engine, tool_id, content, status, terminal_id, null);
     }
 
     fn requestPermission(
