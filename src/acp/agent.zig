@@ -92,6 +92,18 @@ fn elapsedMs(start_ms: i64) u64 {
     return @intCast(now - start_ms);
 }
 
+fn replaceFirst(allocator: Allocator, input: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
+    const pos = std.mem.indexOf(u8, input, needle) orelse {
+        return allocator.dupe(u8, input);
+    };
+    const new_len = input.len - needle.len + replacement.len;
+    const result = try allocator.alloc(u8, new_len);
+    @memcpy(result[0..pos], input[0..pos]);
+    @memcpy(result[pos..][0..replacement.len], replacement);
+    @memcpy(result[pos + replacement.len ..], input[pos + needle.len ..]);
+    return result;
+}
+
 fn dotOutputHasPendingTasks(allocator: Allocator, output: []const u8) !bool {
     const parsed = try std.json.parseFromSlice([]DotTask, allocator, output, .{
         .ignore_unknown_fields = true,
@@ -2282,6 +2294,7 @@ pub const Agent = struct {
         path: ?[]const u8 = null,
         old_string: ?[]const u8 = null,
         new_string: ?[]const u8 = null,
+        replace_all: ?bool = null,
     };
 
     fn trackExecuteTool(self: *Agent, session: *Session, engine: Engine, tool_id: []const u8) !void {
@@ -2444,8 +2457,23 @@ pub const Agent = struct {
                 };
                 defer parsed.deinit();
                 const path = parsed.value.file_path orelse parsed.value.path orelse return;
-                const new_content = parsed.value.new_string orelse return;
-                _ = try self.requestWriteTextFile(session, session_id, path, new_content);
+                const old_string = parsed.value.old_string orelse return;
+                const new_string = parsed.value.new_string orelse return;
+
+                // Read current file content
+                const current = self.requestReadTextFile(session, session_id, path, null, null) catch return;
+                const content = current orelse return;
+                defer self.allocator.free(content);
+
+                // Apply the edit
+                const replace_all = parsed.value.replace_all orelse false;
+                const result = if (replace_all)
+                    std.mem.replaceOwned(u8, self.allocator, content, old_string, new_string) catch return
+                else
+                    replaceFirst(self.allocator, content, old_string, new_string) catch return;
+                defer self.allocator.free(result);
+
+                _ = try self.requestWriteTextFile(session, session_id, path, result);
             },
         }
     }
@@ -4216,6 +4244,18 @@ test "dotOutputHasPendingTasks detects pending tasks" {
 
     const no_tasks = try dotOutputHasPendingTasks(testing.allocator, "[]");
     try testing.expect(!no_tasks);
+}
+
+test "replaceFirst replaces only first occurrence" {
+    const result = try replaceFirst(testing.allocator, "foo bar foo", "foo", "baz");
+    defer testing.allocator.free(result);
+    try testing.expectEqualStrings("baz bar foo", result);
+}
+
+test "replaceFirst returns copy when needle not found" {
+    const result = try replaceFirst(testing.allocator, "hello world", "xyz", "abc");
+    defer testing.allocator.free(result);
+    try testing.expectEqualStrings("hello world", result);
 }
 
 test "max turn marker helpers detect max turn errors" {
