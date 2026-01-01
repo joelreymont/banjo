@@ -3131,6 +3131,12 @@ pub const Agent = struct {
             new_mode == .bypassPermissions,
             session.force_new_claude,
         });
+
+        // Close permission socket when switching to bypass mode
+        if (new_mode == .bypassPermissions) {
+            session.closePermissionSocket(self.allocator);
+        }
+
         if (session.codex_bridge) |*codex_bridge| {
             codex_bridge.approval_policy = codexApprovalPolicy(session.permission_mode);
         }
