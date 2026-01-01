@@ -1495,8 +1495,9 @@ pub const Agent = struct {
     }
 
     fn startClaudeBridge(self: *Agent, session: *Session, session_id: []const u8) !void {
-        // Create permission socket for non-bypass modes
-        if (session.permission_mode != .bypassPermissions and session.permission_socket == null) {
+        // Create permission socket if not already exists (needed even in bypass mode
+        // to receive and auto-approve requests from Claude's hook)
+        if (session.permission_socket == null) {
             session.createPermissionSocket(self.allocator) catch |err| {
                 log.warn("Failed to create permission socket: {}", .{err});
                 // Continue without socket - will fall back to bypass behavior
@@ -2715,6 +2716,13 @@ pub const Agent = struct {
         const req = parsed.value;
         log.info("Permission request from hook: tool={s} id={s}", .{ req.tool_name, req.tool_use_id });
 
+        // Auto-approve in bypass mode
+        if (session.permission_mode == .bypassPermissions) {
+            log.info("Auto-approving in bypass mode", .{});
+            self.sendPermissionResponse(client_fd, "allow", null);
+            return;
+        }
+
         // Forward to Zed via ACP
         const decision = self.requestPermissionFromClient(session, req) catch |err| {
             log.warn("Failed to request permission from client: {}", .{err});
@@ -3165,10 +3173,9 @@ pub const Agent = struct {
             session.force_new_claude,
         });
 
-        // Close permission socket when switching to bypass mode
-        if (new_mode == .bypassPermissions) {
-            session.closePermissionSocket(self.allocator);
-        }
+        // Keep permission socket open even in bypass mode - we auto-approve requests
+        // that come through it. Closing it would cause Claude's hook to fail and
+        // fall back to interactive prompts.
 
         if (session.codex_bridge) |*codex_bridge| {
             codex_bridge.approval_policy = codexApprovalPolicy(session.permission_mode);
