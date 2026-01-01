@@ -2653,16 +2653,23 @@ pub const Agent = struct {
         defer std.posix.close(client_fd);
         log.info("Accepted permission socket connection", .{});
 
-        // Read request from hook
+        // Read request from hook (may arrive in multiple chunks)
         var buf: [4096]u8 = undefined;
-        const n = std.posix.read(client_fd, &buf) catch |err| {
-            log.warn("Permission socket read error: {}", .{err});
-            return;
-        };
-        if (n == 0) return;
+        var total: usize = 0;
+        while (total < buf.len) {
+            const n = std.posix.read(client_fd, buf[total..]) catch |err| {
+                log.warn("Permission socket read error: {}", .{err});
+                return;
+            };
+            if (n == 0) break; // EOF
+            total += n;
+            // Check if we have a complete line (JSON ends with newline)
+            if (std.mem.indexOfScalar(u8, buf[0..total], '\n') != null) break;
+        }
+        if (total == 0) return;
 
         // Parse JSON request
-        const request_json = std.mem.trimRight(u8, buf[0..n], "\n\r");
+        const request_json = std.mem.trimRight(u8, buf[0..total], "\n\r");
         var parsed = std.json.parseFromSlice(PermissionHookRequest, self.allocator, request_json, .{
             .ignore_unknown_fields = true,
         }) catch |err| {
