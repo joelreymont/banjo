@@ -2050,6 +2050,7 @@ pub const Agent = struct {
         .{ "Skill", {} },
         .{ "Read", {} },
         .{ "Write", {} },
+        .{ "Edit", {} },
         .{ "Grep", {} },
         .{ "Glob", {} },
         .{ "LSP", {} },
