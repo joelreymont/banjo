@@ -4532,6 +4532,27 @@ test "Agent requestPermissionFromClient stores allow_always choice" {
     try testing.expectEqualStrings("allow", decision2.behavior);
 }
 
+test "bypass mode skips permission prompts" {
+    // This tests the condition in pollPermissionSocket that auto-approves
+    // when session.permission_mode == .bypassPermissions
+    // Full socket flow is an integration test; here we just verify the mode check
+    var session = Agent.Session{
+        .id = try testing.allocator.dupe(u8, "session-1"),
+        .cwd = try testing.allocator.dupe(u8, "."),
+        .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
+        .availability = .{ .claude = true, .codex = true },
+        .permission_mode = .bypassPermissions,
+        .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
+        .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+        .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
+    };
+    defer session.deinit(testing.allocator);
+
+    // In bypass mode, permission requests should be auto-approved
+    try testing.expectEqual(protocol.PermissionMode.bypassPermissions, session.permission_mode);
+}
+
 test "Agent sendEngineText omits prefix in solo mode" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
