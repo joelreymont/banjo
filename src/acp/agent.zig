@@ -2051,12 +2051,16 @@ pub const Agent = struct {
         .{ "Read", {} },
         .{ "Write", {} },
         .{ "Edit", {} },
+        .{ "MultiEdit", {} },
+        .{ "NotebookRead", {} },
+        .{ "NotebookEdit", {} },
         .{ "Grep", {} },
         .{ "Glob", {} },
         .{ "LSP", {} },
         .{ "KillShell", {} },
         .{ "EnterPlanMode", {} },
         .{ "ExitPlanMode", {} },
+        .{ "AskUserQuestion", {} },
     });
 
     fn sendEngineToolCall(
