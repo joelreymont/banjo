@@ -2030,10 +2030,13 @@ pub const Agent = struct {
         .{ "TaskOutput", {} },
         .{ "Skill", {} },
         .{ "Read", {} },
+        .{ "Write", {} },
         .{ "Grep", {} },
         .{ "Glob", {} },
         .{ "LSP", {} },
         .{ "KillShell", {} },
+        .{ "EnterPlanMode", {} },
+        .{ "ExitPlanMode", {} },
     });
 
     fn sendEngineToolCall(
