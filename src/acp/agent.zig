@@ -4553,6 +4553,110 @@ test "bypass mode skips permission prompts" {
     try testing.expectEqual(protocol.PermissionMode.bypassPermissions, session.permission_mode);
 }
 
+test "permission socket auto-approves in bypass mode" {
+    // Integration test: create actual socket, connect, verify auto-approve
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
+    defer agent.deinit();
+
+    var session = Agent.Session{
+        .id = try testing.allocator.dupe(u8, "test-session"),
+        .cwd = try testing.allocator.dupe(u8, "."),
+        .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
+        .availability = .{ .claude = true, .codex = true },
+        .permission_mode = .bypassPermissions,
+        .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
+        .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+        .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
+    };
+    defer session.deinit(testing.allocator);
+
+    // Create permission socket
+    try session.createPermissionSocket(testing.allocator);
+    try testing.expect(session.permission_socket != null);
+    try testing.expect(session.permission_socket_path != null);
+
+    // Connect to socket like Claude's hook would
+    const client = std.net.connectUnixSocket(session.permission_socket_path.?) catch |err| {
+        std.debug.print("Failed to connect: {}\n", .{err});
+        return err;
+    };
+    defer client.close();
+
+    // Send permission request
+    const request = "{\"tool_name\":\"Bash\",\"tool_use_id\":\"tc-1\",\"tool_input\":{\"command\":\"ls\"},\"session_id\":\"test-session\"}\n";
+    _ = try client.write(request);
+
+    // Poll to handle the request (agent processes it)
+    agent.pollPermissionSocket(&session);
+
+    // Read response
+    var buf: [256]u8 = undefined;
+    const n = try client.read(&buf);
+    const response = buf[0..n];
+
+    // Should be auto-approved
+    try testing.expect(std.mem.indexOf(u8, response, "\"decision\":\"allow\"") != null);
+}
+
+test "permission socket forwards to client in default mode" {
+    // Integration test: in default mode, socket should forward to ACP client
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    // Mock ACP response for permission request
+    const response_json =
+        \\{"jsonrpc":"2.0","id":1,"result":{"outcome":{"outcome":"selected","optionId":"allow_once"}}}
+        \\
+    ;
+    const input_buf = try testing.allocator.dupe(u8, response_json);
+    defer testing.allocator.free(input_buf);
+
+    var input_stream = std.io.fixedBufferStream(input_buf);
+    var reader = jsonrpc.Reader.init(testing.allocator, input_stream.reader().any());
+    defer reader.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream, &reader);
+    defer agent.deinit();
+
+    var session = Agent.Session{
+        .id = try testing.allocator.dupe(u8, "test-session"),
+        .cwd = try testing.allocator.dupe(u8, "."),
+        .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
+        .availability = .{ .claude = true, .codex = true },
+        .permission_mode = .default, // NOT bypass
+        .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
+        .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+        .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
+    };
+    defer session.deinit(testing.allocator);
+
+    // Create permission socket
+    try session.createPermissionSocket(testing.allocator);
+
+    // Connect to socket
+    const client = std.net.connectUnixSocket(session.permission_socket_path.?) catch |err| {
+        std.debug.print("Failed to connect: {}\n", .{err});
+        return err;
+    };
+    defer client.close();
+
+    // Send permission request
+    const request = "{\"tool_name\":\"Bash\",\"tool_use_id\":\"tc-1\",\"tool_input\":{\"command\":\"ls\"},\"session_id\":\"test-session\"}\n";
+    _ = try client.write(request);
+
+    // Poll - this should forward to ACP client
+    agent.pollPermissionSocket(&session);
+
+    // Verify ACP request was sent (check output contains session/request_permission)
+    const output = tw.output.items;
+    try testing.expect(std.mem.indexOf(u8, output, "session/request_permission") != null);
+}
+
 test "Agent sendEngineText omits prefix in solo mode" {
     var tw = try TestWriter.init(testing.allocator);
     defer tw.deinit();
