@@ -1465,11 +1465,18 @@ pub const Agent = struct {
     fn buildClaudeStartOptions(session: *Session) Bridge.StartOptions {
         const allow_resume = !session.force_new_claude;
         const mode = session.permission_mode;
+        const skip = mode == .bypassPermissions;
+        const mode_arg = if (skip) null else @tagName(mode);
+        log.info("buildClaudeStartOptions: mode={s} skip_permissions={} permission_mode_arg={?s}", .{
+            @tagName(mode),
+            skip,
+            mode_arg,
+        });
         return .{
             .resume_session_id = if (allow_resume) session.cli_session_id else null,
             .continue_last = allow_resume and session.cli_session_id == null and session.config.auto_resume,
-            .skip_permissions = mode == .bypassPermissions,
-            .permission_mode = if (mode == .bypassPermissions) null else @tagName(mode),
+            .skip_permissions = skip,
+            .permission_mode = mode_arg,
             .model = session.model,
             .permission_socket_path = session.permission_socket_path,
         };
@@ -3108,8 +3115,15 @@ pub const Agent = struct {
             return;
         };
 
+        const old_mode = session.permission_mode;
         session.permission_mode = new_mode;
-        log.info("Set mode for session {s} to {s}", .{ params.sessionId, mode_value });
+        log.info("Set mode for session {s}: {s} -> {s} (bypass={}, force_restart={})", .{
+            params.sessionId,
+            @tagName(old_mode),
+            mode_value,
+            new_mode == .bypassPermissions,
+            session.force_new_claude,
+        });
         if (session.codex_bridge) |*codex_bridge| {
             codex_bridge.approval_policy = codexApprovalPolicy(session.permission_mode);
         }
