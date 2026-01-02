@@ -2764,6 +2764,29 @@ pub const Agent = struct {
         _ = std.posix.write(fd, response) catch {};
     }
 
+    const AskUserQuestionSocketResponse = struct {
+        decision: []const u8 = "allow",
+        answers: std.json.ArrayHashMap([]const u8),
+    };
+
+    fn sendAskUserQuestionResponse(self: *Agent, fd: std.posix.fd_t, header: []const u8, answer: []const u8) !void {
+        var answers = std.json.ArrayHashMap([]const u8){};
+        try answers.map.put(self.allocator, header, answer);
+        defer answers.map.deinit(self.allocator);
+
+        var out: std.io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        var jw: std.json.Stringify = .{
+            .writer = &out.writer,
+            .options = .{ .emit_null_optional_fields = false },
+        };
+        try jw.write(AskUserQuestionSocketResponse{ .answers = answers });
+        try out.writer.writeByte('\n');
+        const response = try out.toOwnedSlice();
+        defer self.allocator.free(response);
+        _ = try std.posix.write(fd, response);
+    }
+
     // AskUserQuestion input schema
     const AskUserQuestionInput = struct {
         questions: []const Question,
@@ -2843,7 +2866,7 @@ pub const Agent = struct {
         // Return the selected option as the answer
         if (outcome.optionId) |selected| {
             log.info("AskUserQuestion answered: {s}", .{selected});
-            self.sendPermissionResponse(client_fd, "allow", selected);
+            try self.sendAskUserQuestionResponse(client_fd, q.header, selected);
         } else {
             self.sendPermissionResponse(client_fd, "allow", null);
         }

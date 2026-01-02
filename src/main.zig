@@ -178,6 +178,7 @@ const HookSocketRequest = struct {
 const HookSocketResponse = struct {
     decision: []const u8 = "ask",
     reason: ?[]const u8 = null,
+    answers: ?std.json.Value = null,
 };
 
 /// Debug log to file (hooks stderr may not be visible)
@@ -313,9 +314,35 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
     if (decision_map.get(resp.decision)) |decision| {
         hookDebugLog("Outputting decision: {s}", .{resp.decision});
         switch (decision) {
-            .allow => stdout.writeAll(
-                \\{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}
-            ) catch return,
+            .allow => {
+                // Check if we have answers to include (for AskUserQuestion)
+                if (resp.answers) |answers| {
+                    // Build JSON with updatedInput containing answers
+                    var hook_out: std.io.Writer.Allocating = .init(allocator);
+                    defer hook_out.deinit();
+                    var hook_jw: std.json.Stringify = .{
+                        .writer = &hook_out.writer,
+                        .options = .{ .emit_null_optional_fields = false },
+                    };
+                    const HookOutput = struct {
+                        hookSpecificOutput: struct {
+                            hookEventName: []const u8 = "PreToolUse",
+                            permissionDecision: []const u8 = "allow",
+                            updatedInput: struct { answers: std.json.Value },
+                        },
+                    };
+                    hook_jw.write(HookOutput{
+                        .hookSpecificOutput = .{ .updatedInput = .{ .answers = answers } },
+                    }) catch return;
+                    const hook_json = hook_out.toOwnedSlice() catch return;
+                    defer allocator.free(hook_json);
+                    stdout.writeAll(hook_json) catch return;
+                } else {
+                    stdout.writeAll(
+                        \\{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}
+                    ) catch return;
+                }
+            },
             .deny => {
                 // Include reason if provided
                 if (resp.reason) |reason| {
