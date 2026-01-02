@@ -2378,7 +2378,10 @@ pub const Agent = struct {
         const input_value = raw_input orelse return;
         const parsed = std.json.parseFromValue(EditToolInput, self.allocator, input_value, .{
             .ignore_unknown_fields = true,
-        }) catch return;
+        }) catch |err| {
+            log.warn("Failed to parse Edit tool input for tracking: {}", .{err});
+            return;
+        };
         defer parsed.deinit();
 
         const input = parsed.value;
