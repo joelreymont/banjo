@@ -2715,6 +2715,15 @@ pub const Agent = struct {
         const req = parsed.value;
         log.info("Permission request from hook: tool={s} id={s}", .{ req.tool_name, req.tool_use_id });
 
+        // Handle AskUserQuestion specially - show choices to user
+        if (std.mem.eql(u8, req.tool_name, "AskUserQuestion")) {
+            self.handleAskUserQuestion(session, client_fd, req) catch |err| {
+                log.warn("Failed to handle AskUserQuestion: {}", .{err});
+                self.sendPermissionResponse(client_fd, "allow", null);
+            };
+            return;
+        }
+
         // Auto-approve in bypass mode
         if (session.permission_mode == .bypassPermissions) {
             log.info("Auto-approving in bypass mode", .{});
@@ -2753,6 +2762,91 @@ pub const Agent = struct {
         else
             std.fmt.bufPrint(&buf, "{{\"decision\":\"{s}\"}}\n", .{decision}) catch return;
         _ = std.posix.write(fd, response) catch {};
+    }
+
+    // AskUserQuestion input schema
+    const AskUserQuestionInput = struct {
+        questions: []const Question,
+
+        const Question = struct {
+            question: []const u8,
+            header: []const u8,
+            multiSelect: bool,
+            options: []const Option,
+        };
+
+        const Option = struct {
+            label: []const u8,
+            description: []const u8,
+        };
+    };
+
+    fn handleAskUserQuestion(self: *Agent, session: *Session, client_fd: std.posix.fd_t, req: PermissionHookRequest) !void {
+        // Parse the AskUserQuestion input
+        const parsed = std.json.parseFromValue(AskUserQuestionInput, self.allocator, req.tool_input, .{
+            .ignore_unknown_fields = true,
+        }) catch |err| {
+            log.warn("Failed to parse AskUserQuestion input: {}", .{err});
+            self.sendPermissionResponse(client_fd, "allow", null);
+            return;
+        };
+        defer parsed.deinit();
+
+        const input = parsed.value;
+        if (input.questions.len == 0) {
+            self.sendPermissionResponse(client_fd, "allow", null);
+            return;
+        }
+
+        // For now, handle first question only (could loop for multiple)
+        const q = input.questions[0];
+
+        // Build permission options from question options
+        var options: [4]protocol.PermissionOption = undefined;
+        const opt_count = @min(q.options.len, 4);
+        for (q.options[0..opt_count], 0..) |opt, i| {
+            options[i] = .{
+                .kind = .allow_once,
+                .name = opt.label,
+                .optionId = opt.label,
+            };
+        }
+
+        // Send permission request to Zed
+        const request_id = self.next_request_id;
+        self.next_request_id += 1;
+
+        const params = protocol.PermissionRequest{
+            .sessionId = session.id,
+            .toolCall = .{
+                .toolCallId = req.tool_use_id,
+                .title = q.question,
+                .kind = .other,
+                .status = .pending,
+                .rawInput = null,
+            },
+            .options = options[0..opt_count],
+        };
+
+        try self.writer.writeTypedRequest(.{ .number = request_id }, "session/request_permission", params);
+
+        // Wait for user response
+        var response = self.waitForResponse(session, .{ .number = request_id }) catch |err| {
+            log.warn("AskUserQuestion response error: {}", .{err});
+            self.sendPermissionResponse(client_fd, "allow", null);
+            return;
+        };
+        defer response.deinit();
+
+        const outcome = try self.parsePermissionOutcome(response.message.response);
+
+        // Return the selected option as the answer
+        if (outcome.optionId) |selected| {
+            log.info("AskUserQuestion answered: {s}", .{selected});
+            self.sendPermissionResponse(client_fd, "allow", selected);
+        } else {
+            self.sendPermissionResponse(client_fd, "allow", null);
+        }
     }
 
     /// Build a descriptive title for permission prompts from tool name and input
