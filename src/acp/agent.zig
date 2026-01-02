@@ -2466,16 +2466,19 @@ pub const Agent = struct {
                 const new_string = parsed.value.new_string orelse return;
 
                 // Read current file content
-                const current = self.requestReadTextFile(session, session_id, path, null, null) catch return;
+                const current = self.requestReadTextFile(session, session_id, path, null, null) catch |err| {
+                    log.warn("Failed to read file for Edit sync: {}", .{err});
+                    return;
+                };
                 const content = current orelse return;
                 defer self.allocator.free(content);
 
                 // Apply the edit
                 const replace_all = parsed.value.replace_all orelse false;
                 const result = if (replace_all)
-                    std.mem.replaceOwned(u8, self.allocator, content, old_string, new_string) catch return
+                    try std.mem.replaceOwned(u8, self.allocator, content, old_string, new_string)
                 else
-                    replaceFirst(self.allocator, content, old_string, new_string) catch return;
+                    try replaceFirst(self.allocator, content, old_string, new_string);
                 defer self.allocator.free(result);
 
                 _ = try self.requestWriteTextFile(session, session_id, path, result);
