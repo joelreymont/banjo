@@ -2043,10 +2043,10 @@ pub const Agent = struct {
     }
 
     // Tools that run silently without UI updates (internal housekeeping)
+    // Task and AskUserQuestion are NOT quiet - user should see subagent spawns and questions
     const quiet_tools = std.StaticStringMap(void).initComptime(.{
         .{ "TodoWrite", {} },
         .{ "TodoRead", {} },
-        .{ "Task", {} },
         .{ "TaskOutput", {} },
         .{ "Skill", {} },
         .{ "Read", {} },
@@ -2061,7 +2061,6 @@ pub const Agent = struct {
         .{ "KillShell", {} },
         .{ "EnterPlanMode", {} },
         .{ "ExitPlanMode", {} },
-        .{ "AskUserQuestion", {} },
     });
 
     fn sendEngineToolCall(
