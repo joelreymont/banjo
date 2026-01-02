@@ -1680,10 +1680,11 @@ pub const Agent = struct {
                                 std.mem.eql(u8, reason, "end_turn"));
 
                         if (should_nudge) {
-                            log.info("Claude Code stopped ({s}); pending dots, nudging to continue", .{reason});
+                            log.info("Claude Code stopped ({s}); pending dots, nudging", .{reason});
                             const nudge_msg = "🔄 continue working on pending dots";
                             try self.sendUserMessage(session_id, nudge_msg);
-                            _ = try self.sendClaudePromptWithRestart(session, session_id, "continue with the next dot task");
+                            const nudge_prompt = "clean up dots, then pick a dot and work on it";
+                            _ = try self.sendClaudePromptWithRestart(session, session_id, nudge_prompt);
                             stream_prefix_pending = true;
                             thought_prefix_pending = true;
                             continue;
