@@ -452,6 +452,7 @@ pub const Agent = struct {
         quiet_tool_ids: std.StringHashMap(void), // Tool IDs that were silenced (no UI update sent)
         permission_socket: ?std.posix.socket_t = null,
         permission_socket_path: ?[]const u8 = null,
+        nudge_enabled: bool = true,
 
         pub fn deinit(self: *Session, allocator: Allocator) void {
             if (self.bridge) |*b| b.deinit();
@@ -1678,7 +1679,7 @@ pub const Agent = struct {
                     if (msg.getStopReason()) |reason| {
                         // Check if we should auto-continue (nudge) due to pending dot tasks
                         // Don't nudge if there was an API error - stop and let user intervene
-                        const should_nudge = !had_api_error and
+                        const should_nudge = session.nudge_enabled and !had_api_error and
                             dotHasPendingTasks(self.allocator, session.cwd) and
                             (std.mem.eql(u8, reason, "error_max_turns") or
                                 std.mem.eql(u8, reason, "success") or
@@ -1932,7 +1933,8 @@ pub const Agent = struct {
             if (msg.event_type == .turn_completed) {
                 // Check if we should nudge due to pending dot tasks
                 const has_max_turn_error = if (msg.turn_error) |err| isCodexMaxTurnError(err) else false;
-                const should_nudge = dotHasPendingTasks(self.allocator, session.cwd) and
+                const should_nudge = session.nudge_enabled and
+                    dotHasPendingTasks(self.allocator, session.cwd) and
                     (has_max_turn_error or msg.turn_error == null);
 
                 if (should_nudge) {
@@ -3649,7 +3651,28 @@ pub const Agent = struct {
         try self.writer.writeTypedResponse(request.id, protocol.PromptResponse{ .stopReason = .end_turn });
     }
 
-    const Command = enum { version, note, notes, setup, explain, new };
+    fn handleNudgeCommand(self: *Agent, request: jsonrpc.Request, session: *Session, session_id: []const u8, args: ?[]const u8) !void {
+        const msg = if (args) |a| blk: {
+            const trimmed = std.mem.trim(u8, a, " \t");
+            if (std.mem.eql(u8, trimmed, "on")) {
+                session.nudge_enabled = true;
+                break :blk "Auto-nudge enabled. Will continue working on dots when agent stops.";
+            } else if (std.mem.eql(u8, trimmed, "off")) {
+                session.nudge_enabled = false;
+                break :blk "Auto-nudge disabled. Agent will stop when done.";
+            } else {
+                break :blk if (session.nudge_enabled) "Usage: /nudge [on|off]\nCurrent: on" else "Usage: /nudge [on|off]\nCurrent: off";
+            }
+        } else if (session.nudge_enabled) "Auto-nudge is ON. Use `/nudge off` to disable." else "Auto-nudge is OFF. Use `/nudge on` to enable.";
+
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .agent_message_chunk,
+            .content = .{ .type = "text", .text = msg },
+        });
+        try self.writer.writeTypedResponse(request.id, protocol.PromptResponse{ .stopReason = .end_turn });
+    }
+
+    const Command = enum { version, note, notes, setup, explain, new, nudge };
     const command_map = std.StaticStringMap(Command).initComptime(.{
         .{ "version", .version },
         .{ "note", .note },
@@ -3657,6 +3680,7 @@ pub const Agent = struct {
         .{ "setup", .setup },
         .{ "explain", .explain },
         .{ "new", .new },
+        .{ "nudge", .nudge },
     });
 
     const RouteCommand = struct {
@@ -3701,6 +3725,10 @@ pub const Agent = struct {
         }
 
         const command = command_map.get(cmd_name) orelse return text; // Not our command, pass through to CLI
+        const cmd_args: ?[]const u8 = if (space_idx < after_slash.len)
+            std.mem.trimLeft(u8, after_slash[space_idx..], " \t")
+        else
+            null;
 
         switch (command) {
             .version => {
@@ -3749,6 +3777,15 @@ pub const Agent = struct {
                     log.err("New command failed: {}", .{err});
                     self.sendErrorAndEnd(request, session_id, "New command failed") catch |send_err| {
                         log.warn("Failed to send new error: {}", .{send_err});
+                    };
+                };
+                return null;
+            },
+            .nudge => {
+                self.handleNudgeCommand(request, session, session_id, cmd_args) catch |err| {
+                    log.err("Nudge command failed: {}", .{err});
+                    self.sendErrorAndEnd(request, session_id, "Nudge command failed") catch |send_err| {
+                        log.warn("Failed to send nudge error: {}", .{send_err});
                     };
                 };
                 return null;
@@ -4044,6 +4081,7 @@ pub const Agent = struct {
         .{ .name = "note", .description = "Note management commands" },
         .{ .name = "version", .description = "Show banjo version" },
         .{ .name = "new", .description = "Start fresh Claude Code and Codex sessions" },
+        .{ .name = "nudge", .description = "Toggle auto-continue when dots are pending (on/off)" },
     };
 
     const slash_commands = agent_commands ++ [_]protocol.SlashCommand{
@@ -4323,6 +4361,7 @@ const expected_commands_json =
     "{\"name\":\"note\",\"description\":\"Note management commands\"}," ++
     "{\"name\":\"version\",\"description\":\"Show banjo version\"}," ++
     "{\"name\":\"new\",\"description\":\"Start fresh Claude Code and Codex sessions\"}," ++
+    "{\"name\":\"nudge\",\"description\":\"Toggle auto-continue when dots are pending (on/off)\"}," ++
     "{\"name\":\"claude\",\"description\":\"Switch routing mode to Claude\"}," ++
     "{\"name\":\"codex\",\"description\":\"Switch routing mode to Codex\"}," ++
     "{\"name\":\"duet\",\"description\":\"Switch routing mode to Duet\"}," ++

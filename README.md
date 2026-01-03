@@ -22,7 +22,7 @@ Banjo integrates with [Dots](https://github.com/joelreymont/dots) to automatical
 - **Auto-resume sessions** — automatically continues your last conversation
 - **Code notes** — attach notes to code as comments with `/explain`
 - **Auto-setup** — `/setup lsp` configures Zed settings automatically
-- Claude Code commands: `/version`, `/model`, `/compact`, `/review`, `/clear`
+- Claude Code commands: `/version`, `/model`, `/compact`, `/review`, `/clear`, `/nudge`
 - **Duet routing** — `/claude`, `/codex`, `/duet` switch the active routing mode (default: `/claude` when both engines are available)
 - **Codex support** — run Codex prompts side-by-side with Claude Code
 
@@ -104,6 +104,8 @@ Banjo's killer feature: **automatic continuation** when Claude hits turn limits.
 4. If pending tasks exist, Banjo sends "🔄 continue working on pending dots"
 
 This keeps Claude working autonomously on complex multi-step tasks without manual intervention.
+
+Use `/nudge off` to disable auto-continue, `/nudge on` to re-enable.
 
 ## Development
 
