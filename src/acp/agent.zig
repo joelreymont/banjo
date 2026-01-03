@@ -86,6 +86,29 @@ fn isCodexMaxTurnError(err: codex_cli.TurnError) bool {
         containsMaxTurnMarker(err.message);
 }
 
+const api_error_markers = [_][]const u8{
+    "API Error",
+    "APIError",
+    "api_error",
+    "rate_limit",
+    "rate_limit_error",
+    "RateLimitError",
+    "overloaded",
+    "overloaded_error",
+    "server_error",
+    "internal_error",
+    "authentication_error",
+    "invalid_request_error",
+};
+
+fn containsApiErrorMarker(text: ?[]const u8) bool {
+    const haystack = text orelse return false;
+    for (api_error_markers) |marker| {
+        if (std.mem.indexOf(u8, haystack, marker) != null) return true;
+    }
+    return false;
+}
+
 fn elapsedMs(start_ms: i64) u64 {
     const now = std.time.milliTimestamp();
     if (now <= start_ms) return 0;
@@ -1646,6 +1669,7 @@ pub const Agent = struct {
                         if (first_response_ms == 0) {
                             first_response_ms = msg_time_ms;
                         }
+                        if (containsApiErrorMarker(content)) had_api_error = true;
                         try self.sendEngineText(session, session_id, engine, content);
                     }
 
@@ -1664,14 +1688,14 @@ pub const Agent = struct {
 
                     if (msg.getToolResult()) |tool_result| {
                         const status = toolResultStatus(tool_result.is_error);
-                        if (tool_result.is_error) had_api_error = true;
+                        if (containsApiErrorMarker(tool_result.content)) had_api_error = true;
                         try self.handleEngineToolResult(session, session_id, engine, tool_result.id, tool_result.content, status, tool_result.raw);
                     }
                 },
                 .user => {
                     if (msg.getToolResult()) |tool_result| {
                         const status = toolResultStatus(tool_result.is_error);
-                        if (tool_result.is_error) had_api_error = true;
+                        if (containsApiErrorMarker(tool_result.content)) had_api_error = true;
                         try self.handleEngineToolResult(session, session_id, engine, tool_result.id, tool_result.content, status, tool_result.raw);
                     }
                 },
@@ -1720,6 +1744,7 @@ pub const Agent = struct {
                             first_response_ms = msg_time_ms;
                             log.info("First Claude stream response at {d}ms", .{msg_time_ms});
                         }
+                        if (containsApiErrorMarker(text)) had_api_error = true;
                         if (stream_prefix_pending) {
                             try self.sendEngineTextPrefix(session, session_id, engine);
                             stream_prefix_pending = false;
@@ -1811,6 +1836,7 @@ pub const Agent = struct {
 
         var first_response_ms: u64 = 0;
         var msg_count: u32 = 0;
+        var had_api_error = false;
 
         while (true) {
             if (session.cancelled) return .cancelled;
@@ -1846,6 +1872,7 @@ pub const Agent = struct {
             if (msg.event_type == .agent_message_delta) {
                 if (msg.text) |text| {
                     if (first_response_ms == 0) first_response_ms = msg_time_ms;
+                    if (containsApiErrorMarker(text)) had_api_error = true;
                     if (stream_prefix_pending) {
                         try self.sendEngineTextPrefix(session, session_id, engine);
                         stream_prefix_pending = false;
@@ -1858,6 +1885,7 @@ pub const Agent = struct {
             if (msg.event_type == .reasoning_delta) {
                 if (msg.text) |text| {
                     if (first_response_ms == 0) first_response_ms = msg_time_ms;
+                    if (containsApiErrorMarker(text)) had_api_error = true;
                     if (thought_prefix_pending) {
                         try self.sendEngineThoughtPrefix(session, session_id, engine);
                         thought_prefix_pending = false;
@@ -1914,26 +1942,36 @@ pub const Agent = struct {
 
             if (msg.getToolResult()) |tool_result| {
                 const status = exitCodeStatus(tool_result.exit_code);
+                if (containsApiErrorMarker(tool_result.content)) had_api_error = true;
                 try self.handleEngineToolResult(session, session_id, engine, tool_result.id, tool_result.content, status, tool_result.raw);
                 continue;
             }
 
             if (msg.getThought()) |text| {
                 if (first_response_ms == 0) first_response_ms = msg_time_ms;
+                if (containsApiErrorMarker(text)) had_api_error = true;
                 try self.sendEngineThought(session, session_id, engine, text);
                 continue;
             }
 
             if (msg.getText()) |text| {
                 if (first_response_ms == 0) first_response_ms = msg_time_ms;
+                if (containsApiErrorMarker(text)) had_api_error = true;
                 try self.sendEngineText(session, session_id, engine, text);
                 continue;
             }
 
             if (msg.event_type == .turn_completed) {
                 // Check if we should nudge due to pending dot tasks
+                // Don't nudge if there was an API error - stop and let user intervene
                 const has_max_turn_error = if (msg.turn_error) |err| isCodexMaxTurnError(err) else false;
-                const should_nudge = session.nudge_enabled and
+                // Also check turn_error fields for API error markers
+                if (msg.turn_error) |err| {
+                    if (containsApiErrorMarker(err.code) or
+                        containsApiErrorMarker(err.type) or
+                        containsApiErrorMarker(err.message)) had_api_error = true;
+                }
+                const should_nudge = session.nudge_enabled and !had_api_error and
                     dotHasPendingTasks(self.allocator, session.cwd) and
                     (has_max_turn_error or msg.turn_error == null);
 
@@ -1948,6 +1986,8 @@ pub const Agent = struct {
                     stream_prefix_pending = true;
                     thought_prefix_pending = true;
                     continue;
+                } else if (had_api_error) {
+                    log.info("Codex turn completed; not nudging due to API error", .{});
                 }
             }
 
