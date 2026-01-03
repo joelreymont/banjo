@@ -1,6 +1,6 @@
 id = "banjo"
 name = "Banjo"
-version = "0.5.0"
+version = "0.6.1"
 schema_version = 1
 description = "A Second Brain for your code - Claude Code + Codex agent with notes and backlinks"
 authors = ["Joel Reymont <joelr1@gmail.com>"]
@@ -13,17 +13,17 @@ name = "Banjo Duet (Claude Code + Codex)"
 icon = "icon/banjo.svg"
 
 [agent_servers.banjo.targets.darwin-aarch64]
-archive = "https://github.com/joelreymont/banjo/releases/download/v0.5.0/banjo-darwin-arm64.tar.gz"
+archive = "https://github.com/joelreymont/banjo/releases/download/v0.6.1/banjo-darwin-arm64.tar.gz"
 cmd = "./banjo"
 args = ["--agent"]
 
 [agent_servers.banjo.targets.darwin-x86_64]
-archive = "https://github.com/joelreymont/banjo/releases/download/v0.5.0/banjo-darwin-x64.tar.gz"
+archive = "https://github.com/joelreymont/banjo/releases/download/v0.6.1/banjo-darwin-x64.tar.gz"
 cmd = "./banjo"
 args = ["--agent"]
 
 [agent_servers.banjo.targets.linux-x86_64]
-archive = "https://github.com/joelreymont/banjo/releases/download/v0.5.0/banjo-linux-x64.tar.gz"
+archive = "https://github.com/joelreymont/banjo/releases/download/v0.6.1/banjo-linux-x64.tar.gz"
 cmd = "./banjo"
 args = ["--agent"]
 
