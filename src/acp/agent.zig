@@ -1605,6 +1605,7 @@ pub const Agent = struct {
         var stop_reason: protocol.StopReason = .end_turn;
         var first_response_ms: u64 = 0;
         var msg_count: u32 = 0;
+        var had_api_error = false;
 
         while (true) {
             if (session.cancelled) {
@@ -1662,19 +1663,23 @@ pub const Agent = struct {
 
                     if (msg.getToolResult()) |tool_result| {
                         const status = toolResultStatus(tool_result.is_error);
+                        if (tool_result.is_error) had_api_error = true;
                         try self.handleEngineToolResult(session, session_id, engine, tool_result.id, tool_result.content, status, tool_result.raw);
                     }
                 },
                 .user => {
                     if (msg.getToolResult()) |tool_result| {
                         const status = toolResultStatus(tool_result.is_error);
+                        if (tool_result.is_error) had_api_error = true;
                         try self.handleEngineToolResult(session, session_id, engine, tool_result.id, tool_result.content, status, tool_result.raw);
                     }
                 },
                 .result => {
                     if (msg.getStopReason()) |reason| {
                         // Check if we should auto-continue (nudge) due to pending dot tasks
-                        const should_nudge = dotHasPendingTasks(self.allocator, session.cwd) and
+                        // Don't nudge if there was an API error - stop and let user intervene
+                        const should_nudge = !had_api_error and
+                            dotHasPendingTasks(self.allocator, session.cwd) and
                             (std.mem.eql(u8, reason, "error_max_turns") or
                                 std.mem.eql(u8, reason, "success") or
                                 std.mem.eql(u8, reason, "end_turn"));
@@ -1688,6 +1693,8 @@ pub const Agent = struct {
                             stream_prefix_pending = true;
                             thought_prefix_pending = true;
                             continue;
+                        } else if (had_api_error) {
+                            log.info("Claude Code stopped ({s}); not nudging due to API error", .{reason});
                         }
                         stop_reason = mapCliStopReason(reason);
                     }
