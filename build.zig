@@ -5,6 +5,8 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const live_cli_tests = b.option(bool, "live_cli_tests", "Enable live CLI snapshot tests") orelse false;
     const test_filter = b.option([]const u8, "test_filter", "Run only tests matching this filter");
+    const sanitize_opt = b.option(bool, "sanitize", "Enable AddressSanitizer for tests") orelse false;
+    const sanitize: ?std.zig.SanitizeC = if (sanitize_opt) .full else null;
     const filters = if (test_filter) |filter| &[_][]const u8{filter} else &.{};
 
     // Version and git info
@@ -48,6 +50,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .sanitize_c = sanitize,
     });
     test_mod.addOptions("config", options);
 
@@ -79,6 +82,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .sanitize_c = sanitize,
     });
     live_test_mod.addOptions("config", live_options);
 
