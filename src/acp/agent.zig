@@ -482,6 +482,7 @@ pub const Agent = struct {
         handling_prompt: bool = false,
         processing_queue: bool = false,
         prompt_queue: std.ArrayListUnmanaged(QueuedPrompt) = .empty,
+        last_nudge_ms: i64 = 0,
 
         const QueuedPrompt = struct {
             request_id: jsonrpc.Request.Id,
@@ -1806,13 +1807,18 @@ pub const Agent = struct {
                     if (msg.getStopReason()) |reason| {
                         // Check if we should auto-continue (nudge) due to pending dot tasks
                         // Don't nudge if there was an API error - stop and let user intervene
-                        const should_nudge = session.nudge_enabled and !session.cancelled and !had_api_error and
+                        // Cooldown: minimum 30 seconds between nudges to prevent rapid-fire loops
+                        const now_ms = std.time.milliTimestamp();
+                        const nudge_cooldown_ms: i64 = 30_000;
+                        const cooldown_ok = (now_ms - session.last_nudge_ms) >= nudge_cooldown_ms;
+                        const should_nudge = session.nudge_enabled and !session.cancelled and !had_api_error and cooldown_ok and
                             dotHasPendingTasks(self.allocator, session.cwd) and
                             (std.mem.eql(u8, reason, "error_max_turns") or
                                 std.mem.eql(u8, reason, "success") or
                                 std.mem.eql(u8, reason, "end_turn"));
 
                         if (should_nudge) {
+                            session.last_nudge_ms = now_ms;
                             log.info("Claude Code stopped ({s}); pending dots, nudging", .{reason});
                             const nudge_msg = "🔄 continue working on pending dots";
                             try self.sendUserMessage(session_id, nudge_msg);
@@ -1823,6 +1829,8 @@ pub const Agent = struct {
                             continue;
                         } else if (had_api_error) {
                             log.info("Claude Code stopped ({s}); not nudging due to API error", .{reason});
+                        } else if (!cooldown_ok) {
+                            log.info("Claude Code stopped ({s}); not nudging due to cooldown", .{reason});
                         }
                         stop_reason = mapCliStopReason(reason);
                     }
@@ -2074,11 +2082,16 @@ pub const Agent = struct {
                         containsApiErrorMarker(err.type) or
                         containsApiErrorMarker(err.message)) had_api_error = true;
                 }
-                const should_nudge = session.nudge_enabled and !session.cancelled and !had_api_error and
+                // Cooldown: minimum 30 seconds between nudges to prevent rapid-fire loops
+                const now_ms = std.time.milliTimestamp();
+                const nudge_cooldown_ms: i64 = 30_000;
+                const cooldown_ok = (now_ms - session.last_nudge_ms) >= nudge_cooldown_ms;
+                const should_nudge = session.nudge_enabled and !session.cancelled and !had_api_error and cooldown_ok and
                     dotHasPendingTasks(self.allocator, session.cwd) and
                     (has_max_turn_error or msg.turn_error == null);
 
                 if (should_nudge) {
+                    session.last_nudge_ms = now_ms;
                     log.info("Codex turn completed; pending dots, nudging to continue", .{});
                     const nudge_msg = "🔄 continue working on pending dots";
                     try self.sendUserMessage(session_id, nudge_msg);
@@ -2091,6 +2104,8 @@ pub const Agent = struct {
                     continue;
                 } else if (had_api_error) {
                     log.info("Codex turn completed; not nudging due to API error", .{});
+                } else if (!cooldown_ok) {
+                    log.info("Codex turn completed; not nudging due to cooldown", .{});
                 }
             }
 
