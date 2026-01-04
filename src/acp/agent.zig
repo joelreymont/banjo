@@ -99,6 +99,9 @@ const api_error_markers = [_][]const u8{
     "internal_error",
     "authentication_error",
     "invalid_request_error",
+    "out of extra usage",
+    "usage limit",
+    "quota exceeded",
 };
 
 fn containsApiErrorMarker(text: ?[]const u8) bool {
