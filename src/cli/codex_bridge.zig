@@ -1267,12 +1267,11 @@ fn parseServerRequestParams(allocator: Allocator, kind: ServerRequestKind, param
 }
 
 fn parseNotificationParams(arena: *std.heap.ArenaAllocator, comptime T: type, params: std.json.Value) ?T {
-    const parsed = std.json.parseFromValue(T, arena.allocator(), params, .{ .ignore_unknown_fields = true }) catch |err| {
+    // Use parseFromValueLeaky since arena manages lifetime - no deinit needed
+    return std.json.parseFromValueLeaky(T, arena.allocator(), params, .{ .ignore_unknown_fields = true }) catch |err| {
         log.warn("Failed to parse {s} params: {}", .{ @typeName(T), err });
         return null;
     };
-    defer parsed.deinit();
-    return parsed.value;
 }
 
 fn parseParams(allocator: Allocator, comptime T: type, value: std.json.Value) bool {
