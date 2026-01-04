@@ -476,6 +476,31 @@ pub const Agent = struct {
         permission_socket: ?std.posix.socket_t = null,
         permission_socket_path: ?[]const u8 = null,
         nudge_enabled: bool = true,
+        handling_prompt: bool = false,
+        processing_queue: bool = false,
+        prompt_queue: std.ArrayListUnmanaged(QueuedPrompt) = .empty,
+
+        const QueuedPrompt = struct {
+            request_id: jsonrpc.Request.Id,
+            request_id_string: ?[]const u8, // Owned copy if ID is string
+            params_json: []const u8,
+
+            fn init(allocator: Allocator, id: jsonrpc.Request.Id, params_json: []const u8) !QueuedPrompt {
+                return switch (id) {
+                    .number => |n| .{ .request_id = .{ .number = n }, .request_id_string = null, .params_json = params_json },
+                    .string => |s| blk: {
+                        const owned = try allocator.dupe(u8, s);
+                        break :blk .{ .request_id = .{ .string = owned }, .request_id_string = owned, .params_json = params_json };
+                    },
+                    .null => .{ .request_id = .null, .request_id_string = null, .params_json = params_json },
+                };
+            }
+
+            fn deinit(self: QueuedPrompt, allocator: Allocator) void {
+                if (self.request_id_string) |s| allocator.free(s);
+                allocator.free(self.params_json);
+            }
+        };
 
         pub fn deinit(self: *Session, allocator: Allocator) void {
             if (self.bridge) |*b| b.deinit();
@@ -503,6 +528,10 @@ pub const Agent = struct {
                 allocator.free(entry.key_ptr.*);
             }
             self.quiet_tool_ids.deinit();
+            for (self.prompt_queue.items) |item| {
+                item.deinit(allocator);
+            }
+            self.prompt_queue.deinit(allocator);
             allocator.free(self.id);
             allocator.free(self.cwd);
             if (self.model) |m| allocator.free(m);
@@ -910,6 +939,37 @@ pub const Agent = struct {
             return;
         };
 
+        // Queue prompt if another is already being handled (deadlock prevention)
+        if (session.handling_prompt) {
+            const req_id = request.id orelse {
+                log.warn("Cannot queue prompt notification (no request ID)", .{});
+                return;
+            };
+            // Limit queue size to prevent unbounded memory growth
+            if (session.prompt_queue.items.len >= 8) {
+                log.warn("Prompt queue full, rejecting prompt for session {s}", .{session_id});
+                try self.writer.writeResponse(jsonrpc.Response.err(
+                    req_id,
+                    jsonrpc.Error.InternalError,
+                    "Session busy - too many queued prompts",
+                ));
+                return;
+            }
+            log.info("Queueing prompt: another prompt is already being handled for session {s}", .{session_id});
+            const params_json = try std.json.Stringify.valueAlloc(self.allocator, request.params orelse .null, .{});
+            errdefer self.allocator.free(params_json);
+            const queued = try Session.QueuedPrompt.init(self.allocator, req_id, params_json);
+            try session.prompt_queue.append(self.allocator, queued);
+            return; // Response will be sent when queued prompt is processed
+        }
+        session.handling_prompt = true;
+        defer {
+            session.handling_prompt = false;
+            if (!session.processing_queue) {
+                self.processQueuedPrompts(session);
+            }
+        }
+
         var prompt_parts = try self.collectPromptParts(session, session_id, parsed.value.prompt);
         defer prompt_parts.deinit(self.allocator);
 
@@ -995,6 +1055,46 @@ pub const Agent = struct {
 
         try self.writer.writeTypedResponse(request.id, protocol.PromptResponse{ .stopReason = stop_reason });
         response_sent = true;
+    }
+
+    fn processQueuedPrompts(self: *Agent, session: *Session) void {
+        if (session.processing_queue) return; // Prevent recursive calls
+        session.processing_queue = true;
+        defer session.processing_queue = false;
+
+        while (session.prompt_queue.items.len > 0) {
+            const queued = session.prompt_queue.orderedRemove(0);
+            defer queued.deinit(self.allocator);
+
+            // Parse the queued JSON params
+            const parsed_value = std.json.parseFromSlice(std.json.Value, self.allocator, queued.params_json, .{}) catch |err| {
+                log.warn("Failed to parse queued prompt params: {}", .{err});
+                self.writer.writeResponse(jsonrpc.Response.err(
+                    queued.request_id,
+                    jsonrpc.Error.InternalError,
+                    "Failed to process queued prompt",
+                )) catch {};
+                continue;
+            };
+            defer parsed_value.deinit();
+
+            // Re-create request and handle it
+            const request = jsonrpc.Request{
+                .method = "session/prompt",
+                .id = queued.request_id,
+                .params = parsed_value.value,
+            };
+
+            log.info("Processing queued prompt for session {s}", .{session.id});
+            self.handlePrompt(request) catch |err| {
+                log.warn("Failed to handle queued prompt: {}", .{err});
+                self.writer.writeResponse(jsonrpc.Response.err(
+                    queued.request_id,
+                    jsonrpc.Error.InternalError,
+                    "Failed to process queued prompt",
+                )) catch {};
+            };
+        }
     }
 
     const ResourceLinkData = struct {
@@ -5684,6 +5784,72 @@ test "Agent handleRequest - prompt session not found" {
         \\{"jsonrpc":"2.0","error":{"code":-32602,"message":"Session not found"},"id":1}
         \\
     ).diff(tw.getOutput(), true);
+}
+
+test "Agent handleRequest - prompt queued when already handling" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
+
+    // Create a session with handling_prompt = true (simulating in-progress prompt)
+    var session = Agent.Session{
+        .id = try testing.allocator.dupe(u8, "test-session"),
+        .cwd = try testing.allocator.dupe(u8, "."),
+        .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
+        .availability = .{ .claude = true, .codex = false },
+        .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
+        .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+        .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
+        .handling_prompt = true, // Simulates prompt already in progress
+    };
+    defer {
+        testing.allocator.free(session.id);
+        testing.allocator.free(session.cwd);
+        session.pending_execute_tools.deinit();
+        session.pending_edit_tools.deinit();
+        session.always_allowed_tools.deinit();
+        session.quiet_tool_ids.deinit();
+        for (session.prompt_queue.items) |item| {
+            item.deinit(testing.allocator);
+        }
+        session.prompt_queue.deinit(testing.allocator);
+    }
+    try agent.sessions.put(session.id, &session);
+    defer {
+        _ = agent.sessions.remove(session.id);
+        agent.deinit();
+    }
+
+    // Build prompt request
+    var params = std.json.ObjectMap.init(testing.allocator);
+    defer params.deinit();
+    try params.put("sessionId", .{ .string = "test-session" });
+    var prompt_items = std.json.Array.init(testing.allocator);
+    var text_block = std.json.ObjectMap.init(testing.allocator);
+    try text_block.put("type", .{ .string = "text" });
+    try text_block.put("text", .{ .string = "hello" });
+    try prompt_items.append(.{ .object = text_block });
+    try params.put("prompt", .{ .array = prompt_items });
+    defer {
+        for (prompt_items.items) |*item| {
+            item.object.deinit();
+        }
+        prompt_items.deinit();
+    }
+
+    const request = jsonrpc.Request{
+        .method = "session/prompt",
+        .id = .{ .number = 1 },
+        .params = .{ .object = params },
+    };
+
+    try agent.handleRequest(request);
+
+    // Prompt should be queued, no response yet (deadlock prevention)
+    try testing.expectEqual(@as(usize, 0), tw.getOutput().len);
+    try testing.expectEqual(@as(usize, 1), session.prompt_queue.items.len);
 }
 
 test "Agent handleRequest - setMode missing params" {
