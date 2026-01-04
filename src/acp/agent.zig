@@ -1703,7 +1703,7 @@ pub const Agent = struct {
                     if (msg.getStopReason()) |reason| {
                         // Check if we should auto-continue (nudge) due to pending dot tasks
                         // Don't nudge if there was an API error - stop and let user intervene
-                        const should_nudge = session.nudge_enabled and !had_api_error and
+                        const should_nudge = session.nudge_enabled and !session.cancelled and !had_api_error and
                             dotHasPendingTasks(self.allocator, session.cwd) and
                             (std.mem.eql(u8, reason, "error_max_turns") or
                                 std.mem.eql(u8, reason, "success") or
@@ -1971,7 +1971,7 @@ pub const Agent = struct {
                         containsApiErrorMarker(err.type) or
                         containsApiErrorMarker(err.message)) had_api_error = true;
                 }
-                const should_nudge = session.nudge_enabled and !had_api_error and
+                const should_nudge = session.nudge_enabled and !session.cancelled and !had_api_error and
                     dotHasPendingTasks(self.allocator, session.cwd) and
                     (has_max_turn_error or msg.turn_error == null);
 
