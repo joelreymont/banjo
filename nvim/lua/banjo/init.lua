@@ -11,13 +11,8 @@ local default_config = {
         width = 80,
         position = "right",
     },
-    keymaps = {
-        toggle = "<leader>bb",
-        send = "<leader>bs",
-        send_selection = "<leader>bv",
-        cancel = "<leader>bc",
-        nudge = "<leader>bn",
-    },
+    keymap_prefix = "<leader>b",
+    keymaps = true,
 }
 
 local config = {}
@@ -94,41 +89,13 @@ function M.setup(opts)
         bridge.toggle_nudge()
     end, { desc = "Toggle nudge mode" })
 
+    vim.api.nvim_create_user_command("BanjoHelp", function()
+        M.help()
+    end, { desc = "Show Banjo keybindings" })
+
     -- Setup keymaps
     if config.keymaps then
-        if config.keymaps.toggle then
-            vim.keymap.set("n", config.keymaps.toggle, function()
-                panel.toggle()
-            end, { desc = "Toggle Banjo panel" })
-        end
-
-        if config.keymaps.send then
-            vim.keymap.set("n", config.keymaps.send, function()
-                vim.ui.input({ prompt = "Banjo: " }, function(input)
-                    if input and input ~= "" then
-                        M.send(input)
-                    end
-                end)
-            end, { desc = "Send prompt to Banjo" })
-        end
-
-        if config.keymaps.send_selection then
-            vim.keymap.set("v", config.keymaps.send_selection, function()
-                M.send_selection()
-            end, { desc = "Send selection to Banjo" })
-        end
-
-        if config.keymaps.cancel then
-            vim.keymap.set("n", config.keymaps.cancel, function()
-                bridge.cancel()
-            end, { desc = "Cancel Banjo request" })
-        end
-
-        if config.keymaps.nudge then
-            vim.keymap.set("n", config.keymaps.nudge, function()
-                bridge.toggle_nudge()
-            end, { desc = "Toggle Banjo nudge" })
-        end
+        M.setup_keymaps()
     end
 
     -- Auto-start if enabled
@@ -164,45 +131,121 @@ function M.send(prompt)
     end
 end
 
-function M.send_selection()
-    local mode = vim.fn.mode()
-    if mode ~= "v" and mode ~= "V" and mode ~= "\22" then
-        vim.notify("Banjo: Not in visual mode", vim.log.levels.WARN)
-        return
-    end
-
-    -- Exit visual mode to update marks
-    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "n", true)
-
-    vim.defer_fn(function()
-        local start_pos = vim.fn.getpos("'<")
-        local end_pos = vim.fn.getpos("'>")
-        local lines = vim.api.nvim_buf_get_lines(0, start_pos[2] - 1, end_pos[2], false)
-
-        if #lines == 0 then
-            vim.notify("Banjo: No selection", vim.log.levels.WARN)
-            return
-        end
-
-        local text = table.concat(lines, "\n")
-        local file_path = vim.api.nvim_buf_get_name(0)
-
-        vim.ui.input({ prompt = "Banjo (with selection): " }, function(input)
-            if input and input ~= "" then
-                local prompt = input .. "\n\n```\n" .. text .. "\n```"
-                local files = { { path = file_path, content = text } }
-                bridge.send_prompt(prompt, files)
-            end
-        end)
-    end, 50)
-end
-
 function M.is_running()
     return bridge.is_running()
 end
 
 function M.get_mcp_port()
     return bridge.get_mcp_port()
+end
+
+-- Resolve <leader> in prefix to human-readable key name
+local function resolve_prefix(prefix)
+    if not prefix:find("<leader>") then
+        return prefix
+    end
+    local leader = vim.g.mapleader or "\\"
+    local leader_name
+    if leader == " " then
+        leader_name = "SPC "
+    elseif leader == "\\" then
+        leader_name = "\\"
+    else
+        leader_name = leader
+    end
+    return prefix:gsub("<leader>", leader_name)
+end
+
+-- Show help in styled floating window
+function M.help()
+    local prefix = resolve_prefix(config.keymap_prefix or "<leader>b")
+
+    local bindings = {
+        { "b", "Toggle panel" },
+        { "s", "Send prompt" },
+        { "c", "Cancel request" },
+        { "n", "Toggle nudge" },
+        { "h", "Show this help" },
+    }
+
+    local lines = { "Banjo Keybindings", "" }
+    for _, b in ipairs(bindings) do
+        table.insert(lines, string.format("  %s%s  %s", prefix, b[1], b[2]))
+    end
+
+    -- Calculate window size
+    local max_width = 0
+    for _, line in ipairs(lines) do
+        max_width = math.max(max_width, #line)
+    end
+    local width = math.min(max_width + 4, 50)
+    local height = #lines
+
+    -- Create buffer
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+    vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
+
+    -- Calculate position (centered)
+    local uis = vim.api.nvim_list_uis()
+    local ui_height = uis[1] and uis[1].height or 24
+    local ui_width = uis[1] and uis[1].width or 80
+    local row = math.floor((ui_height - height) / 2)
+    local col = math.floor((ui_width - width) / 2)
+
+    -- Create floating window
+    local win = vim.api.nvim_open_win(buf, true, {
+        relative = "editor",
+        width = width,
+        height = height,
+        row = row,
+        col = col,
+        style = "minimal",
+        border = "rounded",
+        title = " Banjo ",
+        title_pos = "center",
+    })
+
+    -- Apply highlights
+    vim.api.nvim_set_option_value("winhl", "Normal:NormalFloat,FloatBorder:FloatBorder", { win = win })
+    vim.api.nvim_buf_add_highlight(buf, -1, "Title", 0, 0, -1)
+
+    local prefix_len = #prefix
+    for i = 3, #lines do
+        vim.api.nvim_buf_add_highlight(buf, -1, "Special", i - 1, 2, 2 + prefix_len + 1)
+    end
+
+    -- Close on any key
+    local function close()
+        vim.api.nvim_win_close(win, true)
+    end
+    vim.keymap.set("n", "<Esc>", close, { buffer = buf, nowait = true })
+    vim.keymap.set("n", "q", close, { buffer = buf, nowait = true })
+    vim.keymap.set("n", "<CR>", close, { buffer = buf, nowait = true })
+end
+
+-- Setup keymaps
+function M.setup_keymaps()
+    local prefix = config.keymap_prefix or "<leader>b"
+
+    local mappings = {
+        { "b", function() panel.toggle() end, "Toggle panel" },
+        { "s", function()
+            vim.ui.input({ prompt = "Banjo: " }, function(input)
+                if input and input ~= "" then
+                    M.send(input)
+                end
+            end)
+        end, "Send prompt" },
+        { "c", function() bridge.cancel() end, "Cancel request" },
+        { "n", function() bridge.toggle_nudge() end, "Toggle nudge" },
+        { "h", M.help, "Help" },
+    }
+
+    for _, m in ipairs(mappings) do
+        vim.keymap.set("n", prefix .. m[1], m[2], { desc = "Banjo: " .. m[3] })
+    end
 end
 
 return M
