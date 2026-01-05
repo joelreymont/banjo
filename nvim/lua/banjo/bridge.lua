@@ -20,6 +20,8 @@ local state = {
     mode = "Default",
     session_id = nil,
     connected = false,
+    session_active = false,
+    session_start_time = nil,
 }
 
 -- Reconnection state
@@ -196,6 +198,10 @@ function M._on_exit(code)
         ws_client.close(client)
         client = nil
     end
+
+    -- Clear session state on disconnect
+    state.session_active = false
+    state.session_start_time = nil
 
     if code ~= 0 then
         vim.notify("Banjo: Process exited with code " .. code, vim.log.levels.WARN)
@@ -605,6 +611,10 @@ function M.send_prompt(text, files)
 end
 
 function M.cancel()
+    -- Clear session state
+    state.session_active = false
+    state.session_start_time = nil
+
     M._send_notification("cancel", {})
 end
 
