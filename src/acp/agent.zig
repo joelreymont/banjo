@@ -1673,6 +1673,19 @@ pub const Agent = struct {
         self.captureCodexSessionId(session);
     }
 
+    /// Trigger a nudge continuation - starts Claude/Codex with the nudge prompt
+    fn triggerNudge(self: *Agent, request: jsonrpc.Request, session: *Session, session_id: []const u8) !void {
+        _ = request;
+        const nudge_prompt = "clean up dots, then pick a dot and work on it";
+        switch (session.config.route) {
+            .claude, .duet => _ = try self.runClaudePrompt(session, session_id, nudge_prompt),
+            .codex => {
+                const inputs = [_]CodexUserInput{.{ .type = "text", .text = nudge_prompt }};
+                _ = try self.runCodexPrompt(session, session_id, nudge_prompt, inputs[0..]);
+            },
+        }
+    }
+
     fn sendClaudePromptWithRestart(
         self: *Agent,
         session: *Session,
@@ -3810,10 +3823,12 @@ pub const Agent = struct {
     }
 
     fn handleNudgeCommand(self: *Agent, request: jsonrpc.Request, session: *Session, session_id: []const u8, args: ?[]const u8) !void {
+        var should_trigger = false;
         const msg = if (args) |a| blk: {
             const trimmed = std.mem.trim(u8, a, " \t");
             if (std.mem.eql(u8, trimmed, "on")) {
                 session.nudge_enabled = true;
+                should_trigger = true;
                 break :blk "Auto-nudge enabled. Will continue working on dots when agent stops.";
             } else if (std.mem.eql(u8, trimmed, "off")) {
                 session.nudge_enabled = false;
@@ -3825,9 +3840,22 @@ pub const Agent = struct {
 
         try self.sendSessionUpdate(session_id, .{
             .sessionUpdate = .agent_message_chunk,
+            .content = .{ .type = "text", .text = "\n" },
+        });
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .agent_message_chunk,
             .content = .{ .type = "text", .text = msg },
         });
-        try self.writer.writeTypedResponse(request.id, protocol.PromptResponse{ .stopReason = .end_turn });
+
+        // If nudge was just enabled and there are pending dots, trigger immediately
+        if (should_trigger and dotHasPendingTasks(self.allocator, session.cwd)) {
+            session.last_nudge_ms = std.time.milliTimestamp();
+            log.info("Nudge enabled with pending dots, triggering continuation", .{});
+            try self.sendUserMessage(session_id, "🔄 continue working on pending dots");
+            _ = try self.triggerNudge(request, session, session_id);
+        } else {
+            try self.writer.writeTypedResponse(request.id, protocol.PromptResponse{ .stopReason = .end_turn });
+        }
     }
 
     const Command = enum { version, note, notes, setup, explain, new, nudge };
