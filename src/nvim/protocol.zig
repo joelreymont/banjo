@@ -156,6 +156,8 @@ pub const SessionIdUpdate = struct {
     session_id: []const u8,
 };
 
+pub const SessionEvent = struct {};
+
 pub const ErrorMessage = struct {
     message: []const u8,
 };

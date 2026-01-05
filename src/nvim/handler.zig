@@ -36,6 +36,9 @@ pub const Handler = struct {
     current_model: ?[]const u8 = null,
     permission_mode: protocol.PermissionMode = .default,
 
+    // Session state
+    session_active: bool = false,
+
     // Pending approval request (for Codex)
     pending_approval_id: ?[]const u8 = null,
     pending_approval_response: ?[]const u8 = null,
@@ -162,6 +165,16 @@ pub const Handler = struct {
         };
         defer parsed.deinit();
 
+        // Emit session_start on first prompt
+        if (!self.session_active) {
+            self.session_active = true;
+            self.sendNotification("session_start", protocol.SessionEvent{}) catch {};
+            // Forward to MCP server
+            if (self.mcp_server) |mcp| {
+                mcp.sendNvimNotification("session_start", protocol.SessionEvent{}) catch {};
+            }
+        }
+
         self.cancelled = false;
         self.processPrompt(parsed.value) catch |err| {
             log.err("Prompt processing error: {}", .{err});
@@ -170,6 +183,16 @@ pub const Handler = struct {
     }
 
     fn handleNvimCancel(self: *Handler) void {
+        // Emit session_end if session is active
+        if (self.session_active) {
+            self.session_active = false;
+            self.sendNotification("session_end", protocol.SessionEvent{}) catch {};
+            // Forward to MCP server
+            if (self.mcp_server) |mcp| {
+                mcp.sendNvimNotification("session_end", protocol.SessionEvent{}) catch {};
+            }
+        }
+
         self.cancelled = true;
         self.sendNotification("status", protocol.StatusUpdate{ .text = "Cancelled" }) catch {};
     }
