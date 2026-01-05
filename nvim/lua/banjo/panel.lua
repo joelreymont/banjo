@@ -559,6 +559,9 @@ function M.append(text, is_thought)
     -- Detect and mark inline formatting
     M._mark_inline_formatting(line_count - 1, vim.api.nvim_buf_line_count(output_buf))
 
+    -- Detect and render lists
+    M._mark_lists(line_count - 1, vim.api.nvim_buf_line_count(output_buf))
+
     -- Detect and mark file paths
     M._mark_file_paths(line_count - 1, vim.api.nvim_buf_line_count(output_buf))
 
@@ -804,6 +807,40 @@ function M._mark_inline_formatting(start_line, end_line)
                 hl_group = "Special",
             })
             col = e + 1
+        end
+
+        ::continue::
+    end
+end
+
+function M._mark_lists(start_line, end_line)
+    if not output_buf or not vim.api.nvim_buf_is_valid(output_buf) then
+        return
+    end
+
+    for line_num = start_line, end_line - 1 do
+        local line_text = vim.api.nvim_buf_get_lines(output_buf, line_num, line_num + 1, false)[1]
+        if not line_text then
+            goto continue
+        end
+
+        local trimmed = vim.trim(line_text)
+
+        -- Unordered list: - item or * item
+        local unordered_start = trimmed:match("^([%-*])%s+")
+        if unordered_start then
+            local indent = line_text:match("^(%s*)") or ""
+            local bullet = "•"
+            local new_line = indent .. bullet .. trimmed:sub(#unordered_start + 1)
+            vim.api.nvim_buf_set_lines(output_buf, line_num, line_num + 1, false, { new_line })
+            goto continue
+        end
+
+        -- Ordered list: 1. item or 2. item
+        local number = trimmed:match("^(%d+)%.%s+")
+        if number then
+            -- Keep numbered lists as-is for now
+            goto continue
         end
 
         ::continue::
