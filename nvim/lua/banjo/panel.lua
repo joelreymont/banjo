@@ -247,15 +247,20 @@ local function setup_output_keymaps()
             return
         end
 
-        -- Pattern matches: path/to/file.ext:123
-        local pattern = "([%w_/.%-]+%.[%w]+):(%d+)"
+        -- Pattern matches: path/to/file:123 (with optional extension)
+        local pattern = "([%w_/.%-]+):(%d+)"
         local s, e, file_path, line_number = string.find(line_text, pattern)
 
         -- Find the match under cursor
         while s do
             if col >= s - 1 and col < e then
-                -- Cursor is on this match
-                vim.cmd(string.format("edit +%s %s", line_number, file_path))
+                -- Validate file exists before jumping
+                local stat = vim.loop.fs_stat(file_path)
+                if stat and stat.type == "file" then
+                    vim.cmd(string.format("edit +%s %s", line_number, file_path))
+                else
+                    vim.notify("Banjo: File not found: " .. file_path, vim.log.levels.WARN)
+                end
                 return
             end
             s, e, file_path, line_number = string.find(line_text, pattern, e + 1)
@@ -897,8 +902,9 @@ function M._mark_file_paths(start_line, end_line)
         return
     end
 
-    -- Pattern matches: path/to/file.ext:123 or file.ext:123
-    local pattern = "([%w_/.%-]+%.[%w]+):(%d+)"
+    -- Pattern matches: path/to/file:123 (with optional extension)
+    -- Supports: file.ext:123, /abs/path/file.ext:123, Makefile:10, etc.
+    local pattern = "([%w_/.%-]+):(%d+)"
 
     for line_num = start_line, end_line - 1 do
         local line_text = vim.api.nvim_buf_get_lines(output_buf, line_num, line_num + 1, false)[1]
@@ -910,11 +916,16 @@ function M._mark_file_paths(start_line, end_line)
                     break
                 end
 
-                -- Create extmark with virtual text for underline effect
-                vim.api.nvim_buf_set_extmark(output_buf, ns_links, line_num, s - 1, {
-                    end_col = e,
-                    hl_group = "Underlined",
-                })
+                -- Validate that the file exists to avoid false positives
+                -- Use vim.loop.fs_stat for efficient file existence check
+                local stat = vim.loop.fs_stat(file_path)
+                if stat and stat.type == "file" then
+                    -- Create extmark with virtual text for underline effect
+                    vim.api.nvim_buf_set_extmark(output_buf, ns_links, line_num, s - 1, {
+                        end_col = e,
+                        hl_group = "Underlined",
+                    })
+                end
 
                 col = e + 1
             end
