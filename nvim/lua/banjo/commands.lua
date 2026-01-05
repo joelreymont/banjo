@@ -22,7 +22,11 @@ local function cmd_help(args, context)
         "",
         "Keybinds:",
         "  <CR> - Submit input",
+        "  <S-CR> - Insert newline (insert mode)",
         "  <C-c> - Cancel request",
+        "  <Tab> - Complete slash command (insert mode)",
+        "  <Up>/<Down> - Navigate input history",
+        "  <Esc> - Leave insert mode and focus output",
         "  i - Focus input (from output)",
         "  q - Close panel (from output)",
     }
