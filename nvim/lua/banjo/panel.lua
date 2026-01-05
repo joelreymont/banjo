@@ -672,18 +672,18 @@ function M.show_tool_result(id, status)
         icon = "⏳"
     end
 
-    -- Try to find and update existing tool line
-    for key, info in pairs(tool_extmarks) do
-        if key:find(id, 1, true) then
-            local mark = vim.api.nvim_buf_get_extmark_by_id(output_buf, ns_tools, info.mark_id, {})
-            if mark and #mark > 0 then
-                local line_num = mark[1]
-                local current_line = vim.api.nvim_buf_get_lines(output_buf, line_num, line_num + 1, false)[1] or ""
-                -- Replace icon
-                local new_line = current_line:gsub("^%s*[⏳▶✓✗]", "  " .. icon)
-                vim.api.nvim_buf_set_lines(output_buf, line_num, line_num + 1, false, { new_line })
-                return
-            end
+    -- Try to find and update existing tool line by exact ID match
+    -- The id parameter is the full composite key: "name_label"
+    local info = tool_extmarks[id]
+    if info then
+        local mark = vim.api.nvim_buf_get_extmark_by_id(output_buf, ns_tools, info.mark_id, {})
+        if mark and #mark > 0 then
+            local line_num = mark[1]
+            local current_line = vim.api.nvim_buf_get_lines(output_buf, line_num, line_num + 1, false)[1] or ""
+            -- Replace icon
+            local new_line = current_line:gsub("^%s*[⏳▶✓✗]", "  " .. icon)
+            vim.api.nvim_buf_set_lines(output_buf, line_num, line_num + 1, false, { new_line })
+            return
         end
     end
 
