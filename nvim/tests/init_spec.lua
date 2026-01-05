@@ -15,12 +15,12 @@ describe("banjo init", function()
   after_each(function()
     helpers.cleanup()
     -- Clear keymaps we may have set
-    pcall(vim.keymap.del, "n", "<leader>bb")
-    pcall(vim.keymap.del, "n", "<leader>bs")
-    pcall(vim.keymap.del, "n", "<leader>bc")
-    pcall(vim.keymap.del, "n", "<leader>bn")
-    pcall(vim.keymap.del, "n", "<leader>bh")
-    pcall(vim.keymap.del, "v", "<leader>bv")
+    pcall(vim.keymap.del, "n", "<leader>ab")
+    pcall(vim.keymap.del, "n", "<leader>as")
+    pcall(vim.keymap.del, "n", "<leader>ac")
+    pcall(vim.keymap.del, "n", "<leader>an")
+    pcall(vim.keymap.del, "n", "<leader>ah")
+    pcall(vim.keymap.del, "v", "<leader>av")
     -- Clear user commands
     pcall(vim.api.nvim_del_user_command, "BanjoToggle")
     pcall(vim.api.nvim_del_user_command, "BanjoStart")
@@ -58,7 +58,7 @@ describe("banjo init", function()
         binary_path = "/bin/true",
         auto_start = false,
         keymaps = true,
-        keymap_prefix = "<leader>b",
+        keymap_prefix = "<leader>a",
       })
 
       -- Check keymaps exist
@@ -101,7 +101,7 @@ describe("banjo init", function()
         binary_path = "/bin/true",
         auto_start = false,
         keymaps = false,
-        keymap_prefix = "<leader>b",
+        keymap_prefix = "<leader>a",
       })
 
       local win_count_before = #vim.api.nvim_list_wins()
@@ -117,7 +117,7 @@ describe("banjo init", function()
         binary_path = "/bin/true",
         auto_start = false,
         keymaps = false,
-        keymap_prefix = "<leader>b",
+        keymap_prefix = "<leader>a",
       })
 
       banjo.help()

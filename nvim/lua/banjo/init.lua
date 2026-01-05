@@ -11,7 +11,7 @@ local default_config = {
         width = 80,
         position = "right",
     },
-    keymap_prefix = "<leader>b",
+    keymap_prefix = "<leader>a",  -- "a" for agent, avoids conflict with buffer keymaps
     keymaps = true,
 }
 

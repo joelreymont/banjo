@@ -35,7 +35,7 @@ Banjo provides a Neovim plugin that runs Claude Code or Codex via an MCP server.
     binary_path = nil,  -- auto-detected from PATH or common locations
     auto_start = true,
     keymaps = true,
-    keymap_prefix = "<leader>b",
+    keymap_prefix = "<leader>a",  -- "a" for agent
     panel = {
       width = 80,
       position = "right",
@@ -56,16 +56,16 @@ Banjo provides a Neovim plugin that runs Claude Code or Codex via an MCP server.
 }
 ```
 
-**Keymaps** (with default `<leader>b` prefix):
+**Keymaps** (with default `<leader>a` prefix):
 
 | Key | Action |
 |-----|--------|
-| `<leader>bb` | Toggle panel |
-| `<leader>bs` | Send prompt |
-| `<leader>bv` | Send with selection (visual) |
-| `<leader>bc` | Cancel request |
-| `<leader>bn` | Toggle nudge |
-| `<leader>bh` | Show keybindings help |
+| `<leader>ab` | Toggle panel |
+| `<leader>as` | Send prompt |
+| `<leader>av` | Send with selection (visual) |
+| `<leader>ac` | Cancel request |
+| `<leader>an` | Toggle nudge |
+| `<leader>ah` | Show keybindings help |
 
 **Commands:**
 
