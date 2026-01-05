@@ -199,6 +199,17 @@ function M._on_exit(code)
         client = nil
     end
 
+    -- Save session before clearing state
+    if state.session_id and state.session_active then
+        local sessions = require("banjo.sessions")
+        local history = require("banjo.history")
+        sessions.save(state.session_id, {
+            history = history.size() > 0 and { history.get(0) } or {},
+            input_text = panel.get_input_text(),
+            timestamp = os.time(),
+        })
+    end
+
     -- Clear session state on disconnect
     state.session_active = false
     state.session_start_time = nil
