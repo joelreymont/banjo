@@ -131,6 +131,8 @@ function M._on_stdout(data)
             if ok and msg.method == "ready" and msg.params and msg.params.mcp_port then
                 mcp_port = msg.params.mcp_port
                 M._connect_websocket(mcp_port)
+            elseif not ok then
+                vim.notify("Banjo: Failed to parse stdout: " .. line, vim.log.levels.ERROR)
             end
         end
     end
@@ -142,6 +144,9 @@ function M._connect_websocket(port)
             local ok, msg = pcall(vim.json.decode, message)
             if ok then
                 M._handle_message(msg)
+            else
+                vim.notify("Banjo: Failed to parse WebSocket message", vim.log.levels.ERROR)
+                panel.append_status("Error: Invalid message from backend")
             end
         end,
         on_connect = function()
