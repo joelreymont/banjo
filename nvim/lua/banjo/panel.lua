@@ -100,6 +100,40 @@ local function setup_input_keymaps()
     -- Shift-Enter for literal newline in insert mode
     vim.keymap.set("i", "<S-CR>", "<CR>", { buffer = input_buf, noremap = true })
 
+    -- Tab for command completion
+    vim.keymap.set("i", "<Tab>", function()
+        local text = M.get_input_text()
+        if not vim.startswith(text, "/") then
+            return "<Tab>"
+        end
+
+        local commands = require("banjo.commands")
+        local parsed = commands.parse(text)
+
+        if parsed and parsed.args == "" then
+            -- Complete command name
+            local prefix = parsed.cmd
+            local all_cmds = commands.list_commands()
+            local matches = {}
+
+            for _, cmd in ipairs(all_cmds) do
+                if vim.startswith(cmd, prefix) then
+                    table.insert(matches, cmd)
+                end
+            end
+
+            if #matches == 1 then
+                -- Single match: complete it
+                M.set_input_text("/" .. matches[1] .. " ")
+            elseif #matches > 1 then
+                -- Multiple matches: show them
+                M.append_status("Available: " .. table.concat(matches, ", "))
+            end
+        end
+
+        return ""
+    end, { buffer = input_buf, noremap = true, expr = true })
+
     -- Ctrl-C to cancel
     vim.keymap.set({ "n", "i" }, "<C-c>", function()
         if bridge then
