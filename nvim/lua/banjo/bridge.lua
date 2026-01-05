@@ -85,6 +85,19 @@ function M.start(binary_path, cwd)
             last_selection = M._capture_selection()
         end,
     })
+
+    -- Graceful shutdown on Vim exit
+    vim.api.nvim_create_autocmd("VimLeavePre", {
+        group = autocmd_group,
+        callback = function()
+            -- Save history before exit
+            local history = require("banjo.history")
+            history.save()
+
+            -- Stop reconnection and close cleanly
+            M.stop()
+        end,
+    })
 end
 
 function M.stop()
