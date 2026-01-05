@@ -556,6 +556,9 @@ function M.append(text, is_thought)
     -- Detect and mark markdown headers
     M._mark_markdown_headers(line_count - 1, vim.api.nvim_buf_line_count(output_buf))
 
+    -- Detect and mark inline formatting
+    M._mark_inline_formatting(line_count - 1, vim.api.nvim_buf_line_count(output_buf))
+
     -- Detect and mark file paths
     M._mark_file_paths(line_count - 1, vim.api.nvim_buf_line_count(output_buf))
 
@@ -743,6 +746,67 @@ function M._mark_markdown_headers(start_line, end_line)
             -- Apply bold highlight
             vim.api.nvim_buf_add_highlight(output_buf, ns_id, "Bold", line_num, 0, -1)
         end
+    end
+end
+
+function M._mark_inline_formatting(start_line, end_line)
+    if not output_buf or not vim.api.nvim_buf_is_valid(output_buf) then
+        return
+    end
+
+    for line_num = start_line, end_line - 1 do
+        local line_text = vim.api.nvim_buf_get_lines(output_buf, line_num, line_num + 1, false)[1]
+        if not line_text then
+            goto continue
+        end
+
+        -- **bold**
+        local col = 1
+        while true do
+            local s, e = string.find(line_text, "%*%*([^*]+)%*%*", col)
+            if not s then break end
+            vim.api.nvim_buf_set_extmark(output_buf, ns_id, line_num, s - 1, {
+                end_col = e,
+                hl_group = "Bold",
+            })
+            col = e + 1
+        end
+
+        -- *italic*
+        col = 1
+        while true do
+            local s, e = string.find(line_text, "%*([^*]+)%*", col)
+            if not s then break end
+            -- Skip if it's part of **bold**
+            if col > 1 and line_text:sub(s - 1, s - 1) == "*" then
+                col = e + 1
+                goto skip_italic
+            end
+            if e < #line_text and line_text:sub(e + 1, e + 1) == "*" then
+                col = e + 1
+                goto skip_italic
+            end
+            vim.api.nvim_buf_set_extmark(output_buf, ns_id, line_num, s - 1, {
+                end_col = e,
+                hl_group = "Italic",
+            })
+            ::skip_italic::
+            col = e + 1
+        end
+
+        -- `inline code`
+        col = 1
+        while true do
+            local s, e = string.find(line_text, "`([^`]+)`", col)
+            if not s then break end
+            vim.api.nvim_buf_set_extmark(output_buf, ns_id, line_num, s - 1, {
+                end_col = e,
+                hl_group = "Special",
+            })
+            col = e + 1
+        end
+
+        ::continue::
     end
 end
 
