@@ -29,6 +29,7 @@ local function cmd_help(args, context)
         "  <Esc> - Leave insert mode and focus output",
         "  i - Focus input (from output)",
         "  q - Close panel (from output)",
+        "  z - Toggle fold at cursor (from output)",
     }
 
     for _, line in ipairs(help_text) do

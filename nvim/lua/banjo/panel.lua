@@ -16,6 +16,11 @@ local current_engine = nil
 -- Tool tracking for in-place updates
 local tool_extmarks = {}
 
+-- Thought block tracking
+local thought_blocks = {}
+local thought_buffer = nil
+local thought_start_line = nil
+
 -- History navigation state
 local history_offset = 0
 local history_temp_input = ""
@@ -216,6 +221,9 @@ local function setup_output_keymaps()
     vim.keymap.set("n", "q", function()
         M.close()
     end, { buffer = output_buf, noremap = true })
+
+    -- 'z' to toggle fold at cursor
+    vim.keymap.set("n", "z", "za", { buffer = output_buf, noremap = true })
 end
 
 -- Window creation
@@ -448,6 +456,44 @@ function M.append(text, is_thought)
 
     if not text or text == "" then
         return
+    end
+
+    -- Accumulate text for thought block detection
+    thought_buffer = (thought_buffer or "") .. text
+
+    -- Check for <think> tag
+    local think_start = thought_buffer:find("<think>")
+    if think_start and not thought_start_line then
+        local line_count = vim.api.nvim_buf_line_count(output_buf)
+        thought_start_line = line_count - 1
+    end
+
+    -- Check for </think> tag
+    local think_end = thought_buffer:find("</think>")
+    if think_end and thought_start_line then
+        local line_count = vim.api.nvim_buf_line_count(output_buf)
+        local end_line = line_count
+
+        table.insert(thought_blocks, {
+            start_line = thought_start_line,
+            end_line = end_line,
+        })
+
+        -- Create fold for this thought block (collapsed by default)
+        vim.api.nvim_buf_call(output_buf, function()
+            -- Enable folding in buffer
+            vim.opt_local.foldmethod = "manual"
+            vim.opt_local.foldenable = true
+
+            -- Create fold
+            vim.cmd(string.format("%d,%dfold", thought_start_line + 1, end_line))
+
+            -- Close the fold
+            vim.cmd(string.format("%dfoldclose", thought_start_line + 1))
+        end)
+
+        thought_start_line = nil
+        thought_buffer = nil
     end
 
     local lines = vim.split(text, "\n", { plain = true })
