@@ -8,6 +8,7 @@ local output_win = nil
 local input_win = nil
 local ns_id = vim.api.nvim_create_namespace("banjo")
 local ns_tools = vim.api.nvim_create_namespace("banjo_tools")
+local ns_links = vim.api.nvim_create_namespace("banjo_links")
 
 -- Streaming state
 local is_streaming = false
@@ -228,6 +229,35 @@ local function setup_output_keymaps()
 
     -- 'z' to toggle fold at cursor
     vim.keymap.set("n", "z", "za", { buffer = output_buf, noremap = true })
+
+    -- <CR> or gf to jump to file path under cursor
+    local function jump_to_file()
+        local cursor = vim.api.nvim_win_get_cursor(output_win)
+        local line_num = cursor[1] - 1
+        local col = cursor[2]
+
+        local line_text = vim.api.nvim_buf_get_lines(output_buf, line_num, line_num + 1, false)[1]
+        if not line_text then
+            return
+        end
+
+        -- Pattern matches: path/to/file.ext:123
+        local pattern = "([%w_/.%-]+%.[%w]+):(%d+)"
+        local s, e, file_path, line_number = string.find(line_text, pattern)
+
+        -- Find the match under cursor
+        while s do
+            if col >= s - 1 and col < e then
+                -- Cursor is on this match
+                vim.cmd(string.format("edit +%s %s", line_number, file_path))
+                return
+            end
+            s, e, file_path, line_number = string.find(line_text, pattern, e + 1)
+        end
+    end
+
+    vim.keymap.set("n", "<CR>", jump_to_file, { buffer = output_buf, noremap = true })
+    vim.keymap.set("n", "gf", jump_to_file, { buffer = output_buf, noremap = true })
 end
 
 -- Window creation
@@ -523,6 +553,9 @@ function M.append(text, is_thought)
         end
     end
 
+    -- Detect and mark file paths
+    M._mark_file_paths(line_count - 1, vim.api.nvim_buf_line_count(output_buf))
+
     -- Defer scroll to avoid excessive updates during fast streaming
     if not pending_scroll then
         pending_scroll = true
@@ -692,6 +725,36 @@ function M._stop_session_timer()
         session_timer:stop()
         session_timer:close()
         session_timer = nil
+    end
+end
+
+function M._mark_file_paths(start_line, end_line)
+    if not output_buf or not vim.api.nvim_buf_is_valid(output_buf) then
+        return
+    end
+
+    -- Pattern matches: path/to/file.ext:123 or file.ext:123
+    local pattern = "([%w_/.%-]+%.[%w]+):(%d+)"
+
+    for line_num = start_line, end_line - 1 do
+        local line_text = vim.api.nvim_buf_get_lines(output_buf, line_num, line_num + 1, false)[1]
+        if line_text then
+            local col = 1
+            while true do
+                local s, e, file_path, line_number = string.find(line_text, pattern, col)
+                if not s then
+                    break
+                end
+
+                -- Create extmark with virtual text for underline effect
+                vim.api.nvim_buf_set_extmark(output_buf, ns_links, line_num, s - 1, {
+                    end_col = e,
+                    hl_group = "Underlined",
+                })
+
+                col = e + 1
+            end
+        end
     end
 end
 
