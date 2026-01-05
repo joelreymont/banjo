@@ -240,6 +240,25 @@ function M.submit_input()
     -- Clear input
     vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, { "" })
 
+    -- Check if it's a slash command
+    local commands = require("banjo.commands")
+    local parsed = commands.parse(text)
+
+    if parsed then
+        -- Try to dispatch locally
+        local handled = commands.dispatch(parsed.cmd, parsed.args, {
+            bridge = bridge,
+            panel = M,
+        })
+
+        if handled then
+            return
+        end
+
+        -- If not handled locally, forward to backend
+        -- (backend commands like /help from Claude CLI)
+    end
+
     -- Display user message in output
     M.append_user_message(text)
 
@@ -282,18 +301,19 @@ function M.append_user_message(text)
     end
 
     local lines = vim.split(text, "\n", { plain = true })
-    local formatted = { "", "**You:**", "" }
+    local formatted = { "" }
     for _, line in ipairs(lines) do
         table.insert(formatted, line)
     end
     table.insert(formatted, "")
 
     local line_count = vim.api.nvim_buf_line_count(output_buf)
+    local start_line = line_count
     vim.api.nvim_buf_set_lines(output_buf, line_count, line_count, false, formatted)
 
-    -- Highlight user section
-    for i = line_count, line_count + #formatted - 1 do
-        vim.api.nvim_buf_add_highlight(output_buf, ns_id, "Title", i, 0, -1)
+    -- Highlight user input with distinct color (String highlight)
+    for i = start_line + 1, start_line + #lines do
+        vim.api.nvim_buf_add_highlight(output_buf, ns_id, "String", i, 0, -1)
     end
 
     M._scroll_to_bottom()
@@ -305,12 +325,6 @@ function M.start_stream(engine)
 
     create_output_buffer()
     create_panel()
-
-    -- Add header for agent response
-    local engine_name = current_engine:sub(1, 1):upper() .. current_engine:sub(2):lower()
-    local header = string.format("**%s:**", engine_name)
-    local line_count = vim.api.nvim_buf_line_count(output_buf)
-    vim.api.nvim_buf_set_lines(output_buf, line_count, line_count, false, { "", header, "" })
 
     M._update_status()
     M._scroll_to_bottom()
