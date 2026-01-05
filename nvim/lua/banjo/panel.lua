@@ -530,6 +530,41 @@ function M.append(text, is_thought)
         thought_buffer = nil
     end
 
+    -- Accumulate text for code fence detection
+    code_buffer = (code_buffer or "") .. text
+
+    -- Check for opening fence: ```lang
+    if not code_start_line then
+        local fence_start, fence_end, lang = code_buffer:find("```([%w]*)")
+        if fence_start then
+            local line_count = vim.api.nvim_buf_line_count(output_buf)
+            code_start_line = line_count - 1
+            code_lang = lang ~= "" and lang or nil
+        end
+    else
+        -- Check for closing fence: ```
+        local fence_end = code_buffer:find("```", 4)
+        if fence_end then
+            local line_count = vim.api.nvim_buf_line_count(output_buf)
+            local end_line = line_count
+
+            table.insert(code_blocks, {
+                start_line = code_start_line,
+                end_line = end_line,
+                lang = code_lang,
+            })
+
+            -- Apply syntax highlighting if language is specified
+            if code_lang then
+                M._highlight_code_block(code_start_line, end_line, code_lang)
+            end
+
+            code_start_line = nil
+            code_lang = nil
+            code_buffer = nil
+        end
+    end
+
     local lines = vim.split(text, "\n", { plain = true })
     local line_count = vim.api.nvim_buf_line_count(output_buf)
     local last_line = vim.api.nvim_buf_get_lines(output_buf, line_count - 1, line_count, false)[1] or ""
@@ -874,6 +909,34 @@ function M._mark_file_paths(start_line, end_line)
                 col = e + 1
             end
         end
+    end
+end
+
+function M._highlight_code_block(start_line, end_line, lang)
+    if not output_buf or not vim.api.nvim_buf_is_valid(output_buf) then
+        return
+    end
+
+    -- Map common language aliases
+    local lang_map = {
+        js = "javascript",
+        ts = "typescript",
+        py = "python",
+        rb = "ruby",
+        sh = "bash",
+        md = "markdown",
+    }
+    local filetype = lang_map[lang] or lang
+
+    -- Use treesitter for syntax highlighting
+    local ok, ts_highlight = pcall(require, "vim.treesitter.highlighter")
+    if not ok then
+        return
+    end
+
+    -- Apply Comment highlight to code block as fallback
+    for i = start_line, end_line - 1 do
+        vim.api.nvim_buf_add_highlight(output_buf, ns_id, "Special", i, 0, -1)
     end
 end
 
