@@ -86,32 +86,6 @@ fn isCodexMaxTurnError(err: codex_cli.TurnError) bool {
         containsMaxTurnMarker(err.message);
 }
 
-const api_error_markers = [_][]const u8{
-    "API Error",
-    "APIError",
-    "api_error",
-    "rate_limit",
-    "rate_limit_error",
-    "RateLimitError",
-    "overloaded",
-    "overloaded_error",
-    "server_error",
-    "internal_error",
-    "authentication_error",
-    "invalid_request_error",
-    "out of extra usage",
-    "usage limit",
-    "quota exceeded",
-};
-
-fn containsApiErrorMarker(text: ?[]const u8) bool {
-    const haystack = text orelse return false;
-    for (api_error_markers) |marker| {
-        if (std.mem.indexOf(u8, haystack, marker) != null) return true;
-    }
-    return false;
-}
-
 fn elapsedMs(start_ms: i64) u64 {
     const now = std.time.milliTimestamp();
     if (now <= start_ms) return 0;
@@ -1746,7 +1720,6 @@ pub const Agent = struct {
         var stop_reason: protocol.StopReason = .end_turn;
         var first_response_ms: u64 = 0;
         var msg_count: u32 = 0;
-        var had_api_error = false;
 
         while (true) {
             if (session.cancelled) {
@@ -1786,7 +1759,6 @@ pub const Agent = struct {
                         if (first_response_ms == 0) {
                             first_response_ms = msg_time_ms;
                         }
-                        if (containsApiErrorMarker(content)) had_api_error = true;
                         try self.sendEngineText(session, session_id, engine, content);
                     }
 
@@ -1805,26 +1777,23 @@ pub const Agent = struct {
 
                     if (msg.getToolResult()) |tool_result| {
                         const status = toolResultStatus(tool_result.is_error);
-                        if (containsApiErrorMarker(tool_result.content)) had_api_error = true;
                         try self.handleEngineToolResult(session, session_id, engine, tool_result.id, tool_result.content, status, tool_result.raw);
                     }
                 },
                 .user => {
                     if (msg.getToolResult()) |tool_result| {
                         const status = toolResultStatus(tool_result.is_error);
-                        if (containsApiErrorMarker(tool_result.content)) had_api_error = true;
                         try self.handleEngineToolResult(session, session_id, engine, tool_result.id, tool_result.content, status, tool_result.raw);
                     }
                 },
                 .result => {
                     if (msg.getStopReason()) |reason| {
                         // Check if we should auto-continue (nudge) due to pending dot tasks
-                        // Don't nudge if there was an API error - stop and let user intervene
                         // Cooldown: minimum 30 seconds between nudges to prevent rapid-fire loops
                         const now_ms = std.time.milliTimestamp();
                         const nudge_cooldown_ms: i64 = 30_000;
                         const cooldown_ok = (now_ms - session.last_nudge_ms) >= nudge_cooldown_ms;
-                        const should_nudge = session.nudge_enabled and !session.cancelled and !had_api_error and cooldown_ok and
+                        const should_nudge = session.nudge_enabled and !session.cancelled and cooldown_ok and
                             dotHasPendingTasks(self.allocator, session.cwd) and
                             (std.mem.eql(u8, reason, "error_max_turns") or
                                 std.mem.eql(u8, reason, "success") or
@@ -1840,8 +1809,6 @@ pub const Agent = struct {
                             stream_prefix_pending = true;
                             thought_prefix_pending = true;
                             continue;
-                        } else if (had_api_error) {
-                            log.info("Claude Code stopped ({s}); not nudging due to API error", .{reason});
                         } else if (!cooldown_ok) {
                             log.info("Claude Code stopped ({s}); not nudging due to cooldown", .{reason});
                         }
@@ -1868,7 +1835,6 @@ pub const Agent = struct {
                             first_response_ms = msg_time_ms;
                             log.info("First Claude stream response at {d}ms", .{msg_time_ms});
                         }
-                        if (containsApiErrorMarker(text)) had_api_error = true;
                         if (stream_prefix_pending) {
                             try self.sendEngineTextPrefix(session, session_id, engine);
                             stream_prefix_pending = false;
@@ -1960,7 +1926,6 @@ pub const Agent = struct {
 
         var first_response_ms: u64 = 0;
         var msg_count: u32 = 0;
-        var had_api_error = false;
 
         while (true) {
             if (session.cancelled) return .cancelled;
@@ -1996,7 +1961,6 @@ pub const Agent = struct {
             if (msg.event_type == .agent_message_delta) {
                 if (msg.text) |text| {
                     if (first_response_ms == 0) first_response_ms = msg_time_ms;
-                    if (containsApiErrorMarker(text)) had_api_error = true;
                     if (stream_prefix_pending) {
                         try self.sendEngineTextPrefix(session, session_id, engine);
                         stream_prefix_pending = false;
@@ -2009,7 +1973,6 @@ pub const Agent = struct {
             if (msg.event_type == .reasoning_delta) {
                 if (msg.text) |text| {
                     if (first_response_ms == 0) first_response_ms = msg_time_ms;
-                    if (containsApiErrorMarker(text)) had_api_error = true;
                     if (thought_prefix_pending) {
                         try self.sendEngineThoughtPrefix(session, session_id, engine);
                         thought_prefix_pending = false;
@@ -2066,42 +2029,34 @@ pub const Agent = struct {
 
             if (msg.getToolResult()) |tool_result| {
                 const status = exitCodeStatus(tool_result.exit_code);
-                if (containsApiErrorMarker(tool_result.content)) had_api_error = true;
                 try self.handleEngineToolResult(session, session_id, engine, tool_result.id, tool_result.content, status, tool_result.raw);
                 continue;
             }
 
             if (msg.getThought()) |text| {
                 if (first_response_ms == 0) first_response_ms = msg_time_ms;
-                if (containsApiErrorMarker(text)) had_api_error = true;
                 try self.sendEngineThought(session, session_id, engine, text);
                 continue;
             }
 
             if (msg.getText()) |text| {
                 if (first_response_ms == 0) first_response_ms = msg_time_ms;
-                if (containsApiErrorMarker(text)) had_api_error = true;
                 try self.sendEngineText(session, session_id, engine, text);
                 continue;
             }
 
             if (msg.event_type == .turn_completed) {
                 // Check if we should nudge due to pending dot tasks
-                // Don't nudge if there was an API error - stop and let user intervene
+                // Nudge only if: no error, or max_turn error (which we can continue through)
                 const has_max_turn_error = if (msg.turn_error) |err| isCodexMaxTurnError(err) else false;
-                // Also check turn_error fields for API error markers
-                if (msg.turn_error) |err| {
-                    if (containsApiErrorMarker(err.code) or
-                        containsApiErrorMarker(err.type) or
-                        containsApiErrorMarker(err.message)) had_api_error = true;
-                }
+                const has_blocking_error = msg.turn_error != null and !has_max_turn_error;
                 // Cooldown: minimum 30 seconds between nudges to prevent rapid-fire loops
                 const now_ms = std.time.milliTimestamp();
                 const nudge_cooldown_ms: i64 = 30_000;
                 const cooldown_ok = (now_ms - session.last_nudge_ms) >= nudge_cooldown_ms;
-                const should_nudge = session.nudge_enabled and !session.cancelled and !had_api_error and cooldown_ok and
-                    dotHasPendingTasks(self.allocator, session.cwd) and
-                    (has_max_turn_error or msg.turn_error == null);
+                const should_nudge = session.nudge_enabled and !session.cancelled and
+                    !has_blocking_error and cooldown_ok and
+                    dotHasPendingTasks(self.allocator, session.cwd);
 
                 if (should_nudge) {
                     session.last_nudge_ms = now_ms;
@@ -2115,8 +2070,8 @@ pub const Agent = struct {
                     stream_prefix_pending = true;
                     thought_prefix_pending = true;
                     continue;
-                } else if (had_api_error) {
-                    log.info("Codex turn completed; not nudging due to API error", .{});
+                } else if (has_blocking_error) {
+                    log.info("Codex turn completed; not nudging due to error", .{});
                 } else if (!cooldown_ok) {
                     log.info("Codex turn completed; not nudging due to cooldown", .{});
                 }
