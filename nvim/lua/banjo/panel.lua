@@ -16,6 +16,10 @@ local current_engine = nil
 -- Tool tracking for in-place updates
 local tool_extmarks = {}
 
+-- History navigation state
+local history_offset = 0
+local history_temp_input = ""
+
 -- Bridge reference (set via set_bridge)
 local bridge = nil
 
@@ -28,6 +32,10 @@ local config = {
 
 function M.setup(opts)
     config = vim.tbl_deep_extend("force", config, opts or {})
+
+    -- Load history from disk
+    local history = require("banjo.history")
+    history.load()
 end
 
 function M.set_bridge(b)
@@ -102,6 +110,46 @@ local function setup_input_keymaps()
         vim.cmd("stopinsert")
         if output_win and vim.api.nvim_win_is_valid(output_win) then
             vim.api.nvim_set_current_win(output_win)
+        end
+    end, { buffer = input_buf, noremap = true })
+
+    -- Up/Down for history navigation
+    vim.keymap.set({ "n", "i" }, "<Up>", function()
+        local history = require("banjo.history")
+
+        -- First Up press: save current input
+        if history_offset == 0 then
+            history_temp_input = M.get_input_text()
+        end
+
+        -- Navigate back in history
+        if history_offset < history.size() then
+            history_offset = history_offset + 1
+            local entry = history.get(history_offset - 1)
+            if entry then
+                M.set_input_text(entry)
+            end
+        end
+    end, { buffer = input_buf, noremap = true })
+
+    vim.keymap.set({ "n", "i" }, "<Down>", function()
+        local history = require("banjo.history")
+
+        if history_offset == 0 then
+            return
+        end
+
+        -- Navigate forward in history
+        history_offset = history_offset - 1
+
+        if history_offset == 0 then
+            -- Restore temp input
+            M.set_input_text(history_temp_input)
+        else
+            local entry = history.get(history_offset - 1)
+            if entry then
+                M.set_input_text(entry)
+            end
         end
     end, { buffer = input_buf, noremap = true })
 end
@@ -236,6 +284,12 @@ function M.submit_input()
     if text == "" then
         return
     end
+
+    -- Add to history and reset navigation
+    local history = require("banjo.history")
+    history.add(text)
+    history_offset = 0
+    history_temp_input = ""
 
     -- Clear input
     vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, { "" })
