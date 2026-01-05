@@ -343,7 +343,9 @@ function M._show_approval_prompt(params)
 end
 
 function M.get_state()
-    return state
+    return vim.tbl_extend("force", state, {
+        reconnect_attempt = reconnect.attempt,
+    })
 end
 
 function M.set_engine(engine)

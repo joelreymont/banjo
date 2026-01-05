@@ -561,7 +561,12 @@ function M._build_status()
     if connected then
         table.insert(parts, "%#DiagnosticOk#●%*")
     else
-        table.insert(parts, "%#DiagnosticError#○%*")
+        local state = bridge and bridge.get_state and bridge.get_state() or {}
+        if state.reconnect_attempt and state.reconnect_attempt > 0 then
+            table.insert(parts, string.format("%%#DiagnosticWarn#○(%d)%%*", state.reconnect_attempt))
+        else
+            table.insert(parts, "%#DiagnosticError#○%*")
+        end
     end
 
     -- Get state from bridge
