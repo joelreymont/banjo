@@ -1,5 +1,5 @@
 const std = @import("std");
-const io_utils = @import("cli/io_utils.zig");
+const io_utils = @import("core/io_utils.zig");
 const Allocator = std.mem.Allocator;
 const max_jsonrpc_line_bytes: usize = 4 * 1024 * 1024;
 

@@ -427,9 +427,11 @@ test {
     _ = jsonrpc;
     _ = @import("acp/agent.zig");
     _ = @import("acp/protocol.zig");
-    _ = @import("cli/bridge.zig");
-    _ = @import("cli/codex_bridge.zig");
-    _ = @import("settings/loader.zig");
+    _ = @import("core/claude_bridge.zig");
+    _ = @import("core/codex_bridge.zig");
+    _ = @import("core/dots.zig");
+    _ = @import("core/settings.zig");
+    _ = @import("core/types.zig");
     _ = @import("tools/proxy.zig");
     _ = @import("util/quickcheck.zig");
 

@@ -3,25 +3,25 @@ const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 const jsonrpc = @import("../jsonrpc.zig");
 const protocol = @import("protocol.zig");
-const bridge = @import("../cli/bridge.zig");
+const bridge = @import("../core/claude_bridge.zig");
 const Bridge = bridge.Bridge;
 const SystemSubtype = bridge.SystemSubtype;
-const codex_cli = @import("../cli/codex_bridge.zig");
+const codex_cli = @import("../core/codex_bridge.zig");
 const CodexBridge = codex_cli.CodexBridge;
 const CodexMessage = codex_cli.CodexMessage;
 const CodexUserInput = codex_cli.UserInput;
-const settings_loader = @import("../settings/loader.zig");
+const settings_loader = @import("../core/settings.zig");
 const Settings = settings_loader.Settings;
+const dots = @import("../core/dots.zig");
+const types = @import("../core/types.zig");
+const Engine = types.Engine;
+const Route = types.Route;
 const notes_commands = @import("../notes/commands.zig");
 const config = @import("config");
 const test_env = @import("../util/test_env.zig");
 const ToolProxy = @import("../tools/proxy.zig").ToolProxy;
 
 const log = std.log.scoped(.agent);
-
-const Engine = enum { claude, codex };
-
-const Route = enum { claude, codex, duet };
 
 /// Banjo version with git hash
 pub const version = "0.6.1 (" ++ config.git_hash ++ ")";
@@ -31,7 +31,6 @@ const max_media_preview_bytes = 2048; // small preview for binary media captions
 const max_codex_image_bytes: usize = 8 * 1024 * 1024; // guard against massive base64 images
 const resource_line_limit: u32 = 200; // limit resource excerpt lines to reduce UI spam
 const max_tool_preview_bytes: usize = 1024; // keep tool call previews readable in the panel
-const max_dot_output_bytes: usize = 128 * 1024; // dot task list output cap
 const default_model_id = "sonnet";
 const response_timeout_ms: i64 = 30_000;
 const prompt_poll_ms: i64 = 250;
@@ -104,78 +103,18 @@ fn replaceFirst(allocator: Allocator, input: []const u8, needle: []const u8, rep
     return result;
 }
 
-fn dotOutputHasPendingTasks(allocator: Allocator, output: []const u8) !bool {
-    const parsed = try std.json.parseFromSlice([]DotTask, allocator, output, .{
-        .ignore_unknown_fields = true,
-    });
-    defer parsed.deinit();
-    return parsed.value.len > 0;
-}
-
-fn dotHasPendingTasks(allocator: Allocator, cwd: []const u8) bool {
-    var args = [_][]const u8{ "dot", "ls", "--json" };
-    var child = std.process.Child.init(&args, allocator);
-    child.cwd = cwd;
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    child.spawn() catch |err| {
-        log.warn("dot ls failed to start: {}", .{err});
-        return false;
-    };
-    errdefer {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-    }
-
-    const stdout = child.stdout orelse return false;
-    const stderr = child.stderr orelse return false;
-    const out = stdout.readToEndAlloc(allocator, max_dot_output_bytes) catch |err| {
-        log.warn("dot ls stdout read failed: {}", .{err});
-        return false;
-    };
-    defer allocator.free(out);
-    const err_out = stderr.readToEndAlloc(allocator, max_dot_output_bytes) catch |err| {
-        log.warn("dot ls stderr read failed: {}", .{err});
-        return false;
-    };
-    defer allocator.free(err_out);
-
-    const term = child.wait() catch |err| {
-        log.warn("dot ls wait failed: {}", .{err});
-        return false;
-    };
-    switch (term) {
-        .Exited => |code| if (code != 0) {
-            log.warn("dot ls exited with code {d}: {s}", .{ code, err_out });
-            return false;
-        },
-        else => {
-            log.warn("dot ls did not exit cleanly: {}", .{term});
-            return false;
-        },
-    }
-
-    return dotOutputHasPendingTasks(allocator, out) catch |err| {
-        log.warn("dot ls output parse failed: {}", .{err});
-        return false;
-    };
-}
-
 fn routeFromEnv() Route {
-    const val = std.posix.getenv("BANJO_ROUTE") orelse return .claude;
-    return route_map.get(val) orelse .claude;
+    return types.routeFromEnv();
 }
 
 fn routeEnvValue() ?Route {
     const val = std.posix.getenv("BANJO_ROUTE") orelse return null;
-    return route_map.get(val);
+    return types.route_map.get(val);
 }
 
 fn primaryAgentFromEnv() Engine {
     const val = std.posix.getenv("BANJO_PRIMARY_AGENT") orelse return .claude;
-    return engine_map.get(val) orelse .claude;
+    return types.engine_map.get(val) orelse .claude;
 }
 
 fn configFromEnv() SessionConfig {
@@ -208,21 +147,6 @@ const falsey_env_values = std.StaticStringMap(void).initComptime(.{
 const bool_str_map = std.StaticStringMap(bool).initComptime(.{
     .{ "true", true },
     .{ "false", false },
-});
-
-const DotTask = struct {
-    status: []const u8,
-};
-
-const route_map = std.StaticStringMap(Route).initComptime(.{
-    .{ "claude", .claude },
-    .{ "codex", .codex },
-    .{ "duet", .duet },
-});
-
-const engine_map = std.StaticStringMap(Engine).initComptime(.{
-    .{ "claude", .claude },
-    .{ "codex", .codex },
 });
 
 const ConfigOptionId = enum {
@@ -1794,7 +1718,7 @@ pub const Agent = struct {
                         const nudge_cooldown_ms: i64 = 30_000;
                         const cooldown_ok = (now_ms - session.last_nudge_ms) >= nudge_cooldown_ms;
                         const should_nudge = session.nudge_enabled and !session.cancelled and cooldown_ok and
-                            dotHasPendingTasks(self.allocator, session.cwd) and
+                            dots.hasPendingTasks(self.allocator, session.cwd) and
                             (std.mem.eql(u8, reason, "error_max_turns") or
                                 std.mem.eql(u8, reason, "success") or
                                 std.mem.eql(u8, reason, "end_turn"));
@@ -2056,7 +1980,7 @@ pub const Agent = struct {
                 const cooldown_ok = (now_ms - session.last_nudge_ms) >= nudge_cooldown_ms;
                 const should_nudge = session.nudge_enabled and !session.cancelled and
                     !has_blocking_error and cooldown_ok and
-                    dotHasPendingTasks(self.allocator, session.cwd);
+                    dots.hasPendingTasks(self.allocator, session.cwd);
 
                 if (should_nudge) {
                     session.last_nudge_ms = now_ms;
@@ -3561,7 +3485,7 @@ pub const Agent = struct {
                 self.updateAllSessions(.auto_resume, .{ .auto_resume = value });
             },
             .route => {
-                const route = route_map.get(params.value) orelse {
+                const route = types.route_map.get(params.value) orelse {
                     try self.writer.writeResponse(jsonrpc.Response.err(
                         request.id,
                         jsonrpc.Error.InvalidParams,
@@ -3573,7 +3497,7 @@ pub const Agent = struct {
                 self.updateAllSessions(.route, .{ .route = route });
             },
             .primary_agent => {
-                const primary = engine_map.get(params.value) orelse {
+                const primary = types.engine_map.get(params.value) orelse {
                     try self.writer.writeResponse(jsonrpc.Response.err(
                         request.id,
                         jsonrpc.Error.InvalidParams,
@@ -3803,7 +3727,7 @@ pub const Agent = struct {
         });
 
         // If nudge was just enabled and there are pending dots, trigger immediately
-        if (should_trigger and dotHasPendingTasks(self.allocator, session.cwd)) {
+        if (should_trigger and dots.hasPendingTasks(self.allocator, session.cwd)) {
             session.last_nudge_ms = std.time.milliTimestamp();
             log.info("Nudge enabled with pending dots, triggering continuation", .{});
             try self.sendUserMessage(session_id, "🔄 continue working on pending dots");
@@ -4558,14 +4482,6 @@ fn expectedNewSessionOutput(
 test "configFromEnv returns defaults" {
     // Env vars may be set in CI; just ensure the function returns a config.
     _ = configFromEnv();
-}
-
-test "dotOutputHasPendingTasks detects pending tasks" {
-    const has_tasks = try dotOutputHasPendingTasks(testing.allocator, "[{\"status\":\"open\"}]");
-    try testing.expect(has_tasks);
-
-    const no_tasks = try dotOutputHasPendingTasks(testing.allocator, "[]");
-    try testing.expect(!no_tasks);
 }
 
 test "replaceFirst replaces only first occurrence" {
