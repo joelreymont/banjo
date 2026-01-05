@@ -379,7 +379,14 @@ function M.submit_input()
     local text = table.concat(lines, "\n")
     text = vim.trim(text)
 
+    -- Validate input
     if text == "" then
+        return
+    end
+
+    -- Enforce reasonable length limit (1MB = 1048576 bytes)
+    if #text > 1048576 then
+        M.append_status("Error: Input too long (max 1MB)")
         return
     end
 
