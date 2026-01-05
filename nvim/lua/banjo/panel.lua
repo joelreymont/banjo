@@ -28,6 +28,9 @@ local history_temp_input = ""
 -- Auto-scroll state
 local last_manual_scroll_time = 0
 
+-- Session duration update timer
+local session_timer = nil
+
 -- Bridge reference (set via set_bridge)
 local bridge = nil
 
@@ -640,6 +643,15 @@ function M._build_status()
         table.insert(parts, "%#DiagnosticInfo#...%*")
     end
 
+    -- Session duration
+    if state.session_active and state.session_start_time then
+        local elapsed_ms = vim.loop.now() - state.session_start_time
+        local elapsed_sec = math.floor(elapsed_ms / 1000)
+        local mins = math.floor(elapsed_sec / 60)
+        local secs = elapsed_sec % 60
+        table.insert(parts, string.format("[%dm %02ds]", mins, secs))
+    end
+
     table.insert(parts, "%=")
 
     -- Help hint
@@ -651,6 +663,27 @@ end
 function M._update_status()
     if output_win and vim.api.nvim_win_is_valid(output_win) then
         vim.api.nvim_set_option_value("winbar", M._build_status(), { win = output_win })
+    end
+end
+
+function M._start_session_timer()
+    if session_timer then
+        return
+    end
+
+    session_timer = vim.loop.new_timer()
+    if session_timer then
+        session_timer:start(1000, 1000, vim.schedule_wrap(function()
+            M._update_status()
+        end))
+    end
+end
+
+function M._stop_session_timer()
+    if session_timer then
+        session_timer:stop()
+        session_timer:close()
+        session_timer = nil
     end
 end
 

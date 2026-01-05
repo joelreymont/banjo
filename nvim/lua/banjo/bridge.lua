@@ -286,6 +286,16 @@ function M._handle_message(msg)
             state.session_id = msg.params.session_id
             panel._update_status()
         end
+    elseif method == "session_start" then
+        state.session_active = true
+        state.session_start_time = vim.loop.now()
+        panel._update_status()
+        panel._start_session_timer()
+    elseif method == "session_end" then
+        state.session_active = false
+        state.session_start_time = nil
+        panel._update_status()
+        panel._stop_session_timer()
     elseif method == "approval_request" then
         if msg.params then
             M._show_approval_prompt(msg.params)
