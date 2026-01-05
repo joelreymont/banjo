@@ -16,6 +16,11 @@ const dots = @import("../core/dots.zig");
 const types = @import("../core/types.zig");
 const Engine = types.Engine;
 const Route = types.Route;
+const engine_mod = @import("../core/engine.zig");
+const callbacks_mod = @import("../core/callbacks.zig");
+const EditorCallbacks = callbacks_mod.EditorCallbacks;
+const CallbackToolKind = callbacks_mod.ToolKind;
+const CallbackToolStatus = callbacks_mod.ToolStatus;
 const notes_commands = @import("../notes/commands.zig");
 const config = @import("config");
 const test_env = @import("../util/test_env.zig");
@@ -495,6 +500,178 @@ pub const Agent = struct {
             return true;
         }
     };
+
+    // Callback context for shared engine
+    const PromptCallbackContext = struct {
+        agent: *Agent,
+        session: *Session,
+        session_id: []const u8,
+    };
+
+    // Convert callback ToolKind to protocol ToolKind
+    fn toProtocolToolKind(kind: CallbackToolKind) protocol.SessionUpdate.ToolKind {
+        return switch (kind) {
+            .read => .read,
+            .edit => .edit,
+            .execute => .execute,
+            .browser => .fetch,
+            .other => .other,
+        };
+    }
+
+    // Convert callback ToolStatus to protocol ToolCallStatus
+    fn toProtocolToolStatus(status: CallbackToolStatus) protocol.SessionUpdate.ToolCallStatus {
+        return switch (status) {
+            .pending, .execute, .approved, .denied => .pending,
+            .completed => .completed,
+            .failed => .failed,
+        };
+    }
+
+    // Static vtable for EditorCallbacks
+    const editor_callbacks_vtable = EditorCallbacks.VTable{
+        .sendText = cbSendText,
+        .sendTextRaw = cbSendTextRaw,
+        .sendTextPrefix = cbSendTextPrefix,
+        .sendThought = cbSendThought,
+        .sendThoughtRaw = cbSendThoughtRaw,
+        .sendThoughtPrefix = cbSendThoughtPrefix,
+        .sendToolCall = cbSendToolCall,
+        .sendToolResult = cbSendToolResult,
+        .sendUserMessage = cbSendUserMessage,
+        .onTimeout = cbOnTimeout,
+        .onSessionId = cbOnSessionId,
+        .onSlashCommands = cbOnSlashCommands,
+        .checkAuthRequired = cbCheckAuthRequired,
+        .sendContinuePrompt = cbSendContinuePrompt,
+    };
+
+    fn cbSendText(ctx: *anyopaque, session_id: []const u8, engine: Engine, text: []const u8) anyerror!void {
+        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        return pctx.agent.sendEngineText(pctx.session, session_id, engine, text);
+    }
+
+    fn cbSendTextRaw(ctx: *anyopaque, session_id: []const u8, text: []const u8) anyerror!void {
+        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        return pctx.agent.sendEngineTextRaw(session_id, text);
+    }
+
+    fn cbSendTextPrefix(ctx: *anyopaque, session_id: []const u8, engine: Engine) anyerror!void {
+        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        return pctx.agent.sendEngineTextPrefix(pctx.session, session_id, engine);
+    }
+
+    fn cbSendThought(ctx: *anyopaque, session_id: []const u8, engine: Engine, text: []const u8) anyerror!void {
+        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        return pctx.agent.sendEngineThought(pctx.session, session_id, engine, text);
+    }
+
+    fn cbSendThoughtRaw(ctx: *anyopaque, session_id: []const u8, text: []const u8) anyerror!void {
+        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        return pctx.agent.sendEngineThoughtRaw(session_id, text);
+    }
+
+    fn cbSendThoughtPrefix(ctx: *anyopaque, session_id: []const u8, engine: Engine) anyerror!void {
+        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        return pctx.agent.sendEngineThoughtPrefix(pctx.session, session_id, engine);
+    }
+
+    fn cbSendToolCall(
+        ctx: *anyopaque,
+        session_id: []const u8,
+        engine: Engine,
+        tool_name: []const u8,
+        tool_label: []const u8,
+        tool_id: []const u8,
+        kind: CallbackToolKind,
+        input: ?std.json.Value,
+    ) anyerror!void {
+        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        return pctx.agent.handleEngineToolCall(
+            pctx.session,
+            session_id,
+            engine,
+            tool_name,
+            tool_label,
+            tool_id,
+            toProtocolToolKind(kind),
+            input,
+        );
+    }
+
+    fn cbSendToolResult(
+        ctx: *anyopaque,
+        session_id: []const u8,
+        engine: Engine,
+        tool_id: []const u8,
+        content: ?[]const u8,
+        status: CallbackToolStatus,
+        raw: ?std.json.Value,
+    ) anyerror!void {
+        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        return pctx.agent.handleEngineToolResult(
+            pctx.session,
+            session_id,
+            engine,
+            tool_id,
+            content,
+            toProtocolToolStatus(status),
+            raw orelse .null,
+        );
+    }
+
+    fn cbSendUserMessage(ctx: *anyopaque, session_id: []const u8, text: []const u8) anyerror!void {
+        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        return pctx.agent.sendUserMessage(session_id, text);
+    }
+
+    fn cbOnTimeout(ctx: *anyopaque) void {
+        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        pctx.agent.pollClientMessages(pctx.session);
+    }
+
+    fn cbOnSessionId(ctx: *anyopaque, engine: Engine, cli_session_id: []const u8) void {
+        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        switch (engine) {
+            .claude => pctx.agent.captureSessionId(&pctx.session.cli_session_id, "Claude", cli_session_id),
+            .codex => pctx.agent.captureSessionId(&pctx.session.codex_session_id, "Codex", cli_session_id),
+        }
+    }
+
+    fn cbOnSlashCommands(ctx: *anyopaque, session_id: []const u8, commands: []const []const u8) anyerror!void {
+        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        return pctx.agent.sendAvailableCommands(session_id, commands);
+    }
+
+    fn cbCheckAuthRequired(ctx: *anyopaque, session_id: []const u8, engine: Engine, content: []const u8) anyerror!?EditorCallbacks.StopReason {
+        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        if (isAuthRequiredContent(content)) {
+            _ = try pctx.agent.handleAuthRequired(session_id, pctx.session, engine);
+            return .auth_required;
+        }
+        return null;
+    }
+
+    fn cbSendContinuePrompt(ctx: *anyopaque, engine: Engine, prompt: []const u8) anyerror!bool {
+        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        switch (engine) {
+            .claude => {
+                _ = pctx.agent.sendClaudePromptWithRestart(pctx.session, pctx.session_id, prompt) catch |err| {
+                    log.err("Failed to send continue prompt: {}", .{err});
+                    return false;
+                };
+                return true;
+            },
+            .codex => {
+                const inputs = [_]CodexUserInput{.{ .type = "text", .text = prompt }};
+                _ = pctx.agent.sendCodexPromptWithRestart(pctx.session, pctx.session_id, inputs[0..]) catch |err| {
+                    log.err("Failed to send continue prompt: {}", .{err});
+                    return false;
+                };
+                return true;
+            },
+        }
+    }
 
     pub fn init(allocator: Allocator, writer: std.io.AnyWriter, reader: ?*jsonrpc.Reader) Agent {
         var agent = Agent{
@@ -1631,191 +1808,46 @@ pub const Agent = struct {
     }
 
     fn runClaudePrompt(self: *Agent, session: *Session, session_id: []const u8, prompt: []const u8) !protocol.StopReason {
-        const start_ms = std.time.milliTimestamp();
-        const engine = Engine.claude;
-        var stream_prefix_pending = true;
-        var thought_prefix_pending = true;
         defer self.clearPendingExecuteTools(session);
 
         const cli_bridge = try self.sendClaudePromptWithRestart(session, session_id, prompt);
-        const prompt_sent_ms = elapsedMs(start_ms);
-        log.info("Claude prompt sent at {d}ms", .{prompt_sent_ms});
 
-        var stop_reason: protocol.StopReason = .end_turn;
-        var first_response_ms: u64 = 0;
-        var msg_count: u32 = 0;
+        var cb_ctx = PromptCallbackContext{
+            .agent = self,
+            .session = session,
+            .session_id = session_id,
+        };
+        const callbacks = EditorCallbacks{
+            .ctx = @ptrCast(&cb_ctx),
+            .vtable = &editor_callbacks_vtable,
+        };
 
-        while (true) {
-            if (session.cancelled) {
-                stop_reason = .cancelled;
-                break;
-            }
+        var prompt_ctx = engine_mod.PromptContext{
+            .allocator = self.allocator,
+            .session_id = session_id,
+            .cwd = session.cwd,
+            .cancelled = &session.cancelled,
+            .nudge = .{
+                .enabled = session.nudge_enabled,
+                .cooldown_ms = 30_000,
+                .last_nudge_ms = &session.last_nudge_ms,
+            },
+            .cb = callbacks,
+            .tag_engine = self.shouldTagEngine(session),
+        };
 
-            const deadline_ms = std.time.milliTimestamp() + prompt_poll_ms;
-            var msg = cli_bridge.readMessageWithTimeout(deadline_ms) catch |err| {
-                if (err == error.Timeout) {
-                    self.pollClientMessages(session);
-                    if (session.cancelled) {
-                        stop_reason = .cancelled;
-                        break;
-                    }
-                    continue;
-                }
-                log.err("Failed to read Claude Code message: {}", .{err});
-                session.bridge.?.deinit();
-                session.bridge = null;
-                break;
-            } orelse {
-                session.bridge.?.deinit();
-                session.bridge = null;
-                break;
-            };
-            defer msg.deinit();
+        const engine_stop = try engine_mod.processClaudeMessages(&prompt_ctx, cli_bridge);
+        return toProtocolStopReason(engine_stop);
+    }
 
-            msg_count += 1;
-            const msg_time_ms = elapsedMs(start_ms);
-            if (first_response_ms == 0) first_response_ms = msg_time_ms;
-            log.debug("Claude msg #{d} ({s}) at {d}ms", .{ msg_count, @tagName(msg.type), msg_time_ms });
-
-            switch (msg.type) {
-                .assistant => {
-                    if (msg.getContent()) |content| {
-                        if (first_response_ms == 0) {
-                            first_response_ms = msg_time_ms;
-                        }
-                        try self.sendEngineText(session, session_id, engine, content);
-                    }
-
-                    if (msg.getToolUse()) |tool| {
-                        try self.handleEngineToolCall(
-                            session,
-                            session_id,
-                            engine,
-                            tool.name,
-                            tool.name,
-                            tool.id,
-                            mapToolKind(tool.name),
-                            tool.input,
-                        );
-                    }
-
-                    if (msg.getToolResult()) |tool_result| {
-                        const status = toolResultStatus(tool_result.is_error);
-                        try self.handleEngineToolResult(session, session_id, engine, tool_result.id, tool_result.content, status, tool_result.raw);
-                    }
-                },
-                .user => {
-                    if (msg.getToolResult()) |tool_result| {
-                        const status = toolResultStatus(tool_result.is_error);
-                        try self.handleEngineToolResult(session, session_id, engine, tool_result.id, tool_result.content, status, tool_result.raw);
-                    }
-                },
-                .result => {
-                    if (msg.getStopReason()) |reason| {
-                        // Check if we should auto-continue (nudge) due to pending dot tasks
-                        // Cooldown: minimum 30 seconds between nudges to prevent rapid-fire loops
-                        const now_ms = std.time.milliTimestamp();
-                        const nudge_cooldown_ms: i64 = 30_000;
-                        const cooldown_ok = (now_ms - session.last_nudge_ms) >= nudge_cooldown_ms;
-                        const should_nudge = session.nudge_enabled and !session.cancelled and cooldown_ok and
-                            dots.hasPendingTasks(self.allocator, session.cwd) and
-                            (std.mem.eql(u8, reason, "error_max_turns") or
-                                std.mem.eql(u8, reason, "success") or
-                                std.mem.eql(u8, reason, "end_turn"));
-
-                        if (should_nudge) {
-                            session.last_nudge_ms = now_ms;
-                            log.info("Claude Code stopped ({s}); pending dots, nudging", .{reason});
-                            const nudge_msg = "🔄 continue working on pending dots";
-                            try self.sendUserMessage(session_id, nudge_msg);
-                            const nudge_prompt = "clean up dots, then pick a dot and work on it";
-                            _ = try self.sendClaudePromptWithRestart(session, session_id, nudge_prompt);
-                            stream_prefix_pending = true;
-                            thought_prefix_pending = true;
-                            continue;
-                        } else if (!cooldown_ok) {
-                            log.info("Claude Code stopped ({s}); not nudging due to cooldown", .{reason});
-                        }
-                        stop_reason = mapCliStopReason(reason);
-                    }
-                    break;
-                },
-                .stream_event => {
-                    if (msg.getStreamEventType()) |event_type| {
-                        switch (event_type) {
-                            .message_start => {
-                                stream_prefix_pending = true;
-                                thought_prefix_pending = true;
-                            },
-                            .message_stop => {
-                                stream_prefix_pending = false;
-                                thought_prefix_pending = false;
-                            },
-                            else => {},
-                        }
-                    }
-                    if (msg.getStreamTextDelta()) |text| {
-                        if (first_response_ms == 0) {
-                            first_response_ms = msg_time_ms;
-                            log.info("First Claude stream response at {d}ms", .{msg_time_ms});
-                        }
-                        if (stream_prefix_pending) {
-                            try self.sendEngineTextPrefix(session, session_id, engine);
-                            stream_prefix_pending = false;
-                        }
-                        try self.sendEngineTextRaw(session_id, text);
-                    }
-                    if (msg.getStreamThinkingDelta()) |thinking| {
-                        if (thought_prefix_pending) {
-                            try self.sendEngineThoughtPrefix(session, session_id, engine);
-                            thought_prefix_pending = false;
-                        }
-                        try self.sendEngineThoughtRaw(session_id, thinking);
-                    }
-                },
-                .system => {
-                    if (msg.getSystemSubtype()) |subtype| {
-                        switch (subtype) {
-                            .init => {
-                                if (msg.getInitInfo()) |init_info| {
-                                    if (init_info.slash_commands) |cmds| {
-                                        try self.sendAvailableCommands(session_id, cmds);
-                                    }
-                                    if (init_info.session_id) |cli_sid| {
-                                        self.captureSessionId(&session.cli_session_id, "Claude", cli_sid);
-                                    }
-                                }
-                                if (msg.getContent()) |content| {
-                                    if (isAuthRequiredContent(content)) {
-                                        stop_reason = try self.handleAuthRequired(session_id, session, engine);
-                                        break;
-                                    }
-                                }
-                            },
-                            .auth_required => {
-                                if (msg.getContent()) |content| {
-                                    if (isAuthRequiredContent(content)) {
-                                        stop_reason = try self.handleAuthRequired(session_id, session, engine);
-                                        break;
-                                    }
-                                }
-                            },
-                            .hook_response => {},
-                        }
-                    } else {
-                        if (msg.getContent()) |content| {
-                            try self.sendEngineText(session, session_id, engine, content);
-                        }
-                    }
-                },
-                else => {},
-            }
-        }
-
-        const total_ms = elapsedMs(start_ms);
-        log.info("Claude prompt complete: {d} msgs, first response at {d}ms, total {d}ms", .{ msg_count, first_response_ms, total_ms });
-
-        return stop_reason;
+    fn toProtocolStopReason(stop: engine_mod.StopReason) protocol.StopReason {
+        return switch (stop) {
+            .end_turn => .end_turn,
+            .cancelled => .cancelled,
+            .max_tokens => .max_tokens,
+            .max_turn_requests => .max_turn_requests,
+            .auth_required => .end_turn,
+        };
     }
 
     fn runCodexPrompt(
