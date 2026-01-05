@@ -19,6 +19,8 @@ local function cmd_help(args, context)
         "  /model <name> - Set model (opus, sonnet, haiku)",
         "  /mode <name> - Set permission mode (default, accept_edits, auto_approve, plan_only)",
         "  /route <engine> - Switch engine (claude, codex)",
+        "  /sessions - List saved sessions",
+        "  /load <id> - Restore a saved session",
         "",
         "Keybinds:",
         "  <CR> - Submit input",
@@ -172,6 +174,50 @@ local function cmd_route(args, context)
     end
 end
 
+local function cmd_sessions(args, context)
+    local panel = context.panel
+    if not panel then return end
+
+    local sessions = require("banjo.sessions")
+    local list = sessions.list()
+
+    if #list == 0 then
+        panel.append_status("No saved sessions")
+        return
+    end
+
+    panel.append_status("Saved sessions:")
+    for _, session in ipairs(list) do
+        local time = os.date("%Y-%m-%d %H:%M:%S", session.timestamp)
+        panel.append_status(string.format("  %s - %s", session.id, time))
+    end
+end
+
+local function cmd_load(args, context)
+    local panel = context.panel
+    if not panel then return end
+
+    if not args or args == "" then
+        panel.append_status("Usage: /load <session_id>")
+        return
+    end
+
+    local sessions = require("banjo.sessions")
+    local data = sessions.load(args)
+
+    if not data then
+        panel.append_status(string.format("Session not found: %s", args))
+        return
+    end
+
+    -- Restore input text
+    if data.input_text then
+        panel.set_input_text(data.input_text)
+    end
+
+    panel.append_status(string.format("Loaded session: %s", args))
+end
+
 -- Register built-in commands
 M.register("help", cmd_help)
 M.register("clear", cmd_clear)
@@ -180,6 +226,8 @@ M.register("cancel", cmd_cancel)
 M.register("model", cmd_model)
 M.register("mode", cmd_mode)
 M.register("route", cmd_route)
+M.register("sessions", cmd_sessions)
+M.register("load", cmd_load)
 
 -- Parse input text into command and arguments
 -- Returns: {cmd = string, args = string} or nil if not a command
