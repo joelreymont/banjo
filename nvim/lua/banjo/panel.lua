@@ -20,6 +20,9 @@ local tool_extmarks = {}
 local history_offset = 0
 local history_temp_input = ""
 
+-- Auto-scroll state
+local last_manual_scroll_time = 0
+
 -- Bridge reference (set via set_bridge)
 local bridge = nil
 
@@ -158,6 +161,14 @@ local function setup_output_keymaps()
     if not output_buf or not vim.api.nvim_buf_is_valid(output_buf) then
         return
     end
+
+    -- Track manual scrolling
+    vim.api.nvim_create_autocmd("CursorMoved", {
+        buffer = output_buf,
+        callback = function()
+            last_manual_scroll_time = vim.loop.now()
+        end,
+    })
 
     -- 'i' to focus input
     vim.keymap.set("n", "i", function()
@@ -559,10 +570,22 @@ function M._update_status()
 end
 
 function M._scroll_to_bottom()
-    if output_win and vim.api.nvim_win_is_valid(output_win) then
-        local line_count = vim.api.nvim_buf_line_count(output_buf)
-        vim.api.nvim_win_set_cursor(output_win, { line_count, 0 })
+    if not output_win or not vim.api.nvim_win_is_valid(output_win) then
+        return
     end
+
+    -- Only auto-scroll if user hasn't manually scrolled in last 2 seconds
+    local now = vim.loop.now()
+    local time_since_scroll = now - last_manual_scroll_time
+
+    if time_since_scroll < 2000 then
+        -- User recently scrolled, preserve position
+        return
+    end
+
+    -- Auto-scroll to bottom
+    local line_count = vim.api.nvim_buf_line_count(output_buf)
+    vim.api.nvim_win_set_cursor(output_win, { line_count, 0 })
 end
 
 -- Accessors for testing
