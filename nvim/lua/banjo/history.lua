@@ -42,6 +42,16 @@ function M.size()
     return #entries
 end
 
+-- Get all entries (for session persistence)
+function M.get_all()
+    -- Return a copy to prevent external modification
+    local copy = {}
+    for i, entry in ipairs(entries) do
+        copy[i] = entry
+    end
+    return copy
+end
+
 -- Clear all history
 function M.clear()
     entries = {}

@@ -204,7 +204,7 @@ function M._on_exit(code)
         local sessions = require("banjo.sessions")
         local history = require("banjo.history")
         sessions.save(state.session_id, {
-            history = history.size() > 0 and { history.get(0) } or {},
+            history = history.get_all(),
             input_text = panel.get_input_text(),
             timestamp = os.time(),
         })
