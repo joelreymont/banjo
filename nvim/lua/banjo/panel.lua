@@ -506,6 +506,8 @@ function M.append(text, is_thought)
     if think_start and not thought_start_line then
         local line_count = vim.api.nvim_buf_line_count(output_buf)
         thought_start_line = line_count - 1
+        -- Reset buffer after detecting opening tag to prevent memory leak
+        thought_buffer = ""
     end
 
     -- Check for </think> tag
@@ -546,6 +548,8 @@ function M.append(text, is_thought)
             local line_count = vim.api.nvim_buf_line_count(output_buf)
             code_start_line = line_count - 1
             code_lang = lang ~= "" and lang or nil
+            -- Reset buffer after detecting opening tag to prevent memory leak
+            code_buffer = ""
         end
     else
         -- Check for closing fence: ```
