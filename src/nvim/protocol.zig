@@ -2,15 +2,62 @@ const std = @import("std");
 const types = @import("../core/types.zig");
 const Engine = types.Engine;
 
+// Permission modes for Claude Code
+pub const PermissionMode = enum {
+    default,
+    accept_edits,
+    auto_approve,
+    plan_only,
+
+    pub fn toString(self: PermissionMode) []const u8 {
+        return switch (self) {
+            .default => "Default",
+            .accept_edits => "Accept Edits",
+            .auto_approve => "Auto-approve",
+            .plan_only => "Plan Only",
+        };
+    }
+
+    pub fn toCliFlag(self: PermissionMode) ?[]const u8 {
+        return switch (self) {
+            .default => null,
+            .accept_edits => "--allowedTools",
+            .auto_approve => "--dangerouslySkipPermissions",
+            .plan_only => "--plan",
+        };
+    }
+};
+
 // Request from Lua to Zig
 pub const Request = union(enum) {
     prompt: PromptRequest,
     cancel: void,
     nudge_toggle: void,
+    set_engine: SetEngineRequest,
+    set_model: SetModelRequest,
+    set_permission_mode: SetPermissionModeRequest,
+    get_state: void,
     selection_changed: SelectionInfo,
     file_opened: FileInfo,
     file_closed: FileInfo,
     shutdown: void,
+};
+
+pub const SetEngineRequest = struct {
+    engine: []const u8, // "claude", "codex"
+};
+
+pub const SetModelRequest = struct {
+    model: []const u8, // "sonnet", "opus", "haiku"
+};
+
+pub const SetPermissionModeRequest = struct {
+    mode: []const u8, // "default", "accept_edits", "auto_approve", "plan_only"
+};
+
+pub const ApprovalResponseRequest = struct {
+    id: []const u8,
+    decision: []const u8, // "approve" or "decline"
 };
 
 pub const PromptRequest = struct {
@@ -52,8 +99,25 @@ pub const Notification = union(enum) {
     tool_call: ToolCall,
     tool_result: ToolResult,
     permission_request: PermissionRequest,
+    approval_request: ApprovalRequest,
     session_id: SessionIdUpdate,
+    state: StateResponse,
     error_msg: ErrorMessage,
+};
+
+pub const StateResponse = struct {
+    engine: []const u8,
+    model: ?[]const u8 = null,
+    mode: []const u8,
+    session_id: ?[]const u8 = null,
+    connected: bool,
+};
+
+pub const ApprovalRequest = struct {
+    id: []const u8,
+    tool_name: []const u8,
+    arguments: ?[]const u8 = null,
+    risk_level: []const u8 = "medium", // "low", "medium", "high"
 };
 
 pub const StreamStart = struct {

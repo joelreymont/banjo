@@ -29,6 +29,10 @@ pub const Opcode = enum(u4) {
             else => error.ReservedOpcode,
         };
     }
+
+    pub fn isControl(self: Opcode) bool {
+        return @intFromEnum(self) >= 0x8;
+    }
 };
 
 pub const ParseResult = struct {
@@ -37,6 +41,7 @@ pub const ParseResult = struct {
 };
 
 pub const HandshakeResult = struct {
+    path: []const u8,
     auth_token: ?[]const u8,
     ws_key: []const u8,
 };
@@ -48,9 +53,16 @@ pub fn parseFrame(data: []u8) !ParseResult {
     if (data.len < 2) return error.NeedMoreData;
 
     const fin = (data[0] & 0x80) != 0;
+    // RFC 6455 Section 5.2: RSV1, RSV2, RSV3 MUST be 0 unless extension negotiated
+    if ((data[0] & 0x70) != 0) return error.ReservedBitsSet;
     const opcode = Opcode.fromU4(@truncate(data[0] & 0x0F)) catch return error.ReservedOpcode;
     const masked = (data[1] & 0x80) != 0;
     var payload_len: u64 = data[1] & 0x7F;
+
+    // RFC 6455 Section 5.5: Control frames MUST NOT be fragmented
+    if (opcode.isControl() and !fin) return error.FragmentedControlFrame;
+    // RFC 6455 Section 5.5: Control frame payload MUST be <= 125 bytes
+    if (opcode.isControl() and payload_len > 125) return error.ControlFrameTooLarge;
 
     var offset: usize = 2;
 
@@ -121,9 +133,14 @@ pub fn encodeFrame(allocator: Allocator, opcode: Opcode, payload: []const u8) ![
     return buf.toOwnedSlice(allocator);
 }
 
+pub const ClientKind = enum {
+    mcp, // Claude CLI with auth token
+    nvim, // Neovim plugin (no auth)
+};
+
 /// Perform WebSocket handshake on a socket.
-/// Returns auth token from header if present.
-pub fn performHandshake(allocator: Allocator, socket_fd: std.posix.socket_t, expected_auth_token: []const u8) !void {
+/// Returns the client kind based on path.
+pub fn performHandshakeWithPath(allocator: Allocator, socket_fd: std.posix.socket_t, expected_auth_token: []const u8) !ClientKind {
     var header_buf: [4096]u8 = undefined;
     var total_read: usize = 0;
 
@@ -144,20 +161,34 @@ pub fn performHandshake(allocator: Allocator, socket_fd: std.posix.socket_t, exp
         }
     }
 
+    // Check if headers were complete (didn't just fill buffer without finding \r\n\r\n)
+    if (std.mem.indexOf(u8, header_buf[0..total_read], "\r\n\r\n") == null) {
+        return error.HeadersTooLarge;
+    }
+
     const headers = header_buf[0..total_read];
     const parsed = try parseHttpHeaders(allocator, headers);
     defer {
         if (parsed.auth_token) |t| allocator.free(t);
         allocator.free(parsed.ws_key);
+        allocator.free(parsed.path);
     }
 
-    // Validate auth token
-    if (parsed.auth_token) |token| {
-        if (!std.mem.eql(u8, token, expected_auth_token)) {
-            return error.InvalidAuthToken;
+    // Determine client kind from path
+    const client_kind: ClientKind = if (std.mem.eql(u8, parsed.path, "/nvim"))
+        .nvim
+    else
+        .mcp;
+
+    // Validate auth token for MCP clients only
+    if (client_kind == .mcp) {
+        if (parsed.auth_token) |token| {
+            if (!std.mem.eql(u8, token, expected_auth_token)) {
+                return error.InvalidAuthToken;
+            }
+        } else {
+            return error.MissingAuthToken;
         }
-    } else {
-        return error.MissingAuthToken;
     }
 
     // Compute accept key
@@ -180,31 +211,88 @@ pub fn performHandshake(allocator: Allocator, socket_fd: std.posix.socket_t, exp
     _ = try std.posix.write(socket_fd, response_template);
     _ = try std.posix.write(socket_fd, &accept_key);
     _ = try std.posix.write(socket_fd, response_end);
+
+    return client_kind;
+}
+
+/// Perform WebSocket handshake on a socket (MCP auth required).
+/// Legacy function for backwards compatibility.
+pub fn performHandshake(allocator: Allocator, socket_fd: std.posix.socket_t, expected_auth_token: []const u8) !void {
+    const kind = try performHandshakeWithPath(allocator, socket_fd, expected_auth_token);
+    if (kind != .mcp) {
+        return error.InvalidPath;
+    }
 }
 
 fn parseHttpHeaders(allocator: Allocator, headers: []const u8) !HandshakeResult {
+    var path: ?[]const u8 = null;
+    errdefer if (path) |p| allocator.free(p);
+
     var ws_key: ?[]const u8 = null;
     errdefer if (ws_key) |k| allocator.free(k);
 
     var auth_token: ?[]const u8 = null;
     errdefer if (auth_token) |t| allocator.free(t);
 
+    // RFC 6455 required headers
+    var has_upgrade = false;
+    var has_connection_upgrade = false;
+    var has_version_13 = false;
+
     var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    var first_line = true;
     while (lines.next()) |line| {
         if (line.len == 0) break;
+
+        if (first_line) {
+            first_line = false;
+            // Parse request line: "GET /path HTTP/1.1"
+            var parts = std.mem.splitScalar(u8, line, ' ');
+            const method = parts.next() orelse return error.MalformedRequest;
+            // RFC 6455: WebSocket handshake MUST be GET
+            if (!std.mem.eql(u8, method, "GET")) {
+                return error.InvalidHttpMethod;
+            }
+            if (parts.next()) |p| {
+                path = try allocator.dupe(u8, p);
+            }
+            continue;
+        }
 
         if (parseHeader(line, "Sec-WebSocket-Key: ")) |value| {
             ws_key = try allocator.dupe(u8, value);
         } else if (parseHeader(line, "x-claude-code-ide-authorization: ")) |value| {
             auth_token = try allocator.dupe(u8, value);
+        } else if (std.ascii.startsWithIgnoreCase(line, "Upgrade:")) {
+            // Check for "websocket" (case-insensitive)
+            const value = std.mem.trim(u8, line["Upgrade:".len..], " \t");
+            if (std.ascii.eqlIgnoreCase(value, "websocket")) {
+                has_upgrade = true;
+            }
+        } else if (std.ascii.startsWithIgnoreCase(line, "Connection:")) {
+            // Check for "Upgrade" in Connection header (may have multiple values)
+            const value = line["Connection:".len..];
+            if (std.ascii.indexOfIgnoreCase(value, "upgrade") != null) {
+                has_connection_upgrade = true;
+            }
+        } else if (parseHeader(line, "Sec-WebSocket-Version: ")) |value| {
+            if (std.mem.eql(u8, value, "13")) {
+                has_version_13 = true;
+            }
         }
     }
 
-    if (ws_key == null) {
-        return error.MissingWebSocketKey;
-    }
+    // RFC 6455 Section 4.2.1: Server MUST validate these headers
+    if (!has_upgrade) return error.MissingUpgradeHeader;
+    if (!has_connection_upgrade) return error.MissingConnectionUpgrade;
+    if (!has_version_13) return error.UnsupportedWebSocketVersion;
+    if (ws_key == null) return error.MissingWebSocketKey;
+
+    // Ensure path is always allocated
+    const final_path = path orelse try allocator.dupe(u8, "/");
 
     return .{
+        .path = final_path,
         .ws_key = ws_key.?,
         .auth_token = auth_token,
     };

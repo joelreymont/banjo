@@ -1,78 +1,198 @@
--- Test helpers for Banjo Neovim plugin
+-- Test helpers for banjo.nvim e2e tests
 local M = {}
 
--- Create a test buffer with content
-function M.setup_test_buffer(content)
-  content = content or { "fn main() {", "    let x = 1;", "}" }
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_set_current_buf(buf)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, content)
-  vim.bo[buf].filetype = "rust"
-  return buf
-end
-
--- Clean up test state
-function M.cleanup()
-  -- Stop bridge if running
-  local ok, bridge = pcall(require, "banjo.bridge")
-  if ok and bridge.stop then
-    bridge.stop()
-  end
-
-  -- Close panel if open
-  local ok2, panel = pcall(require, "banjo.panel")
-  if ok2 and panel.close then
-    panel.close()
-  end
-
-  -- Close all buffers except current
-  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-    if vim.api.nvim_buf_is_valid(buf) then
-      pcall(vim.api.nvim_buf_delete, buf, { force = true })
+-- Wait for a condition with timeout, processing vim event loop
+-- This is critical for async operations in headless mode
+---@param condition_fn function Returns true when condition is met
+---@param timeout_ms number Maximum time to wait
+---@param interval_ms number|nil Poll interval (default 50ms)
+---@return boolean success True if condition was met
+function M.wait_for(condition_fn, timeout_ms, interval_ms)
+    timeout_ms = timeout_ms or 5000
+    interval_ms = interval_ms or 50
+    
+    local start = vim.loop.now()
+    while vim.loop.now() - start < timeout_ms do
+        -- Process pending vim events (critical for headless mode)
+        vim.wait(interval_ms, function()
+            return condition_fn()
+        end, interval_ms)
+        
+        if condition_fn() then
+            return true
+        end
+        
+        -- Run the libuv event loop to process I/O
+        vim.loop.run("nowait")
     end
-  end
+    
+    return false
+end
 
-  -- Close all windows except current
-  for _, win in ipairs(vim.api.nvim_list_wins()) do
-    if vim.api.nvim_win_is_valid(win) and win ~= vim.api.nvim_get_current_win() then
-      pcall(vim.api.nvim_win_close, win, true)
+-- Setup an isolated test environment
+---@param opts table|nil Options: {cwd = string}
+---@return table env Test environment with cleanup function
+function M.setup_test_env(opts)
+    opts = opts or {}
+    
+    local test_dir = opts.cwd or vim.fn.tempname() .. "_banjo_e2e_" .. math.random(10000)
+    vim.fn.mkdir(test_dir, "p")
+    
+    -- Create a test file
+    local test_file = test_dir .. "/test.lua"
+    local f = io.open(test_file, "w")
+    if f then
+        f:write("-- Test file\nlocal x = 1\n")
+        f:close()
     end
-  end
+    
+    return {
+        dir = test_dir,
+        file = test_file,
+        binary = vim.g.banjo_test_binary,
+        cleanup = function()
+            vim.fn.delete(test_dir, "rf")
+        end,
+    }
 end
 
--- Wait for async operations
-function M.wait(ms)
-  ms = ms or 100
-  vim.wait(ms)
+-- Capture the current state of a buffer for assertions
+---@param buf number|nil Buffer handle (default: current)
+---@return table state Buffer state
+function M.capture_buffer_state(buf)
+    buf = buf or vim.api.nvim_get_current_buf()
+    
+    return {
+        lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false),
+        line_count = vim.api.nvim_buf_line_count(buf),
+        name = vim.api.nvim_buf_get_name(buf),
+        filetype = vim.bo[buf].filetype,
+        modified = vim.bo[buf].modified,
+    }
 end
 
--- Wait for a condition with libuv event processing
-function M.wait_for(condition_fn, timeout_ms)
-  timeout_ms = timeout_ms or 5000
-  local uv = vim.uv or vim.loop
-  local start = uv.now()
-  while not condition_fn() and (uv.now() - start) < timeout_ms do
-    uv.run("nowait")
-    vim.wait(10, condition_fn, 10)
-  end
-  return condition_fn()
+-- Capture display state (extmarks, virtual text, etc.)
+---@param buf number|nil Buffer handle
+---@param ns_id number|nil Namespace (default: all)
+---@return table state Display state
+function M.capture_display_state(buf, ns_id)
+    buf = buf or vim.api.nvim_get_current_buf()
+    ns_id = ns_id or -1  -- -1 = all namespaces
+    
+    local extmarks = vim.api.nvim_buf_get_extmarks(buf, ns_id, 0, -1, {
+        details = true,
+    })
+    
+    return {
+        extmarks = extmarks,
+        extmark_count = #extmarks,
+    }
 end
 
--- Count windows
-function M.count_windows()
-  return #vim.api.nvim_list_wins()
-end
-
--- Find window by buffer name pattern
-function M.find_window_by_name(pattern)
-  for _, win in ipairs(vim.api.nvim_list_wins()) do
-    local buf = vim.api.nvim_win_get_buf(win)
-    local name = vim.api.nvim_buf_get_name(buf)
-    if name:match(pattern) then
-      return win
+-- Get all windows and their properties
+---@return table windows Window info list
+function M.get_windows()
+    local windows = {}
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+        local buf = vim.api.nvim_win_get_buf(win)
+        table.insert(windows, {
+            handle = win,
+            buffer = buf,
+            buffer_name = vim.api.nvim_buf_get_name(buf),
+            width = vim.api.nvim_win_get_width(win),
+            height = vim.api.nvim_win_get_height(win),
+            cursor = vim.api.nvim_win_get_cursor(win),
+        })
     end
-  end
-  return nil
+    return windows
+end
+
+-- Find the banjo panel window
+---@return table|nil window Panel window info or nil
+function M.find_panel_window()
+    for _, win in ipairs(M.get_windows()) do
+        if win.buffer_name:match("Banjo$") then
+            return win
+        end
+    end
+    return nil
+end
+
+-- Assert that a condition is true, with message
+---@param condition boolean
+---@param message string
+function M.assert(condition, message)
+    if not condition then
+        error("Assertion failed: " .. (message or "unknown"))
+    end
+end
+
+-- Assert two values are equal
+---@param expected any
+---@param actual any
+---@param message string|nil
+function M.assert_eq(expected, actual, message)
+    if expected ~= actual then
+        local msg = message and (message .. ": ") or ""
+        error(string.format("%sExpected %s, got %s", msg, vim.inspect(expected), vim.inspect(actual)))
+    end
+end
+
+-- Assert a value is truthy
+---@param value any
+---@param message string|nil
+function M.assert_truthy(value, message)
+    if not value then
+        error("Expected truthy value: " .. (message or vim.inspect(value)))
+    end
+end
+
+-- Assert a string contains a substring
+---@param haystack string
+---@param needle string
+---@param message string|nil
+function M.assert_contains(haystack, needle, message)
+    if not haystack:find(needle, 1, true) then
+        local msg = message and (message .. ": ") or ""
+        error(string.format("%sExpected '%s' to contain '%s'", msg, haystack, needle))
+    end
+end
+
+-- Simple test registry for when plenary is not available
+M._tests = {}
+M._test_results = { passed = 0, failed = 0, errors = {} }
+
+function M.describe(name, fn)
+    M._current_describe = name
+    fn()
+    M._current_describe = nil
+end
+
+function M.it(name, fn)
+    local full_name = M._current_describe and (M._current_describe .. " " .. name) or name
+    table.insert(M._tests, { name = full_name, fn = fn })
+end
+
+function M.run_tests()
+    print("Running " .. #M._tests .. " tests...")
+    
+    for _, test in ipairs(M._tests) do
+        local ok, err = pcall(test.fn)
+        if ok then
+            M._test_results.passed = M._test_results.passed + 1
+            print("  ✓ " .. test.name)
+        else
+            M._test_results.failed = M._test_results.failed + 1
+            table.insert(M._test_results.errors, { name = test.name, error = err })
+            print("  ✗ " .. test.name)
+            print("    " .. tostring(err))
+        end
+    end
+    
+    print("")
+    print(string.format("Results: %d passed, %d failed", M._test_results.passed, M._test_results.failed))
+    
+    return M._test_results.failed == 0
 end
 
 return M

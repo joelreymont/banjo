@@ -11,7 +11,8 @@ const log = std.log.scoped(.mcp_server);
 pub const McpServer = struct {
     allocator: Allocator,
     tcp_socket: posix.socket_t,
-    client_socket: ?posix.socket_t = null,
+    mcp_client_socket: ?posix.socket_t = null,
+    nvim_client_socket: ?posix.socket_t = null,
     lock_file: ?lockfile.LockFile = null,
     port: u16,
     auth_token: [36]u8,
@@ -24,12 +25,17 @@ pub const McpServer = struct {
     // Selection cache for getLatestSelection (owned strings)
     last_selection: ?OwnedSelection = null,
 
-    // Read buffer for WebSocket frames
-    read_buffer: std.ArrayList(u8) = .empty,
+    // Read buffers for WebSocket frames (separate per client)
+    mcp_read_buffer: std.ArrayList(u8) = .empty,
+    nvim_read_buffer: std.ArrayList(u8) = .empty,
 
-    // Callback for sending tool requests to Lua
+    // Callback for sending tool requests to nvim
     tool_request_callback: ?*const fn (tool_name: []const u8, correlation_id: []const u8, args: ?std.json.Value) void = null,
     callback_ctx: ?*anyopaque = null,
+
+    // Callback for nvim messages (prompt, cancel, etc.)
+    nvim_message_callback: ?*const fn (ctx: *anyopaque, method: []const u8, params: ?std.json.Value) void = null,
+    nvim_callback_ctx: ?*anyopaque = null,
 
     // Type declarations (must come after fields)
     const OwnedSelection = struct {
@@ -109,7 +115,8 @@ pub const McpServer = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.pending_tool_requests.deinit();
-        self.read_buffer.deinit(self.allocator);
+        self.mcp_read_buffer.deinit(self.allocator);
+        self.nvim_read_buffer.deinit(self.allocator);
         // Free owned selection data
         if (self.last_selection) |sel| {
             sel.deinit(self.allocator);
@@ -129,15 +136,26 @@ pub const McpServer = struct {
     }
 
     pub fn stop(self: *McpServer) void {
-        // Send close frame if client connected
-        if (self.client_socket) |sock| {
+        // Send close frame to MCP client if connected
+        if (self.mcp_client_socket) |sock| {
             const close_frame = websocket.encodeFrame(self.allocator, .close, "") catch null;
             if (close_frame) |frame| {
                 _ = posix.write(sock, frame) catch {};
                 self.allocator.free(frame);
             }
             posix.close(sock);
-            self.client_socket = null;
+            self.mcp_client_socket = null;
+        }
+
+        // Send close frame to nvim client if connected
+        if (self.nvim_client_socket) |sock| {
+            const close_frame = websocket.encodeFrame(self.allocator, .close, "") catch null;
+            if (close_frame) |frame| {
+                _ = posix.write(sock, frame) catch {};
+                self.allocator.free(frame);
+            }
+            posix.close(sock);
+            self.nvim_client_socket = null;
         }
 
         // Delete lock file
@@ -156,15 +174,21 @@ pub const McpServer = struct {
     /// Poll for events with timeout in milliseconds.
     /// Returns true if should continue polling.
     pub fn poll(self: *McpServer, timeout_ms: i32) !bool {
-        var fds: [2]posix.pollfd = undefined;
+        var fds: [3]posix.pollfd = undefined;
         var nfds: usize = 0;
 
         // Always poll TCP accept socket
         fds[nfds] = .{ .fd = self.tcp_socket, .events = posix.POLL.IN, .revents = 0 };
         nfds += 1;
 
-        // Poll client socket if connected
-        if (self.client_socket) |sock| {
+        // Poll MCP client socket if connected
+        if (self.mcp_client_socket) |sock| {
+            fds[nfds] = .{ .fd = sock, .events = posix.POLL.IN, .revents = 0 };
+            nfds += 1;
+        }
+
+        // Poll nvim client socket if connected
+        if (self.nvim_client_socket) |sock| {
             fds[nfds] = .{ .fd = sock, .events = posix.POLL.IN, .revents = 0 };
             nfds += 1;
         }
@@ -183,22 +207,27 @@ pub const McpServer = struct {
                     self.acceptConnection() catch |err| {
                         log.warn("Accept failed: {}", .{err});
                     };
-                } else if (self.client_socket != null and fd.fd == self.client_socket.?) {
-                    self.handleClientMessage() catch |err| {
-                        log.warn("Client message failed: {}", .{err});
-                        // Close connection on error
-                        if (self.client_socket) |sock| {
-                            posix.close(sock);
-                            self.client_socket = null;
-                        }
+                } else if (self.mcp_client_socket != null and fd.fd == self.mcp_client_socket.?) {
+                    self.handleMcpClientMessage() catch |err| {
+                        log.warn("MCP client message failed: {}", .{err});
+                        self.closeMcpClient();
+                    };
+                } else if (self.nvim_client_socket != null and fd.fd == self.nvim_client_socket.?) {
+                    self.handleNvimClientMessage() catch |err| {
+                        log.warn("Nvim client message failed: {}", .{err});
+                        self.closeNvimClient();
                     };
                 }
             }
+            // Guard: socket may have been closed in error handler above
             if (fd.revents & posix.POLL.HUP != 0 or fd.revents & posix.POLL.ERR != 0) {
-                if (self.client_socket != null and fd.fd == self.client_socket.?) {
-                    log.info("Client disconnected", .{});
-                    posix.close(self.client_socket.?);
-                    self.client_socket = null;
+                if (self.mcp_client_socket != null and fd.fd == self.mcp_client_socket.?) {
+                    log.info("MCP client disconnected", .{});
+                    self.closeMcpClient();
+                }
+                if (self.nvim_client_socket != null and fd.fd == self.nvim_client_socket.?) {
+                    log.info("Nvim client disconnected", .{});
+                    self.closeNvimClient();
                 }
             }
         }
@@ -206,30 +235,59 @@ pub const McpServer = struct {
         return true;
     }
 
+    fn closeMcpClient(self: *McpServer) void {
+        if (self.mcp_client_socket) |sock| {
+            posix.close(sock);
+            self.mcp_client_socket = null;
+            self.mcp_read_buffer.clearRetainingCapacity();
+        }
+    }
+
+    fn closeNvimClient(self: *McpServer) void {
+        if (self.nvim_client_socket) |sock| {
+            posix.close(sock);
+            self.nvim_client_socket = null;
+            self.nvim_read_buffer.clearRetainingCapacity();
+        }
+    }
+
     fn acceptConnection(self: *McpServer) !void {
         const client = try posix.accept(self.tcp_socket, null, null, 0);
         errdefer posix.close(client);
 
-        // Close existing client if any
-        if (self.client_socket) |old| {
-            log.info("Closing existing client connection", .{});
-            posix.close(old);
-        }
-
-        // Perform WebSocket handshake
-        websocket.performHandshake(self.allocator, client, &self.auth_token) catch |err| {
+        // Perform WebSocket handshake and determine client type
+        const client_kind = websocket.performHandshakeWithPath(self.allocator, client, &self.auth_token) catch |err| {
             log.warn("WebSocket handshake failed: {}", .{err});
             posix.close(client);
             return;
         };
 
-        self.client_socket = client;
-        self.read_buffer.clearRetainingCapacity();
-        log.info("Claude CLI connected", .{});
+        switch (client_kind) {
+            .mcp => {
+                // Close existing MCP client if any
+                if (self.mcp_client_socket) |old| {
+                    log.info("Closing existing MCP client connection", .{});
+                    posix.close(old);
+                }
+                self.mcp_client_socket = client;
+                self.mcp_read_buffer.clearRetainingCapacity();
+                log.info("Claude CLI connected", .{});
+            },
+            .nvim => {
+                // Close existing nvim client if any
+                if (self.nvim_client_socket) |old| {
+                    log.info("Closing existing nvim client connection", .{});
+                    posix.close(old);
+                }
+                self.nvim_client_socket = client;
+                self.nvim_read_buffer.clearRetainingCapacity();
+                log.info("Neovim connected", .{});
+            },
+        }
     }
 
-    fn handleClientMessage(self: *McpServer) !void {
-        const client = self.client_socket orelse return;
+    fn handleMcpClientMessage(self: *McpServer) !void {
+        const client = self.mcp_client_socket orelse return;
 
         // Read available data into buffer
         var temp_buf: [4096]u8 = undefined;
@@ -239,16 +297,16 @@ pub const McpServer = struct {
         };
         if (n == 0) return error.ConnectionClosed;
 
-        try self.read_buffer.appendSlice(self.allocator, temp_buf[0..n]);
+        try self.mcp_read_buffer.appendSlice(self.allocator, temp_buf[0..n]);
 
         // Try to parse complete frames
-        while (self.read_buffer.items.len >= 2) {
-            const result = websocket.parseFrame(self.read_buffer.items) catch |err| switch (err) {
+        while (self.mcp_read_buffer.items.len >= 2) {
+            const result = websocket.parseFrame(self.mcp_read_buffer.items) catch |err| switch (err) {
                 error.NeedMoreData => break,
                 error.ReservedOpcode => {
                     log.warn("Received frame with reserved opcode, closing connection", .{});
                     posix.close(client);
-                    self.client_socket = null;
+                    self.mcp_client_socket = null;
                     return;
                 },
                 else => return err,
@@ -257,7 +315,7 @@ pub const McpServer = struct {
             // Process frame
             switch (result.frame.opcode) {
                 .text => {
-                    try self.handleJsonRpcMessage(result.frame.payload);
+                    try self.handleMcpJsonRpcMessage(result.frame.payload);
                 },
                 .ping => {
                     // Respond with pong
@@ -266,26 +324,95 @@ pub const McpServer = struct {
                     _ = try posix.write(client, pong);
                 },
                 .close => {
-                    log.info("Client sent close frame", .{});
-                    posix.close(client);
-                    self.client_socket = null;
+                    log.info("MCP client sent close frame", .{});
+                    self.closeMcpClient();
                     return;
                 },
                 else => {},
             }
 
             // Remove consumed bytes
-            const remaining = self.read_buffer.items[result.consumed..];
-            std.mem.copyForwards(u8, self.read_buffer.items[0..remaining.len], remaining);
-            self.read_buffer.shrinkRetainingCapacity(remaining.len);
+            const remaining = self.mcp_read_buffer.items[result.consumed..];
+            std.mem.copyForwards(u8, self.mcp_read_buffer.items[0..remaining.len], remaining);
+            self.mcp_read_buffer.shrinkRetainingCapacity(remaining.len);
         }
     }
 
-    fn handleJsonRpcMessage(self: *McpServer, payload: []const u8) !void {
+    fn handleNvimClientMessage(self: *McpServer) !void {
+        const client = self.nvim_client_socket orelse return;
+
+        // Read available data into buffer
+        var temp_buf: [4096]u8 = undefined;
+        const n = posix.read(client, &temp_buf) catch |err| switch (err) {
+            error.WouldBlock => return,
+            else => return err,
+        };
+        if (n == 0) return error.ConnectionClosed;
+
+        try self.nvim_read_buffer.appendSlice(self.allocator, temp_buf[0..n]);
+
+        // Try to parse complete frames
+        while (self.nvim_read_buffer.items.len >= 2) {
+            const result = websocket.parseFrame(self.nvim_read_buffer.items) catch |err| switch (err) {
+                error.NeedMoreData => break,
+                error.ReservedOpcode => {
+                    log.warn("Received nvim frame with reserved opcode, closing connection", .{});
+                    self.closeNvimClient();
+                    return;
+                },
+                else => return err,
+            };
+
+            // Process frame
+            switch (result.frame.opcode) {
+                .text => {
+                    self.handleNvimJsonRpcMessage(result.frame.payload);
+                },
+                .ping => {
+                    // Respond with pong
+                    const pong = try websocket.encodeFrame(self.allocator, .pong, result.frame.payload);
+                    defer self.allocator.free(pong);
+                    _ = try posix.write(client, pong);
+                },
+                .close => {
+                    log.info("Nvim client sent close frame", .{});
+                    self.closeNvimClient();
+                    return;
+                },
+                else => {},
+            }
+
+            // Remove consumed bytes
+            const remaining = self.nvim_read_buffer.items[result.consumed..];
+            std.mem.copyForwards(u8, self.nvim_read_buffer.items[0..remaining.len], remaining);
+            self.nvim_read_buffer.shrinkRetainingCapacity(remaining.len);
+        }
+    }
+
+    fn handleNvimJsonRpcMessage(self: *McpServer, payload: []const u8) void {
         const parsed = std.json.parseFromSlice(mcp_types.JsonRpcRequest, self.allocator, payload, .{
             .ignore_unknown_fields = true,
         }) catch {
-            try self.sendError(null, mcp_types.ErrorCode.ParseError, "Parse error");
+            log.warn("Failed to parse nvim JSON-RPC message", .{});
+            return;
+        };
+        defer parsed.deinit();
+
+        const req = parsed.value;
+
+        // Forward to handler via callback
+        if (self.nvim_message_callback) |callback| {
+            if (self.nvim_callback_ctx) |ctx| {
+                callback(ctx, req.method, req.params);
+            }
+        }
+    }
+
+    fn handleMcpJsonRpcMessage(self: *McpServer, payload: []const u8) !void {
+        const parsed = std.json.parseFromSlice(mcp_types.JsonRpcRequest, self.allocator, payload, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            try self.sendMcpError(null, mcp_types.ErrorCode.ParseError, "Parse error");
             return;
         };
         defer parsed.deinit();
@@ -304,7 +431,7 @@ pub const McpServer = struct {
 
         const kind = method_map.get(method) orelse {
             if (id != null) {
-                try self.sendError(id, mcp_types.ErrorCode.MethodNotFound, "Method not found");
+                try self.sendMcpError(id, mcp_types.ErrorCode.MethodNotFound, "Method not found");
             }
             return;
         };
@@ -339,7 +466,7 @@ pub const McpServer = struct {
         if (id == null) return; // tools/call requires an id
 
         const tool_params = params orelse {
-            try self.sendError(id, mcp_types.ErrorCode.InvalidParams, "Missing params");
+            try self.sendMcpError(id, mcp_types.ErrorCode.InvalidParams, "Missing params");
             return;
         };
 
@@ -347,7 +474,7 @@ pub const McpServer = struct {
         const parsed = std.json.parseFromValue(mcp_types.ToolsCallParams, self.allocator, tool_params, .{
             .ignore_unknown_fields = true,
         }) catch {
-            try self.sendError(id, mcp_types.ErrorCode.InvalidParams, "Invalid tool call params");
+            try self.sendMcpError(id, mcp_types.ErrorCode.InvalidParams, "Invalid tool call params");
             return;
         };
         defer parsed.deinit();
@@ -435,23 +562,21 @@ pub const McpServer = struct {
     };
 
     pub fn handleToolResponse(self: *McpServer, correlation_id: []const u8, result: ?[]const u8, err: ?[]const u8) !void {
-        const pending = self.pending_tool_requests.get(correlation_id) orelse {
+        // Use fetchRemove to atomically remove and get the entry
+        // This avoids dangling pointer issues since the key IS the correlation_id in the value
+        const kv = self.pending_tool_requests.fetchRemove(correlation_id) orelse {
             log.warn("Unknown correlation id: {s}", .{correlation_id});
             return;
         };
+        const pending = kv.value;
+        defer pending.deinit(self.allocator);
 
         // Parse the ID back from JSON
         var id_parsed = std.json.parseFromSlice(std.json.Value, self.allocator, pending.mcp_request_id_json, .{}) catch {
-            log.err("Failed to parse stored request ID", .{});
-            pending.deinit(self.allocator);
-            _ = self.pending_tool_requests.remove(correlation_id);
+            log.err("Failed to parse stored request ID for {s}", .{correlation_id});
             return;
         };
         defer id_parsed.deinit();
-
-        // Remove and free the pending request
-        _ = self.pending_tool_requests.remove(correlation_id);
-        pending.deinit(self.allocator);
 
         if (err) |error_msg| {
             try self.sendToolErrorWithId(id_parsed.value, error_msg);
@@ -491,22 +616,34 @@ pub const McpServer = struct {
         var to_remove: std.ArrayList([]const u8) = .empty;
         defer to_remove.deinit(self.allocator);
 
+        // Collect keys that have timed out (dupe to avoid use-after-free during removal)
         var iter = self.pending_tool_requests.iterator();
         while (iter.next()) |entry| {
             if (entry.value_ptr.deadline_ms < now) {
-                to_remove.append(self.allocator, entry.key_ptr.*) catch |err| {
+                const key_copy = self.allocator.dupe(u8, entry.key_ptr.*) catch |err| {
+                    log.err("Failed to allocate key copy for timeout removal: {}", .{err});
+                    continue;
+                };
+                to_remove.append(self.allocator, key_copy) catch |err| {
+                    self.allocator.free(key_copy);
                     log.err("Failed to track timed-out request for removal: {}", .{err});
                     continue;
                 };
             }
         }
 
-        for (to_remove.items) |key| {
-            if (self.pending_tool_requests.get(key)) |pending| {
+        for (to_remove.items) |key_copy| {
+            defer self.allocator.free(key_copy);
+
+            // Use fetchRemove to atomically remove and get ownership of key/value
+            if (self.pending_tool_requests.fetchRemove(key_copy)) |kv| {
+                const pending = kv.value;
+                // Note: kv.key == pending.correlation_id (same allocation)
+                // pending.deinit() frees correlation_id, so don't free kv.key separately
+
                 // Parse the ID back from JSON and send timeout error
                 var id_parsed = std.json.parseFromSlice(std.json.Value, self.allocator, pending.mcp_request_id_json, .{}) catch {
                     pending.deinit(self.allocator);
-                    _ = self.pending_tool_requests.remove(key);
                     continue;
                 };
                 defer id_parsed.deinit();
@@ -514,7 +651,6 @@ pub const McpServer = struct {
                 self.sendToolErrorWithId(id_parsed.value, "Tool request timed out") catch {};
                 pending.deinit(self.allocator);
             }
-            _ = self.pending_tool_requests.remove(key);
         }
     }
 
@@ -526,7 +662,7 @@ pub const McpServer = struct {
             .id = id,
             .result = try jsonValueFromTyped(arena.allocator(), result),
         };
-        try self.sendTypedResponse(response);
+        try self.sendMcpTypedResponse(response);
     }
 
     fn sendToolResult(self: *McpServer, id: std.json.Value, json_text: []const u8) !void {
@@ -542,7 +678,7 @@ pub const McpServer = struct {
             .id = id,
             .result = try jsonValueFromTyped(arena.allocator(), tool_result),
         };
-        try self.sendTypedResponse(response);
+        try self.sendMcpTypedResponse(response);
     }
 
     fn sendToolResultOptional(self: *McpServer, id: ?std.json.Value, json_text: []const u8) !void {
@@ -558,7 +694,7 @@ pub const McpServer = struct {
             .id = id,
             .result = try jsonValueFromTyped(arena.allocator(), tool_result),
         };
-        try self.sendTypedResponse(response);
+        try self.sendMcpTypedResponse(response);
     }
 
     fn sendToolError(self: *McpServer, id: ?std.json.Value, message: []const u8) !void {
@@ -586,7 +722,7 @@ pub const McpServer = struct {
             .id = id,
             .result = try jsonValueFromTyped(arena.allocator(), error_result),
         };
-        try self.sendTypedResponse(response);
+        try self.sendMcpTypedResponse(response);
     }
 
     const ToolErrorResult = struct {
@@ -594,7 +730,7 @@ pub const McpServer = struct {
         isError: bool,
     };
 
-    fn sendError(self: *McpServer, id: ?std.json.Value, code: i32, message: []const u8) !void {
+    fn sendMcpError(self: *McpServer, id: ?std.json.Value, code: i32, message: []const u8) !void {
         const response = mcp_types.JsonRpcResponse{
             .id = id,
             .@"error" = .{
@@ -602,10 +738,10 @@ pub const McpServer = struct {
                 .message = message,
             },
         };
-        try self.sendTypedResponse(response);
+        try self.sendMcpTypedResponse(response);
     }
 
-    fn sendTypedResponse(self: *McpServer, response: mcp_types.JsonRpcResponse) !void {
+    fn sendMcpTypedResponse(self: *McpServer, response: mcp_types.JsonRpcResponse) !void {
         var out: std.io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
 
@@ -617,7 +753,7 @@ pub const McpServer = struct {
 
         const buf = try out.toOwnedSlice();
         defer self.allocator.free(buf);
-        try self.sendWebSocketMessage(buf);
+        try self.sendMcpWebSocketMessage(buf);
     }
 
     fn jsonValueFromTyped(allocator: Allocator, value: anytype) !std.json.Value {
@@ -635,13 +771,68 @@ pub const McpServer = struct {
         return parsed.value;
     }
 
-    fn sendWebSocketMessage(self: *McpServer, message: []const u8) !void {
-        const client = self.client_socket orelse return error.NotConnected;
+    fn sendMcpWebSocketMessage(self: *McpServer, message: []const u8) !void {
+        const client = self.mcp_client_socket orelse return error.NotConnected;
 
         const frame = try websocket.encodeFrame(self.allocator, .text, message);
         defer self.allocator.free(frame);
 
         _ = try posix.write(client, frame);
+    }
+
+    /// Send a JSON-RPC notification to the nvim client
+    pub fn sendNvimNotification(self: *McpServer, method: []const u8, params: anytype) !void {
+        const client = self.nvim_client_socket orelse return error.NotConnected;
+
+        var out: std.io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+
+        var jw: std.json.Stringify = .{
+            .writer = &out.writer,
+            .options = .{ .emit_null_optional_fields = false },
+        };
+
+        // Build notification structure
+        const T = @TypeOf(params);
+        if (T == @TypeOf(.{})) {
+            try jw.write(.{
+                .jsonrpc = "2.0",
+                .method = method,
+            });
+        } else {
+            // Serialize params to json.Value first
+            var param_out: std.io.Writer.Allocating = .init(self.allocator);
+            defer param_out.deinit();
+            var param_jw: std.json.Stringify = .{
+                .writer = &param_out.writer,
+                .options = .{ .emit_null_optional_fields = false },
+            };
+            try param_jw.write(params);
+            const param_json = try param_out.toOwnedSlice();
+            defer self.allocator.free(param_json);
+
+            var param_parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, param_json, .{});
+            defer param_parsed.deinit();
+
+            try jw.write(.{
+                .jsonrpc = "2.0",
+                .method = method,
+                .params = param_parsed.value,
+            });
+        }
+
+        const buf = try out.toOwnedSlice();
+        defer self.allocator.free(buf);
+
+        const frame = try websocket.encodeFrame(self.allocator, .text, buf);
+        defer self.allocator.free(frame);
+
+        _ = try posix.write(client, frame);
+    }
+
+    /// Check if nvim client is connected
+    pub fn isNvimConnected(self: *McpServer) bool {
+        return self.nvim_client_socket != null;
     }
 };
 
@@ -653,7 +844,8 @@ test "McpServer init and deinit" {
     defer server.deinit();
 
     try testing.expect(server.port > 0);
-    try testing.expectEqual(@as(?posix.socket_t, null), server.client_socket);
+    try testing.expectEqual(@as(?posix.socket_t, null), server.mcp_client_socket);
+    try testing.expectEqual(@as(?posix.socket_t, null), server.nvim_client_socket);
 }
 
 test "McpServer port binding" {

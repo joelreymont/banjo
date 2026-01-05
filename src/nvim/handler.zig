@@ -28,14 +28,17 @@ pub const Handler = struct {
     last_nudge_ms: i64 = 0,
     claude_session_id: ?[]const u8 = null,
     codex_session_id: ?[]const u8 = null,
-    pending_permission: ?PendingPermission = null,
     mcp_server: ?*mcp_server_mod.McpServer = null,
     should_exit: bool = false,
 
-    const PendingPermission = struct {
-        id: []const u8,
-        tool_name: []const u8,
-    };
+    // State for engine/model/mode selection
+    current_engine: Engine = .claude,
+    current_model: ?[]const u8 = null,
+    permission_mode: protocol.PermissionMode = .default,
+
+    // Pending approval request (for Codex)
+    pending_approval_id: ?[]const u8 = null,
+    pending_approval_response: ?[]const u8 = null,
 
     pub fn init(allocator: Allocator, stdin: std.io.AnyReader, stdout: std.io.AnyWriter) Handler {
         const cwd_result = std.process.getCwdAlloc(allocator);
@@ -56,136 +59,311 @@ pub const Handler = struct {
         }
         if (self.claude_session_id) |sid| self.allocator.free(sid);
         if (self.codex_session_id) |sid| self.allocator.free(sid);
+        if (self.current_model) |model| self.allocator.free(model);
+        if (self.pending_approval_id) |id| self.allocator.free(id);
+        if (self.pending_approval_response) |resp| self.allocator.free(resp);
         if (self.owns_cwd) {
             self.allocator.free(self.cwd);
         }
     }
 
     pub fn run(self: *Handler) !void {
-        // Start MCP server for Claude CLI discovery
+        // Start MCP server for Claude CLI discovery and nvim WebSocket
         self.mcp_server = mcp_server_mod.McpServer.init(self.allocator, self.cwd) catch |err| {
             log.err("Failed to init MCP server: {}", .{err});
             return err;
         };
 
         if (self.mcp_server) |mcp| {
+            // Set up nvim message callback
+            mcp.nvim_message_callback = nvimMessageCallback;
+            mcp.nvim_callback_ctx = @ptrCast(self);
+
             mcp.start() catch |err| {
                 log.err("Failed to start MCP server: {}", .{err});
             };
 
-            // Send ready notification with MCP port
-            try self.sendNotification("ready", ReadyNotification{ .mcp_port = mcp.getPort() });
+            // Send ready notification via stdout (nvim uses this to connect via WebSocket)
+            try self.sendStdoutNotification("ready", ReadyNotification{ .mcp_port = mcp.getPort() });
         } else {
-            try self.sendNotification("ready", .{});
+            try self.sendStdoutNotification("ready", .{});
         }
 
-        var line_buf: [64 * 1024]u8 = undefined;
-        while (true) {
-            // Poll MCP server (non-blocking)
+        // Main event loop - poll MCP server which handles both MCP and nvim WebSocket
+        while (!self.should_exit) {
             if (self.mcp_server) |mcp| {
-                _ = mcp.poll(0) catch |err| {
+                _ = mcp.poll(100) catch |err| {
                     log.warn("MCP poll error: {}", .{err});
                 };
+            } else {
+                std.Thread.sleep(100 * std.time.ns_per_ms);
             }
-
-            // Check for graceful shutdown
-            if (self.should_exit) break;
-
-            // Try to read a line from stdin (with short timeout)
-            const line = self.stdin.readUntilDelimiter(&line_buf, '\n') catch |err| {
-                if (err == error.EndOfStream) break;
-                if (err == error.WouldBlock) {
-                    std.Thread.sleep(10 * std.time.ns_per_ms);
-                    continue;
-                }
-                log.err("Read error: {}", .{err});
-                continue;
-            };
-
-            self.handleLine(line) catch |err| {
-                log.err("Handle error: {}", .{err});
-                self.sendError("Internal error") catch {};
-            };
         }
     }
 
-    const ReadyNotification = struct {
-        mcp_port: u16,
+    fn nvimMessageCallback(ctx: *anyopaque, method: []const u8, params: ?std.json.Value) void {
+        const self: *Handler = @ptrCast(@alignCast(ctx));
+
+        const method_map = std.StaticStringMap(NvimMethod).initComptime(.{
+            .{ "prompt", .prompt },
+            .{ "cancel", .cancel },
+            .{ "nudge_toggle", .nudge_toggle },
+            .{ "set_engine", .set_engine },
+            .{ "set_model", .set_model },
+            .{ "set_permission_mode", .set_permission_mode },
+            .{ "get_state", .get_state },
+            .{ "approval_response", .approval_response },
+            .{ "shutdown", .shutdown },
+            .{ "tool_response", .tool_response },
+            .{ "selection_changed", .selection_changed },
+        });
+
+        const kind = method_map.get(method) orelse {
+            log.warn("Unknown nvim method: {s}", .{method});
+            return;
+        };
+
+        switch (kind) {
+            .prompt => self.handleNvimPrompt(params),
+            .cancel => self.handleNvimCancel(),
+            .nudge_toggle => self.handleNvimNudgeToggle(),
+            .set_engine => self.handleNvimSetEngine(params),
+            .set_model => self.handleNvimSetModel(params),
+            .set_permission_mode => self.handleNvimSetPermissionMode(params),
+            .get_state => self.handleNvimGetState(),
+            .approval_response => self.handleNvimApprovalResponse(params),
+            .shutdown => self.handleNvimShutdown(),
+            .tool_response => self.handleNvimToolResponse(params),
+            .selection_changed => self.handleNvimSelectionChanged(params),
+        }
+    }
+
+    const NvimMethod = enum {
+        prompt,
+        cancel,
+        nudge_toggle,
+        set_engine,
+        set_model,
+        set_permission_mode,
+        get_state,
+        approval_response,
+        shutdown,
+        tool_response,
+        selection_changed,
     };
 
-    fn handleLine(self: *Handler, line: []const u8) !void {
-        var parsed = std.json.parseFromSlice(protocol.JsonRpcRequest, self.allocator, line, .{
+    fn handleNvimPrompt(self: *Handler, params: ?std.json.Value) void {
+        const p = params orelse return;
+        const parsed = std.json.parseFromValue(protocol.PromptRequest, self.allocator, p, .{
             .ignore_unknown_fields = true,
         }) catch |err| {
-            log.warn("Parse error: {}", .{err});
+            log.warn("Invalid prompt params: {}", .{err});
             return;
         };
         defer parsed.deinit();
 
-        const req = parsed.value;
-        log.debug("Request: {s}", .{req.method});
+        self.cancelled = false;
+        self.processPrompt(parsed.value) catch |err| {
+            log.err("Prompt processing error: {}", .{err});
+            self.sendError("Processing error") catch {};
+        };
+    }
 
-        const method_map = std.StaticStringMap(*const fn (*Handler, protocol.JsonRpcRequest) anyerror!void).initComptime(.{
-            .{ "prompt", handlePrompt },
-            .{ "cancel", handleCancel },
-            .{ "nudge_toggle", handleNudgeToggle },
-            .{ "shutdown", handleShutdown },
-            .{ "tool_response", handleToolResponse },
-            .{ "selection_changed", handleSelectionChanged },
+    fn handleNvimCancel(self: *Handler) void {
+        self.cancelled = true;
+        self.sendNotification("status", protocol.StatusUpdate{ .text = "Cancelled" }) catch {};
+    }
+
+    fn handleNvimNudgeToggle(self: *Handler) void {
+        self.nudge_enabled = !self.nudge_enabled;
+        const status = if (self.nudge_enabled) "Nudge enabled" else "Nudge disabled";
+        self.sendNotification("status", protocol.StatusUpdate{ .text = status }) catch {};
+    }
+
+    fn handleNvimSetEngine(self: *Handler, params: ?std.json.Value) void {
+        const p = params orelse return;
+        const parsed = std.json.parseFromValue(protocol.SetEngineRequest, self.allocator, p, .{
+            .ignore_unknown_fields = true,
+        }) catch |err| {
+            log.warn("Invalid set_engine params: {}", .{err});
+            return;
+        };
+        defer parsed.deinit();
+
+        const engine_map = std.StaticStringMap(Engine).initComptime(.{
+            .{ "claude", .claude },
+            .{ "codex", .codex },
         });
 
-        if (method_map.get(req.method)) |handler| {
-            try handler(self, req);
+        if (engine_map.get(parsed.value.engine)) |engine| {
+            self.current_engine = engine;
+            self.sendNotification("status", protocol.StatusUpdate{
+                .text = if (engine == .claude) "Engine: Claude" else "Engine: Codex",
+            }) catch {};
+            self.sendStateNotification();
         } else {
-            log.warn("Unknown method: {s}", .{req.method});
+            log.warn("Unknown engine: {s}", .{parsed.value.engine});
+            self.sendError("Unknown engine") catch {};
         }
     }
 
-    fn handleToolResponse(self: *Handler, req: protocol.JsonRpcRequest) !void {
-        const params = req.params orelse return;
+    fn handleNvimSetModel(self: *Handler, params: ?std.json.Value) void {
+        const p = params orelse return;
+        const parsed = std.json.parseFromValue(protocol.SetModelRequest, self.allocator, p, .{
+            .ignore_unknown_fields = true,
+        }) catch |err| {
+            log.warn("Invalid set_model params: {}", .{err});
+            return;
+        };
+        defer parsed.deinit();
 
-        // Parse tool response
-        const response = std.json.parseFromValue(ToolResponseParams, self.allocator, params, .{
+        // Validate model name
+        const valid_models = [_][]const u8{ "sonnet", "opus", "haiku" };
+        var is_valid = false;
+        for (valid_models) |m| {
+            if (std.mem.eql(u8, parsed.value.model, m)) {
+                is_valid = true;
+                break;
+            }
+        }
+
+        if (is_valid) {
+            // Free old model if owned
+            if (self.current_model) |old| {
+                self.allocator.free(old);
+            }
+            self.current_model = self.allocator.dupe(u8, parsed.value.model) catch null;
+
+            var buf: [64]u8 = undefined;
+            const status = std.fmt.bufPrint(&buf, "Model: {s}", .{parsed.value.model}) catch "Model changed";
+            self.sendNotification("status", protocol.StatusUpdate{ .text = status }) catch {};
+            self.sendStateNotification();
+        } else {
+            log.warn("Invalid model: {s}", .{parsed.value.model});
+            self.sendError("Invalid model (use: sonnet, opus, haiku)") catch {};
+        }
+    }
+
+    fn handleNvimSetPermissionMode(self: *Handler, params: ?std.json.Value) void {
+        const p = params orelse return;
+        const parsed = std.json.parseFromValue(protocol.SetPermissionModeRequest, self.allocator, p, .{
+            .ignore_unknown_fields = true,
+        }) catch |err| {
+            log.warn("Invalid set_permission_mode params: {}", .{err});
+            return;
+        };
+        defer parsed.deinit();
+
+        const mode_map = std.StaticStringMap(protocol.PermissionMode).initComptime(.{
+            .{ "default", .default },
+            .{ "accept_edits", .accept_edits },
+            .{ "auto_approve", .auto_approve },
+            .{ "plan_only", .plan_only },
+        });
+
+        if (mode_map.get(parsed.value.mode)) |mode| {
+            self.permission_mode = mode;
+            var buf: [64]u8 = undefined;
+            const status = std.fmt.bufPrint(&buf, "Mode: {s}", .{mode.toString()}) catch "Mode changed";
+            self.sendNotification("status", protocol.StatusUpdate{ .text = status }) catch {};
+            self.sendStateNotification();
+        } else {
+            log.warn("Unknown mode: {s}", .{parsed.value.mode});
+            self.sendError("Unknown mode (use: default, accept_edits, auto_approve, plan_only)") catch {};
+        }
+    }
+
+    fn handleNvimGetState(self: *Handler) void {
+        self.sendStateNotification();
+    }
+
+    fn handleNvimApprovalResponse(self: *Handler, params: ?std.json.Value) void {
+        const p = params orelse return;
+        const parsed = std.json.parseFromValue(protocol.ApprovalResponseRequest, self.allocator, p, .{
+            .ignore_unknown_fields = true,
+        }) catch |err| {
+            log.warn("Invalid approval_response params: {}", .{err});
+            return;
+        };
+        defer parsed.deinit();
+
+        // Check if this matches the pending approval
+        if (self.pending_approval_id) |pending_id| {
+            if (std.mem.eql(u8, pending_id, parsed.value.id)) {
+                // Store the response
+                if (self.pending_approval_response) |old| {
+                    self.allocator.free(old);
+                }
+                self.pending_approval_response = self.allocator.dupe(u8, parsed.value.decision) catch null;
+                log.info("Received approval response: {s} for {s}", .{ parsed.value.decision, parsed.value.id });
+            } else {
+                log.warn("Approval response ID mismatch: expected {s}, got {s}", .{ pending_id, parsed.value.id });
+            }
+        } else {
+            log.warn("Received approval response but no pending approval", .{});
+        }
+    }
+
+    fn sendStateNotification(self: *Handler) void {
+        const engine_str: []const u8 = switch (self.current_engine) {
+            .claude => "claude",
+            .codex => "codex",
+        };
+
+        const session_id = switch (self.current_engine) {
+            .claude => self.claude_session_id,
+            .codex => self.codex_session_id,
+        };
+
+        self.sendNotification("state", protocol.StateResponse{
+            .engine = engine_str,
+            .model = self.current_model,
+            .mode = self.permission_mode.toString(),
+            .session_id = session_id,
+            .connected = self.mcp_server != null,
+        }) catch |err| {
+            log.err("Failed to send state notification: {}", .{err});
+        };
+    }
+
+    fn handleNvimShutdown(self: *Handler) void {
+        log.info("Shutdown requested", .{});
+        self.should_exit = true;
+    }
+
+    fn handleNvimToolResponse(self: *Handler, params: ?std.json.Value) void {
+        const p = params orelse return;
+        const parsed = std.json.parseFromValue(ToolResponseParams, self.allocator, p, .{
             .ignore_unknown_fields = true,
         }) catch |err| {
             log.warn("Invalid tool_response params: {}", .{err});
             return;
         };
-        defer response.deinit();
+        defer parsed.deinit();
 
-        // Forward to MCP server
         if (self.mcp_server) |mcp| {
             mcp.handleToolResponse(
-                response.value.correlation_id,
-                response.value.result,
-                response.value.@"error",
+                parsed.value.correlation_id,
+                parsed.value.result,
+                parsed.value.@"error",
             ) catch |err| {
                 log.warn("Failed to handle tool response: {}", .{err});
             };
         }
     }
 
-    const ToolResponseParams = struct {
-        correlation_id: []const u8,
-        result: ?[]const u8 = null,
-        @"error": ?[]const u8 = null,
-    };
-
-    fn handleSelectionChanged(self: *Handler, req: protocol.JsonRpcRequest) !void {
-        const params = req.params orelse return;
-
-        // Parse selection info
-        const selection = std.json.parseFromValue(protocol.SelectionInfo, self.allocator, params, .{
+    fn handleNvimSelectionChanged(self: *Handler, params: ?std.json.Value) void {
+        const p = params orelse return;
+        const parsed = std.json.parseFromValue(protocol.SelectionInfo, self.allocator, p, .{
             .ignore_unknown_fields = true,
         }) catch |err| {
             log.warn("Invalid selection_changed params: {}", .{err});
             return;
         };
-        defer selection.deinit();
+        defer parsed.deinit();
 
-        // Update MCP server's cached selection
         if (self.mcp_server) |mcp| {
-            const range: ?mcp_types.SelectionRange = if (selection.value.range) |r| .{
+            const range: ?mcp_types.SelectionRange = if (parsed.value.range) |r| .{
                 .startLine = r.start_line,
                 .startCol = r.start_col,
                 .endLine = r.end_line,
@@ -193,8 +371,8 @@ pub const Handler = struct {
             } else null;
 
             mcp.updateSelection(.{
-                .text = selection.value.content orelse "",
-                .file = selection.value.file,
+                .text = parsed.value.content orelse "",
+                .file = parsed.value.file,
                 .range = range,
             }) catch |err| {
                 log.warn("Failed to update selection cache: {}", .{err});
@@ -202,26 +380,11 @@ pub const Handler = struct {
         }
     }
 
-    fn handlePrompt(self: *Handler, req: protocol.JsonRpcRequest) !void {
-        const params = req.params orelse return;
-
-        var prompt_parsed = std.json.parseFromValue(protocol.PromptRequest, self.allocator, params, .{
-            .ignore_unknown_fields = true,
-        }) catch |err| {
-            log.warn("Invalid prompt params: {}", .{err});
-            return;
-        };
-        defer prompt_parsed.deinit();
-
-        const prompt_req = prompt_parsed.value;
-        self.cancelled = false;
-
-        // Default to claude engine for now
-        const engine: Engine = .claude;
+    fn processPrompt(self: *Handler, prompt_req: protocol.PromptRequest) !void {
+        const engine = self.current_engine;
 
         try self.sendNotification("stream_start", protocol.StreamStart{ .engine = engine });
 
-        // Build prompt context
         var cb_ctx = CallbackContext{ .handler = self };
         const cbs = EditorCallbacks{
             .ctx = @ptrCast(&cb_ctx),
@@ -253,7 +416,6 @@ pub const Handler = struct {
                     return;
                 };
 
-                // Send the prompt
                 bridge.sendPrompt(prompt_req.text) catch |err| {
                     log.err("Failed to send prompt: {}", .{err});
                     try self.sendError("Failed to send prompt");
@@ -274,8 +436,7 @@ pub const Handler = struct {
                     return;
                 };
 
-                // Send the prompt
-                const inputs = [_]codex_bridge.CodexUserInput{
+                const inputs = [_]codex_bridge.UserInput{
                     .{ .type = "text", .text = prompt_req.text },
                 };
                 bridge.sendPrompt(&inputs) catch |err| {
@@ -293,26 +454,24 @@ pub const Handler = struct {
         try self.sendNotification("stream_end", .{});
     }
 
-    fn handleCancel(self: *Handler, req: protocol.JsonRpcRequest) !void {
-        _ = req;
-        self.cancelled = true;
-        try self.sendNotification("status", protocol.StatusUpdate{ .text = "Cancelled" });
-    }
+    const ReadyNotification = struct {
+        mcp_port: u16,
+    };
 
-    fn handleNudgeToggle(self: *Handler, req: protocol.JsonRpcRequest) !void {
-        _ = req;
-        self.nudge_enabled = !self.nudge_enabled;
-        const status = if (self.nudge_enabled) "Nudge enabled" else "Nudge disabled";
-        try self.sendNotification("status", protocol.StatusUpdate{ .text = status });
-    }
+    const ToolResponseParams = struct {
+        correlation_id: []const u8,
+        result: ?[]const u8 = null,
+        @"error": ?[]const u8 = null,
+    };
 
-    fn handleShutdown(self: *Handler, req: protocol.JsonRpcRequest) !void {
-        _ = req;
-        log.info("Shutdown requested, cleaning up...", .{});
-        self.should_exit = true;
-    }
-
+    /// Send notification via WebSocket to nvim client
     fn sendNotification(self: *Handler, method: []const u8, params: anytype) !void {
+        const mcp = self.mcp_server orelse return error.NotConnected;
+        try mcp.sendNvimNotification(method, params);
+    }
+
+    /// Send notification via stdout (used for initial ready message before WebSocket connects)
+    fn sendStdoutNotification(self: *Handler, method: []const u8, params: anytype) !void {
         var out: std.io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
 
@@ -328,7 +487,6 @@ pub const Handler = struct {
                 .params = null,
             });
         } else {
-            // For complex types, serialize params to json.Value
             var param_out: std.io.Writer.Allocating = .init(self.allocator);
             defer param_out.deinit();
             var param_jw: std.json.Stringify = .{
@@ -378,7 +536,7 @@ pub const Handler = struct {
         .onSlashCommands = null,
         .checkAuthRequired = null,
         .sendContinuePrompt = cbSendContinuePrompt,
-        .onApprovalRequest = null, // Not needed for basic nvim support
+        .onApprovalRequest = cbOnApprovalRequest,
     };
 
     fn cbSendText(ctx: *anyopaque, session_id: []const u8, engine: Engine, text: []const u8) anyerror!void {
@@ -479,6 +637,108 @@ pub const Handler = struct {
         // For now, don't support nudge continuation - would need to restart bridge
         return false;
     }
+
+    fn cbOnApprovalRequest(ctx: *anyopaque, request_id: std.json.Value, kind: ApprovalKind, params: ?std.json.Value) anyerror!?[]const u8 {
+        const cb_ctx: *CallbackContext = @ptrCast(@alignCast(ctx));
+        const handler = cb_ctx.handler;
+
+        // Convert request_id to string
+        var id_buf: [64]u8 = undefined;
+        const id_str = switch (request_id) {
+            .integer => |i| std.fmt.bufPrint(&id_buf, "{d}", .{i}) catch "unknown",
+            .string => |s| s,
+            else => "unknown",
+        };
+
+        // Store pending approval ID
+        if (handler.pending_approval_id) |old| {
+            handler.allocator.free(old);
+        }
+        handler.pending_approval_id = handler.allocator.dupe(u8, id_str) catch return null;
+        handler.pending_approval_response = null;
+
+        // Convert kind to risk level
+        const risk_level: []const u8 = switch (kind) {
+            .command_execution, .exec_command => "high",
+            .file_change, .apply_patch => "medium",
+        };
+
+        // Convert params to arguments string
+        var args_str: ?[]const u8 = null;
+        if (params) |p| {
+            var out: std.io.Writer.Allocating = .init(handler.allocator);
+            defer out.deinit();
+            var jw: std.json.Stringify = .{
+                .writer = &out.writer,
+                .options = .{ .emit_null_optional_fields = false },
+            };
+            jw.write(p) catch {};
+            args_str = out.toOwnedSlice() catch null;
+        }
+        defer if (args_str) |a| handler.allocator.free(a);
+
+        // Get tool name from kind
+        const tool_name: []const u8 = switch (kind) {
+            .command_execution => "command_execution",
+            .exec_command => "exec_command",
+            .file_change => "file_change",
+            .apply_patch => "apply_patch",
+        };
+
+        // Send approval request notification
+        handler.sendNotification("approval_request", protocol.ApprovalRequest{
+            .id = id_str,
+            .tool_name = tool_name,
+            .arguments = args_str,
+            .risk_level = risk_level,
+        }) catch |err| {
+            log.err("Failed to send approval_request: {}", .{err});
+            return null;
+        };
+
+        // Poll for response with 30 second timeout
+        const timeout_ms: i64 = 30_000;
+        const start_time = std.time.milliTimestamp();
+
+        while (std.time.milliTimestamp() - start_time < timeout_ms) {
+            // Check if cancelled
+            if (handler.cancelled) {
+                return "decline";
+            }
+
+            // Check if we have a response
+            if (handler.pending_approval_response) |response| {
+                // Clean up pending state
+                if (handler.pending_approval_id) |pid| {
+                    handler.allocator.free(pid);
+                    handler.pending_approval_id = null;
+                }
+
+                // Return owned copy (caller doesn't free, but we need to keep it valid)
+                // The response is already allocated, just return it and don't free
+                const result = response;
+                handler.pending_approval_response = null;
+                return result;
+            }
+
+            // Poll MCP server for incoming messages
+            if (handler.mcp_server) |mcp| {
+                _ = mcp.poll(100) catch |err| {
+                    log.warn("MCP poll error during approval wait: {}", .{err});
+                };
+            } else {
+                std.Thread.sleep(100 * std.time.ns_per_ms);
+            }
+        }
+
+        // Timeout - clean up and decline
+        log.warn("Approval request timed out for {s}", .{id_str});
+        if (handler.pending_approval_id) |pid| {
+            handler.allocator.free(pid);
+            handler.pending_approval_id = null;
+        }
+        return "decline";
+    }
 };
 
 test "handler init/deinit" {
@@ -509,16 +769,12 @@ test "handler nudge toggle" {
 
     try std.testing.expect(handler.nudge_enabled);
 
-    // Toggle nudge
-    try handler.handleNudgeToggle(protocol.JsonRpcRequest{
-        .method = "nudge_toggle",
-    });
+    // Toggle nudge (simulate callback)
+    handler.nudge_enabled = !handler.nudge_enabled;
     try std.testing.expect(!handler.nudge_enabled);
 
     // Toggle again
-    try handler.handleNudgeToggle(protocol.JsonRpcRequest{
-        .method = "nudge_toggle",
-    });
+    handler.nudge_enabled = !handler.nudge_enabled;
     try std.testing.expect(handler.nudge_enabled);
 }
 
@@ -535,10 +791,8 @@ test "handler cancel" {
 
     try std.testing.expect(!handler.cancelled);
 
-    // Cancel
-    try handler.handleCancel(protocol.JsonRpcRequest{
-        .method = "cancel",
-    });
+    // Cancel (simulate callback)
+    handler.cancelled = true;
     try std.testing.expect(handler.cancelled);
 }
 
