@@ -553,6 +553,9 @@ function M.append(text, is_thought)
         end
     end
 
+    -- Detect and mark markdown headers
+    M._mark_markdown_headers(line_count - 1, vim.api.nvim_buf_line_count(output_buf))
+
     -- Detect and mark file paths
     M._mark_file_paths(line_count - 1, vim.api.nvim_buf_line_count(output_buf))
 
@@ -725,6 +728,21 @@ function M._stop_session_timer()
         session_timer:stop()
         session_timer:close()
         session_timer = nil
+    end
+end
+
+function M._mark_markdown_headers(start_line, end_line)
+    if not output_buf or not vim.api.nvim_buf_is_valid(output_buf) then
+        return
+    end
+
+    -- Pattern matches: ## Header or # Header
+    for line_num = start_line, end_line - 1 do
+        local line_text = vim.api.nvim_buf_get_lines(output_buf, line_num, line_num + 1, false)[1]
+        if line_text and vim.startswith(vim.trim(line_text), "#") then
+            -- Apply bold highlight
+            vim.api.nvim_buf_add_highlight(output_buf, ns_id, "Bold", line_num, 0, -1)
+        end
     end
 end
 
