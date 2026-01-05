@@ -90,12 +90,6 @@ fn isCodexMaxTurnError(err: codex_cli.TurnError) bool {
         containsMaxTurnMarker(err.message);
 }
 
-fn elapsedMs(start_ms: i64) u64 {
-    const now = std.time.milliTimestamp();
-    if (now <= start_ms) return 0;
-    return @intCast(now - start_ms);
-}
-
 fn replaceFirst(allocator: Allocator, input: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
     const pos = std.mem.indexOf(u8, input, needle) orelse {
         return allocator.dupe(u8, input);
@@ -544,6 +538,7 @@ pub const Agent = struct {
         .onSlashCommands = cbOnSlashCommands,
         .checkAuthRequired = cbCheckAuthRequired,
         .sendContinuePrompt = cbSendContinuePrompt,
+        .onApprovalRequest = cbOnApprovalRequest,
     };
 
     fn cbSendText(ctx: *anyopaque, session_id: []const u8, engine: Engine, text: []const u8) anyerror!void {
@@ -671,6 +666,54 @@ pub const Agent = struct {
                 return true;
             },
         }
+    }
+
+    fn cbOnApprovalRequest(ctx: *anyopaque, request_id: std.json.Value, kind: callbacks_mod.ApprovalKind, params: ?std.json.Value) anyerror!?[]const u8 {
+        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+
+        // Map to protocol types
+        const title = switch (kind) {
+            .command_execution, .exec_command => "Bash",
+            .file_change, .apply_patch => "Edit",
+        };
+        const proto_kind: protocol.SessionUpdate.ToolKind = switch (kind) {
+            .command_execution, .exec_command => .execute,
+            .file_change, .apply_patch => .edit,
+        };
+
+        // Convert json.Value back to RpcRequestId for formatting
+        const rpc_request_id: CodexMessage.RpcRequestId = switch (request_id) {
+            .integer => |id| .{ .integer = id },
+            .string => |id| .{ .string = id },
+            else => return "decline", // Invalid request_id type
+        };
+
+        // Format tool call ID
+        const tool_call_id = try pctx.agent.formatApprovalToolCallId(rpc_request_id);
+        defer pctx.agent.allocator.free(tool_call_id);
+
+        // Request permission via ACP
+        const outcome = pctx.agent.requestPermission(
+            pctx.session,
+            pctx.session_id,
+            tool_call_id,
+            title,
+            proto_kind,
+            params,
+        ) catch |err| {
+            log.warn("Failed to request permission from client: {}", .{err});
+            return "decline";
+        };
+        defer if (outcome.optionId) |option_id| pctx.agent.allocator.free(option_id);
+
+        // Map callback kind to CodexMessage.ApprovalKind for the existing helper
+        const codex_kind: CodexMessage.ApprovalKind = switch (kind) {
+            .command_execution => .command_execution,
+            .exec_command => .exec_command,
+            .file_change => .file_change,
+            .apply_patch => .apply_patch,
+        };
+        return pctx.agent.permissionDecisionForCodex(codex_kind, outcome);
     }
 
     pub fn init(allocator: Allocator, writer: std.io.AnyWriter, reader: ?*jsonrpc.Reader) Agent {
@@ -1857,12 +1900,9 @@ pub const Agent = struct {
         prompt: []const u8,
         codex_inputs: ?[]const CodexUserInput,
     ) !protocol.StopReason {
-        const start_ms = std.time.milliTimestamp();
-        const engine = Engine.codex;
-        var stream_prefix_pending = true;
-        var thought_prefix_pending = true;
         defer self.clearPendingExecuteTools(session);
 
+        // Build input list
         var input_list: std.ArrayListUnmanaged(CodexUserInput) = .empty;
         defer input_list.deinit(self.allocator);
 
@@ -1872,173 +1912,37 @@ pub const Agent = struct {
         if (codex_inputs) |inputs| {
             try input_list.appendSlice(self.allocator, inputs);
         }
-
         const inputs = input_list.items;
         if (inputs.len == 0) return .end_turn;
 
-        const active_bridge = try self.sendCodexPromptWithRestart(session, session_id, inputs);
-        const prompt_sent_ms = elapsedMs(start_ms);
-        log.info("Codex prompt sent at {d}ms", .{prompt_sent_ms});
+        const codex_bridge = try self.sendCodexPromptWithRestart(session, session_id, inputs);
 
-        var first_response_ms: u64 = 0;
-        var msg_count: u32 = 0;
+        var cb_ctx = PromptCallbackContext{
+            .agent = self,
+            .session = session,
+            .session_id = session_id,
+        };
+        const callbacks = EditorCallbacks{
+            .ctx = @ptrCast(&cb_ctx),
+            .vtable = &editor_callbacks_vtable,
+        };
 
-        while (true) {
-            if (session.cancelled) return .cancelled;
+        var prompt_ctx = engine_mod.PromptContext{
+            .allocator = self.allocator,
+            .session_id = session_id,
+            .cwd = session.cwd,
+            .cancelled = &session.cancelled,
+            .nudge = .{
+                .enabled = session.nudge_enabled,
+                .cooldown_ms = 30_000,
+                .last_nudge_ms = &session.last_nudge_ms,
+            },
+            .cb = callbacks,
+            .tag_engine = self.shouldTagEngine(session),
+        };
 
-            const deadline_ms = std.time.milliTimestamp() + prompt_poll_ms;
-            var msg = active_bridge.readMessageWithTimeout(deadline_ms) catch |err| {
-                if (err == error.Timeout) {
-                    self.pollClientMessages(session);
-                    if (session.cancelled) return .cancelled;
-                    continue;
-                }
-                log.err("Failed to read Codex message: {}", .{err});
-                active_bridge.deinit();
-                session.codex_bridge = null;
-                break;
-            } orelse {
-                active_bridge.deinit();
-                session.codex_bridge = null;
-                break;
-            };
-            defer msg.deinit();
-
-            msg_count += 1;
-            const msg_time_ms = elapsedMs(start_ms);
-            if (first_response_ms == 0) first_response_ms = msg_time_ms;
-
-            if (msg.event_type == .turn_started) {
-                stream_prefix_pending = true;
-                thought_prefix_pending = true;
-                continue;
-            }
-
-            if (msg.event_type == .agent_message_delta) {
-                if (msg.text) |text| {
-                    if (first_response_ms == 0) first_response_ms = msg_time_ms;
-                    if (stream_prefix_pending) {
-                        try self.sendEngineTextPrefix(session, session_id, engine);
-                        stream_prefix_pending = false;
-                    }
-                    try self.sendEngineTextRaw(session_id, text);
-                }
-                continue;
-            }
-
-            if (msg.event_type == .reasoning_delta) {
-                if (msg.text) |text| {
-                    if (first_response_ms == 0) first_response_ms = msg_time_ms;
-                    if (thought_prefix_pending) {
-                        try self.sendEngineThoughtPrefix(session, session_id, engine);
-                        thought_prefix_pending = false;
-                    }
-                    try self.sendEngineThoughtRaw(session_id, text);
-                }
-                continue;
-            }
-
-            if (msg.getSessionId()) |sid| {
-                self.captureSessionId(&session.codex_session_id, "Codex", sid);
-            }
-
-            if (msg.getApprovalRequest()) |approval| {
-                const title = switch (approval.kind) {
-                    .command_execution, .exec_command => "Bash",
-                    .file_change, .apply_patch => "Edit",
-                };
-                const kind: protocol.SessionUpdate.ToolKind = switch (approval.kind) {
-                    .command_execution, .exec_command => .execute,
-                    .file_change, .apply_patch => .edit,
-                };
-                const tool_call_id = try self.formatApprovalToolCallId(approval.request_id);
-                defer self.allocator.free(tool_call_id);
-
-                const outcome = self.requestPermission(session, session_id, tool_call_id, title, kind, approval.params) catch |err| {
-                    log.warn("Failed to request permission from client: {}", .{err});
-                    active_bridge.respondApproval(approval.request_id, "decline") catch |resp_err| {
-                        log.warn("Failed to decline Codex approval request: {}", .{resp_err});
-                    };
-                    continue;
-                };
-                defer if (outcome.optionId) |option_id| self.allocator.free(option_id);
-                const decision = self.permissionDecisionForCodex(approval.kind, outcome);
-                active_bridge.respondApproval(approval.request_id, decision) catch |resp_err| {
-                    log.warn("Failed to respond to Codex approval request: {}", .{resp_err});
-                };
-                continue;
-            }
-
-            if (msg.getToolCall()) |tool| {
-                try self.handleEngineToolCall(
-                    session,
-                    session_id,
-                    engine,
-                    "Bash",
-                    tool.command,
-                    tool.id,
-                    .execute,
-                    null,
-                );
-                continue;
-            }
-
-            if (msg.getToolResult()) |tool_result| {
-                const status = exitCodeStatus(tool_result.exit_code);
-                try self.handleEngineToolResult(session, session_id, engine, tool_result.id, tool_result.content, status, tool_result.raw);
-                continue;
-            }
-
-            if (msg.getThought()) |text| {
-                if (first_response_ms == 0) first_response_ms = msg_time_ms;
-                try self.sendEngineThought(session, session_id, engine, text);
-                continue;
-            }
-
-            if (msg.getText()) |text| {
-                if (first_response_ms == 0) first_response_ms = msg_time_ms;
-                try self.sendEngineText(session, session_id, engine, text);
-                continue;
-            }
-
-            if (msg.event_type == .turn_completed) {
-                // Check if we should nudge due to pending dot tasks
-                // Nudge only if: no error, or max_turn error (which we can continue through)
-                const has_max_turn_error = if (msg.turn_error) |err| isCodexMaxTurnError(err) else false;
-                const has_blocking_error = msg.turn_error != null and !has_max_turn_error;
-                // Cooldown: minimum 30 seconds between nudges to prevent rapid-fire loops
-                const now_ms = std.time.milliTimestamp();
-                const nudge_cooldown_ms: i64 = 30_000;
-                const cooldown_ok = (now_ms - session.last_nudge_ms) >= nudge_cooldown_ms;
-                const should_nudge = session.nudge_enabled and !session.cancelled and
-                    !has_blocking_error and cooldown_ok and
-                    dots.hasPendingTasks(self.allocator, session.cwd);
-
-                if (should_nudge) {
-                    session.last_nudge_ms = now_ms;
-                    log.info("Codex turn completed; pending dots, nudging to continue", .{});
-                    const nudge_msg = "🔄 continue working on pending dots";
-                    try self.sendUserMessage(session_id, nudge_msg);
-                    const continue_inputs = [_]CodexUserInput{
-                        .{ .type = "text", .text = "continue with the next dot task" },
-                    };
-                    _ = try self.sendCodexPromptWithRestart(session, session_id, continue_inputs[0..]);
-                    stream_prefix_pending = true;
-                    thought_prefix_pending = true;
-                    continue;
-                } else if (has_blocking_error) {
-                    log.info("Codex turn completed; not nudging due to error", .{});
-                } else if (!cooldown_ok) {
-                    log.info("Codex turn completed; not nudging due to cooldown", .{});
-                }
-            }
-
-            if (msg.isTurnCompleted()) break;
-        }
-
-        const total_ms = elapsedMs(start_ms);
-        log.info("Codex prompt complete: {d} msgs, first response at {d}ms, total {d}ms", .{ msg_count, first_response_ms, total_ms });
-        return .end_turn;
+        const engine_stop = try engine_mod.processCodexMessages(&prompt_ctx, codex_bridge);
+        return toProtocolStopReason(engine_stop);
     }
 
     fn captureCodexSessionId(self: *Agent, session: *Session) void {

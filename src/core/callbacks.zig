@@ -19,6 +19,14 @@ pub const ToolKind = enum {
     other,
 };
 
+/// Codex approval request kind
+pub const ApprovalKind = enum {
+    command_execution,
+    exec_command,
+    file_change,
+    apply_patch,
+};
+
 pub const EditorCallbacks = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -44,6 +52,11 @@ pub const EditorCallbacks = struct {
         // Continue prompt (for nudge with bridge restart capability)
         // Returns true if prompt was sent and loop should continue, false to break
         sendContinuePrompt: *const fn (ctx: *anyopaque, engine: Engine, prompt: []const u8) anyerror!bool,
+
+        // Codex approval request handling
+        // request_id is the raw JSON value (integer or string)
+        // Returns decision string: "approve" or "decline", or null if not handled
+        onApprovalRequest: ?*const fn (ctx: *anyopaque, request_id: std.json.Value, kind: ApprovalKind, params: ?std.json.Value) anyerror!?[]const u8,
     };
 
     pub const StopReason = enum {
@@ -113,5 +126,12 @@ pub const EditorCallbacks = struct {
 
     pub fn sendContinuePrompt(self: EditorCallbacks, engine: Engine, prompt: []const u8) !bool {
         return self.vtable.sendContinuePrompt(self.ctx, engine, prompt);
+    }
+
+    pub fn onApprovalRequest(self: EditorCallbacks, request_id: std.json.Value, kind: ApprovalKind, params: ?std.json.Value) !?[]const u8 {
+        if (self.vtable.onApprovalRequest) |f| {
+            return f(self.ctx, request_id, kind, params);
+        }
+        return null;
     }
 };

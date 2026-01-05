@@ -1,0 +1,668 @@
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const posix = std.posix;
+
+const lockfile = @import("lockfile.zig");
+const websocket = @import("websocket.zig");
+const mcp_types = @import("mcp_types.zig");
+
+const log = std.log.scoped(.mcp_server);
+
+pub const McpServer = struct {
+    allocator: Allocator,
+    tcp_socket: posix.socket_t,
+    client_socket: ?posix.socket_t = null,
+    lock_file: ?lockfile.LockFile = null,
+    port: u16,
+    auth_token: [36]u8,
+    cwd: []const u8,
+
+    // Tool request management
+    pending_tool_requests: std.StringHashMap(PendingToolRequest),
+    next_request_id: u64 = 0,
+
+    // Selection cache for getLatestSelection (owned strings)
+    last_selection: ?OwnedSelection = null,
+
+    // Read buffer for WebSocket frames
+    read_buffer: std.ArrayList(u8) = .empty,
+
+    // Callback for sending tool requests to Lua
+    tool_request_callback: ?*const fn (tool_name: []const u8, correlation_id: []const u8, args: ?std.json.Value) void = null,
+    callback_ctx: ?*anyopaque = null,
+
+    // Type declarations (must come after fields)
+    const OwnedSelection = struct {
+        text: []const u8, // owned
+        file: []const u8, // owned
+        range: ?mcp_types.SelectionRange,
+
+        fn deinit(self: *const OwnedSelection, allocator: Allocator) void {
+            allocator.free(self.text);
+            allocator.free(self.file);
+        }
+
+        fn toResult(self: OwnedSelection) mcp_types.SelectionResult {
+            return .{
+                .text = self.text,
+                .file = self.file,
+                .range = self.range,
+            };
+        }
+    };
+
+    const PendingToolRequest = struct {
+        correlation_id: []const u8, // owned
+        mcp_request_id_json: []const u8, // owned - serialized JSON of the ID
+        tool_name: []const u8, // owned
+        deadline_ms: i64,
+
+        fn deinit(self: *const PendingToolRequest, allocator: Allocator) void {
+            allocator.free(self.correlation_id);
+            allocator.free(self.mcp_request_id_json);
+            allocator.free(self.tool_name);
+        }
+    };
+
+    pub fn init(allocator: Allocator, cwd: []const u8) !*McpServer {
+        // Create TCP socket
+        const sock = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+        errdefer posix.close(sock);
+
+        // Set SO_REUSEADDR
+        const one: u32 = 1;
+        try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
+
+        // Bind to random port on localhost
+        var addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+        try posix.bind(sock, &addr.any, addr.getOsSockLen());
+        try posix.listen(sock, 1);
+
+        // Get assigned port
+        var bound_addr: std.net.Address = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
+        var addr_len: posix.socklen_t = bound_addr.getOsSockLen();
+        try posix.getsockname(sock, &bound_addr.any, &addr_len);
+        const port = bound_addr.getPort();
+
+        // Generate auth token
+        var auth_token: [36]u8 = undefined;
+        lockfile.generateUuidV4(&auth_token);
+
+        const self = try allocator.create(McpServer);
+        self.* = McpServer{
+            .allocator = allocator,
+            .tcp_socket = sock,
+            .port = port,
+            .auth_token = auth_token,
+            .cwd = cwd,
+            .pending_tool_requests = std.StringHashMap(PendingToolRequest).init(allocator),
+        };
+
+        return self;
+    }
+
+    pub fn deinit(self: *McpServer) void {
+        self.stop();
+        // Clean up any remaining pending requests
+        var iter = self.pending_tool_requests.iterator();
+        while (iter.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.pending_tool_requests.deinit();
+        self.read_buffer.deinit(self.allocator);
+        // Free owned selection data
+        if (self.last_selection) |sel| {
+            sel.deinit(self.allocator);
+        }
+        self.allocator.destroy(self);
+    }
+
+    pub fn start(self: *McpServer) !void {
+        // Create lock file
+        self.lock_file = try lockfile.create(
+            self.allocator,
+            self.port,
+            self.cwd,
+            &self.auth_token,
+        );
+        log.info("MCP server listening on port {d}", .{self.port});
+    }
+
+    pub fn stop(self: *McpServer) void {
+        // Send close frame if client connected
+        if (self.client_socket) |sock| {
+            const close_frame = websocket.encodeFrame(self.allocator, .close, "") catch null;
+            if (close_frame) |frame| {
+                _ = posix.write(sock, frame) catch {};
+                self.allocator.free(frame);
+            }
+            posix.close(sock);
+            self.client_socket = null;
+        }
+
+        // Delete lock file
+        if (self.lock_file) |*lock| {
+            lock.deinit();
+            self.lock_file = null;
+        }
+
+        posix.close(self.tcp_socket);
+    }
+
+    pub fn getPort(self: *McpServer) u16 {
+        return self.port;
+    }
+
+    /// Poll for events with timeout in milliseconds.
+    /// Returns true if should continue polling.
+    pub fn poll(self: *McpServer, timeout_ms: i32) !bool {
+        var fds: [2]posix.pollfd = undefined;
+        var nfds: usize = 0;
+
+        // Always poll TCP accept socket
+        fds[nfds] = .{ .fd = self.tcp_socket, .events = posix.POLL.IN, .revents = 0 };
+        nfds += 1;
+
+        // Poll client socket if connected
+        if (self.client_socket) |sock| {
+            fds[nfds] = .{ .fd = sock, .events = posix.POLL.IN, .revents = 0 };
+            nfds += 1;
+        }
+
+        const ready = try posix.poll(fds[0..nfds], timeout_ms);
+        if (ready == 0) {
+            // Timeout - check for expired requests
+            self.checkTimeouts();
+            return true;
+        }
+
+        // Handle events
+        for (fds[0..nfds]) |fd| {
+            if (fd.revents & posix.POLL.IN != 0) {
+                if (fd.fd == self.tcp_socket) {
+                    self.acceptConnection() catch |err| {
+                        log.warn("Accept failed: {}", .{err});
+                    };
+                } else if (self.client_socket != null and fd.fd == self.client_socket.?) {
+                    self.handleClientMessage() catch |err| {
+                        log.warn("Client message failed: {}", .{err});
+                        // Close connection on error
+                        if (self.client_socket) |sock| {
+                            posix.close(sock);
+                            self.client_socket = null;
+                        }
+                    };
+                }
+            }
+            if (fd.revents & posix.POLL.HUP != 0 or fd.revents & posix.POLL.ERR != 0) {
+                if (self.client_socket != null and fd.fd == self.client_socket.?) {
+                    log.info("Client disconnected", .{});
+                    posix.close(self.client_socket.?);
+                    self.client_socket = null;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    fn acceptConnection(self: *McpServer) !void {
+        const client = try posix.accept(self.tcp_socket, null, null, 0);
+        errdefer posix.close(client);
+
+        // Close existing client if any
+        if (self.client_socket) |old| {
+            log.info("Closing existing client connection", .{});
+            posix.close(old);
+        }
+
+        // Perform WebSocket handshake
+        websocket.performHandshake(self.allocator, client, &self.auth_token) catch |err| {
+            log.warn("WebSocket handshake failed: {}", .{err});
+            posix.close(client);
+            return;
+        };
+
+        self.client_socket = client;
+        self.read_buffer.clearRetainingCapacity();
+        log.info("Claude CLI connected", .{});
+    }
+
+    fn handleClientMessage(self: *McpServer) !void {
+        const client = self.client_socket orelse return;
+
+        // Read available data into buffer
+        var temp_buf: [4096]u8 = undefined;
+        const n = posix.read(client, &temp_buf) catch |err| switch (err) {
+            error.WouldBlock => return,
+            else => return err,
+        };
+        if (n == 0) return error.ConnectionClosed;
+
+        try self.read_buffer.appendSlice(self.allocator, temp_buf[0..n]);
+
+        // Try to parse complete frames
+        while (self.read_buffer.items.len >= 2) {
+            const result = websocket.parseFrame(self.read_buffer.items) catch |err| switch (err) {
+                error.NeedMoreData => break,
+                error.ReservedOpcode => {
+                    log.warn("Received frame with reserved opcode, closing connection", .{});
+                    posix.close(client);
+                    self.client_socket = null;
+                    return;
+                },
+                else => return err,
+            };
+
+            // Process frame
+            switch (result.frame.opcode) {
+                .text => {
+                    try self.handleJsonRpcMessage(result.frame.payload);
+                },
+                .ping => {
+                    // Respond with pong
+                    const pong = try websocket.encodeFrame(self.allocator, .pong, result.frame.payload);
+                    defer self.allocator.free(pong);
+                    _ = try posix.write(client, pong);
+                },
+                .close => {
+                    log.info("Client sent close frame", .{});
+                    posix.close(client);
+                    self.client_socket = null;
+                    return;
+                },
+                else => {},
+            }
+
+            // Remove consumed bytes
+            const remaining = self.read_buffer.items[result.consumed..];
+            std.mem.copyForwards(u8, self.read_buffer.items[0..remaining.len], remaining);
+            self.read_buffer.shrinkRetainingCapacity(remaining.len);
+        }
+    }
+
+    fn handleJsonRpcMessage(self: *McpServer, payload: []const u8) !void {
+        const parsed = std.json.parseFromSlice(mcp_types.JsonRpcRequest, self.allocator, payload, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            try self.sendError(null, mcp_types.ErrorCode.ParseError, "Parse error");
+            return;
+        };
+        defer parsed.deinit();
+
+        const req = parsed.value;
+        const method = req.method;
+        const id = req.id;
+
+        // Dispatch by method
+        const method_map = std.StaticStringMap(MethodKind).initComptime(.{
+            .{ mcp_types.Method.Initialize, .initialize },
+            .{ mcp_types.Method.Initialized, .initialized },
+            .{ mcp_types.Method.ToolsList, .tools_list },
+            .{ mcp_types.Method.ToolsCall, .tools_call },
+        });
+
+        const kind = method_map.get(method) orelse {
+            if (id != null) {
+                try self.sendError(id, mcp_types.ErrorCode.MethodNotFound, "Method not found");
+            }
+            return;
+        };
+
+        switch (kind) {
+            .initialize => try self.handleInitialize(id),
+            .initialized => {}, // Notification, no response needed
+            .tools_list => try self.handleToolsList(id),
+            .tools_call => try self.handleToolsCall(id, req.params),
+        }
+    }
+
+    const MethodKind = enum {
+        initialize,
+        initialized,
+        tools_list,
+        tools_call,
+    };
+
+    fn handleInitialize(self: *McpServer, id: ?std.json.Value) !void {
+        const result = mcp_types.InitializeResult{};
+        try self.sendResult(id, result);
+    }
+
+    fn handleToolsList(self: *McpServer, id: ?std.json.Value) !void {
+        const tools = mcp_types.getToolDefinitions();
+        const result = mcp_types.ToolsListResult{ .tools = tools };
+        try self.sendResult(id, result);
+    }
+
+    fn handleToolsCall(self: *McpServer, id: ?std.json.Value, params: ?std.json.Value) !void {
+        if (id == null) return; // tools/call requires an id
+
+        const tool_params = params orelse {
+            try self.sendError(id, mcp_types.ErrorCode.InvalidParams, "Missing params");
+            return;
+        };
+
+        // Parse tool name and arguments
+        const parsed = std.json.parseFromValue(mcp_types.ToolsCallParams, self.allocator, tool_params, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            try self.sendError(id, mcp_types.ErrorCode.InvalidParams, "Invalid tool call params");
+            return;
+        };
+        defer parsed.deinit();
+
+        const tool_name = parsed.value.name;
+        const tool_args = parsed.value.arguments;
+
+        // Check if this is a local tool (can be handled without Lua)
+        if (self.handleLocalTool(id, tool_name, tool_args)) |_| {
+            return; // Handled locally
+        } else |_| {}
+
+        // Forward to Lua via callback
+        if (self.tool_request_callback) |callback| {
+            const correlation_id = try self.generateCorrelationId();
+            errdefer self.allocator.free(correlation_id);
+
+            // Serialize ID to owned string
+            const id_json = try serializeToJson(self.allocator, id.?);
+            errdefer self.allocator.free(id_json);
+
+            // Dupe tool name
+            const owned_tool_name = try self.allocator.dupe(u8, tool_name);
+            errdefer self.allocator.free(owned_tool_name);
+
+            try self.pending_tool_requests.put(correlation_id, .{
+                .correlation_id = correlation_id,
+                .mcp_request_id_json = id_json,
+                .tool_name = owned_tool_name,
+                .deadline_ms = std.time.milliTimestamp() + TOOL_REQUEST_TIMEOUT_MS,
+            });
+            callback(owned_tool_name, correlation_id, tool_args);
+        } else {
+            try self.sendToolError(id, "Tool handler not available");
+        }
+    }
+
+    const TOOL_REQUEST_TIMEOUT_MS: i64 = 30_000;
+
+    fn handleLocalTool(self: *McpServer, id: ?std.json.Value, tool_name: []const u8, args: ?std.json.Value) !void {
+        const local_tools = std.StaticStringMap(LocalTool).initComptime(.{
+            .{ "getWorkspaceFolders", .get_workspace_folders },
+            .{ "getLatestSelection", .get_latest_selection },
+            .{ "executeCode", .execute_code },
+        });
+
+        const tool = local_tools.get(tool_name) orelse return error.NotLocalTool;
+
+        _ = args;
+        switch (tool) {
+            .get_workspace_folders => {
+                const folders = [_][]const u8{self.cwd};
+                const result = mcp_types.WorkspaceFoldersResult{ .folders = &folders };
+                const json_str = try serializeToJson(self.allocator, result);
+                defer self.allocator.free(json_str);
+                try self.sendToolResultOptional(id, json_str);
+            },
+            .get_latest_selection => {
+                const result = if (self.last_selection) |sel|
+                    sel.toResult()
+                else
+                    mcp_types.SelectionResult{};
+                const json_str = try serializeToJson(self.allocator, result);
+                defer self.allocator.free(json_str);
+                try self.sendToolResultOptional(id, json_str);
+            },
+            .execute_code => {
+                try self.sendToolError(id, "Jupyter kernel execution not supported in Neovim");
+            },
+        }
+    }
+
+    fn serializeToJson(allocator: Allocator, value: anytype) ![]u8 {
+        var out: std.io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        var jw: std.json.Stringify = .{ .writer = &out.writer };
+        try jw.write(value);
+        return out.toOwnedSlice();
+    }
+
+    const LocalTool = enum {
+        get_workspace_folders,
+        get_latest_selection,
+        execute_code,
+    };
+
+    pub fn handleToolResponse(self: *McpServer, correlation_id: []const u8, result: ?[]const u8, err: ?[]const u8) !void {
+        const pending = self.pending_tool_requests.get(correlation_id) orelse {
+            log.warn("Unknown correlation id: {s}", .{correlation_id});
+            return;
+        };
+
+        // Parse the ID back from JSON
+        var id_parsed = std.json.parseFromSlice(std.json.Value, self.allocator, pending.mcp_request_id_json, .{}) catch {
+            log.err("Failed to parse stored request ID", .{});
+            pending.deinit(self.allocator);
+            _ = self.pending_tool_requests.remove(correlation_id);
+            return;
+        };
+        defer id_parsed.deinit();
+
+        // Remove and free the pending request
+        _ = self.pending_tool_requests.remove(correlation_id);
+        pending.deinit(self.allocator);
+
+        if (err) |error_msg| {
+            try self.sendToolErrorWithId(id_parsed.value, error_msg);
+        } else if (result) |r| {
+            try self.sendToolResult(id_parsed.value, r);
+        } else {
+            try self.sendToolErrorWithId(id_parsed.value, "No result");
+        }
+    }
+
+    pub fn updateSelection(self: *McpServer, selection: mcp_types.SelectionResult) !void {
+        // Free previous selection if any
+        if (self.last_selection) |prev| {
+            prev.deinit(self.allocator);
+        }
+
+        // Duplicate strings to take ownership
+        const text = try self.allocator.dupe(u8, selection.text);
+        errdefer self.allocator.free(text);
+        const file = try self.allocator.dupe(u8, selection.file);
+
+        self.last_selection = .{
+            .text = text,
+            .file = file,
+            .range = selection.range,
+        };
+    }
+
+    fn generateCorrelationId(self: *McpServer) ![]const u8 {
+        const id = self.next_request_id;
+        self.next_request_id += 1;
+        return try std.fmt.allocPrint(self.allocator, "tool-{d}", .{id});
+    }
+
+    fn checkTimeouts(self: *McpServer) void {
+        const now = std.time.milliTimestamp();
+        var to_remove: std.ArrayList([]const u8) = .empty;
+        defer to_remove.deinit(self.allocator);
+
+        var iter = self.pending_tool_requests.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.deadline_ms < now) {
+                to_remove.append(self.allocator, entry.key_ptr.*) catch |err| {
+                    log.err("Failed to track timed-out request for removal: {}", .{err});
+                    continue;
+                };
+            }
+        }
+
+        for (to_remove.items) |key| {
+            if (self.pending_tool_requests.get(key)) |pending| {
+                // Parse the ID back from JSON and send timeout error
+                var id_parsed = std.json.parseFromSlice(std.json.Value, self.allocator, pending.mcp_request_id_json, .{}) catch {
+                    pending.deinit(self.allocator);
+                    _ = self.pending_tool_requests.remove(key);
+                    continue;
+                };
+                defer id_parsed.deinit();
+
+                self.sendToolErrorWithId(id_parsed.value, "Tool request timed out") catch {};
+                pending.deinit(self.allocator);
+            }
+            _ = self.pending_tool_requests.remove(key);
+        }
+    }
+
+    fn sendResult(self: *McpServer, id: ?std.json.Value, result: anytype) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
+        const response = mcp_types.JsonRpcResponse{
+            .id = id,
+            .result = try jsonValueFromTyped(arena.allocator(), result),
+        };
+        try self.sendTypedResponse(response);
+    }
+
+    fn sendToolResult(self: *McpServer, id: std.json.Value, json_text: []const u8) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
+        // MCP tool results must be wrapped in content array
+        const content = [_]mcp_types.ContentItem{
+            .{ .text = json_text },
+        };
+        const tool_result = mcp_types.ToolCallResult{ .content = &content };
+        const response = mcp_types.JsonRpcResponse{
+            .id = id,
+            .result = try jsonValueFromTyped(arena.allocator(), tool_result),
+        };
+        try self.sendTypedResponse(response);
+    }
+
+    fn sendToolResultOptional(self: *McpServer, id: ?std.json.Value, json_text: []const u8) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
+        // MCP tool results must be wrapped in content array
+        const content = [_]mcp_types.ContentItem{
+            .{ .text = json_text },
+        };
+        const tool_result = mcp_types.ToolCallResult{ .content = &content };
+        const response = mcp_types.JsonRpcResponse{
+            .id = id,
+            .result = try jsonValueFromTyped(arena.allocator(), tool_result),
+        };
+        try self.sendTypedResponse(response);
+    }
+
+    fn sendToolError(self: *McpServer, id: ?std.json.Value, message: []const u8) !void {
+        try self.sendToolErrorImpl(id, message);
+    }
+
+    fn sendToolErrorWithId(self: *McpServer, id: std.json.Value, message: []const u8) !void {
+        try self.sendToolErrorImpl(id, message);
+    }
+
+    fn sendToolErrorImpl(self: *McpServer, id: ?std.json.Value, message: []const u8) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
+        // MCP errors are returned as isError content per spec
+        const content = [_]mcp_types.ContentItem{
+            .{ .text = message },
+        };
+        const error_result = ToolErrorResult{
+            .content = &content,
+            .isError = true,
+        };
+
+        const response = mcp_types.JsonRpcResponse{
+            .id = id,
+            .result = try jsonValueFromTyped(arena.allocator(), error_result),
+        };
+        try self.sendTypedResponse(response);
+    }
+
+    const ToolErrorResult = struct {
+        content: []const mcp_types.ContentItem,
+        isError: bool,
+    };
+
+    fn sendError(self: *McpServer, id: ?std.json.Value, code: i32, message: []const u8) !void {
+        const response = mcp_types.JsonRpcResponse{
+            .id = id,
+            .@"error" = .{
+                .code = code,
+                .message = message,
+            },
+        };
+        try self.sendTypedResponse(response);
+    }
+
+    fn sendTypedResponse(self: *McpServer, response: mcp_types.JsonRpcResponse) !void {
+        var out: std.io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+
+        var jw: std.json.Stringify = .{
+            .writer = &out.writer,
+            .options = .{ .emit_null_optional_fields = false },
+        };
+        try jw.write(response);
+
+        const buf = try out.toOwnedSlice();
+        defer self.allocator.free(buf);
+        try self.sendWebSocketMessage(buf);
+    }
+
+    fn jsonValueFromTyped(allocator: Allocator, value: anytype) !std.json.Value {
+        var out: std.io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+
+        var jw: std.json.Stringify = .{ .writer = &out.writer };
+        try jw.write(value);
+
+        const json_str = try out.toOwnedSlice();
+        defer allocator.free(json_str);
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_str, .{});
+        // Don't deinit - caller owns the value
+        return parsed.value;
+    }
+
+    fn sendWebSocketMessage(self: *McpServer, message: []const u8) !void {
+        const client = self.client_socket orelse return error.NotConnected;
+
+        const frame = try websocket.encodeFrame(self.allocator, .text, message);
+        defer self.allocator.free(frame);
+
+        _ = try posix.write(client, frame);
+    }
+};
+
+// Tests
+const testing = std.testing;
+
+test "McpServer init and deinit" {
+    const server = try McpServer.init(testing.allocator, "/tmp");
+    defer server.deinit();
+
+    try testing.expect(server.port > 0);
+    try testing.expectEqual(@as(?posix.socket_t, null), server.client_socket);
+}
+
+test "McpServer port binding" {
+    const server1 = try McpServer.init(testing.allocator, "/tmp");
+    defer server1.deinit();
+
+    const server2 = try McpServer.init(testing.allocator, "/tmp");
+    defer server2.deinit();
+
+    // Both should get different ports
+    try testing.expect(server1.port != server2.port);
+}

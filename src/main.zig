@@ -2,6 +2,7 @@ const std = @import("std");
 const jsonrpc = @import("jsonrpc.zig");
 const Agent = @import("acp/agent.zig").Agent;
 const LspServer = @import("lsp/server.zig").Server;
+const NvimHandler = @import("nvim/handler.zig").Handler;
 const config = @import("config");
 
 const log = std.log.scoped(.banjo);
@@ -10,6 +11,7 @@ const log = std.log.scoped(.banjo);
 const Mode = enum {
     agent, // ACP agent mode (default)
     lsp, // LSP server mode
+    nvim, // Neovim handler mode
     hook_permission, // Permission hook for Claude Code
 };
 
@@ -30,6 +32,7 @@ const CliOptions = struct {
 const ArgAction = enum {
     mode_agent,
     mode_lsp,
+    mode_nvim,
     verbose,
     session_id,
     permission_mode,
@@ -39,6 +42,7 @@ const ArgAction = enum {
 const arg_map = std.StaticStringMap(ArgAction).initComptime(.{
     .{ "--agent", .mode_agent },
     .{ "--lsp", .mode_lsp },
+    .{ "--nvim", .mode_nvim },
     .{ "--verbose", .verbose },
     .{ "-v", .verbose },
     .{ "--session-id", .session_id },
@@ -73,6 +77,7 @@ fn parseArgs(allocator: std.mem.Allocator) !CliOptions {
             switch (action) {
                 .mode_agent => opts.mode = .agent,
                 .mode_lsp => opts.mode = .lsp,
+                .mode_nvim => opts.mode = .nvim,
                 .verbose => opts.verbose = true,
                 .session_id => {
                     if (args.next()) |sid| {
@@ -98,6 +103,7 @@ fn parseArgs(allocator: std.mem.Allocator) !CliOptions {
         switch (action) {
             .mode_agent => opts.mode = .agent,
             .mode_lsp => opts.mode = .lsp,
+            .mode_nvim => opts.mode = .nvim,
             .verbose => opts.verbose = true,
             .session_id => {
                 if (opts.session_id) |sid| allocator.free(sid);
@@ -145,6 +151,7 @@ fn printHelp() void {
         \\Modes:
         \\  --agent                     ACP agent mode (default)
         \\  --lsp                       LSP server mode for note stickies
+        \\  --nvim                      Neovim handler mode
         \\
         \\Hook subcommands:
         \\  hook permission             Claude Code PermissionRequest hook
@@ -412,6 +419,12 @@ pub fn main() !void {
                 };
             }
         },
+        .nvim => {
+            log.info("Banjo Neovim v{s} ({s}) starting", .{ config.version, config.git_hash });
+            var handler = NvimHandler.init(allocator, stdin, stdout);
+            defer handler.deinit();
+            try handler.run();
+        },
         .hook_permission => {
             try runPermissionHook(allocator);
         },
@@ -445,4 +458,8 @@ test {
     _ = @import("lsp/protocol.zig");
     _ = @import("lsp/diagnostics.zig");
     _ = @import("lsp/server.zig");
+
+    // Neovim handler
+    _ = @import("nvim/protocol.zig");
+    _ = @import("nvim/handler.zig");
 }

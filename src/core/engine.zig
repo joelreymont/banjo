@@ -8,6 +8,7 @@ const callbacks = @import("callbacks.zig");
 const EditorCallbacks = callbacks.EditorCallbacks;
 const ToolKind = callbacks.ToolKind;
 const ToolStatus = callbacks.ToolStatus;
+const ApprovalKind = callbacks.ApprovalKind;
 pub const StopReason = callbacks.EditorCallbacks.StopReason;
 const claude_bridge = @import("claude_bridge.zig");
 const Bridge = claude_bridge.Bridge;
@@ -154,8 +155,8 @@ pub fn processClaudeMessages(
                     const should_nudge = ctx.nudge.enabled and !ctx.cancelled.* and cooldown_ok and
                         dots.hasPendingTasks(ctx.allocator, ctx.cwd) and
                         (std.mem.eql(u8, reason, "error_max_turns") or
-                        std.mem.eql(u8, reason, "success") or
-                        std.mem.eql(u8, reason, "end_turn"));
+                            std.mem.eql(u8, reason, "success") or
+                            std.mem.eql(u8, reason, "end_turn"));
 
                     if (should_nudge) {
                         ctx.nudge.last_nudge_ms.* = now_ms;
@@ -305,9 +306,18 @@ fn isCodexMaxTurnError(err: codex_bridge.TurnError) bool {
         containsMaxTurnMarker(err.message);
 }
 
-fn exitCodeStatus(exit_code: ?i32) ToolStatus {
+fn exitCodeStatus(exit_code: ?i64) ToolStatus {
     const code = exit_code orelse return .completed;
     return if (code == 0) .completed else .failed;
+}
+
+fn mapCodexApprovalKind(kind: codex_bridge.CodexMessage.ApprovalKind) ApprovalKind {
+    return switch (kind) {
+        .command_execution => .command_execution,
+        .exec_command => .exec_command,
+        .file_change => .file_change,
+        .apply_patch => .apply_patch,
+    };
 }
 
 /// Process Codex CLI messages from an active bridge.
@@ -374,10 +384,34 @@ pub fn processCodexMessages(
             continue;
         }
 
-        if (msg.event_type == .agent_message) {
+        if (msg.event_type == .turn_started) {
             stream_prefix_pending = true;
             thought_prefix_pending = true;
             continue;
+        }
+
+        if (msg.getApprovalRequest()) |approval| {
+            const cb_kind = mapCodexApprovalKind(approval.kind);
+            // Convert RpcRequestId to json.Value for the callback
+            const request_id_json: std.json.Value = switch (approval.request_id) {
+                .integer => |id| .{ .integer = id },
+                .string => |id| .{ .string = id },
+            };
+            if (try ctx.cb.onApprovalRequest(request_id_json, cb_kind, approval.params)) |decision| {
+                bridge.respondApproval(approval.request_id, decision) catch |err| {
+                    log.warn("Failed to respond to Codex approval: {}", .{err});
+                };
+            } else {
+                // No callback or callback returned null, auto-decline
+                bridge.respondApproval(approval.request_id, "decline") catch |err| {
+                    log.warn("Failed to decline Codex approval: {}", .{err});
+                };
+            }
+            continue;
+        }
+
+        if (msg.getSessionId()) |sid| {
+            ctx.cb.onSessionId(engine, sid);
         }
 
         if (msg.getToolCall()) |tool| {
