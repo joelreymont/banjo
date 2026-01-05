@@ -23,6 +23,12 @@ local thought_blocks = {}
 local thought_buffer = nil
 local thought_start_line = nil
 
+-- Code fence tracking
+local code_blocks = {}
+local code_buffer = nil
+local code_start_line = nil
+local code_lang = nil
+
 -- History navigation state
 local history_offset = 0
 local history_temp_input = ""

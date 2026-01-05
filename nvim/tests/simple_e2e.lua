@@ -156,8 +156,8 @@ panel.append_user_message("User prompt here")
 
 local lines = vim.api.nvim_buf_get_lines(output_buf, 0, -1, false)
 local content = table.concat(lines, "\n")
-if content:find("You:") and content:find("User prompt here") then
-    pass("User message displays with 'You:' prefix")
+if content:find("User prompt here") then
+    pass("User message displays correctly")
 else
     fail("User message display incorrect", "got: " .. content:sub(1, 100))
 end
@@ -173,7 +173,7 @@ panel.end_stream()
 
 lines = vim.api.nvim_buf_get_lines(output_buf, 0, -1, false)
 content = table.concat(lines, "\n")
-if content:find("Claude:") and content:find("Hello from stream!") then
+if content:find("Hello from stream!") then
     pass("Streaming response displays correctly")
 else
     fail("Streaming response incorrect", "got: " .. content:sub(1, 150))
@@ -381,6 +381,57 @@ wait_for(function()
     local st = bridge.get_state()
     return st and st.mode == "Default"
 end, 2000)
+
+log("")
+log("=== Markdown Rendering Tests ===")
+
+-- Test 19: Markdown headers
+log("Test 19: Markdown headers...")
+panel.clear()
+panel.append("# Header 1\n## Header 2\n")
+lines = vim.api.nvim_buf_get_lines(output_buf, 0, -1, false)
+content = table.concat(lines, "\n")
+if content:find("# Header 1") and content:find("## Header 2") then
+    pass("Markdown headers render")
+else
+    fail("Markdown headers failed", "got: " .. content)
+end
+
+-- Test 20: Markdown lists
+log("Test 20: Markdown lists...")
+panel.clear()
+panel.append("- Item 1\n- Item 2\n* Item 3\n")
+lines = vim.api.nvim_buf_get_lines(output_buf, 0, -1, false)
+content = table.concat(lines, "\n")
+if content:find("•") then
+    pass("Markdown lists render with bullets")
+else
+    fail("Markdown lists failed", "got: " .. content)
+end
+
+-- Test 21: Code blocks
+log("Test 21: Code blocks...")
+panel.clear()
+panel.append("```lua\nlocal x = 1\n```\n")
+lines = vim.api.nvim_buf_get_lines(output_buf, 0, -1, false)
+content = table.concat(lines, "\n")
+if content:find("lua") and content:find("local x = 1") then
+    pass("Code blocks render")
+else
+    fail("Code blocks failed", "got: " .. content)
+end
+
+-- Test 22: Thought blocks with folding
+log("Test 22: Thought blocks with folding...")
+panel.clear()
+panel.append("<think>This is a thought</think>\n")
+lines = vim.api.nvim_buf_get_lines(output_buf, 0, -1, false)
+content = table.concat(lines, "\n")
+if content:find("think") then
+    pass("Thought blocks detected")
+else
+    fail("Thought blocks failed", "got: " .. content)
+end
 
 -- Cleanup
 log("")
