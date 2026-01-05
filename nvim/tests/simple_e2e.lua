@@ -433,6 +433,88 @@ else
     fail("Thought blocks failed", "got: " .. content)
 end
 
+log("")
+log("=== Slash Command Tests ===")
+
+-- Test 23: /clear command
+log("Test 23: /clear command...")
+panel.append("Test content")
+local commands = require("banjo.commands")
+commands.dispatch("clear", "", { panel = panel, bridge = bridge })
+lines = vim.api.nvim_buf_get_lines(output_buf, 0, -1, false)
+if #lines <= 1 or (lines[1] == "" and #lines == 1) then
+    pass("/clear clears output")
+else
+    fail("/clear failed", "buffer has " .. #lines .. " lines")
+end
+
+-- Test 24: /help command
+log("Test 24: /help command...")
+panel.clear()
+commands.dispatch("help", "", { panel = panel, bridge = bridge })
+lines = vim.api.nvim_buf_get_lines(output_buf, 0, -1, false)
+content = table.concat(lines, "\n")
+if content:find("/help") and content:find("/clear") and content:find("/model") then
+    pass("/help displays command list")
+else
+    fail("/help failed", "got: " .. content:sub(1, 100))
+end
+
+-- Test 25: /model command
+log("Test 25: /model command...")
+panel.clear()
+commands.dispatch("model", "haiku", { panel = panel, bridge = bridge })
+wait_for(function()
+    local st = bridge.get_state()
+    return st and st.model == "haiku"
+end, 2000)
+local state = bridge.get_state()
+if state and state.model == "haiku" then
+    pass("/model sets model to haiku")
+else
+    fail("/model failed", "model: " .. tostring(state and state.model))
+end
+
+-- Test 26: /mode command
+log("Test 26: /mode command...")
+commands.dispatch("mode", "accept_edits", { panel = panel, bridge = bridge })
+wait_for(function()
+    local st = bridge.get_state()
+    return st and st.mode == "Accept Edits"
+end, 2000)
+state = bridge.get_state()
+if state and state.mode == "Accept Edits" then
+    pass("/mode sets mode to Accept Edits")
+else
+    fail("/mode failed", "mode: " .. tostring(state and state.mode))
+end
+-- Reset to default
+commands.dispatch("mode", "default", { panel = panel, bridge = bridge })
+wait_for(function()
+    local st = bridge.get_state()
+    return st and st.mode == "Default"
+end, 2000)
+
+-- Test 27: /route command
+log("Test 27: /route command...")
+commands.dispatch("route", "codex", { panel = panel, bridge = bridge })
+wait_for(function()
+    local st = bridge.get_state()
+    return st and st.engine == "codex"
+end, 2000)
+state = bridge.get_state()
+if state and state.engine == "codex" then
+    pass("/route sets engine to codex")
+else
+    fail("/route failed", "engine: " .. tostring(state and state.engine))
+end
+-- Reset to claude
+commands.dispatch("route", "claude", { panel = panel, bridge = bridge })
+wait_for(function()
+    local st = bridge.get_state()
+    return st and st.engine == "claude"
+end, 2000)
+
 -- Cleanup
 log("")
 log("Cleaning up...")

@@ -218,17 +218,6 @@ local function cmd_load(args, context)
     panel.append_status(string.format("Loaded session: %s", args))
 end
 
--- Register built-in commands
-M.register("help", cmd_help)
-M.register("clear", cmd_clear)
-M.register("new", cmd_new)
-M.register("cancel", cmd_cancel)
-M.register("model", cmd_model)
-M.register("mode", cmd_mode)
-M.register("route", cmd_route)
-M.register("sessions", cmd_sessions)
-M.register("load", cmd_load)
-
 -- Parse input text into command and arguments
 -- Returns: {cmd = string, args = string} or nil if not a command
 function M.parse(text)
@@ -261,6 +250,17 @@ end
 function M.register(name, handler)
     registry[name] = handler
 end
+
+-- Register built-in commands
+M.register("help", cmd_help)
+M.register("clear", cmd_clear)
+M.register("new", cmd_new)
+M.register("cancel", cmd_cancel)
+M.register("model", cmd_model)
+M.register("mode", cmd_mode)
+M.register("route", cmd_route)
+M.register("sessions", cmd_sessions)
+M.register("load", cmd_load)
 
 -- Dispatch a command
 -- Returns: true if handled locally, false if should forward to backend
