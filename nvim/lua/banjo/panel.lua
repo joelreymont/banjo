@@ -12,6 +12,7 @@ local ns_tools = vim.api.nvim_create_namespace("banjo_tools")
 -- Streaming state
 local is_streaming = false
 local current_engine = nil
+local pending_scroll = false
 
 -- Tool tracking for in-place updates
 local tool_extmarks = {}
@@ -522,7 +523,14 @@ function M.append(text, is_thought)
         end
     end
 
-    M._scroll_to_bottom()
+    -- Defer scroll to avoid excessive updates during fast streaming
+    if not pending_scroll then
+        pending_scroll = true
+        vim.schedule(function()
+            pending_scroll = false
+            M._scroll_to_bottom()
+        end)
+    end
 end
 
 function M.append_status(msg)
