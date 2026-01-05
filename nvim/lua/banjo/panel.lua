@@ -881,24 +881,23 @@ function M._mark_lists(start_line, end_line)
             goto continue
         end
 
-        local trimmed = vim.trim(line_text)
+        -- Find list marker position (accounting for leading whitespace)
+        local indent_end = line_text:find("[^%s]") or 1
+        local after_indent = line_text:sub(indent_end)
 
         -- Unordered list: - item or * item
-        local unordered_start = trimmed:match("^([%-*])%s+")
-        if unordered_start then
-            local indent = line_text:match("^(%s*)") or ""
-            local bullet = "•"
-            local new_line = indent .. bullet .. trimmed:sub(#unordered_start + 1)
-            vim.api.nvim_buf_set_lines(output_buf, line_num, line_num + 1, false, { new_line })
+        if after_indent:match("^[%-*]%s+") then
+            -- Use virtual text to overlay the bullet
+            -- This preserves the original buffer content for copy/paste
+            vim.api.nvim_buf_set_extmark(output_buf, ns_id, line_num, indent_end - 1, {
+                end_col = indent_end, -- Cover the - or * character
+                virt_text = { { "•", "Normal" } },
+                virt_text_pos = "overlay",
+            })
             goto continue
         end
 
-        -- Ordered list: 1. item or 2. item
-        local number = trimmed:match("^(%d+)%.%s+")
-        if number then
-            -- Keep numbered lists as-is for now
-            goto continue
-        end
+        -- Ordered lists: keep as-is (numbered lists are clear enough)
 
         ::continue::
     end
