@@ -450,8 +450,24 @@ end
 function M.clear()
     if output_buf and vim.api.nvim_buf_is_valid(output_buf) then
         vim.api.nvim_buf_set_lines(output_buf, 0, -1, false, {})
+
+        -- Clear all extmark namespaces to prevent memory leak
+        vim.api.nvim_buf_clear_namespace(output_buf, ns_id, 0, -1)
+        vim.api.nvim_buf_clear_namespace(output_buf, ns_tools, 0, -1)
+        vim.api.nvim_buf_clear_namespace(output_buf, ns_links, 0, -1)
     end
+
+    -- Reset tool tracking
     tool_extmarks = {}
+
+    -- Reset thought/code tracking state to prevent memory leak and incorrect behavior
+    thought_blocks = {}
+    thought_buffer = nil
+    thought_start_line = nil
+    code_blocks = {}
+    code_buffer = nil
+    code_start_line = nil
+    code_lang = nil
 end
 
 function M.append_user_message(text)
@@ -482,6 +498,13 @@ function M.start_stream(engine)
     is_streaming = true
     current_engine = engine or "claude"
 
+    -- Reset streaming state to ensure clean slate (prevents state leakage from cancelled streams)
+    thought_buffer = nil
+    thought_start_line = nil
+    code_buffer = nil
+    code_start_line = nil
+    code_lang = nil
+
     create_output_buffer()
     create_panel()
 
@@ -497,6 +520,13 @@ function M.end_stream()
         local line_count = vim.api.nvim_buf_line_count(output_buf)
         vim.api.nvim_buf_set_lines(output_buf, line_count, line_count, false, { "" })
     end
+
+    -- Reset streaming state in case of unclosed tags
+    thought_buffer = nil
+    thought_start_line = nil
+    code_buffer = nil
+    code_start_line = nil
+    code_lang = nil
 
     M._update_status()
 end
