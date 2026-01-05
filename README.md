@@ -13,8 +13,69 @@ Banjo integrates with [Dots](https://github.com/joelreymont/dots) to automatical
 
 ## Installation
 
+### Zed
+
 1. Open Zed → Extensions → Search "Banjo Duet" → Install
 2. Open Agent Panel (`Cmd+?`) → Select "Banjo Duet"
+
+### Neovim
+
+Banjo provides a Neovim plugin that runs Claude Code or Codex via an MCP server.
+
+**Requirements:**
+- Neovim 0.9+
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed (`claude /login`)
+
+**With lazy.nvim:**
+
+```lua
+{
+  "joelreymont/banjo",
+  opts = {
+    binary_path = nil,  -- auto-detected from PATH or common locations
+    auto_start = true,
+    keymaps = true,
+    keymap_prefix = "<leader>b",
+    panel = {
+      width = 80,
+      position = "right",
+    },
+  },
+}
+```
+
+**Local development:**
+
+```lua
+{
+  dir = "/path/to/banjo/nvim",
+  opts = {
+    binary_path = "/path/to/banjo/zig-out/bin/banjo",
+    -- ... other options
+  },
+}
+```
+
+**Keymaps** (with default `<leader>b` prefix):
+
+| Key | Action |
+|-----|--------|
+| `<leader>bb` | Toggle panel |
+| `<leader>bs` | Send prompt |
+| `<leader>bv` | Send with selection (visual) |
+| `<leader>bc` | Cancel request |
+| `<leader>bn` | Toggle nudge |
+| `<leader>bh` | Show keybindings help |
+
+**Commands:**
+
+- `:BanjoToggle` — Toggle the output panel
+- `:BanjoStart` / `:BanjoStop` — Start/stop the backend
+- `:BanjoSend <prompt>` — Send a prompt
+- `:BanjoCancel` — Cancel current request
+- `:BanjoNudge` — Toggle auto-continue with dots
+- `:BanjoClear` — Clear the panel
+- `:BanjoHelp` — Show keybindings
 
 ## Features
 

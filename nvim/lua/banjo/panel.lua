@@ -78,7 +78,7 @@ function M.toggle()
 end
 
 function M.is_open()
-    return win and vim.api.nvim_win_is_valid(win)
+    return win ~= nil and vim.api.nvim_win_is_valid(win)
 end
 
 function M.clear()
