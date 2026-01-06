@@ -259,7 +259,6 @@ M.register("cancel", cmd_cancel)
 M.register("model", cmd_model)
 M.register("mode", cmd_mode)
 M.register("agent", cmd_agent)
-M.register("route", cmd_agent)  -- Backwards compatibility
 M.register("sessions", cmd_sessions)
 M.register("load", cmd_load)
 

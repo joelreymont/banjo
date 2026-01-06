@@ -346,6 +346,21 @@ describe("banjo commands", function()
 
         assert.equals(3, #models_set, "Should accept all three models")
       end)
+
+      it("shows not connected message when no bridge", function()
+        local status_lines = {}
+
+        local mock_panel = {
+          append_status = function(line)
+            table.insert(status_lines, line)
+          end
+        }
+
+        commands.dispatch("model", "opus", { panel = mock_panel })
+
+        local status = table.concat(status_lines, "\n")
+        assert.truthy(status:find("Not connected"), "Should show not connected message")
+      end)
     end)
 
     describe("/mode", function()
@@ -412,6 +427,21 @@ describe("banjo commands", function()
 
         assert.equals(4, #modes_set, "Should accept all four modes")
       end)
+
+      it("shows not connected message when no bridge", function()
+        local status_lines = {}
+
+        local mock_panel = {
+          append_status = function(line)
+            table.insert(status_lines, line)
+          end
+        }
+
+        commands.dispatch("mode", "default", { panel = mock_panel })
+
+        local status = table.concat(status_lines, "\n")
+        assert.truthy(status:find("Not connected"), "Should show not connected message")
+      end)
     end)
 
     describe("/agent", function()
@@ -477,23 +507,19 @@ describe("banjo commands", function()
         assert.equals(2, #agents_set, "Should accept both agents")
       end)
 
-      it("supports /route for backwards compatibility", function()
-        local set_engine_arg = nil
+      it("shows not connected message when no bridge", function()
+        local status_lines = {}
 
-        local mock_bridge = {
-          set_engine = function(agent)
-            set_engine_arg = agent
+        local mock_panel = {
+          append_status = function(line)
+            table.insert(status_lines, line)
           end
         }
 
-        local mock_panel = {
-          append_status = function() end,
-          _update_status = function() end
-        }
+        commands.dispatch("agent", "claude", { panel = mock_panel })
 
-        commands.dispatch("route", "claude", { bridge = mock_bridge, panel = mock_panel })
-
-        assert.equals("claude", set_engine_arg, "Should still work with /route")
+        local status = table.concat(status_lines, "\n")
+        assert.truthy(status:find("Not connected"), "Should show not connected message")
       end)
     end)
 

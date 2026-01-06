@@ -496,21 +496,21 @@ wait_for(function()
     return st and st.mode == "Default"
 end, 2000)
 
--- Test 27: /route command
-log("Test 27: /route command...")
-commands.dispatch("route", "codex", { panel = panel, bridge = bridge })
+-- Test 27: /agent command
+log("Test 27: /agent command...")
+commands.dispatch("agent", "codex", { panel = panel, bridge = bridge })
 wait_for(function()
     local st = bridge.get_state()
     return st and st.engine == "codex"
 end, 2000)
 state = bridge.get_state()
 if state and state.engine == "codex" then
-    pass("/route sets engine to codex")
+    pass("/agent sets engine to codex")
 else
-    fail("/route failed", "engine: " .. tostring(state and state.engine))
+    fail("/agent failed", "engine: " .. tostring(state and state.engine))
 end
 -- Reset to claude
-commands.dispatch("route", "claude", { panel = panel, bridge = bridge })
+commands.dispatch("agent", "claude", { panel = panel, bridge = bridge })
 wait_for(function()
     local st = bridge.get_state()
     return st and st.engine == "claude"
