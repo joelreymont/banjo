@@ -18,7 +18,7 @@ local function cmd_help(args, context)
         "  /cancel - Cancel current request",
         "  /model <name> - Set model (opus, sonnet, haiku)",
         "  /mode <name> - Set permission mode (default, accept_edits, auto_approve, plan_only)",
-        "  /route <engine> - Switch engine (claude, codex)",
+        "  /agent <name> - Switch agent (claude, codex)",
         "  /sessions - List saved sessions",
         "  /load <id> - Restore a saved session",
         "",
@@ -142,29 +142,29 @@ local function cmd_mode(args, context)
     end
 end
 
-local function cmd_route(args, context)
+local function cmd_agent(args, context)
     local bridge = context.bridge
     local panel = context.panel
 
     if not args or args == "" then
         if panel then
-            panel.append_status("Usage: /route <claude|codex>")
+            panel.append_status("Usage: /agent <claude|codex>")
         end
         return
     end
 
-    local engine = args:lower()
-    if engine ~= "claude" and engine ~= "codex" then
+    local agent = args:lower()
+    if agent ~= "claude" and agent ~= "codex" then
         if panel then
-            panel.append_status("Invalid engine. Use: claude or codex")
+            panel.append_status("Invalid agent. Use: claude or codex")
         end
         return
     end
 
     if bridge and bridge.set_engine then
-        bridge.set_engine(engine)
+        bridge.set_engine(agent)
         if panel then
-            panel.append_status("Engine: " .. engine)
+            panel.append_status("Agent: " .. agent)
             panel._update_status()
         end
     else
@@ -258,7 +258,8 @@ M.register("new", cmd_new)
 M.register("cancel", cmd_cancel)
 M.register("model", cmd_model)
 M.register("mode", cmd_mode)
-M.register("route", cmd_route)
+M.register("agent", cmd_agent)
+M.register("route", cmd_agent)  -- Backwards compatibility
 M.register("sessions", cmd_sessions)
 M.register("load", cmd_load)
 

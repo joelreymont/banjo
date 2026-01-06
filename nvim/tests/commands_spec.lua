@@ -414,14 +414,14 @@ describe("banjo commands", function()
       end)
     end)
 
-    describe("/route", function()
-      it("sets engine when valid", function()
+    describe("/agent", function()
+      it("sets agent when valid", function()
         local set_engine_arg = nil
         local status_lines = {}
 
         local mock_bridge = {
-          set_engine = function(engine)
-            set_engine_arg = engine
+          set_engine = function(agent)
+            set_engine_arg = agent
           end
         }
 
@@ -432,15 +432,15 @@ describe("banjo commands", function()
           _update_status = function() end
         }
 
-        commands.dispatch("route", "codex", { bridge = mock_bridge, panel = mock_panel })
+        commands.dispatch("agent", "codex", { bridge = mock_bridge, panel = mock_panel })
 
-        assert.equals("codex", set_engine_arg, "Should set engine")
+        assert.equals("codex", set_engine_arg, "Should set agent")
 
         local status = table.concat(status_lines, "\n")
-        assert.truthy(status:find("Engine: codex"), "Should show engine confirmation")
+        assert.truthy(status:find("Agent: codex"), "Should show agent confirmation")
       end)
 
-      it("validates engine names", function()
+      it("validates agent names", function()
         local status_lines = {}
 
         local mock_panel = {
@@ -449,18 +449,18 @@ describe("banjo commands", function()
           end
         }
 
-        commands.dispatch("route", "invalid", { panel = mock_panel })
+        commands.dispatch("agent", "invalid", { panel = mock_panel })
 
         local status = table.concat(status_lines, "\n")
-        assert.truthy(status:find("Invalid engine"), "Should reject invalid engine")
+        assert.truthy(status:find("Invalid agent"), "Should reject invalid agent")
       end)
 
-      it("accepts all valid engines", function()
-        local engines_set = {}
+      it("accepts all valid agents", function()
+        local agents_set = {}
 
         local mock_bridge = {
-          set_engine = function(engine)
-            table.insert(engines_set, engine)
+          set_engine = function(agent)
+            table.insert(agents_set, agent)
           end
         }
 
@@ -471,10 +471,29 @@ describe("banjo commands", function()
 
         local context = { bridge = mock_bridge, panel = mock_panel }
 
-        commands.dispatch("route", "claude", context)
-        commands.dispatch("route", "codex", context)
+        commands.dispatch("agent", "claude", context)
+        commands.dispatch("agent", "codex", context)
 
-        assert.equals(2, #engines_set, "Should accept both engines")
+        assert.equals(2, #agents_set, "Should accept both agents")
+      end)
+
+      it("supports /route for backwards compatibility", function()
+        local set_engine_arg = nil
+
+        local mock_bridge = {
+          set_engine = function(agent)
+            set_engine_arg = agent
+          end
+        }
+
+        local mock_panel = {
+          append_status = function() end,
+          _update_status = function() end
+        }
+
+        commands.dispatch("route", "claude", { bridge = mock_bridge, panel = mock_panel })
+
+        assert.equals("claude", set_engine_arg, "Should still work with /route")
       end)
     end)
 
