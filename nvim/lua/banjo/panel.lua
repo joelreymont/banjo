@@ -846,10 +846,20 @@ function M._build_status(panel_state)
         table.insert(parts, bridge_state.model)
     end
 
-    -- Mode (only show if not default)
-    if bridge_state.mode and bridge_state.mode ~= "Default" then
-        table.insert(parts, string.format("(%s)", bridge_state.mode))
-    end
+    -- Mode (always show)
+    local mode = bridge_state.mode or "default"
+    local mode_display = {
+        default = "Default",
+        accept_edits = "Accept Edits",
+        auto_approve = "Auto Approve",
+        plan_only = "Plan",
+        -- Handle capitalized versions from backend
+        Default = "Default",
+        ["Accept Edits"] = "Accept Edits",
+        ["Auto Approve"] = "Auto Approve",
+        Plan = "Plan",
+    }
+    table.insert(parts, string.format("(%s)", mode_display[mode] or mode))
 
     -- Streaming indicator
     if panel_state.is_streaming then
