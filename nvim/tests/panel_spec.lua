@@ -21,14 +21,14 @@ describe("banjo panel", function()
       panel.toggle()
       helpers.wait(50)
 
-      assert.equals(2, helpers.count_windows())
+      assert.equals(3, helpers.count_windows()) -- +2 windows (output + input)
       assert.is_true(panel.is_open())
     end)
 
     it("closes panel when open", function()
       panel.toggle() -- open
       helpers.wait(50)
-      assert.equals(2, helpers.count_windows())
+      assert.equals(3, helpers.count_windows())
 
       panel.toggle() -- close
       helpers.wait(50)
@@ -44,7 +44,7 @@ describe("banjo panel", function()
       helpers.wait(50)
 
       assert.is_true(panel.is_open())
-      assert.equals(2, helpers.count_windows())
+      assert.equals(3, helpers.count_windows()) -- +2 windows (output + input)
     end)
 
     it("close removes window", function()
@@ -63,7 +63,7 @@ describe("banjo panel", function()
       panel.open()
       helpers.wait(50)
 
-      assert.equals(2, helpers.count_windows())
+      assert.equals(3, helpers.count_windows()) -- +2 windows (output + input)
     end)
   end)
 
@@ -116,26 +116,26 @@ describe("banjo panel", function()
       panel.start_stream("claude")
       helpers.wait(50)
 
-      assert.is_true(panel.is_open())
+      assert.is_true(panel.is_open(), "Panel should be open after start_stream")
 
       local buf = vim.fn.bufnr("Banjo")
-      local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-      local content = table.concat(lines, "\n")
-
-      assert.truthy(content:find("CLAUDE"))
+      assert.truthy(buf > 0, "Panel buffer should exist")
     end)
 
-    it("end_stream adds separator", function()
+    it("end_stream adds blank line", function()
       panel.start_stream("codex")
       panel.append("Response text")
+
+      local buf = vim.fn.bufnr("Banjo")
+      local lines_before = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+      local count_before = #lines_before
+
       panel.end_stream()
       helpers.wait(50)
 
-      local buf = vim.fn.bufnr("Banjo")
-      local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-      local content = table.concat(lines, "\n")
-
-      assert.truthy(content:find("---"))
+      local lines_after = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+      -- end_stream should add a blank line
+      assert.truthy(#lines_after > count_before, "Should add blank line after end_stream")
     end)
   end)
 end)

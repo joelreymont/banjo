@@ -8,7 +8,7 @@ describe("Banjo Panel", function()
     local bridge
 
     -- Setup before tests
-    before_each = function()
+    before_each(function()
         env = helpers.setup_test_env()
 
         -- Require modules fresh
@@ -19,10 +19,10 @@ describe("Banjo Panel", function()
         banjo = require("banjo")
         panel = require("banjo.panel")
         bridge = require("banjo.bridge")
-    end
+    end)
 
     -- Cleanup after tests
-    after_each = function()
+    after_each(function()
         if bridge then
             pcall(bridge.stop)
         end
@@ -32,7 +32,7 @@ describe("Banjo Panel", function()
         if env then
             env.cleanup()
         end
-    end
+    end)
 
     it("creates panel window when opened", function()
         -- Setup banjo without auto-start
@@ -115,7 +115,7 @@ describe("Banjo Bridge", function()
     local banjo
     local bridge
 
-    before_each = function()
+    before_each(function()
         env = helpers.setup_test_env()
 
         package.loaded["banjo"] = nil
@@ -124,16 +124,16 @@ describe("Banjo Bridge", function()
 
         banjo = require("banjo")
         bridge = require("banjo.bridge")
-    end
+    end)
 
-    after_each = function()
+    after_each(function()
         if bridge then
             pcall(bridge.stop)
         end
         if env then
             env.cleanup()
         end
-    end
+    end)
 
     it("starts and connects to backend", function()
         if not env.binary then
@@ -197,7 +197,7 @@ describe("Banjo Integration", function()
     local bridge
     local panel
 
-    before_each = function()
+    before_each(function()
         env = helpers.setup_test_env()
 
         package.loaded["banjo"] = nil
@@ -207,9 +207,9 @@ describe("Banjo Integration", function()
         banjo = require("banjo")
         bridge = require("banjo.bridge")
         panel = require("banjo.panel")
-    end
+    end)
 
-    after_each = function()
+    after_each(function()
         if bridge then
             pcall(bridge.stop)
         end
@@ -219,7 +219,7 @@ describe("Banjo Integration", function()
         if env then
             env.cleanup()
         end
-    end
+    end)
 
     it("shows streaming output in panel", function()
         if not env.binary then

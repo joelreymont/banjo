@@ -107,6 +107,18 @@ function M.get_windows()
     return windows
 end
 
+-- Count valid windows
+---@return number count Number of valid windows
+function M.count_windows()
+    local count = 0
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+        if vim.api.nvim_win_is_valid(win) then
+            count = count + 1
+        end
+    end
+    return count
+end
+
 -- Find the banjo panel window
 ---@return table|nil window Panel window info or nil
 function M.find_panel_window()
@@ -160,7 +172,15 @@ end
 
 -- Cleanup function for tests
 function M.cleanup()
-    -- Close all Banjo windows and delete buffers
+    -- Clean up panel state for all tabs FIRST (before deleting buffers)
+    local panel_ok, panel = pcall(require, "banjo.panel")
+    if panel_ok and panel.cleanup_tab then
+        for _, tab in ipairs(vim.api.nvim_list_tabpages()) do
+            pcall(panel.cleanup_tab, tab)
+        end
+    end
+
+    -- Close all Banjo windows
     for _, win in ipairs(vim.api.nvim_list_wins()) do
         if vim.api.nvim_win_is_valid(win) then
             local buf = vim.api.nvim_win_get_buf(win)
@@ -171,21 +191,24 @@ function M.cleanup()
         end
     end
 
-    -- Delete all Banjo buffers
+    -- Delete all Banjo buffers (force delete to bypass E89)
     for _, buf in ipairs(vim.api.nvim_list_bufs()) do
         if vim.api.nvim_buf_is_valid(buf) then
             local bufname = vim.api.nvim_buf_get_name(buf)
             if bufname:match("Banjo") then
-                pcall(vim.api.nvim_buf_delete, buf, { force = true })
+                vim.api.nvim_buf_set_option(buf, "modified", false)
+                pcall(vim.api.nvim_buf_delete, buf, { force = true, unload = false })
             end
         end
     end
 
-    -- Clean up panel state for all tabs
-    local panel_ok, panel = pcall(require, "banjo.panel")
-    if panel_ok and panel.cleanup_tab then
-        for _, tab in ipairs(vim.api.nvim_list_tabpages()) do
-            pcall(panel.cleanup_tab, tab)
+    -- Wipe any remaining unlisted buffers with Banjo in name
+    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_valid(buf) then
+            local bufname = vim.api.nvim_buf_get_name(buf)
+            if bufname:match("Banjo") then
+                pcall(vim.cmd, "bwipeout! " .. buf)
+            end
         end
     end
 end

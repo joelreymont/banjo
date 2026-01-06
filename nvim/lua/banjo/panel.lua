@@ -1122,4 +1122,7 @@ function M.cleanup_tab(tabid)
     states[tabid] = nil
 end
 
+-- Expose for testing
+M._get_state = get_state
+
 return M
