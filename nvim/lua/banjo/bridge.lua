@@ -226,55 +226,13 @@ function M._connect_websocket(port, tabid)
             end
         end,
         on_connect = function()
-            local my_b = bridges[my_tabid]
-            if not my_b or not vim.api.nvim_tabpage_is_valid(my_tabid) then return end
-            -- Reset reconnection state on successful connect
-            my_b.reconnect.attempt = 0
-            vim.notify("Banjo: Connected", vim.log.levels.INFO)
+            vim.schedule(function()
+                local my_b = bridges[my_tabid]
+                if not my_b or not vim.api.nvim_tabpage_is_valid(my_tabid) then return end
+                -- Reset reconnection state on successful connect
+                my_b.reconnect.attempt = 0
+                vim.notify("Banjo: Connected", vim.log.levels.INFO)
 
-            -- Switch to correct tab for panel operations
-            local current_tab = vim.api.nvim_get_current_tabpage()
-            local need_switch = current_tab ~= my_tabid
-            if need_switch then
-                vim.api.nvim_set_current_tabpage(my_tabid)
-            end
-
-            panel._update_status()
-            -- Restore preserved input if any
-            if my_b.preserved.input_text and my_b.preserved.input_text ~= "" then
-                panel.set_input_text(my_b.preserved.input_text)
-                my_b.preserved.input_text = nil
-            end
-
-            -- Restore original tab
-            if need_switch and vim.api.nvim_tabpage_is_valid(current_tab) then
-                vim.api.nvim_set_current_tabpage(current_tab)
-            end
-        end,
-        on_disconnect = function(code, reason)
-            vim.notify("Banjo: Disconnected (" .. code .. ")", vim.log.levels.WARN)
-            local my_b = bridges[my_tabid]
-            if my_b then
-                my_b.client = nil
-                -- Switch to correct tab for panel operations
-                local current_tab = vim.api.nvim_get_current_tabpage()
-                local need_switch = current_tab ~= my_tabid
-                if need_switch and vim.api.nvim_tabpage_is_valid(my_tabid) then
-                    vim.api.nvim_set_current_tabpage(my_tabid)
-                end
-
-                panel._update_status()
-
-                -- Restore original tab
-                if need_switch and vim.api.nvim_tabpage_is_valid(current_tab) then
-                    vim.api.nvim_set_current_tabpage(current_tab)
-                end
-            end
-            -- WebSocket reconnection is handled by process restart
-        end,
-        on_error = function(err)
-            vim.notify("Banjo: " .. err, vim.log.levels.ERROR)
-            if bridges[my_tabid] and vim.api.nvim_tabpage_is_valid(my_tabid) then
                 -- Switch to correct tab for panel operations
                 local current_tab = vim.api.nvim_get_current_tabpage()
                 local need_switch = current_tab ~= my_tabid
@@ -283,12 +241,60 @@ function M._connect_websocket(port, tabid)
                 end
 
                 panel._update_status()
+                -- Restore preserved input if any
+                if my_b.preserved.input_text and my_b.preserved.input_text ~= "" then
+                    panel.set_input_text(my_b.preserved.input_text)
+                    my_b.preserved.input_text = nil
+                end
 
                 -- Restore original tab
                 if need_switch and vim.api.nvim_tabpage_is_valid(current_tab) then
                     vim.api.nvim_set_current_tabpage(current_tab)
                 end
-            end
+            end)
+        end,
+        on_disconnect = function(code, reason)
+            vim.schedule(function()
+                vim.notify("Banjo: Disconnected (" .. code .. ")", vim.log.levels.WARN)
+                local my_b = bridges[my_tabid]
+                if my_b then
+                    my_b.client = nil
+                    -- Switch to correct tab for panel operations
+                    local current_tab = vim.api.nvim_get_current_tabpage()
+                    local need_switch = current_tab ~= my_tabid
+                    if need_switch and vim.api.nvim_tabpage_is_valid(my_tabid) then
+                        vim.api.nvim_set_current_tabpage(my_tabid)
+                    end
+
+                    panel._update_status()
+
+                    -- Restore original tab
+                    if need_switch and vim.api.nvim_tabpage_is_valid(current_tab) then
+                        vim.api.nvim_set_current_tabpage(current_tab)
+                    end
+                end
+                -- WebSocket reconnection is handled by process restart
+            end)
+        end,
+        on_error = function(err)
+            vim.schedule(function()
+                vim.notify("Banjo: " .. err, vim.log.levels.ERROR)
+                if bridges[my_tabid] and vim.api.nvim_tabpage_is_valid(my_tabid) then
+                    -- Switch to correct tab for panel operations
+                    local current_tab = vim.api.nvim_get_current_tabpage()
+                    local need_switch = current_tab ~= my_tabid
+                    if need_switch then
+                        vim.api.nvim_set_current_tabpage(my_tabid)
+                    end
+
+                    panel._update_status()
+
+                    -- Restore original tab
+                    if need_switch and vim.api.nvim_tabpage_is_valid(current_tab) then
+                        vim.api.nvim_set_current_tabpage(current_tab)
+                    end
+                end
+            end)
         end,
     })
 

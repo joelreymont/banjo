@@ -26,18 +26,21 @@ describe("banjo bridge", function()
   describe("message handling", function()
     it("handles invalid JSON gracefully", function()
       -- Should not error
-      bridge._on_stdout({ "not valid json" })
+      local tabid = vim.api.nvim_get_current_tabpage()
+      bridge._on_stdout({ "not valid json" }, tabid)
     end)
 
     it("handles empty data", function()
-      bridge._on_stdout({ "" })
+      local tabid = vim.api.nvim_get_current_tabpage()
+      bridge._on_stdout({ "" }, tabid)
     end)
 
     it("handles partial JSON lines", function()
+      local tabid = vim.api.nvim_get_current_tabpage()
       -- First chunk
-      bridge._on_stdout({ '{"method":' })
+      bridge._on_stdout({ '{"method":' }, tabid)
       -- Second chunk completes the line
-      bridge._on_stdout({ '"test"}\n' })
+      bridge._on_stdout({ '"test"}\n' }, tabid)
       -- Should have processed without error
     end)
   end)
