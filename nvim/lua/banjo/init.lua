@@ -112,7 +112,9 @@ function M.start()
         return
     end
 
-    bridge.start(config.binary_path, vim.fn.getcwd())
+    -- Use tab-local CWD (-1 = current tab, 0 = any window in tab)
+    local cwd = vim.fn.getcwd(-1, 0)
+    bridge.start(config.binary_path, cwd)
 end
 
 function M.stop()
