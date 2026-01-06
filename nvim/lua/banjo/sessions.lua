@@ -25,13 +25,18 @@ function M.save(id, data)
     end
 
     local file = io.open(file_path, "w")
-    if file then
-        file:write(json)
-        file:close()
-        return true
+    if not file then
+        return false
     end
 
-    return false
+    local write_ok, write_err = file:write(json)
+    file:close()
+
+    if not write_ok then
+        return false
+    end
+
+    return true
 end
 
 -- Load session data from disk

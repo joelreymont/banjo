@@ -41,9 +41,9 @@ end
 
 local function cmd_clear(args, context)
     local panel = context.panel
-    if panel then
-        panel.clear()
-    end
+    if not panel then return end
+
+    panel.clear()
 end
 
 local function cmd_new(args, context)

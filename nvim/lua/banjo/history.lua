@@ -65,10 +65,12 @@ function M.save()
     end
 
     local file = io.open(history_file, "w")
-    if file then
-        file:write(json)
-        file:close()
+    if not file then
+        return
     end
+
+    file:write(json)
+    file:close()
 end
 
 -- Load history from disk
