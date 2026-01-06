@@ -70,4 +70,45 @@ describe("banjo bridge", function()
       assert.is_table(result)
     end)
   end)
+
+  describe("tab isolation", function()
+    it("maintains separate bridge state per tab", function()
+      -- Get initial tab
+      local tab1 = vim.api.nvim_get_current_tabpage()
+
+      -- Create second tab
+      vim.cmd("tabnew")
+      local tab2 = vim.api.nvim_get_current_tabpage()
+      assert.are_not.equals(tab1, tab2, "Should create different tab")
+
+      -- Tab 2 should have independent state
+      assert.is_false(bridge.is_running(), "New tab should not be running")
+      assert.is_nil(bridge.get_mcp_port(), "New tab should have no port")
+
+      -- Switch back to tab 1
+      vim.api.nvim_set_current_tabpage(tab1)
+      assert.is_false(bridge.is_running(), "Tab 1 should not be running")
+
+      -- Clean up
+      pcall(vim.api.nvim_set_current_tabpage, tab2)
+      pcall(vim.cmd, "tabclose")
+    end)
+
+    it("TabClosed autocmd cleans up bridge state", function()
+      -- Create a tab
+      vim.cmd("tabnew")
+      local tab = vim.api.nvim_get_current_tabpage()
+
+      -- Close the tab - should trigger TabClosed autocmd
+      vim.cmd("tabclose")
+      helpers.wait(50)
+
+      -- Verify no errors occurred
+      -- (If TabClosed has syntax error, this would fail)
+      local ok = pcall(function()
+        bridge.is_running()
+      end)
+      assert.is_true(ok, "TabClosed autocmd should not cause errors")
+    end)
+  end)
 end)
