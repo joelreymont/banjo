@@ -73,7 +73,7 @@ local function create_output_buffer()
     vim.api.nvim_set_option_value("buftype", "nofile", { buf = state.output_buf })
     vim.api.nvim_set_option_value("bufhidden", "hide", { buf = state.output_buf })
     vim.api.nvim_set_option_value("swapfile", false, { buf = state.output_buf })
-    vim.api.nvim_set_option_value("filetype", "markdown", { buf = state.output_buf })
+    vim.api.nvim_set_option_value("filetype", "banjo_output", { buf = state.output_buf })
     vim.api.nvim_set_option_value("modifiable", true, { buf = state.output_buf })
 
     -- Use per-tab buffer name to support multiple tabs
@@ -167,9 +167,11 @@ local function setup_input_keymaps()
         end
     end, { buffer = state.input_buf, noremap = true })
 
-    -- Escape to leave insert mode and focus output
-    vim.keymap.set("i", "<Esc>", function()
-        vim.cmd("stopinsert")
+    -- Escape to leave insert mode (standard vim behavior)
+    vim.keymap.set("i", "<Esc>", "<Esc>", { buffer = state.input_buf, noremap = true })
+
+    -- 'o' to focus output (mirrors 'i' in output to focus input)
+    vim.keymap.set("n", "o", function()
         if state.output_win and vim.api.nvim_win_is_valid(state.output_win) then
             vim.api.nvim_set_current_win(state.output_win)
         end
@@ -752,7 +754,7 @@ end
 
 -- Tool display
 
-function M.show_tool_call(name, label)
+function M.show_tool_call(id, name, label)
     local state = get_state()
     if not state.output_buf or not vim.api.nvim_buf_is_valid(state.output_buf) then
         return
@@ -767,9 +769,11 @@ function M.show_tool_call(name, label)
     local line_count = vim.api.nvim_buf_line_count(state.output_buf)
     vim.api.nvim_buf_set_lines(state.output_buf, line_count, line_count, false, { line })
 
-    -- Store extmark for later update
-    local mark_id = vim.api.nvim_buf_set_extmark(state.output_buf, ns_tools, line_count, 0, {})
-    state.tool_extmarks[name .. "_" .. label] = { mark_id = mark_id, line = line_count }
+    -- Store extmark for later update, keyed by tool_id from backend
+    if id then
+        local mark_id = vim.api.nvim_buf_set_extmark(state.output_buf, ns_tools, line_count, 0, {})
+        state.tool_extmarks[id] = { mark_id = mark_id, line = line_count }
+    end
 
     M._scroll_to_bottom()
 end
@@ -804,11 +808,8 @@ function M.show_tool_result(id, status)
         end
     end
 
-    -- Fallback: append new line
-    local line = string.format("  [%s] %s", icon, id or "")
-    local line_count = vim.api.nvim_buf_line_count(state.output_buf)
-    vim.api.nvim_buf_set_lines(state.output_buf, line_count, line_count, false, { line })
-
+    -- Fallback: append new line (don't show raw tool IDs)
+    -- This shouldn't happen if tool_call was received first, but handle gracefully
     M._scroll_to_bottom()
 end
 
@@ -876,9 +877,6 @@ function M._build_status(panel_state)
     end
 
     table.insert(parts, "%=")
-
-    -- Help hint
-    table.insert(parts, "%#Comment#Ctrl-C:cancel q:close%*")
 
     return table.concat(parts, " ")
 end

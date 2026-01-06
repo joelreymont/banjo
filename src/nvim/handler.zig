@@ -433,7 +433,10 @@ pub const Handler = struct {
                 var bridge = claude_bridge.Bridge.init(self.allocator, prompt_ctx.cwd);
                 defer bridge.deinit();
 
-                bridge.start(.{}) catch |err| {
+                bridge.start(.{
+                    .permission_mode = self.permission_mode.toCliArg(),
+                    .model = self.current_model,
+                }) catch |err| {
                     log.err("Failed to start Claude bridge: {}", .{err});
                     try self.sendError("Failed to start Claude");
                     return;

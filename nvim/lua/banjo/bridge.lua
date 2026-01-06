@@ -404,9 +404,10 @@ function M._handle_message(msg, tabid)
     elseif method == "stream_end" then
         panel.end_stream()
     elseif method == "tool_call" then
+        local id = msg.params and msg.params.id
         local name = msg.params and msg.params.name or "?"
         local label = msg.params and msg.params.label or ""
-        panel.show_tool_call(name, label)
+        panel.show_tool_call(id, name, label)
     elseif method == "tool_result" then
         local id = msg.params and msg.params.id
         local status = msg.params and msg.params.status

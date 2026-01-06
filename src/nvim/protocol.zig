@@ -26,6 +26,16 @@ pub const PermissionMode = enum {
             .plan_only => "--plan",
         };
     }
+
+    /// Returns the value for --permission-mode CLI arg, or null for default
+    pub fn toCliArg(self: PermissionMode) ?[]const u8 {
+        return switch (self) {
+            .default => null,
+            .accept_edits => "acceptEdits",
+            .auto_approve => "bypassPermissions",
+            .plan_only => "plan",
+        };
+    }
 };
 
 // Request from Lua to Zig
