@@ -44,42 +44,20 @@ describe("banjo integration", function()
       return
     end
     it("starts binary and receives ready notification", function()
-      local ready_received = false
-
-      -- Initialize bridge state for current tab
-      bridge.get_state()
-      local mcp_port = nil
-
-      -- Initialize bridge state for current tab
-      bridge.get_state()
-
-      -- Hook into _handle_message to capture ready
-      local orig_handle = bridge._handle_message
-      bridge._handle_message = function(msg, tabid)
-        if msg.method == "ready" then
-          ready_received = true
-          if msg.params and msg.params.mcp_port then
-            mcp_port = msg.params.mcp_port
-          end
-        end
-        return orig_handle(msg, tabid)
-      end
-
       bridge.start(vim.g.banjo_test_binary, test_cwd)
 
-      -- Wait for ready notification (up to 15 seconds)
+      -- Wait for backend to be running and MCP port to be set (ready notification received)
       local ok = helpers.wait_for(function()
-        return ready_received
+        return bridge.is_running() and bridge.get_mcp_port() ~= nil
       end, 15000)
 
-      bridge._handle_message = orig_handle
-
-      assert.is_true(ok, "Should receive ready notification")
+      assert.is_true(ok, "Backend should start and send ready notification")
       assert.is_true(bridge.is_running(), "Bridge should be running")
+
+      local mcp_port = bridge.get_mcp_port()
       assert.is_not_nil(mcp_port, "Should receive MCP port")
       assert.truthy(mcp_port > 0, "MCP port should be positive")
     end)
-
     it("is_running returns true after start", function()
       bridge.start(vim.g.banjo_test_binary, test_cwd)
 
