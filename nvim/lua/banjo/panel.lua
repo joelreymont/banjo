@@ -1072,4 +1072,28 @@ function M.get_input_win()
     return state.input_win
 end
 
+function M.cleanup_tab(tabid)
+    if not states[tabid] then
+        return
+    end
+
+    local state = states[tabid]
+
+    -- Stop session timer
+    if state.session_timer then
+        state.session_timer:stop()
+        state.session_timer:close()
+    end
+
+    -- Clear extmarks
+    if state.output_buf and vim.api.nvim_buf_is_valid(state.output_buf) then
+        vim.api.nvim_buf_clear_namespace(state.output_buf, ns_id, 0, -1)
+        vim.api.nvim_buf_clear_namespace(state.output_buf, ns_tools, 0, -1)
+        vim.api.nvim_buf_clear_namespace(state.output_buf, ns_links, 0, -1)
+    end
+
+    -- Remove state
+    states[tabid] = nil
+end
+
 return M

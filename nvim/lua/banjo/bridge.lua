@@ -106,6 +106,34 @@ function M.start(binary_path, cwd)
             M.stop()
         end,
     })
+
+    -- Cleanup per-tab resources on tab close
+    vim.api.nvim_create_autocmd("TabClosed", {
+        callback = function(ev)
+            local tabid = tonumber(ev.match)
+            if tabid and bridges[tabid] then
+                -- Stop backend for this tab
+                local old_b = bridges[tabid]
+                if old_b.reconnect.timer then
+                    old_b.reconnect.timer:stop()
+                    old_b.reconnect.timer:close()
+                end
+                if old_b.client then
+                    ws_client.close(old_b.client)
+                end
+                if old_b.job_id then
+                    vim.fn.jobstop(old_b.job_id)
+                end
+                if old_b.autocmd_group then
+                    vim.api.nvim_del_augroup_by_id(old_b.autocmd_group)
+                end
+                bridges[tabid] = nil
+
+                -- Cleanup panel state for this tab
+                panel.cleanup_tab(tabid)
+            end
+        end,
+    })
 end
 
 function M.stop()
