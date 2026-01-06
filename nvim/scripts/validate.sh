@@ -33,9 +33,9 @@ fi
 echo "✓ Syntax checks passed"
 echo ""
 
-# Run unit tests with plenary
+# Run unit tests with plenary (skip integration tests that need backend binary)
 echo "Running unit tests..."
-nvim -l scripts/run_tests.lua
+nvim --headless -c "lua vim.g.banjo_test_binary = nil" -l scripts/run_tests.lua
 result=$?
 
 if [ $result -eq 0 ]; then
