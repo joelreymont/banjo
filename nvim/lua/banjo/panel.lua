@@ -762,44 +762,44 @@ end
 -- Status line
 
 function M._build_status()
-    local state = get_state()
+    local panel_state = get_state()
     local parts = {}
 
     -- Connection status
-    local connected = state.bridge and state.bridge.is_running and state.bridge.is_running()
+    local connected = panel_state.bridge and panel_state.bridge.is_running and panel_state.bridge.is_running()
     if connected then
         table.insert(parts, "%#DiagnosticOk#●%*")
     else
-        local state = state.bridge and state.bridge.get_state and state.bridge.get_state() or {}
-        if state.reconnect_attempt and state.reconnect_attempt > 0 then
-            table.insert(parts, string.format("%%#DiagnosticWarn#○(%d)%%*", state.reconnect_attempt))
+        local bridge_state = panel_state.bridge and panel_state.bridge.get_state and panel_state.bridge.get_state() or {}
+        if bridge_state.reconnect_attempt and bridge_state.reconnect_attempt > 0 then
+            table.insert(parts, string.format("%%#DiagnosticWarn#○(%d)%%*", bridge_state.reconnect_attempt))
         else
             table.insert(parts, "%#DiagnosticError#○%*")
         end
     end
 
-    -- Get state from state.bridge
-    local state = state.bridge and state.bridge.get_state and state.bridge.get_state() or {}
+    -- Get bridge state
+    local bridge_state = panel_state.bridge and panel_state.bridge.get_state and panel_state.bridge.get_state() or {}
 
     -- Engine
-    local engine = state.engine or state.current_engine
+    local engine = bridge_state.engine or panel_state.current_engine
     if engine then
         local engine_name = engine:sub(1, 1):upper() .. engine:sub(2):lower()
         table.insert(parts, string.format("[%s]", engine_name))
     end
 
     -- Model
-    if state.model then
-        table.insert(parts, state.model)
+    if bridge_state.model then
+        table.insert(parts, bridge_state.model)
     end
 
     -- Mode (only show if not default)
-    if state.mode and state.mode ~= "Default" then
-        table.insert(parts, string.format("(%s)", state.mode))
+    if bridge_state.mode and bridge_state.mode ~= "Default" then
+        table.insert(parts, string.format("(%s)", bridge_state.mode))
     end
 
     -- Streaming indicator
-    if state.is_streaming then
+    if panel_state.is_streaming then
         table.insert(parts, "%#DiagnosticInfo#...%*")
     end
 
