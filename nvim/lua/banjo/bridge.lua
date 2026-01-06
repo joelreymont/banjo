@@ -64,12 +64,12 @@ function M.start(binary_path, cwd)
     b.job_id = vim.fn.jobstart({ binary_path, "--nvim" }, {
         cwd = cwd,
         stdout_buffered = false,
-        on_stdout = function(_, data)
+        on_stdout = vim.schedule_wrap(function(_, data)
             M._on_stdout(data, my_tabid)
-        end,
-        on_exit = function(_, code)
+        end),
+        on_exit = vim.schedule_wrap(function(_, code)
             M._on_exit(code, my_tabid)
-        end,
+        end),
     })
 
     if b.job_id <= 0 then

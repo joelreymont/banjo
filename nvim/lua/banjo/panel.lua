@@ -1107,6 +1107,10 @@ function M.cleanup_tab(tabid)
         state.session_timer:close()
     end
 
+    -- Delete autocmd group
+    local group_name = string.format("BanjoOutput_%d_%d", tabid, state.output_buf)
+    pcall(vim.api.nvim_del_augroup_by_name, group_name)
+
     -- Clear extmarks
     if state.output_buf and vim.api.nvim_buf_is_valid(state.output_buf) then
         vim.api.nvim_buf_clear_namespace(state.output_buf, ns_id, 0, -1)

@@ -64,19 +64,17 @@ function M.connect(client, host, port, path, timeout_ms)
     local timed_out = false
 
     if timeout_timer then
-        timeout_timer:start(timeout_ms, 0, function()
+        timeout_timer:start(timeout_ms, 0, vim.schedule_wrap(function()
             if client.state == "connecting" then
                 timed_out = true
                 client.state = "closed"
-                vim.schedule(function()
-                    client.on_error("Connection timeout after " .. timeout_ms .. "ms")
-                end)
+                client.on_error("Connection timeout after " .. timeout_ms .. "ms")
                 if tcp and not tcp:is_closing() then
                     tcp:close()
                 end
             end
             timeout_timer:close()
-        end)
+        end))
     end
 
     tcp:connect(host, port, function(err)
