@@ -202,28 +202,30 @@ function M._connect_websocket(port, tabid)
     local my_tabid = tabid
     b.client = ws_client.new({
         on_message = function(message)
-            local ok, msg = pcall(vim.json.decode, message)
-            if ok then
-                M._handle_message(msg, my_tabid)
-            else
-                vim.notify("Banjo: Failed to parse WebSocket message", vim.log.levels.ERROR)
-                local my_b = bridges[my_tabid]
-                if my_b and vim.api.nvim_tabpage_is_valid(my_tabid) then
-                    -- Switch to correct tab for panel operations
-                    local current_tab = vim.api.nvim_get_current_tabpage()
-                    local need_switch = current_tab ~= my_tabid
-                    if need_switch then
-                        vim.api.nvim_set_current_tabpage(my_tabid)
-                    end
+            vim.schedule(function()
+                local ok, msg = pcall(vim.json.decode, message)
+                if ok then
+                    M._handle_message(msg, my_tabid)
+                else
+                    vim.notify("Banjo: Failed to parse WebSocket message", vim.log.levels.ERROR)
+                    local my_b = bridges[my_tabid]
+                    if my_b and vim.api.nvim_tabpage_is_valid(my_tabid) then
+                        -- Switch to correct tab for panel operations
+                        local current_tab = vim.api.nvim_get_current_tabpage()
+                        local need_switch = current_tab ~= my_tabid
+                        if need_switch then
+                            vim.api.nvim_set_current_tabpage(my_tabid)
+                        end
 
-                    panel.append_status("Error: Invalid message from backend")
+                        panel.append_status("Error: Invalid message from backend")
 
-                    -- Restore original tab
-                    if need_switch and vim.api.nvim_tabpage_is_valid(current_tab) then
-                        vim.api.nvim_set_current_tabpage(current_tab)
+                        -- Restore original tab
+                        if need_switch and vim.api.nvim_tabpage_is_valid(current_tab) then
+                            vim.api.nvim_set_current_tabpage(current_tab)
+                        end
                     end
                 end
-            end
+            end)
         end,
         on_connect = function()
             vim.schedule(function()
@@ -820,6 +822,9 @@ M._get_current_selection = M._get_current_selection
 M._get_open_editors = M._get_open_editors
 M._get_diagnostics = M._get_diagnostics
 M._check_dirty = M._check_dirty
+M._connect_websocket = M._connect_websocket
+M._on_stdout = M._on_stdout
+M._on_exit = M._on_exit
 
 -- Global TabClosed autocmd (registered once at module load)
 vim.api.nvim_create_autocmd("TabClosed", {
