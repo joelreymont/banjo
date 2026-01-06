@@ -388,7 +388,6 @@ describe("banjo integration", function()
       assert.truthy(content:find("test%.txt"), "Should have tool label")
     end)
   end)
-    end)
 
 describe("banjo panel integration", function()
   -- These tests verify panel behavior with simulated backend messages
