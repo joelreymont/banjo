@@ -1,5 +1,5 @@
 #!/bin/bash
-# Syntax validation for Lua files in the Banjo Neovim plugin
+# Syntax validation and testing for Lua files in the Banjo Neovim plugin
 
 set -e
 
@@ -30,4 +30,17 @@ if grep -q "Error\|loop or previous error" /tmp/banjo-validate.log; then
     exit 1
 fi
 
-echo "✓ All syntax checks passed"
+echo "✓ Syntax checks passed"
+echo ""
+
+# Run unit tests with plenary
+echo "Running unit tests..."
+nvim -l scripts/run_tests.lua
+result=$?
+
+if [ $result -eq 0 ]; then
+    echo "✓ All tests passed"
+else
+    echo "✗ Tests failed"
+    exit $result
+fi

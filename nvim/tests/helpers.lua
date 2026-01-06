@@ -10,22 +10,22 @@ local M = {}
 function M.wait_for(condition_fn, timeout_ms, interval_ms)
     timeout_ms = timeout_ms or 5000
     interval_ms = interval_ms or 50
-    
+
     local start = vim.loop.now()
     while vim.loop.now() - start < timeout_ms do
         -- Process pending vim events (critical for headless mode)
         vim.wait(interval_ms, function()
             return condition_fn()
         end, interval_ms)
-        
+
         if condition_fn() then
             return true
         end
-        
+
         -- Run the libuv event loop to process I/O
         vim.loop.run("nowait")
     end
-    
+
     return false
 end
 
@@ -34,10 +34,10 @@ end
 ---@return table env Test environment with cleanup function
 function M.setup_test_env(opts)
     opts = opts or {}
-    
+
     local test_dir = opts.cwd or vim.fn.tempname() .. "_banjo_e2e_" .. math.random(10000)
     vim.fn.mkdir(test_dir, "p")
-    
+
     -- Create a test file
     local test_file = test_dir .. "/test.lua"
     local f = io.open(test_file, "w")
@@ -45,7 +45,7 @@ function M.setup_test_env(opts)
         f:write("-- Test file\nlocal x = 1\n")
         f:close()
     end
-    
+
     return {
         dir = test_dir,
         file = test_file,
@@ -61,7 +61,7 @@ end
 ---@return table state Buffer state
 function M.capture_buffer_state(buf)
     buf = buf or vim.api.nvim_get_current_buf()
-    
+
     return {
         lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false),
         line_count = vim.api.nvim_buf_line_count(buf),
@@ -78,11 +78,11 @@ end
 function M.capture_display_state(buf, ns_id)
     buf = buf or vim.api.nvim_get_current_buf()
     ns_id = ns_id or -1  -- -1 = all namespaces
-    
+
     local extmarks = vim.api.nvim_buf_get_extmarks(buf, ns_id, 0, -1, {
         details = true,
     })
-    
+
     return {
         extmarks = extmarks,
         extmark_count = #extmarks,
@@ -158,41 +158,15 @@ function M.assert_contains(haystack, needle, message)
     end
 end
 
--- Simple test registry for when plenary is not available
-M._tests = {}
-M._test_results = { passed = 0, failed = 0, errors = {} }
-
-function M.describe(name, fn)
-    M._current_describe = name
-    fn()
-    M._current_describe = nil
+-- Cleanup function for tests
+function M.cleanup()
+    -- Clean up any test state
+    -- Tests should call this in after_each
 end
 
-function M.it(name, fn)
-    local full_name = M._current_describe and (M._current_describe .. " " .. name) or name
-    table.insert(M._tests, { name = full_name, fn = fn })
-end
-
-function M.run_tests()
-    print("Running " .. #M._tests .. " tests...")
-    
-    for _, test in ipairs(M._tests) do
-        local ok, err = pcall(test.fn)
-        if ok then
-            M._test_results.passed = M._test_results.passed + 1
-            print("  ✓ " .. test.name)
-        else
-            M._test_results.failed = M._test_results.failed + 1
-            table.insert(M._test_results.errors, { name = test.name, error = err })
-            print("  ✗ " .. test.name)
-            print("    " .. tostring(err))
-        end
-    end
-    
-    print("")
-    print(string.format("Results: %d passed, %d failed", M._test_results.passed, M._test_results.failed))
-    
-    return M._test_results.failed == 0
+-- Simple wait helper for tests
+function M.wait(ms)
+    vim.wait(ms, function() return false end, 10)
 end
 
 return M
