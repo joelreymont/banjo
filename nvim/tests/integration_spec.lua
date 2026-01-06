@@ -161,8 +161,6 @@ describe("banjo integration", function()
       local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
       local line_count = #lines
 
-      local line_count = #lines
-      -- end_stream adds a blank line
       assert.truthy(line_count >= 2, "Should have at least 2 lines after end_stream")
       assert.equals("", lines[line_count], "Last line should be blank after end_stream")
     end)
@@ -388,10 +386,9 @@ describe("banjo integration", function()
       assert.truthy(content:find("the response"), "Should have response text (part 2)")
       assert.truthy(content:find("Write"), "Should have tool call")
       assert.truthy(content:find("test%.txt"), "Should have tool label")
-      assert.truthy(content:find("test%.txt"), "Should have tool label")
     end)
   end)
-end)
+    end)
 
 describe("banjo panel integration", function()
   -- These tests verify panel behavior with simulated backend messages

@@ -127,7 +127,8 @@ function M.find_panel_window()
         if vim.api.nvim_win_is_valid(win) then
             local buf = vim.api.nvim_win_get_buf(win)
             local bufname = vim.api.nvim_buf_get_name(buf)
-            if bufname:match("Banjo$") then
+            -- Match "Banjo" or "Banjo-{tabid}" (output buffer, not input)
+            if bufname:match("Banjo%-?%d*$") and not bufname:match("BanjoInput") then
                 return {
                     handle = win,
                     buffer = buf,
