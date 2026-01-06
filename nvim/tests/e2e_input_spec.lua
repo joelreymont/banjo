@@ -101,7 +101,7 @@ describe("banjo E2E input/output", function()
 
       -- Wait for response to stream back (give it up to 15 seconds for AI response)
       local got_response = helpers.wait_for(function()
-        local output_buf = vim.fn.bufnr("Banjo")
+        local output_buf = helpers.get_banjo_buffer()
         if output_buf == -1 then
           return false
         end
@@ -114,7 +114,7 @@ describe("banjo E2E input/output", function()
       assert.is_true(got_response, "Should receive response within 15s")
 
       -- Verify output panel contains response
-      local output_buf = vim.fn.bufnr("Banjo")
+      local output_buf = helpers.get_banjo_buffer()
       local lines = vim.api.nvim_buf_get_lines(output_buf, 0, -1, false)
       local content = table.concat(lines, "\n")
 
@@ -152,7 +152,7 @@ describe("banjo E2E input/output", function()
       helpers.wait(500)
 
       -- Both should be processed without errors
-      local output_buf = vim.fn.bufnr("Banjo")
+      local output_buf = helpers.get_banjo_buffer()
       if output_buf ~= -1 then
         local lines = vim.api.nvim_buf_get_lines(output_buf, 0, -1, false)
         local content = table.concat(lines, "\n")
@@ -183,7 +183,7 @@ describe("banjo E2E input/output", function()
       helpers.wait(2000)
 
       -- Check that we're getting progressive updates
-      local output_buf = vim.fn.bufnr("Banjo")
+      local output_buf = helpers.get_banjo_buffer()
       if output_buf ~= -1 then
         local snapshot1 = vim.api.nvim_buf_get_lines(output_buf, 0, -1, false)
         local len1 = table.concat(snapshot1, "\n"):len()

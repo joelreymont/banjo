@@ -119,12 +119,24 @@ function M.count_windows()
     return count
 end
 
--- Find the banjo panel window
+-- Find the banjo panel window in current tab
 ---@return table|nil window Panel window info or nil
 function M.find_panel_window()
-    for _, win in ipairs(M.get_windows()) do
-        if win.buffer_name:match("Banjo$") then
-            return win
+    local current_tab = vim.api.nvim_get_current_tabpage()
+    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(current_tab)) do
+        if vim.api.nvim_win_is_valid(win) then
+            local buf = vim.api.nvim_win_get_buf(win)
+            local bufname = vim.api.nvim_buf_get_name(buf)
+            if bufname:match("Banjo$") then
+                return {
+                    handle = win,
+                    buffer = buf,
+                    buffer_name = bufname,
+                    width = vim.api.nvim_win_get_width(win),
+                    height = vim.api.nvim_win_get_height(win),
+                    cursor = vim.api.nvim_win_get_cursor(win),
+                }
+            end
         end
     end
     return nil
@@ -191,23 +203,13 @@ function M.cleanup()
         end
     end
 
-    -- Delete all Banjo buffers (force delete to bypass E89)
+    -- Wipe all Banjo buffers (bwipeout removes name, delete does not)
     for _, buf in ipairs(vim.api.nvim_list_bufs()) do
         if vim.api.nvim_buf_is_valid(buf) then
             local bufname = vim.api.nvim_buf_get_name(buf)
             if bufname:match("Banjo") then
-                vim.api.nvim_buf_set_option(buf, "modified", false)
-                pcall(vim.api.nvim_buf_delete, buf, { force = true, unload = false })
-            end
-        end
-    end
-
-    -- Wipe any remaining unlisted buffers with Banjo in name
-    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-        if vim.api.nvim_buf_is_valid(buf) then
-            local bufname = vim.api.nvim_buf_get_name(buf)
-            if bufname:match("Banjo") then
-                pcall(vim.cmd, "bwipeout! " .. buf)
+                -- Use bwipeout to completely remove buffer AND its name
+                pcall(vim.cmd, string.format("bwipeout! %d", buf))
             end
         end
     end
@@ -216,6 +218,13 @@ end
 -- Simple wait helper for tests
 function M.wait(ms)
     vim.wait(ms, function() return false end, 10)
+end
+
+-- Get Banjo output buffer for current tab
+function M.get_banjo_buffer()
+    local tabid = vim.api.nvim_get_current_tabpage()
+    local bufname = string.format("Banjo-%d", tabid)
+    return vim.fn.bufnr(bufname)
 end
 
 return M

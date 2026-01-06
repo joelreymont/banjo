@@ -74,7 +74,10 @@ local function create_output_buffer()
     vim.api.nvim_set_option_value("swapfile", false, { buf = state.output_buf })
     vim.api.nvim_set_option_value("filetype", "markdown", { buf = state.output_buf })
     vim.api.nvim_set_option_value("modifiable", true, { buf = state.output_buf })
-    vim.api.nvim_buf_set_name(state.output_buf, "Banjo")
+
+    -- Use per-tab buffer name to support multiple tabs
+    local tabid = vim.api.nvim_get_current_tabpage()
+    vim.api.nvim_buf_set_name(state.output_buf, string.format("Banjo-%d", tabid))
 
     return state.output_buf
 end
@@ -92,7 +95,10 @@ local function create_input_buffer()
     vim.api.nvim_set_option_value("bufhidden", "hide", { buf = state.input_buf })
     vim.api.nvim_set_option_value("swapfile", false, { buf = state.input_buf })
     vim.api.nvim_set_option_value("filetype", "markdown", { buf = state.input_buf })
-    vim.api.nvim_buf_set_name(state.input_buf, "BanjoInput")
+
+    -- Use per-tab buffer name to support multiple tabs
+    local tabid = vim.api.nvim_get_current_tabpage()
+    vim.api.nvim_buf_set_name(state.input_buf, string.format("BanjoInput-%d", tabid))
 
     -- Set initial prompt indicator
     vim.api.nvim_buf_set_lines(state.input_buf, 0, -1, false, { "" })

@@ -75,7 +75,7 @@ describe("banjo panel", function()
       panel.append("Hello World")
 
       -- Get buffer content
-      local buf = vim.fn.bufnr("Banjo")
+      local buf = helpers.get_banjo_buffer()
       local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
       local content = table.concat(lines, "\n")
 
@@ -88,7 +88,7 @@ describe("banjo panel", function()
 
       panel.append("Line 1\nLine 2\nLine 3")
 
-      local buf = vim.fn.bufnr("Banjo")
+      local buf = helpers.get_banjo_buffer()
       local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
 
       assert.truthy(#lines >= 3)
@@ -103,7 +103,7 @@ describe("banjo panel", function()
 
       panel.clear()
 
-      local buf = vim.fn.bufnr("Banjo")
+      local buf = helpers.get_banjo_buffer()
       local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
       local content = table.concat(lines, "")
 
@@ -118,7 +118,7 @@ describe("banjo panel", function()
 
       assert.is_true(panel.is_open(), "Panel should be open after start_stream")
 
-      local buf = vim.fn.bufnr("Banjo")
+      local buf = helpers.get_banjo_buffer()
       assert.truthy(buf > 0, "Panel buffer should exist")
     end)
 
@@ -126,7 +126,7 @@ describe("banjo panel", function()
       panel.start_stream("codex")
       panel.append("Response text")
 
-      local buf = vim.fn.bufnr("Banjo")
+      local buf = helpers.get_banjo_buffer()
       local lines_before = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
       local count_before = #lines_before
 

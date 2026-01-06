@@ -138,7 +138,7 @@ describe("banjo integration", function()
 
       helpers.wait(100)
 
-      local buf = vim.fn.bufnr("Banjo")
+      local buf = helpers.get_banjo_buffer()
       local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
       local content = table.concat(lines, "\n")
 
@@ -157,7 +157,7 @@ describe("banjo integration", function()
 
       helpers.wait(100)
 
-      local buf = vim.fn.bufnr("Banjo")
+      local buf = helpers.get_banjo_buffer()
       local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
       local content = table.concat(lines, "\n")
 
@@ -175,7 +175,7 @@ describe("banjo integration", function()
 
       helpers.wait(100)
 
-      local buf = vim.fn.bufnr("Banjo")
+      local buf = helpers.get_banjo_buffer()
       local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
       local content = table.concat(lines, "\n")
 
@@ -367,7 +367,7 @@ describe("banjo integration", function()
       -- Verify panel state
       assert.is_true(panel.is_open(), "Panel should be open")
 
-      local buf = vim.fn.bufnr("Banjo")
+      local buf = helpers.get_banjo_buffer()
       local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
       local content = table.concat(lines, "\n")
 
@@ -401,7 +401,7 @@ describe("banjo panel integration", function()
       panel.append("Let me think...", true) -- is_thought = true
       helpers.wait(50)
 
-      local buf = vim.fn.bufnr("Banjo")
+      local buf = helpers.get_banjo_buffer()
       assert.truthy(buf > 0, "Panel buffer should exist")
 
       -- Check that highlight was applied (Comment group for thoughts)
@@ -451,7 +451,7 @@ describe("banjo panel integration", function()
 
       helpers.wait(100)
 
-      local buf = vim.fn.bufnr("Banjo")
+      local buf = helpers.get_banjo_buffer()
       local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
       local content = table.concat(lines, "")
 
