@@ -12,6 +12,7 @@ local function get_bridge()
     local tabid = vim.api.nvim_get_current_tabpage()
     if not bridges[tabid] then
         bridges[tabid] = {
+            tabid = tabid,
             client = nil,
             job_id = nil,
             mcp_port = nil,
@@ -56,7 +57,8 @@ function M.start(binary_path, cwd)
     b.reconnect.cwd = cwd
     b.reconnect.enabled = true
 
-    b.autocmd_group = vim.api.nvim_create_augroup("BanjoEvents", { clear = true })
+    local tabid = vim.api.nvim_get_current_tabpage()
+    b.autocmd_group = vim.api.nvim_create_augroup("BanjoEvents_" .. tabid, { clear = true })
 
     -- Spawn the binary to get the WebSocket port
     b.job_id = vim.fn.jobstart({ binary_path, "--nvim" }, {
@@ -76,12 +78,20 @@ function M.start(binary_path, cwd)
     end
 
     -- Track selection changes
+    local my_tabid = b.tabid
     vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
         group = b.autocmd_group,
         callback = function()
+            -- Only track if we're in the correct tab
+            if vim.api.nvim_get_current_tabpage() ~= my_tabid then
+                return
+            end
             local mode = vim.fn.mode()
             if mode == "v" or mode == "V" or mode == "\22" then
-                b.last_selection = M._capture_selection()
+                local my_b = bridges[my_tabid]
+                if my_b then
+                    my_b.last_selection = M._capture_selection()
+                end
             end
         end,
     })
@@ -90,7 +100,14 @@ function M.start(binary_path, cwd)
         group = b.autocmd_group,
         pattern = "[vV\22]*:*",
         callback = function()
-            b.last_selection = M._capture_selection()
+            -- Only track if we're in the correct tab
+            if vim.api.nvim_get_current_tabpage() ~= my_tabid then
+                return
+            end
+            local my_b = bridges[my_tabid]
+            if my_b then
+                my_b.last_selection = M._capture_selection()
+            end
         end,
     })
 
@@ -104,34 +121,6 @@ function M.start(binary_path, cwd)
 
             -- Stop reconnection and close cleanly
             M.stop()
-        end,
-    })
-
-    -- Cleanup per-tab resources on tab close
-    vim.api.nvim_create_autocmd("TabClosed", {
-        callback = function(ev)
-            local tabid = tonumber(ev.match)
-            if tabid and bridges[tabid] then
-                -- Stop backend for this tab
-                local old_b = bridges[tabid]
-                if old_b.reconnect.timer then
-                    old_b.reconnect.timer:stop()
-                    old_b.reconnect.timer:close()
-                end
-                if old_b.client then
-                    ws_client.close(old_b.client)
-                end
-                if old_b.job_id then
-                    vim.fn.jobstop(old_b.job_id)
-                end
-                if old_b.autocmd_group then
-                    vim.api.nvim_del_augroup_by_id(old_b.autocmd_group)
-                end
-                bridges[tabid] = nil
-
-                -- Cleanup panel state for this tab
-                panel.cleanup_tab(tabid)
-            end
         end,
     })
 end
@@ -171,7 +160,7 @@ end
 
 function M.get_mcp_port()
     local b = get_bridge()
-    return mcp_port
+    return b.mcp_port
 end
 
 -- Process stdout from binary (only used for initial ready notification)
@@ -193,37 +182,48 @@ end
 
 function M._connect_websocket(port)
     local b = get_bridge()
+    local my_tabid = b.tabid
     b.client = ws_client.new({
         on_message = function(message)
             local ok, msg = pcall(vim.json.decode, message)
             if ok then
-                M._handle_message(msg)
+                M._handle_message(msg, my_tabid)
             else
                 vim.notify("Banjo: Failed to parse WebSocket message", vim.log.levels.ERROR)
-                panel.append_status("Error: Invalid message from backend")
+                local my_b = bridges[my_tabid]
+                if my_b then
+                    panel.append_status("Error: Invalid message from backend")
+                end
             end
         end,
         on_connect = function()
-            -- Reset reconnection b.state on successful connect
-            b.reconnect.attempt = 0
+            local my_b = bridges[my_tabid]
+            if not my_b then return end
+            -- Reset reconnection state on successful connect
+            my_b.reconnect.attempt = 0
             vim.notify("Banjo: Connected", vim.log.levels.INFO)
             panel._update_status()
 
-            -- Restore b.preserved input if any
-            if b.preserved.input_text and b.preserved.input_text ~= "" then
-                panel.set_input_text(b.preserved.input_text)
-                b.preserved.input_text = nil
+            -- Restore preserved input if any
+            if my_b.preserved.input_text and my_b.preserved.input_text ~= "" then
+                panel.set_input_text(my_b.preserved.input_text)
+                my_b.preserved.input_text = nil
             end
         end,
         on_disconnect = function(code, reason)
             vim.notify("Banjo: Disconnected (" .. code .. ")", vim.log.levels.WARN)
-            b.client = nil
-            panel._update_status()
+            local my_b = bridges[my_tabid]
+            if my_b then
+                my_b.client = nil
+                panel._update_status()
+            end
             -- WebSocket reconnection is handled by process restart
         end,
         on_error = function(err)
             vim.notify("Banjo: " .. err, vim.log.levels.ERROR)
-            panel._update_status()
+            if bridges[my_tabid] then
+                panel._update_status()
+            end
         end,
     })
 
@@ -276,23 +276,33 @@ function M._on_exit(code)
         vim.notify(string.format("Banjo: Reconnecting in %.1fs (attempt %d)", delay_ms / 1000, b.reconnect.attempt), vim.log.levels.INFO)
 
         -- Schedule reconnection
+        local my_tabid = b.tabid
         b.reconnect.timer = vim.loop.new_timer()
         if b.reconnect.timer then
             b.reconnect.timer:start(delay_ms, 0, vim.schedule_wrap(function()
-                if b.reconnect.timer then
-                    b.reconnect.timer:close()
-                    b.reconnect.timer = nil
+                local my_b = bridges[my_tabid]
+                if not my_b then return end
+                if my_b.reconnect.timer then
+                    my_b.reconnect.timer:close()
+                    my_b.reconnect.timer = nil
                 end
-                if b.reconnect.enabled and b.reconnect.binary_path then
-                    M.start(b.reconnect.binary_path, b.reconnect.cwd)
+                if my_b.reconnect.enabled and my_b.reconnect.binary_path then
+                    -- Switch to the correct tab before starting
+                    local current_tab = vim.api.nvim_get_current_tabpage()
+                    if vim.api.nvim_tabpage_is_valid(my_tabid) and current_tab ~= my_tabid then
+                        vim.api.nvim_set_current_tabpage(my_tabid)
+                    end
+                    M.start(my_b.reconnect.binary_path, my_b.reconnect.cwd)
                 end
             end))
         end
     end
 end
 
-function M._handle_message(msg)
-    local b = get_bridge()
+function M._handle_message(msg, tabid)
+    tabid = tabid or vim.api.nvim_get_current_tabpage()
+    local b = bridges[tabid]
+    if not b then return end
     local method = msg.method
     if not method then
         -- JSON-RPC response, not notification
@@ -711,5 +721,33 @@ M._get_current_selection = M._get_current_selection
 M._get_open_editors = M._get_open_editors
 M._get_diagnostics = M._get_diagnostics
 M._check_dirty = M._check_dirty
+
+-- Global TabClosed autocmd (registered once at module load)
+vim.api.nvim_create_autocmd("TabClosed", {
+    callback = function(ev)
+        local tabid = tonumber(ev.match)
+        if tabid and bridges[tabid] then
+            -- Stop backend for this tab
+            local old_b = bridges[tabid]
+            if old_b.reconnect.timer then
+                pcall(old_b.reconnect.timer.stop, old_b.reconnect.timer)
+                pcall(old_b.reconnect.timer.close, old_b.reconnect.timer)
+            end
+            if old_b.client then
+                pcall(ws_client.close, old_b.client)
+            end
+            if old_b.job_id then
+                pcall(vim.fn.jobstop, old_b.job_id)
+            end
+            if old_b.autocmd_group then
+                pcall(vim.api.nvim_del_augroup_by_id, old_b.autocmd_group)
+            end
+            bridges[tabid] = nil
+
+            -- Cleanup panel state for this tab
+            pcall(panel.cleanup_tab, tabid)
+        end
+    end,
+})
 
 return M

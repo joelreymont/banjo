@@ -48,8 +48,6 @@ local function get_state()
 end
 
 function M.setup(opts)
-    local state = get_state()
-    local state = get_state()
     config = vim.tbl_deep_extend("force", config, opts or {})
 
     -- Load history from disk
@@ -837,7 +835,7 @@ function M._start_session_timer()
 
     state.session_timer = vim.loop.new_timer()
     if state.session_timer then
-        session_timer:start(1000, 1000, vim.schedule_wrap(function()
+        state.session_timer:start(1000, 1000, vim.schedule_wrap(function()
             M._update_status()
         end))
     end
@@ -846,8 +844,8 @@ end
 function M._stop_session_timer()
     local state = get_state()
     if state.session_timer then
-        session_timer:stop()
-        session_timer:close()
+        state.session_timer:stop()
+        state.session_timer:close()
         state.session_timer = nil
     end
 end
