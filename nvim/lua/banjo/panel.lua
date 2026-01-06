@@ -26,6 +26,7 @@ local function get_state()
             input_buf = nil,
             output_win = nil,
             input_win = nil,
+            last_width = nil,
             is_streaming = false,
             current_engine = nil,
             pending_scroll = false,
@@ -94,7 +95,7 @@ local function create_input_buffer()
     vim.api.nvim_set_option_value("buftype", "nofile", { buf = state.input_buf })
     vim.api.nvim_set_option_value("bufhidden", "hide", { buf = state.input_buf })
     vim.api.nvim_set_option_value("swapfile", false, { buf = state.input_buf })
-    vim.api.nvim_set_option_value("filetype", "markdown", { buf = state.input_buf })
+    vim.api.nvim_set_option_value("filetype", "banjo_input", { buf = state.input_buf })
 
     -- Use per-tab buffer name to support multiple tabs
     local tabid = vim.api.nvim_get_current_tabpage()
@@ -303,9 +304,24 @@ local function create_panel()
     create_output_buffer()
     create_input_buffer()
 
-    -- Create main split for the panel
+    -- Validate buffers were created
+    if not state.output_buf or not vim.api.nvim_buf_is_valid(state.output_buf) then
+        vim.notify("Banjo: Failed to create output buffer", vim.log.levels.ERROR)
+        return
+    end
+    if not state.input_buf or not vim.api.nvim_buf_is_valid(state.input_buf) then
+        vim.notify("Banjo: Failed to create input buffer", vim.log.levels.ERROR)
+        return
+    end
+
+    -- Create main split for the panel (use saved width if available)
+    local width = state.last_width or config.width
     local cmd = config.position == "left" and "topleft" or "botright"
-    vim.cmd(cmd .. " " .. config.width .. "vsplit")
+    local ok, err = pcall(vim.cmd, cmd .. " " .. width .. "vsplit")
+    if not ok then
+        vim.notify("Banjo: Failed to create panel: " .. tostring(err), vim.log.levels.ERROR)
+        return
+    end
     local panel_win = vim.api.nvim_get_current_win()
 
     -- Set output buffer in the main window
@@ -322,7 +338,11 @@ local function create_panel()
     vim.api.nvim_set_option_value("cursorline", false, { win = state.output_win })
 
     -- Create horizontal split for input at bottom
-    vim.cmd("belowright " .. config.input_height .. "split")
+    ok, err = pcall(vim.cmd, "belowright " .. config.input_height .. "split")
+    if not ok then
+        vim.notify("Banjo: Failed to create input split: " .. tostring(err), vim.log.levels.ERROR)
+        return
+    end
     state.input_win = vim.api.nvim_get_current_win()
     vim.api.nvim_win_set_buf(state.input_win, state.input_buf)
 
@@ -356,19 +376,28 @@ end
 
 function M.close()
     local state = get_state()
-    if state.input_win and vim.api.nvim_win_is_valid(state.input_win) then
-        vim.api.nvim_win_close(state.input_win, true)
+
+    -- Save panel width before closing
+    if state.output_win and vim.api.nvim_win_is_valid(state.output_win) then
+        state.last_width = vim.api.nvim_win_get_width(state.output_win)
+    end
+
+    if state.input_win then
+        if vim.api.nvim_win_is_valid(state.input_win) then
+            vim.api.nvim_win_close(state.input_win, true)
+        end
         state.input_win = nil
     end
 
-    if state.output_win and vim.api.nvim_win_is_valid(state.output_win) then
-        vim.api.nvim_win_close(state.output_win, true)
+    if state.output_win then
+        if vim.api.nvim_win_is_valid(state.output_win) then
+            vim.api.nvim_win_close(state.output_win, true)
+        end
         state.output_win = nil
     end
 end
 
 function M.toggle()
-    local state = get_state()
     if M.is_open() then
         M.close()
     else

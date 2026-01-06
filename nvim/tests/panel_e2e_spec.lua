@@ -74,6 +74,107 @@ describe("Banjo Panel", function()
         helpers.assert(not panel.is_open(), "Panel should be closed after second toggle")
     end)
 
+    it("reopens panel after close via toggle", function()
+        banjo.setup({
+            binary_path = env.binary,
+            auto_start = false,
+        })
+
+        -- Step 1: Open panel (simulates user pressing <leader>ab which calls panel.toggle())
+        panel.open()
+        helpers.wait_for(function()
+            return panel.is_open()
+        end, 1000)
+        helpers.assert_truthy(panel.is_open(), "Panel should be open initially")
+        helpers.assert_truthy(helpers.find_panel_window(), "Panel window should exist")
+
+        -- Capture state for debugging
+        local state_before_close = panel._get_state()
+        local output_win_before = state_before_close.output_win
+        local input_win_before = state_before_close.input_win
+
+        -- Step 2: Close via toggle (simulates :BanjoToggle)
+        panel.toggle()
+        helpers.wait_for(function()
+            return not panel.is_open()
+        end, 1000)
+        helpers.assert(not panel.is_open(), "Panel should be closed after toggle")
+        helpers.assert(not helpers.find_panel_window(), "Panel window should not exist after close")
+
+        -- Verify state was cleaned up
+        local state_after_close = panel._get_state()
+        helpers.assert(state_after_close.output_win == nil, "output_win should be nil after close")
+        helpers.assert(state_after_close.input_win == nil, "input_win should be nil after close")
+
+        -- Step 3: Reopen via toggle (this is the failing case user reported)
+        panel.toggle()
+        helpers.wait_for(function()
+            return panel.is_open()
+        end, 1000)
+        helpers.assert_truthy(panel.is_open(), "Panel should reopen after second toggle")
+        helpers.assert_truthy(helpers.find_panel_window(), "Panel window should exist after reopen")
+
+        -- Verify new windows were created
+        local state_after_reopen = panel._get_state()
+        helpers.assert_truthy(state_after_reopen.output_win, "output_win should exist after reopen")
+        helpers.assert_truthy(state_after_reopen.input_win, "input_win should exist after reopen")
+    end)
+
+    it("reopens panel multiple times", function()
+        banjo.setup({
+            binary_path = env.binary,
+            auto_start = false,
+        })
+
+        -- Toggle 5 times to ensure state is properly managed
+        for i = 1, 5 do
+            panel.toggle()
+            local expected_open = (i % 2 == 1)
+            helpers.wait_for(function()
+                return panel.is_open() == expected_open
+            end, 1000)
+            helpers.assert_eq(expected_open, panel.is_open(),
+                string.format("Toggle %d: panel should be %s", i, expected_open and "open" or "closed"))
+        end
+    end)
+
+    it("reopens after external window close", function()
+        banjo.setup({
+            binary_path = env.binary,
+            auto_start = false,
+        })
+
+        -- Open panel
+        panel.open()
+        helpers.wait_for(function()
+            return panel.is_open()
+        end, 1000)
+        helpers.assert_truthy(panel.is_open(), "Panel should be open")
+
+        local state = panel._get_state()
+        local output_win = state.output_win
+
+        -- Simulate external close (user presses 'q' or :q in panel window)
+        -- This closes window without going through panel.close()
+        if output_win and vim.api.nvim_win_is_valid(output_win) then
+            vim.api.nvim_win_close(output_win, true)
+        end
+
+        -- Panel should detect it's closed via is_open() check
+        helpers.wait_for(function()
+            return not panel.is_open()
+        end, 1000)
+        helpers.assert(not panel.is_open(), "Panel should detect external close")
+
+        -- Toggle should reopen
+        panel.toggle()
+        helpers.wait_for(function()
+            return panel.is_open()
+        end, 1000)
+        helpers.assert_truthy(panel.is_open(), "Panel should reopen after external close")
+        helpers.assert_truthy(helpers.find_panel_window(), "Panel window should exist")
+    end)
+
     it("appends text to panel", function()
         banjo.setup({
             binary_path = env.binary,
