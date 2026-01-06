@@ -4,56 +4,62 @@ local panel = require("banjo.panel")
 
 local M = {}
 
--- Wire up bidirectional reference
-panel.set_bridge(M)
+-- Per-tab bridge b.state (indexed by tabpage handle)
+local bridges = {}
 
-local client = nil
-local job_id = nil  -- Process handle for cleanup
-local mcp_port = nil
-local last_selection = nil
-local autocmd_group = nil
-
--- Current state from backend
-local state = {
-    engine = "claude",
-    model = nil,
-    mode = "Default",
-    session_id = nil,
-    connected = false,
-    session_active = false,
-    session_start_time = nil,
-}
-
--- Reconnection state
-local reconnect = {
-    attempt = 0,
-    max_delay_ms = 30000,
-    base_delay_ms = 1000,
-    timer = nil,
-    enabled = true,
-    binary_path = nil,
-    cwd = nil,
-}
-
--- State preservation across reconnects
-local preserved = {
-    input_text = nil,
-}
+-- Per-tab bridge b.state accessor
+local function get_bridge()
+    local tabid = vim.api.nvim_get_current_tabpage()
+    if not bridges[tabid] then
+        bridges[tabid] = {
+            client = nil,
+            job_id = nil,
+            mcp_port = nil,
+            last_selection = nil,
+            autocmd_group = nil,
+            state = {
+                engine = "claude",
+                model = nil,
+                mode = "Default",
+                session_id = nil,
+                connected = false,
+                session_active = false,
+                session_start_time = nil,
+            },
+            reconnect = {
+                attempt = 0,
+                max_delay_ms = 30000,
+                base_delay_ms = 1000,
+                timer = nil,
+                enabled = true,
+                binary_path = nil,
+                cwd = nil,
+            },
+            preserved = {
+                input_text = nil,
+            },
+        }
+        -- Wire up bidirectional reference per tab
+        panel.set_bridge(M)
+    end
+    return bridges[tabid]
+end
 
 function M.start(binary_path, cwd)
-    if client and ws_client.is_connected(client) then
+    local b = get_bridge()
+    if b.client and ws_client.is_connected(b.client) then
         return
     end
 
     -- Save for reconnection
-    reconnect.binary_path = binary_path
-    reconnect.cwd = cwd
-    reconnect.enabled = true
+    b.reconnect.binary_path = binary_path
+    b.reconnect.cwd = cwd
+    b.reconnect.enabled = true
 
-    autocmd_group = vim.api.nvim_create_augroup("BanjoEvents", { clear = true })
+    b.autocmd_group = vim.api.nvim_create_augroup("BanjoEvents", { clear = true })
 
     -- Spawn the binary to get the WebSocket port
-    job_id = vim.fn.jobstart({ binary_path, "--nvim" }, {
+    b.job_id = vim.fn.jobstart({ binary_path, "--nvim" }, {
         cwd = cwd,
         stdout_buffered = false,
         on_stdout = function(_, data)
@@ -64,33 +70,33 @@ function M.start(binary_path, cwd)
         end,
     })
 
-    if job_id <= 0 then
+    if b.job_id <= 0 then
         vim.notify("Banjo: Failed to start binary", vim.log.levels.ERROR)
         return
     end
 
     -- Track selection changes
     vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
-        group = autocmd_group,
+        group = b.autocmd_group,
         callback = function()
             local mode = vim.fn.mode()
             if mode == "v" or mode == "V" or mode == "\22" then
-                last_selection = M._capture_selection()
+                b.last_selection = M._capture_selection()
             end
         end,
     })
 
     vim.api.nvim_create_autocmd("ModeChanged", {
-        group = autocmd_group,
+        group = b.autocmd_group,
         pattern = "[vV\22]*:*",
         callback = function()
-            last_selection = M._capture_selection()
+            b.last_selection = M._capture_selection()
         end,
     })
 
     -- Graceful shutdown on Vim exit
     vim.api.nvim_create_autocmd("VimLeavePre", {
-        group = autocmd_group,
+        group = b.autocmd_group,
         callback = function()
             -- Save history before exit
             local history = require("banjo.history")
@@ -103,49 +109,53 @@ function M.start(binary_path, cwd)
 end
 
 function M.stop()
+    local b = get_bridge()
     -- Disable reconnection
-    reconnect.enabled = false
-    if reconnect.timer then
-        reconnect.timer:stop()
-        reconnect.timer:close()
-        reconnect.timer = nil
+    b.reconnect.enabled = false
+    if b.reconnect.timer then
+        b.reconnect.timer:stop()
+        b.reconnect.timer:close()
+        b.reconnect.timer = nil
     end
 
-    if client then
-        ws_client.close(client)
-        client = nil
+    if b.client then
+        ws_client.close(b.client)
+        b.client = nil
     end
 
-    if job_id then
-        vim.fn.jobstop(job_id)
-        job_id = nil
+    if b.job_id then
+        vim.fn.jobstop(b.job_id)
+        b.job_id = nil
     end
 
-    mcp_port = nil
+    b.mcp_port = nil
 
-    if autocmd_group then
-        vim.api.nvim_del_augroup_by_id(autocmd_group)
-        autocmd_group = nil
+    if b.autocmd_group then
+        vim.api.nvim_del_augroup_by_id(b.autocmd_group)
+        b.autocmd_group = nil
     end
 end
 
 function M.is_running()
-    return client ~= nil and ws_client.is_connected(client)
+    local b = get_bridge()
+    return b.client ~= nil and ws_client.is_connected(b.client)
 end
 
 function M.get_mcp_port()
+    local b = get_bridge()
     return mcp_port
 end
 
 -- Process stdout from binary (only used for initial ready notification)
 -- Note: vim.fn.jobstart sends data as array of lines (newlines stripped)
 function M._on_stdout(data)
+    local b = get_bridge()
     for _, line in ipairs(data) do
         if line ~= "" then
             local ok, msg = pcall(vim.json.decode, line)
             if ok and msg.method == "ready" and msg.params and msg.params.mcp_port then
-                mcp_port = msg.params.mcp_port
-                M._connect_websocket(mcp_port)
+                b.mcp_port = msg.params.mcp_port
+                M._connect_websocket(b.mcp_port)
             elseif not ok then
                 vim.notify("Banjo: Failed to parse stdout: " .. line, vim.log.levels.ERROR)
             end
@@ -154,7 +164,8 @@ function M._on_stdout(data)
 end
 
 function M._connect_websocket(port)
-    client = ws_client.new({
+    local b = get_bridge()
+    b.client = ws_client.new({
         on_message = function(message)
             local ok, msg = pcall(vim.json.decode, message)
             if ok then
@@ -165,20 +176,20 @@ function M._connect_websocket(port)
             end
         end,
         on_connect = function()
-            -- Reset reconnection state on successful connect
-            reconnect.attempt = 0
+            -- Reset reconnection b.state on successful connect
+            b.reconnect.attempt = 0
             vim.notify("Banjo: Connected", vim.log.levels.INFO)
             panel._update_status()
 
-            -- Restore preserved input if any
-            if preserved.input_text and preserved.input_text ~= "" then
-                panel.set_input_text(preserved.input_text)
-                preserved.input_text = nil
+            -- Restore b.preserved input if any
+            if b.preserved.input_text and b.preserved.input_text ~= "" then
+                panel.set_input_text(b.preserved.input_text)
+                b.preserved.input_text = nil
             end
         end,
         on_disconnect = function(code, reason)
             vim.notify("Banjo: Disconnected (" .. code .. ")", vim.log.levels.WARN)
-            client = nil
+            b.client = nil
             panel._update_status()
             -- WebSocket reconnection is handled by process restart
         end,
@@ -188,63 +199,64 @@ function M._connect_websocket(port)
         end,
     })
 
-    ws_client.connect(client, "127.0.0.1", port, "/nvim")
+    ws_client.connect(b.client, "127.0.0.1", port, "/nvim")
 end
 
 function M._on_exit(code)
-    job_id = nil
-    mcp_port = nil
-    if client then
-        ws_client.close(client)
-        client = nil
+    local b = get_bridge()
+    b.job_id = nil
+    b.mcp_port = nil
+    if b.client then
+        ws_client.close(b.client)
+        b.client = nil
     end
 
     -- Save session before clearing state
-    if state.session_id and state.session_active then
+    if b.state.session_id and b.state.session_active then
         local sessions = require("banjo.sessions")
         local history = require("banjo.history")
-        sessions.save(state.session_id, {
+        sessions.save(b.state.session_id, {
             history = history.get_all(),
             input_text = panel.get_input_text(),
             timestamp = os.time(),
         })
     end
 
-    -- Clear session state on disconnect
-    state.session_active = false
-    state.session_start_time = nil
+    -- Clear session b.state on disconnect
+    b.state.session_active = false
+    b.state.session_start_time = nil
 
     if code ~= 0 then
         vim.notify("Banjo: Process exited with code " .. code, vim.log.levels.WARN)
     end
 
     -- Schedule reconnection if enabled
-    if reconnect.enabled and reconnect.binary_path then
+    if b.reconnect.enabled and b.reconnect.binary_path then
         -- Preserve current input text
         local current_input = panel.get_input_text()
         if current_input and current_input ~= "" then
-            preserved.input_text = current_input
+            b.preserved.input_text = current_input
         end
 
         -- Calculate delay with exponential backoff
         local delay_ms = math.min(
-            reconnect.base_delay_ms * math.pow(2, reconnect.attempt),
-            reconnect.max_delay_ms
+            b.reconnect.base_delay_ms * math.pow(2, b.reconnect.attempt),
+            b.reconnect.max_delay_ms
         )
-        reconnect.attempt = reconnect.attempt + 1
+        b.reconnect.attempt = b.reconnect.attempt + 1
 
-        vim.notify(string.format("Banjo: Reconnecting in %.1fs (attempt %d)", delay_ms / 1000, reconnect.attempt), vim.log.levels.INFO)
+        vim.notify(string.format("Banjo: Reconnecting in %.1fs (attempt %d)", delay_ms / 1000, b.reconnect.attempt), vim.log.levels.INFO)
 
         -- Schedule reconnection
-        reconnect.timer = vim.loop.new_timer()
-        if reconnect.timer then
-            reconnect.timer:start(delay_ms, 0, vim.schedule_wrap(function()
-                if reconnect.timer then
-                    reconnect.timer:close()
-                    reconnect.timer = nil
+        b.reconnect.timer = vim.loop.new_timer()
+        if b.reconnect.timer then
+            b.reconnect.timer:start(delay_ms, 0, vim.schedule_wrap(function()
+                if b.reconnect.timer then
+                    b.reconnect.timer:close()
+                    b.reconnect.timer = nil
                 end
-                if reconnect.enabled and reconnect.binary_path then
-                    M.start(reconnect.binary_path, reconnect.cwd)
+                if b.reconnect.enabled and b.reconnect.binary_path then
+                    M.start(b.reconnect.binary_path, b.reconnect.cwd)
                 end
             end))
         end
@@ -252,6 +264,7 @@ function M._on_exit(code)
 end
 
 function M._handle_message(msg)
+    local b = get_bridge()
     local method = msg.method
     if not method then
         -- JSON-RPC response, not notification
@@ -285,26 +298,26 @@ function M._handle_message(msg)
         vim.notify("Banjo: " .. text, vim.log.levels.INFO)
     elseif method == "state" then
         if msg.params then
-            state.engine = msg.params.engine or state.engine
-            state.model = msg.params.model
-            state.mode = msg.params.mode or state.mode
-            state.session_id = msg.params.session_id
-            state.connected = msg.params.connected or false
+            b.state.engine = msg.params.engine or b.state.engine
+            b.state.model = msg.params.model
+            b.state.mode = msg.params.mode or b.state.mode
+            b.state.session_id = msg.params.session_id
+            b.state.connected = msg.params.connected or false
             panel._update_status()
         end
     elseif method == "session_id" then
         if msg.params then
-            state.session_id = msg.params.session_id
+            b.state.session_id = msg.params.session_id
             panel._update_status()
         end
     elseif method == "session_start" then
-        state.session_active = true
-        state.session_start_time = vim.loop.now()
+        b.state.session_active = true
+        b.state.session_start_time = vim.loop.now()
         panel._update_status()
         panel._start_session_timer()
     elseif method == "session_end" then
-        state.session_active = false
-        state.session_start_time = nil
+        b.state.session_active = false
+        b.state.session_start_time = nil
         panel._update_status()
         panel._stop_session_timer()
     elseif method == "approval_request" then
@@ -316,6 +329,7 @@ end
 
 -- Approval prompt handling
 function M._show_approval_prompt(params)
+    local b = get_bridge()
     local id = params.id or "unknown"
     local tool_name = params.tool_name or "unknown"
     local risk_level = params.risk_level or "medium"
@@ -388,28 +402,34 @@ function M._show_approval_prompt(params)
 end
 
 function M.get_state()
-    return vim.tbl_extend("force", state, {
-        reconnect_attempt = reconnect.attempt,
+    local b = get_bridge()
+    return vim.tbl_extend("force", b.state, {
+        reconnect_attempt = b.reconnect.attempt,
     })
 end
 
 function M.set_engine(engine)
+    local b = get_bridge()
     M._send_notification("set_engine", { engine = engine })
 end
 
 function M.set_model(model)
+    local b = get_bridge()
     M._send_notification("set_model", { model = model })
 end
 
 function M.set_permission_mode(mode)
+    local b = get_bridge()
     M._send_notification("set_permission_mode", { mode = mode })
 end
 
 function M.request_state()
+    local b = get_bridge()
     M._send_notification("get_state", {})
 end
 
 function M._handle_tool_request(params)
+    local b = get_bridge()
     if not params then return end
 
     local tool = params.tool
@@ -440,6 +460,7 @@ function M._handle_tool_request(params)
 end
 
 function M._capture_selection()
+    local b = get_bridge()
     local start_pos = vim.fn.getpos("v")
     local end_pos = vim.fn.getpos(".")
 
@@ -470,17 +491,19 @@ function M._capture_selection()
 end
 
 function M._get_current_selection()
-    if last_selection and last_selection.content and last_selection.content ~= "" then
+    local b = get_bridge()
+    if b.last_selection and b.last_selection.content and b.last_selection.content ~= "" then
         return {
-            text = last_selection.content,
-            file = last_selection.file or "",
-            range = last_selection.range,
+            text = b.last_selection.content,
+            file = b.last_selection.file or "",
+            range = b.last_selection.range,
         }
     end
     return { text = "", file = vim.api.nvim_buf_get_name(0) }
 end
 
 function M._get_open_editors()
+    local b = get_bridge()
     local editors = {}
     for _, buf in ipairs(vim.api.nvim_list_bufs()) do
         if vim.api.nvim_buf_is_loaded(buf) and vim.bo[buf].buflisted then
@@ -497,6 +520,7 @@ function M._get_open_editors()
 end
 
 function M._get_diagnostics()
+    local b = get_bridge()
     local diagnostics = {}
     for _, buf in ipairs(vim.api.nvim_list_bufs()) do
         if vim.api.nvim_buf_is_loaded(buf) then
@@ -517,6 +541,7 @@ function M._get_diagnostics()
 end
 
 function M._check_dirty(file)
+    local b = get_bridge()
     if not file then
         return { isDirty = false }
     end
@@ -529,6 +554,7 @@ function M._check_dirty(file)
 end
 
 function M._save_document(file)
+    local b = get_bridge()
     if not file then
         return { success = false, error = "No file specified" }
     end
@@ -548,6 +574,7 @@ function M._save_document(file)
 end
 
 function M._open_diff(args)
+    local b = get_bridge()
     if not args or not args.oldContent or not args.newContent then
         return { success = false, error = "Missing diff content" }
     end
@@ -571,6 +598,7 @@ function M._open_diff(args)
 end
 
 function M._close_diff()
+    local b = get_bridge()
     for _, buf in ipairs(vim.api.nvim_list_bufs()) do
         local name = vim.api.nvim_buf_get_name(buf)
         if name:match("^banjo://diff/") then
@@ -582,7 +610,8 @@ function M._close_diff()
 end
 
 function M._send_tool_response(correlation_id, result, err)
-    if not client or not ws_client.is_connected(client) then
+    local b = get_bridge()
+    if not b.client or not ws_client.is_connected(b.client) then
         return
     end
 
@@ -600,11 +629,12 @@ function M._send_tool_response(correlation_id, result, err)
         response.params.result = vim.json.encode(result)
     end
 
-    ws_client.send(client, vim.json.encode(response))
+    ws_client.send(b.client, vim.json.encode(response))
 end
 
 function M._send_notification(method, params)
-    if not client or not ws_client.is_connected(client) then
+    local b = get_bridge()
+    if not b.client or not ws_client.is_connected(b.client) then
         return
     end
 
@@ -613,11 +643,12 @@ function M._send_notification(method, params)
         method = method,
         params = params,
     })
-    ws_client.send(client, msg)
+    ws_client.send(b.client, msg)
 end
 
 function M.send_prompt(text, files)
-    if not client or not ws_client.is_connected(client) then
+    local b = get_bridge()
+    if not b.client or not ws_client.is_connected(b.client) then
         vim.notify("Banjo: Not connected", vim.log.levels.WARN)
         return
     end
@@ -632,14 +663,16 @@ function M.send_prompt(text, files)
 end
 
 function M.cancel()
+    local b = get_bridge()
     -- Clear session state
-    state.session_active = false
-    state.session_start_time = nil
+    b.state.session_active = false
+    b.state.session_start_time = nil
 
     M._send_notification("cancel", {})
 end
 
 function M.toggle_nudge()
+    local b = get_bridge()
     M._send_notification("nudge_toggle", {})
 end
 
