@@ -22,12 +22,7 @@ print("")
 
 if has_plenary then
     -- Use plenary.busted for better test output
-    for _, file in ipairs(spec_files) do
-        print("Loading: " .. vim.fn.fnamemodify(file, ":t"))
-        dofile(file)
-    end
-    
-    -- Run with plenary
+    -- test_directory() loads and runs tests automatically
     require("plenary.test_harness").test_directory(test_dir, {
         minimal_init = test_dir .. "/minimal_init.lua",
         sequential = true,
@@ -36,7 +31,7 @@ else
     -- Fallback to simple test runner
     print("Plenary not found, using simple test runner")
     print("")
-    
+
     for _, file in ipairs(spec_files) do
         print("Loading: " .. vim.fn.fnamemodify(file, ":t"))
         -- Set up describe/it from helpers
@@ -44,9 +39,9 @@ else
         _G.it = helpers.it
         dofile(file)
     end
-    
+
     local success = helpers.run_tests()
-    
+
     -- Exit with appropriate code
     vim.schedule(function()
         vim.cmd("qa" .. (success and "!" or "ll!"))
