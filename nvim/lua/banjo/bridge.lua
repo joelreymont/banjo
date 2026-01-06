@@ -112,6 +112,7 @@ function M.start(binary_path, cwd)
     })
 
     -- Graceful shutdown on Vim exit
+    local my_tabid = b.tabid
     vim.api.nvim_create_autocmd("VimLeavePre", {
         group = b.autocmd_group,
         callback = function()
@@ -119,8 +120,24 @@ function M.start(binary_path, cwd)
             local history = require("banjo.history")
             history.save()
 
-            -- Stop reconnection and close cleanly
-            M.stop()
+            -- Stop reconnection and close cleanly for THIS tab
+            local my_b = bridges[my_tabid]
+            if my_b then
+                my_b.reconnect.enabled = false
+                if my_b.reconnect.timer then
+                    my_b.reconnect.timer:stop()
+                    my_b.reconnect.timer:close()
+                    my_b.reconnect.timer = nil
+                end
+                if my_b.client then
+                    ws_client.close(my_b.client)
+                    my_b.client = nil
+                end
+                if my_b.job_id then
+                    vim.fn.jobstop(my_b.job_id)
+                    my_b.job_id = nil
+                end
+            end
         end,
     })
 end
@@ -380,6 +397,7 @@ end
 -- Approval prompt handling
 function M._show_approval_prompt(params)
     local b = get_bridge()
+    local my_tabid = b.tabid
     local id = params.id or "unknown"
     local tool_name = params.tool_name or "unknown"
     local risk_level = params.risk_level or "medium"
@@ -440,7 +458,16 @@ function M._show_approval_prompt(params)
     local function close_and_respond(decision)
         vim.api.nvim_win_close(win, true)
         vim.api.nvim_buf_delete(buf, { force = true })
-        M._send_notification("approval_response", { id = id, decision = decision })
+        -- Use captured bridge instead of get_bridge()
+        local my_b = bridges[my_tabid]
+        if my_b and my_b.client and ws_client.is_connected(my_b.client) then
+            local response = {
+                jsonrpc = "2.0",
+                method = "approval_response",
+                params = { id = id, decision = decision },
+            }
+            ws_client.send(my_b.client, vim.json.encode(response))
+        end
     end
 
     vim.keymap.set("n", "y", function() close_and_respond("approve") end, { buffer = buf, nowait = true })
@@ -479,6 +506,7 @@ function M.request_state()
 end
 
 function M._handle_tool_request(params)
+    -- NOTE: Assumes _handle_message has already switched to correct tab context
     local b = get_bridge()
     if not params then return end
 
