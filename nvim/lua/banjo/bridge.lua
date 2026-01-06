@@ -57,18 +57,18 @@ function M.start(binary_path, cwd)
     b.reconnect.cwd = cwd
     b.reconnect.enabled = true
 
-    local tabid = vim.api.nvim_get_current_tabpage()
-    b.autocmd_group = vim.api.nvim_create_augroup("BanjoEvents_" .. tabid, { clear = true })
+    local my_tabid = b.tabid
+    b.autocmd_group = vim.api.nvim_create_augroup("BanjoEvents_" .. my_tabid, { clear = true })
 
     -- Spawn the binary to get the WebSocket port
     b.job_id = vim.fn.jobstart({ binary_path, "--nvim" }, {
         cwd = cwd,
         stdout_buffered = false,
         on_stdout = function(_, data)
-            M._on_stdout(data)
+            M._on_stdout(data, my_tabid)
         end,
         on_exit = function(_, code)
-            M._on_exit(code)
+            M._on_exit(code, my_tabid)
         end,
     })
 
@@ -78,7 +78,6 @@ function M.start(binary_path, cwd)
     end
 
     -- Track selection changes
-    local my_tabid = b.tabid
     vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
         group = b.autocmd_group,
         callback = function()
@@ -112,7 +111,6 @@ function M.start(binary_path, cwd)
     })
 
     -- Graceful shutdown on Vim exit
-    local my_tabid = b.tabid
     vim.api.nvim_create_autocmd("VimLeavePre", {
         group = b.autocmd_group,
         callback = function()
@@ -182,14 +180,15 @@ end
 
 -- Process stdout from binary (only used for initial ready notification)
 -- Note: vim.fn.jobstart sends data as array of lines (newlines stripped)
-function M._on_stdout(data)
-    local b = get_bridge()
+function M._on_stdout(data, tabid)
+    local b = bridges[tabid]
+    if not b then return end
     for _, line in ipairs(data) do
         if line ~= "" then
             local ok, msg = pcall(vim.json.decode, line)
             if ok and msg.method == "ready" and msg.params and msg.params.mcp_port then
                 b.mcp_port = msg.params.mcp_port
-                M._connect_websocket(b.mcp_port)
+                M._connect_websocket(b.mcp_port, tabid)
             elseif not ok then
                 vim.notify("Banjo: Failed to parse stdout: " .. line, vim.log.levels.ERROR)
             end
@@ -197,9 +196,10 @@ function M._on_stdout(data)
     end
 end
 
-function M._connect_websocket(port)
-    local b = get_bridge()
-    local my_tabid = b.tabid
+function M._connect_websocket(port, tabid)
+    local b = bridges[tabid]
+    if not b then return end
+    local my_tabid = tabid
     b.client = ws_client.new({
         on_message = function(message)
             local ok, msg = pcall(vim.json.decode, message)
@@ -295,8 +295,9 @@ function M._connect_websocket(port)
     ws_client.connect(b.client, "127.0.0.1", port, "/nvim")
 end
 
-function M._on_exit(code)
-    local b = get_bridge()
+function M._on_exit(code, tabid)
+    local b = bridges[tabid]
+    if not b then return end
     b.job_id = nil
     b.mcp_port = nil
     if b.client then
@@ -818,9 +819,11 @@ M._check_dirty = M._check_dirty
 vim.api.nvim_create_autocmd("TabClosed", {
     callback = function(ev)
         local tabid = tonumber(ev.match)
-        if tabid and bridges[tabid] then
-            -- Stop backend for this tab
-            local old_b = bridges[tabid]
+        if not tabid or not bridges[tabid] then
+            return
+        end
+        -- Stop backend for this tab
+        local old_b = bridges[tabid]
             if old_b.reconnect.timer then
                 pcall(old_b.reconnect.timer.stop, old_b.reconnect.timer)
                 pcall(old_b.reconnect.timer.close, old_b.reconnect.timer)

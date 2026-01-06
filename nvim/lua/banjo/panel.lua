@@ -217,7 +217,7 @@ local function setup_output_keymaps()
 
     -- Track manual scrolling
     local my_tabid = vim.api.nvim_get_current_tabpage()
-    local group_name = string.format("BanjoOutput_%d", state.output_buf)
+    local group_name = string.format("BanjoOutput_%d_%d", my_tabid, state.output_buf)
     local augroup = vim.api.nvim_create_augroup(group_name, { clear = true })
     vim.api.nvim_create_autocmd("CursorMoved", {
         group = augroup,
@@ -689,6 +689,10 @@ function M.append(text, is_thought)
         vim.schedule(function()
             local my_state = states[my_tabid]
             if not my_state then return end
+            if not my_state.output_win or not vim.api.nvim_win_is_valid(my_state.output_win) then
+                my_state.pending_scroll = false
+                return
+            end
             my_state.pending_scroll = false
             M._scroll_to_bottom(my_state)
         end)
@@ -1091,7 +1095,7 @@ function M.get_input_win()
 end
 
 function M.cleanup_tab(tabid)
-    if not states[tabid] then
+    if type(tabid) ~= "number" or not states[tabid] then
         return
     end
 
