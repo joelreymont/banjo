@@ -304,9 +304,13 @@ function M._on_exit(code)
                     my_b.reconnect.timer = nil
                 end
                 if my_b.reconnect.enabled and my_b.reconnect.binary_path then
+                    -- Validate tab still exists before switching
+                    if not vim.api.nvim_tabpage_is_valid(my_tabid) then
+                        return
+                    end
                     -- Switch to the correct tab before starting
                     local current_tab = vim.api.nvim_get_current_tabpage()
-                    if vim.api.nvim_tabpage_is_valid(my_tabid) and current_tab ~= my_tabid then
+                    if current_tab ~= my_tabid then
                         vim.api.nvim_set_current_tabpage(my_tabid)
                     end
                     M.start(my_b.reconnect.binary_path, my_b.reconnect.cwd)
