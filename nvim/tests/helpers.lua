@@ -160,8 +160,34 @@ end
 
 -- Cleanup function for tests
 function M.cleanup()
-    -- Clean up any test state
-    -- Tests should call this in after_each
+    -- Close all Banjo windows and delete buffers
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+        if vim.api.nvim_win_is_valid(win) then
+            local buf = vim.api.nvim_win_get_buf(win)
+            local bufname = vim.api.nvim_buf_get_name(buf)
+            if bufname:match("Banjo") then
+                pcall(vim.api.nvim_win_close, win, true)
+            end
+        end
+    end
+
+    -- Delete all Banjo buffers
+    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_valid(buf) then
+            local bufname = vim.api.nvim_buf_get_name(buf)
+            if bufname:match("Banjo") then
+                pcall(vim.api.nvim_buf_delete, buf, { force = true })
+            end
+        end
+    end
+
+    -- Clean up panel state for all tabs
+    local panel_ok, panel = pcall(require, "banjo.panel")
+    if panel_ok and panel.cleanup_tab then
+        for _, tab in ipairs(vim.api.nvim_list_tabpages()) do
+            pcall(panel.cleanup_tab, tab)
+        end
+    end
 end
 
 -- Simple wait helper for tests
