@@ -111,6 +111,47 @@ describe("banjo panel", function()
     end)
   end)
 
+  describe("input text", function()
+    it("get_input_text returns empty initially", function()
+      panel.open()
+      helpers.wait(50)
+
+      local text = panel.get_input_text()
+      assert.equals("", text)
+    end)
+
+    it("set_input_text updates input buffer", function()
+      panel.open()
+      helpers.wait(50)
+
+      panel.set_input_text("test input")
+      local text = panel.get_input_text()
+
+      assert.equals("test input", text)
+    end)
+
+    it("set_input_text handles multiline", function()
+      panel.open()
+      helpers.wait(50)
+
+      panel.set_input_text("line 1\nline 2\nline 3")
+      local text = panel.get_input_text()
+
+      assert.equals("line 1\nline 2\nline 3", text)
+    end)
+
+    it("set_input_text clears previous content", function()
+      panel.open()
+      helpers.wait(50)
+
+      panel.set_input_text("first")
+      panel.set_input_text("second")
+      local text = panel.get_input_text()
+
+      assert.equals("second", text)
+    end)
+  end)
+
   describe("stream", function()
     it("start_stream opens panel with header", function()
       panel.start_stream("claude")
