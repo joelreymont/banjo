@@ -824,24 +824,23 @@ vim.api.nvim_create_autocmd("TabClosed", {
         end
         -- Stop backend for this tab
         local old_b = bridges[tabid]
-            if old_b.reconnect.timer then
-                pcall(old_b.reconnect.timer.stop, old_b.reconnect.timer)
-                pcall(old_b.reconnect.timer.close, old_b.reconnect.timer)
-            end
-            if old_b.client then
-                pcall(ws_client.close, old_b.client)
-            end
-            if old_b.job_id then
-                pcall(vim.fn.jobstop, old_b.job_id)
-            end
-            if old_b.autocmd_group then
-                pcall(vim.api.nvim_del_augroup_by_id, old_b.autocmd_group)
-            end
-            bridges[tabid] = nil
-
-            -- Cleanup panel state for this tab
-            pcall(panel.cleanup_tab, tabid)
+        if old_b.reconnect.timer then
+            pcall(old_b.reconnect.timer.stop, old_b.reconnect.timer)
+            pcall(old_b.reconnect.timer.close, old_b.reconnect.timer)
         end
+        if old_b.client then
+            pcall(ws_client.close, old_b.client)
+        end
+        if old_b.job_id then
+            pcall(vim.fn.jobstop, old_b.job_id)
+        end
+        if old_b.autocmd_group then
+            pcall(vim.api.nvim_del_augroup_by_id, old_b.autocmd_group)
+        end
+        bridges[tabid] = nil
+
+        -- Cleanup panel state for this tab
+        pcall(panel.cleanup_tab, tabid)
     end,
 })
 
