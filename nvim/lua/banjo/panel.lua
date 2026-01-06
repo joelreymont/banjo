@@ -216,10 +216,18 @@ local function setup_output_keymaps()
     end
 
     -- Track manual scrolling
+    local my_tabid = vim.api.nvim_get_current_tabpage()
     vim.api.nvim_create_autocmd("CursorMoved", {
         buffer = state.output_buf,
         callback = function()
-            state.last_manual_scroll_time = vim.loop.now()
+            -- Only track if we're in the correct tab
+            if vim.api.nvim_get_current_tabpage() ~= my_tabid then
+                return
+            end
+            local my_state = states[my_tabid]
+            if my_state then
+                my_state.last_manual_scroll_time = vim.loop.now()
+            end
         end,
     })
 
@@ -803,9 +811,9 @@ function M._build_status()
         table.insert(parts, "%#DiagnosticInfo#...%*")
     end
 
-    -- Session duration
-    if state.session_active and state.session_start_time then
-        local elapsed_ms = vim.loop.now() - state.session_start_time
+    -- Session duration (from bridge state)
+    if bridge_state.session_active and bridge_state.session_start_time then
+        local elapsed_ms = vim.loop.now() - bridge_state.session_start_time
         local elapsed_sec = math.floor(elapsed_ms / 1000)
         local mins = math.floor(elapsed_sec / 60)
         local secs = elapsed_sec % 60
@@ -829,6 +837,7 @@ end
 
 function M._start_session_timer()
     local state = get_state()
+    local my_tabid = vim.api.nvim_get_current_tabpage()
     if state.session_timer then
         return
     end
@@ -836,7 +845,12 @@ function M._start_session_timer()
     state.session_timer = vim.loop.new_timer()
     if state.session_timer then
         state.session_timer:start(1000, 1000, vim.schedule_wrap(function()
-            M._update_status()
+            -- Use captured tabid to get correct state
+            local my_state = states[my_tabid]
+            if not my_state then return end
+            if my_state.output_win and vim.api.nvim_win_is_valid(my_state.output_win) then
+                vim.api.nvim_set_option_value("winbar", M._build_status(), { win = my_state.output_win })
+            end
         end))
     end
 end
