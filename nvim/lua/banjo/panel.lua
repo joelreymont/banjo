@@ -217,7 +217,10 @@ local function setup_output_keymaps()
 
     -- Track manual scrolling
     local my_tabid = vim.api.nvim_get_current_tabpage()
+    local group_name = string.format("BanjoOutput_%d", state.output_buf)
+    local augroup = vim.api.nvim_create_augroup(group_name, { clear = true })
     vim.api.nvim_create_autocmd("CursorMoved", {
+        group = augroup,
         buffer = state.output_buf,
         callback = function()
             -- Only track if we're in the correct tab
@@ -249,12 +252,12 @@ local function setup_output_keymaps()
 
     -- <CR> or gf to jump to file path under cursor
     local function jump_to_file()
-        local state = get_state()
-        local cursor = vim.api.nvim_win_get_cursor(state.output_win)
+        local panel_state = get_state()
+        local cursor = vim.api.nvim_win_get_cursor(panel_state.output_win)
         local line_num = cursor[1] - 1
         local col = cursor[2]
 
-        local line_text = vim.api.nvim_buf_get_lines(state.output_buf, line_num, line_num + 1, false)[1]
+        local line_text = vim.api.nvim_buf_get_lines(panel_state.output_buf, line_num, line_num + 1, false)[1]
         if not line_text then
             return
         end
@@ -559,6 +562,7 @@ end
 
 function M.append(text, is_thought)
     local state = get_state()
+    local my_tabid = vim.api.nvim_get_current_tabpage()
     if not state.output_buf or not vim.api.nvim_buf_is_valid(state.output_buf) then
         create_output_buffer()
     end
@@ -683,8 +687,10 @@ function M.append(text, is_thought)
     if not state.pending_scroll then
         state.pending_scroll = true
         vim.schedule(function()
-            state.pending_scroll = false
-            M._scroll_to_bottom()
+            local my_state = states[my_tabid]
+            if not my_state then return end
+            my_state.pending_scroll = false
+            M._scroll_to_bottom(my_state)
         end)
     end
 end
@@ -769,8 +775,8 @@ end
 
 -- Status line
 
-function M._build_status()
-    local panel_state = get_state()
+function M._build_status(panel_state)
+    panel_state = panel_state or get_state()
     local parts = {}
 
     -- Connection status
@@ -849,7 +855,7 @@ function M._start_session_timer()
             local my_state = states[my_tabid]
             if not my_state then return end
             if my_state.output_win and vim.api.nvim_win_is_valid(my_state.output_win) then
-                vim.api.nvim_set_option_value("winbar", M._build_status(), { win = my_state.output_win })
+                vim.api.nvim_set_option_value("winbar", M._build_status(my_state), { win = my_state.output_win })
             end
         end))
     end
@@ -1042,15 +1048,15 @@ function M._highlight_code_block(start_line, end_line, lang)
     end
 end
 
-function M._scroll_to_bottom()
-    local state = get_state()
-    if not state.output_win or not vim.api.nvim_win_is_valid(state.output_win) then
+function M._scroll_to_bottom(panel_state)
+    panel_state = panel_state or get_state()
+    if not panel_state.output_win or not vim.api.nvim_win_is_valid(panel_state.output_win) then
         return
     end
 
     -- Only auto-scroll if user hasn't manually scrolled in last 2 seconds
     local now = vim.loop.now()
-    local time_since_scroll = now - state.last_manual_scroll_time
+    local time_since_scroll = now - panel_state.last_manual_scroll_time
 
     if time_since_scroll < 2000 then
         -- User recently scrolled, preserve position
@@ -1058,8 +1064,8 @@ function M._scroll_to_bottom()
     end
 
     -- Auto-scroll to bottom
-    local line_count = vim.api.nvim_buf_line_count(state.output_buf)
-    vim.api.nvim_win_set_cursor(state.output_win, { line_count, 0 })
+    local line_count = vim.api.nvim_buf_line_count(panel_state.output_buf)
+    vim.api.nvim_win_set_cursor(panel_state.output_win, { line_count, 0 })
 end
 
 -- Accessors for testing

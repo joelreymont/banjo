@@ -198,7 +198,7 @@ function M._connect_websocket(port)
         end,
         on_connect = function()
             local my_b = bridges[my_tabid]
-            if not my_b then return end
+            if not my_b or not vim.api.nvim_tabpage_is_valid(my_tabid) then return end
             -- Reset reconnection state on successful connect
             my_b.reconnect.attempt = 0
             vim.notify("Banjo: Connected", vim.log.levels.INFO)
@@ -309,6 +309,13 @@ function M._handle_message(msg, tabid)
         return
     end
 
+    -- Switch to correct tab temporarily to ensure panel methods operate on correct state
+    local current_tab = vim.api.nvim_get_current_tabpage()
+    local need_switch = current_tab ~= tabid
+    if need_switch and vim.api.nvim_tabpage_is_valid(tabid) then
+        vim.api.nvim_set_current_tabpage(tabid)
+    end
+
     if method == "stream_start" then
         local engine = msg.params and msg.params.engine or "claude"
         panel.start_stream(engine)
@@ -362,6 +369,11 @@ function M._handle_message(msg, tabid)
         if msg.params then
             M._show_approval_prompt(msg.params)
         end
+    end
+
+    -- Restore original tab
+    if need_switch and vim.api.nvim_tabpage_is_valid(current_tab) then
+        vim.api.nvim_set_current_tabpage(current_tab)
     end
 end
 
