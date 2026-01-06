@@ -389,6 +389,7 @@ describe("banjo integration", function()
     end)
   end)
 
+end)
 describe("banjo panel integration", function()
   -- These tests verify panel behavior with simulated backend messages
   -- They don't require the actual binary
