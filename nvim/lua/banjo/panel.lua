@@ -342,30 +342,11 @@ local function setup_input_keymaps()
     end, { buffer = state.input_buf, noremap = true })
 end
 
-local function setup_output_keymaps()
-    local state = get_state()
-    if not state.output_buf or not vim.api.nvim_buf_is_valid(state.output_buf) then
+-- Set output buffer keymaps (called on buffer creation and BufEnter to ensure precedence)
+local function set_output_keymaps(buf, state)
+    if not buf or not vim.api.nvim_buf_is_valid(buf) then
         return
     end
-
-    -- Track manual scrolling
-    local my_tabid = vim.api.nvim_get_current_tabpage()
-    local group_name = string.format("BanjoOutput_%d_%d", my_tabid, state.output_buf)
-    local augroup = vim.api.nvim_create_augroup(group_name, { clear = true })
-    vim.api.nvim_create_autocmd("CursorMoved", {
-        group = augroup,
-        buffer = state.output_buf,
-        callback = function()
-            -- Only track if we're in the correct tab
-            if vim.api.nvim_get_current_tabpage() ~= my_tabid then
-                return
-            end
-            local my_state = states[my_tabid]
-            if my_state then
-                my_state.last_manual_scroll_time = vim.loop.now()
-            end
-        end,
-    })
 
     -- 'i' to focus input
     vim.keymap.set("n", "i", function()
@@ -373,40 +354,37 @@ local function setup_output_keymaps()
             vim.api.nvim_set_current_win(state.input_win)
             vim.cmd("startinsert!")
         end
-    end, { buffer = state.output_buf, noremap = true })
+    end, { buffer = buf, noremap = true })
 
-    -- 'q' to close panel (use vim.schedule to run after ftplugin)
-    vim.schedule(function()
-        if state.output_buf and vim.api.nvim_buf_is_valid(state.output_buf) then
-            vim.keymap.set("n", "q", function()
-                M.close()
-            end, { buffer = state.output_buf, noremap = true })
-        end
-    end)
+    -- 'q' to close panel
+    vim.keymap.set("n", "q", function()
+        M.close()
+    end, { buffer = buf, noremap = true })
 
     -- 'z' to toggle fold at cursor
-    vim.keymap.set("n", "z", "za", { buffer = state.output_buf, noremap = true })
+    vim.keymap.set("n", "z", "za", { buffer = buf, noremap = true })
 
     -- <CR> or gf to jump to file path under cursor
     local function jump_to_file()
-        local panel_state = get_state()
-        local cursor = vim.api.nvim_win_get_cursor(panel_state.output_win)
+        if not state.output_win or not vim.api.nvim_win_is_valid(state.output_win) then
+            return
+        end
+        local cursor = vim.api.nvim_win_get_cursor(state.output_win)
         local line_num = cursor[1] - 1
         local col = cursor[2]
 
-        local line_text = vim.api.nvim_buf_get_lines(panel_state.output_buf, line_num, line_num + 1, false)[1]
+        local lines = vim.api.nvim_buf_get_lines(buf, line_num, line_num + 1, false)
+        local line_text = lines[1]
         if not line_text then
             return
         end
 
-        -- Pattern matches: path/to/file:123 (with optional extension)
+        -- Pattern matches: path/to/file:123
         local pattern = "([%w_/.%-]+):(%d+)"
         local s, e, file_path, line_number = string.find(line_text, pattern)
 
-        -- Find the match under cursor
         while s do
             if col >= s - 1 and col < e then
-                -- Validate file exists before jumping
                 local stat = vim.loop.fs_stat(file_path)
                 if stat and stat.type == "file" then
                     vim.cmd(string.format("edit +%s %s", line_number, file_path))
@@ -419,8 +397,50 @@ local function setup_output_keymaps()
         end
     end
 
-    vim.keymap.set("n", "<CR>", jump_to_file, { buffer = state.output_buf, noremap = true })
-    vim.keymap.set("n", "gf", jump_to_file, { buffer = state.output_buf, noremap = true })
+    vim.keymap.set("n", "<CR>", jump_to_file, { buffer = buf, noremap = true })
+    vim.keymap.set("n", "gf", jump_to_file, { buffer = buf, noremap = true })
+end
+
+local function setup_output_keymaps()
+    local state = get_state()
+    if not state.output_buf or not vim.api.nvim_buf_is_valid(state.output_buf) then
+        return
+    end
+
+    local my_tabid = vim.api.nvim_get_current_tabpage()
+    local group_name = string.format("BanjoOutput_%d_%d", my_tabid, state.output_buf)
+    local augroup = vim.api.nvim_create_augroup(group_name, { clear = true })
+
+    -- Track manual scrolling
+    vim.api.nvim_create_autocmd("CursorMoved", {
+        group = augroup,
+        buffer = state.output_buf,
+        callback = function()
+            if vim.api.nvim_get_current_tabpage() ~= my_tabid then
+                return
+            end
+            local my_state = states[my_tabid]
+            if my_state then
+                my_state.last_manual_scroll_time = vim.loop.now()
+            end
+        end,
+    })
+
+    -- Re-establish keymaps on BufEnter to ensure they override any ftplugin keymaps
+    vim.api.nvim_create_autocmd({ "BufEnter", "FileType" }, {
+        group = augroup,
+        buffer = state.output_buf,
+        callback = function()
+            vim.schedule(function()
+                set_output_keymaps(state.output_buf, state)
+            end)
+        end,
+    })
+
+    -- Set keymaps now (deferred to run after ftplugin)
+    vim.schedule(function()
+        set_output_keymaps(state.output_buf, state)
+    end)
 end
 
 -- Window creation
