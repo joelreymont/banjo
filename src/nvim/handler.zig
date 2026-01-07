@@ -49,9 +49,17 @@ pub const Handler = struct {
     prompt_mutex: std.Thread.Mutex = .{},
     prompt_ready: std.Thread.Condition = .{},
 
+    // Pending continuation prompt (for nudge/dots auto-continue)
+    pending_continuation: ?PendingContinuation = null,
+
     const PendingPrompt = struct {
         text: []const u8,
         cwd: ?[]const u8,
+    };
+
+    const PendingContinuation = struct {
+        text: []const u8,
+        engine: Engine,
     };
 
     pub fn init(allocator: Allocator, stdin: std.io.AnyReader, stdout: std.io.AnyWriter) Handler {
@@ -81,6 +89,11 @@ pub const Handler = struct {
         if (self.pending_prompt) |p| {
             self.allocator.free(p.text);
             if (p.cwd) |c| self.allocator.free(c);
+        }
+
+        // Clean up pending continuation if any
+        if (self.pending_continuation) |c| {
+            self.allocator.free(c.text);
         }
 
         if (self.mcp_server) |mcp| {
@@ -176,6 +189,33 @@ pub const Handler = struct {
             log.err("Prompt processing error: {}", .{err});
             self.sendError("Processing error") catch {};
         };
+
+        // Process any pending continuation (from nudge/dots)
+        while (self.pending_continuation) |continuation| {
+            self.pending_continuation = null;
+            defer self.allocator.free(continuation.text);
+
+            if (self.cancelled.load(.acquire)) break;
+
+            log.info("Processing continuation prompt for {s}", .{@tagName(continuation.engine)});
+            self.cancelled.store(false, .release);
+
+            // Override engine for continuation
+            const saved_engine = self.current_engine;
+            self.current_engine = continuation.engine;
+            defer self.current_engine = saved_engine;
+
+            const cont_req = protocol.PromptRequest{
+                .text = continuation.text,
+                .cwd = null,
+            };
+
+            self.processPrompt(cont_req) catch |err| {
+                log.err("Continuation processing error: {}", .{err});
+                self.sendError("Continuation error") catch {};
+                break;
+            };
+        }
     }
 
     fn pollThreadFn(self: *Handler) void {
@@ -648,8 +688,8 @@ pub const Handler = struct {
         .sendUserMessage = cbSendUserMessage,
         .onTimeout = cbOnTimeout,
         .onSessionId = cbOnSessionId,
-        .onSlashCommands = null,
-        .checkAuthRequired = null,
+        .onSlashCommands = null, // nvim handles slash commands locally
+        .checkAuthRequired = cbCheckAuthRequired,
         .sendContinuePrompt = cbSendContinuePrompt,
         .onApprovalRequest = cbOnApprovalRequest,
     };
@@ -785,12 +825,37 @@ pub const Handler = struct {
         };
     }
 
-    fn cbSendContinuePrompt(ctx: *anyopaque, engine: Engine, prompt: []const u8) anyerror!bool {
-        _ = ctx;
+    fn cbCheckAuthRequired(ctx: *anyopaque, session_id: []const u8, engine: Engine, content: []const u8) anyerror!?EditorCallbacks.StopReason {
+        _ = session_id;
         _ = engine;
-        _ = prompt;
-        // For now, don't support nudge continuation - would need to restart bridge
-        return false;
+        const cb_ctx: *CallbackContext = @ptrCast(@alignCast(ctx));
+
+        // Check if content indicates auth is required
+        if (std.mem.indexOf(u8, content, "/login") != null or
+            std.mem.indexOf(u8, content, "authenticate") != null)
+        {
+            cb_ctx.handler.sendNotification("error_msg", protocol.ErrorMessage{
+                .message = "Authentication required. Please run `claude /login` in your terminal, then try again.",
+            }) catch {};
+            return .auth_required;
+        }
+        return null;
+    }
+
+    fn cbSendContinuePrompt(ctx: *anyopaque, engine: Engine, prompt: []const u8) anyerror!bool {
+        const cb_ctx: *CallbackContext = @ptrCast(@alignCast(ctx));
+        const handler = cb_ctx.handler;
+
+        // Queue continuation prompt to be processed after current prompt completes
+        if (handler.pending_continuation) |old| {
+            handler.allocator.free(old.text);
+        }
+        handler.pending_continuation = .{
+            .text = handler.allocator.dupe(u8, prompt) catch return false,
+            .engine = engine,
+        };
+        log.info("Queued continuation prompt for {s}", .{@tagName(engine)});
+        return true;
     }
 
     fn cbOnApprovalRequest(ctx: *anyopaque, request_id: std.json.Value, kind: ApprovalKind, params: ?std.json.Value) anyerror!?[]const u8 {
