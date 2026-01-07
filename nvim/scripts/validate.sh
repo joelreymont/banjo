@@ -23,7 +23,7 @@ done
 
 # Check files load in Neovim context
 echo "Checking module loading in Neovim..."
-nvim --headless -c 'lua require("banjo").setup({auto_start = false, binary_path = "/bin/true", keymaps = false})' -c 'qa' 2>&1 | tee /tmp/banjo-validate.log
+nvim --headless -c 'lua require("banjo").setup({auto_start = false, binary_path = "/usr/bin/true", keymaps = false})' -c 'qa' 2>&1 | tee /tmp/banjo-validate.log
 if grep -qE "Error|loop or previous error|E[0-9]+:|syntax error" /tmp/banjo-validate.log; then
     echo "FAIL: Module loading error"
     cat /tmp/banjo-validate.log
