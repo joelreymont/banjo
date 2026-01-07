@@ -215,8 +215,16 @@ local function set_input_keymaps(buf, state)
         return
     end
 
-    -- Enter to submit
+    -- Enter to submit (accepts completion first if popup visible)
     vim.keymap.set("i", "<CR>", function()
+        if vim.fn.pumvisible() == 1 then
+            -- Accept completion, then submit after popup closes
+            vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-y>", true, false, true), "n", false)
+            vim.schedule(function()
+                M.submit_input()
+            end)
+            return
+        end
         M.submit_input()
     end, { buffer = buf, noremap = true })
 
@@ -937,9 +945,9 @@ function M.show_tool_call(id, name, label)
         display_label = display_label:sub(1, 47) .. "..."
     end
 
-    local line = string.format("  %s **%s** `%s`", "⏳", name, display_label)
+    local line = string.format("  %s **%s** `%s`", "○", name, display_label)
     local line_count = vim.api.nvim_buf_line_count(state.output_buf)
-    vim.api.nvim_buf_set_lines(state.output_buf, line_count, line_count, false, { line })
+    vim.api.nvim_buf_set_lines(state.output_buf, line_count, line_count, false, { line, "" })
 
     -- Store extmark for later update, keyed by tool_id from backend
     if id then
@@ -962,7 +970,7 @@ function M.show_tool_result(id, status)
     elseif status == "running" then
         icon = "▶"
     elseif status == "pending" then
-        icon = "⏳"
+        icon = "○"
     end
 
     -- Try to find and update existing tool line by exact ID match
