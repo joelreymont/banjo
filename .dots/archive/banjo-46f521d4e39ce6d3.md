@@ -1,0 +1,11 @@
+---
+title: Fix notesToDiagnostics partial allocation leak
+status: closed
+priority: 2
+issue-type: task
+created-at: "2025-12-27T22:48:28.794950+02:00"
+closed-at: "2025-12-27T22:49:29.103350+02:00"
+close-reason: Completed via TodoWrite
+---
+
+Fixing notesToDiagnostics partial leak
