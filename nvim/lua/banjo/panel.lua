@@ -870,8 +870,15 @@ function M.append(text, is_thought)
     local last_line = vim.api.nvim_buf_get_lines(state.output_buf, line_count - 1, line_count, false)[1] or ""
 
     -- If last line is blank (separator), don't consume it - add new lines after
+    -- If last line is a tool call, add blank line before new text
+    local is_tool_line = last_line:match("^%s*[○▶✓✗]%s*%*%*")
     if last_line == "" then
         vim.api.nvim_buf_set_lines(state.output_buf, line_count, line_count, false, lines)
+    elseif is_tool_line then
+        vim.api.nvim_buf_set_lines(state.output_buf, line_count, line_count, false, { "", lines[1] })
+        if #lines > 1 then
+            vim.api.nvim_buf_set_lines(state.output_buf, line_count + 2, line_count + 2, false, vim.list_slice(lines, 2))
+        end
     else
         -- Append first line to last line
         if #lines > 0 then
