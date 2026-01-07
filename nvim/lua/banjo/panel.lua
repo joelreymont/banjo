@@ -117,11 +117,23 @@ local function create_input_buffer()
     return state.input_buf
 end
 
--- Command argument options
+-- Command argument options with descriptions
 local command_args = {
-    mode = { "default", "accept_edits", "auto_approve", "plan_only" },
-    model = { "opus", "sonnet", "haiku" },
-    agent = { "claude", "codex" },
+    mode = {
+        { word = "default", info = "Ask for permission on each action" },
+        { word = "accept_edits", info = "Auto-accept file edits" },
+        { word = "auto_approve", info = "No confirmations needed" },
+        { word = "plan_only", info = "Suggest without executing" },
+    },
+    model = {
+        { word = "opus", info = "Most capable, best for complex tasks" },
+        { word = "sonnet", info = "Balanced speed and capability" },
+        { word = "haiku", info = "Fastest, good for simple tasks" },
+    },
+    agent = {
+        { word = "claude", info = "Claude Code (Anthropic)" },
+        { word = "codex", info = "Codex (OpenAI)" },
+    },
 }
 
 -- Slash command completion function
@@ -160,10 +172,10 @@ local function banjo_complete(findstart, base)
             local args = command_args[cmd_match]
 
             for _, arg in ipairs(args) do
-                if base == "" or vim.startswith(arg, base) then
+                if base == "" or vim.startswith(arg.word, base) then
                     table.insert(matches, {
-                        word = arg,
-                        menu = "[" .. cmd_match .. "]",
+                        word = arg.word,
+                        menu = arg.info,
                     })
                 end
             end
@@ -245,39 +257,31 @@ local function setup_input_keymaps()
         end
     end, { buffer = state.input_buf, noremap = true })
 
-    -- Tab for command completion
+    -- Tab navigates completion menu or triggers completion
     vim.keymap.set("i", "<Tab>", function()
-        local text = M.get_input_text()
-        if not vim.startswith(text, "/") then
-            return "<Tab>"
+        if vim.fn.pumvisible() == 1 then
+            -- Completion menu is visible: select next item
+            return vim.api.nvim_replace_termcodes("<C-n>", true, false, true)
         end
 
-        local commands = require("banjo.commands")
-        local parsed = commands.parse(text)
-
-        if parsed and parsed.args == "" then
-            -- Complete command name
-            local prefix = parsed.cmd
-            local all_cmds = commands.list_commands()
-            local matches = {}
-
-            for _, cmd in ipairs(all_cmds) do
-                if vim.startswith(cmd, prefix) then
-                    table.insert(matches, cmd)
-                end
-            end
-
-            if #matches == 1 then
-                -- Single match: complete it
-                M.set_input_text("/" .. matches[1] .. " ")
-            elseif #matches > 1 then
-                -- Multiple matches: show them
-                M.append_status("Available: " .. table.concat(matches, ", "))
-            end
+        local line = vim.api.nvim_get_current_line()
+        if vim.startswith(line, "/") then
+            -- On a slash command: trigger completion
+            vim.api.nvim_set_option_value("completefunc", "v:lua.banjo_complete", { buf = state.input_buf })
+            return vim.api.nvim_replace_termcodes("<C-x><C-u>", true, false, true)
         end
 
-        return ""
-    end, { buffer = state.input_buf, noremap = true, expr = true })
+        -- Default: insert tab
+        return vim.api.nvim_replace_termcodes("<Tab>", true, false, true)
+    end, { buffer = state.input_buf, expr = true })
+
+    -- Shift-Tab navigates completion menu backwards
+    vim.keymap.set("i", "<S-Tab>", function()
+        if vim.fn.pumvisible() == 1 then
+            return vim.api.nvim_replace_termcodes("<C-p>", true, false, true)
+        end
+        return vim.api.nvim_replace_termcodes("<S-Tab>", true, false, true)
+    end, { buffer = state.input_buf, expr = true })
 
     -- Ctrl-C to cancel
     vim.keymap.set({ "n", "i" }, "<C-c>", function()
