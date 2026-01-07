@@ -44,6 +44,16 @@ pub const Handler = struct {
     pending_approval_id: ?[]const u8 = null,
     pending_approval_response: ?[]const u8 = null,
 
+    // Message queue for decoupling poll thread from processing
+    pending_prompt: ?PendingPrompt = null,
+    prompt_mutex: std.Thread.Mutex = .{},
+    prompt_ready: std.Thread.Condition = .{},
+
+    const PendingPrompt = struct {
+        text: []const u8,
+        cwd: ?[]const u8,
+    };
+
     pub fn init(allocator: Allocator, stdin: std.io.AnyReader, stdout: std.io.AnyWriter) Handler {
         const cwd_result = std.process.getCwdAlloc(allocator);
         const cwd = cwd_result catch "/";
@@ -58,11 +68,21 @@ pub const Handler = struct {
     }
 
     pub fn deinit(self: *Handler) void {
-        // Signal poll thread to exit and wait
+        // Signal threads to exit
         self.should_exit.store(true, .release);
+        self.prompt_ready.signal(); // Wake main thread if waiting
+
+        // Wait for poll thread
         if (self.poll_thread) |thread| {
             thread.join();
         }
+
+        // Clean up pending prompt if any
+        if (self.pending_prompt) |p| {
+            self.allocator.free(p.text);
+            if (p.cwd) |c| self.allocator.free(c);
+        }
+
         if (self.mcp_server) |mcp| {
             mcp.deinit();
         }
@@ -98,17 +118,64 @@ pub const Handler = struct {
             try self.sendStdoutNotification("ready", .{});
         }
 
-        // Spawn poll thread to receive messages (including cancel) while prompt is processing
+        // Spawn poll thread to receive WebSocket messages
         self.poll_thread = std.Thread.spawn(.{}, pollThreadFn, .{self}) catch |err| {
             log.err("Failed to spawn poll thread: {}", .{err});
             return err;
         };
 
-        // Wait for poll thread to exit (happens when should_exit is set)
+        // Main thread: wait for and process prompts
+        while (!self.should_exit.load(.acquire)) {
+            // Wait for a prompt to be queued
+            self.prompt_mutex.lock();
+            while (self.pending_prompt == null and !self.should_exit.load(.acquire)) {
+                self.prompt_ready.wait(&self.prompt_mutex);
+            }
+
+            // Take the prompt
+            const prompt = self.pending_prompt;
+            self.pending_prompt = null;
+            self.prompt_mutex.unlock();
+
+            // Process it (if we got one and not exiting)
+            if (prompt) |p| {
+                self.processQueuedPrompt(p);
+            }
+        }
+
+        // Wait for poll thread to exit
         if (self.poll_thread) |thread| {
             thread.join();
             self.poll_thread = null;
         }
+    }
+
+    fn processQueuedPrompt(self: *Handler, prompt: PendingPrompt) void {
+        defer {
+            self.allocator.free(prompt.text);
+            if (prompt.cwd) |c| self.allocator.free(c);
+        }
+
+        // Emit session_start if not already in a session
+        if (!self.session_active) {
+            self.session_active = true;
+            self.sendNotification("session_start", protocol.SessionEvent{}) catch {};
+            if (self.mcp_server) |mcp| {
+                mcp.sendNvimNotification("session_start", protocol.SessionEvent{}) catch {};
+            }
+        }
+
+        self.cancelled.store(false, .release);
+
+        const req = protocol.PromptRequest{
+            .text = prompt.text,
+            .cwd = prompt.cwd,
+        };
+
+        self.processPrompt(req) catch |err| {
+            log.err("Prompt processing error: {}", .{err});
+            self.sendError("Processing error") catch {};
+        };
     }
 
     fn pollThreadFn(self: *Handler) void {
@@ -184,21 +251,23 @@ pub const Handler = struct {
         };
         defer parsed.deinit();
 
-        // Emit session_start on first prompt
-        if (!self.session_active) {
-            self.session_active = true;
-            self.sendNotification("session_start", protocol.SessionEvent{}) catch {};
-            // Forward to MCP server
-            if (self.mcp_server) |mcp| {
-                mcp.sendNvimNotification("session_start", protocol.SessionEvent{}) catch {};
-            }
-        }
-
-        self.cancelled.store(false, .release);
-        self.processPrompt(parsed.value) catch |err| {
-            log.err("Prompt processing error: {}", .{err});
-            self.sendError("Processing error") catch {};
+        // Clone the prompt data since we're queuing it
+        const text = self.allocator.dupe(u8, parsed.value.text) catch {
+            log.err("Failed to allocate prompt text", .{});
+            return;
         };
+        const cwd = if (parsed.value.cwd) |c| self.allocator.dupe(u8, c) catch null else null;
+
+        // Queue the prompt and signal main thread
+        self.prompt_mutex.lock();
+        // If there's already a pending prompt, free it (shouldn't happen normally)
+        if (self.pending_prompt) |old| {
+            self.allocator.free(old.text);
+            if (old.cwd) |c| self.allocator.free(c);
+        }
+        self.pending_prompt = .{ .text = text, .cwd = cwd };
+        self.prompt_mutex.unlock();
+        self.prompt_ready.signal();
     }
 
     fn handleNvimCancel(self: *Handler) void {
@@ -371,6 +440,7 @@ pub const Handler = struct {
     fn handleNvimShutdown(self: *Handler) void {
         log.info("Shutdown requested", .{});
         self.should_exit.store(true, .release);
+        self.prompt_ready.signal(); // Wake up main thread
     }
 
     fn handleNvimToolResponse(self: *Handler, params: ?std.json.Value) void {
@@ -701,7 +771,7 @@ pub const Handler = struct {
     }
 
     fn cbOnTimeout(ctx: *anyopaque) void {
-        // Poll thread handles message reception - nothing to do here
+        // Poll thread handles WebSocket messages independently - nothing needed here
         _ = ctx;
     }
 
@@ -995,6 +1065,124 @@ test "should_exit flag stops poll thread" {
     try std.testing.expect(thread_exited.load(.acquire));
 
     // Now safe to deinit (thread already joined)
+    handler.deinit();
+}
+
+test "prompt queueing - main thread sees queued prompt" {
+    const allocator = std.testing.allocator;
+
+    var stdin_buf: [0]u8 = undefined;
+    var stdout_buf: [4096]u8 = undefined;
+    var stdin = std.io.fixedBufferStream(&stdin_buf);
+    var stdout = std.io.fixedBufferStream(&stdout_buf);
+
+    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+
+    // Simulate what handleNvimPrompt does - queue a prompt
+    const text = try allocator.dupe(u8, "test prompt");
+    handler.prompt_mutex.lock();
+    handler.pending_prompt = .{ .text = text, .cwd = null };
+    handler.prompt_mutex.unlock();
+    handler.prompt_ready.signal();
+
+    // Verify prompt is queued
+    handler.prompt_mutex.lock();
+    try std.testing.expect(handler.pending_prompt != null);
+    try std.testing.expectEqualStrings("test prompt", handler.pending_prompt.?.text);
+    handler.prompt_mutex.unlock();
+
+    // Clean up
+    handler.should_exit.store(true, .release);
+    handler.deinit();
+}
+
+test "cancel flag visible across threads during simulated processing" {
+    const allocator = std.testing.allocator;
+
+    var stdin_buf: [0]u8 = undefined;
+    var stdout_buf: [4096]u8 = undefined;
+    var stdin = std.io.fixedBufferStream(&stdin_buf);
+    var stdout = std.io.fixedBufferStream(&stdout_buf);
+
+    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+
+    var processing_saw_cancel = std.atomic.Value(bool).init(false);
+    var processing_started = std.atomic.Value(bool).init(false);
+
+    // Simulate main thread processing a prompt
+    const processor = try std.Thread.spawn(.{}, struct {
+        fn run(h: *Handler, started: *std.atomic.Value(bool), saw_cancel: *std.atomic.Value(bool)) void {
+            started.store(true, .release);
+            // Simulate polling for cancel during processing
+            const start = std.time.milliTimestamp();
+            while (std.time.milliTimestamp() - start < 1000) {
+                if (h.cancelled.load(.acquire)) {
+                    saw_cancel.store(true, .release);
+                    return;
+                }
+                std.Thread.sleep(10 * std.time.ns_per_ms);
+            }
+        }
+    }.run, .{ &handler, &processing_started, &processing_saw_cancel });
+
+    // Wait for processing to start
+    while (!processing_started.load(.acquire)) {
+        std.Thread.yield() catch {};
+    }
+
+    // Simulate poll thread receiving cancel (like handleNvimCancel)
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    handler.cancelled.store(true, .release);
+
+    processor.join();
+
+    // Verify processing saw the cancel
+    try std.testing.expect(processing_saw_cancel.load(.acquire));
+
+    handler.deinit();
+}
+
+test "prompt queue with condition variable wakeup" {
+    const allocator = std.testing.allocator;
+
+    var stdin_buf: [0]u8 = undefined;
+    var stdout_buf: [4096]u8 = undefined;
+    var stdin = std.io.fixedBufferStream(&stdin_buf);
+    var stdout = std.io.fixedBufferStream(&stdout_buf);
+
+    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+
+    var waiter_got_prompt = std.atomic.Value(bool).init(false);
+
+    // Simulate main thread waiting for prompt
+    const waiter = try std.Thread.spawn(.{}, struct {
+        fn run(h: *Handler, got_prompt: *std.atomic.Value(bool)) void {
+            h.prompt_mutex.lock();
+            // Wait with timeout
+            const start = std.time.milliTimestamp();
+            while (h.pending_prompt == null and std.time.milliTimestamp() - start < 1000) {
+                h.prompt_ready.timedWait(&h.prompt_mutex, 100 * std.time.ns_per_ms) catch {};
+            }
+            if (h.pending_prompt != null) {
+                got_prompt.store(true, .release);
+            }
+            h.prompt_mutex.unlock();
+        }
+    }.run, .{ &handler, &waiter_got_prompt });
+
+    // Small delay then queue prompt
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    const text = try allocator.dupe(u8, "queued prompt");
+    handler.prompt_mutex.lock();
+    handler.pending_prompt = .{ .text = text, .cwd = null };
+    handler.prompt_mutex.unlock();
+    handler.prompt_ready.signal();
+
+    waiter.join();
+
+    // Verify waiter got the prompt
+    try std.testing.expect(waiter_got_prompt.load(.acquire));
+
     handler.deinit();
 }
 

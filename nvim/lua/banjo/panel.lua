@@ -76,6 +76,16 @@ local function create_output_buffer()
     vim.api.nvim_set_option_value("filetype", "markdown", { buf = state.output_buf })
     vim.api.nvim_set_option_value("modifiable", true, { buf = state.output_buf })
 
+    -- Set fold options for manual folding (must be window-local, set when displayed)
+    vim.api.nvim_create_autocmd("BufWinEnter", {
+        buffer = state.output_buf,
+        callback = function()
+            vim.opt_local.foldmethod = "manual"
+            vim.opt_local.foldenable = true
+            vim.opt_local.foldlevel = 99  -- Start with all folds open
+        end,
+    })
+
     -- Disable completions for output buffer (prevent blink.cmp and other plugins)
     vim.api.nvim_set_option_value("omnifunc", "", { buf = state.output_buf })
     vim.api.nvim_set_option_value("completefunc", "", { buf = state.output_buf })
@@ -883,16 +893,17 @@ function M.append(text, is_thought)
     local line_count = vim.api.nvim_buf_line_count(state.output_buf)
     local last_line = vim.api.nvim_buf_get_lines(state.output_buf, line_count - 1, line_count, false)[1] or ""
 
+    -- If we just showed tool calls, add blank line before continuing text
+    if state.needs_newline_after_tool then
+        state.needs_newline_after_tool = false
+        vim.api.nvim_buf_set_lines(state.output_buf, line_count, line_count, false, { "" })
+        line_count = line_count + 1
+        last_line = ""
+    end
+
     -- If last line is blank (separator), don't consume it - add new lines after
-    -- If last line is a tool call, add blank line before new text
-    local is_tool_line = last_line:match("^%s*[○▶✓✗]%s*%*%*")
     if last_line == "" then
         vim.api.nvim_buf_set_lines(state.output_buf, line_count, line_count, false, lines)
-    elseif is_tool_line then
-        vim.api.nvim_buf_set_lines(state.output_buf, line_count, line_count, false, { "", lines[1] })
-        if #lines > 1 then
-            vim.api.nvim_buf_set_lines(state.output_buf, line_count + 2, line_count + 2, false, vim.list_slice(lines, 2))
-        end
     else
         -- Append first line to last line
         if #lines > 0 then
@@ -1044,12 +1055,22 @@ function M.show_tool_call(id, name, label, input)
         return
     end
 
-    local display_label = label
-    if #display_label > 50 then
-        display_label = display_label:sub(1, 47) .. "..."
+    -- Only show label if different from name and non-empty
+    local display_label = nil
+    if label and label ~= "" and label ~= name then
+        display_label = label
+        if #display_label > 50 then
+            display_label = display_label:sub(1, 47) .. "..."
+        end
     end
 
-    local line = string.format("  %s **%s** `%s` ", "○", name, display_label)
+    local line
+    if display_label then
+        line = string.format("  %s **%s** `%s`", "○", name, display_label)
+    else
+        line = string.format("  %s **%s**", "○", name)
+    end
+
     local line_count = vim.api.nvim_buf_line_count(state.output_buf)
 
     -- Format input nicely (extract meaningful fields)
@@ -1063,6 +1084,9 @@ function M.show_tool_call(id, name, label, input)
         local all_lines = { line }
         vim.list_extend(all_lines, formatted_lines)
         vim.api.nvim_buf_set_lines(state.output_buf, line_count, line_count, false, all_lines)
+
+        -- Mark that we need a newline before next text append (only when we have input lines)
+        state.needs_newline_after_tool = true
 
         -- Create fold for input (start after header, end at last input line)
         local fold_start = line_count + 1  -- 0-indexed, +1 for first input line
