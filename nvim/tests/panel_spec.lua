@@ -152,6 +152,84 @@ describe("banjo panel", function()
     end)
   end)
 
+  describe("output keymaps", function()
+    it("sets q keymap on output buffer", function()
+      panel.open()
+      helpers.wait(100) -- Wait for deferred keymap setup
+
+      local buf = helpers.get_banjo_buffer()
+      local maps = vim.api.nvim_buf_get_keymap(buf, "n")
+      local has_q = false
+      for _, m in ipairs(maps) do
+        if m.lhs == "q" then
+          has_q = true
+          break
+        end
+      end
+      assert.is_true(has_q, "Output buffer should have 'q' keymap")
+    end)
+
+    it("sets i keymap on output buffer", function()
+      panel.open()
+      helpers.wait(100)
+
+      local buf = helpers.get_banjo_buffer()
+      local maps = vim.api.nvim_buf_get_keymap(buf, "n")
+      local has_i = false
+      for _, m in ipairs(maps) do
+        if m.lhs == "i" then
+          has_i = true
+          break
+        end
+      end
+      assert.is_true(has_i, "Output buffer should have 'i' keymap")
+    end)
+
+    it("sets z keymap on output buffer", function()
+      panel.open()
+      helpers.wait(100)
+
+      local buf = helpers.get_banjo_buffer()
+      local maps = vim.api.nvim_buf_get_keymap(buf, "n")
+      local has_z = false
+      for _, m in ipairs(maps) do
+        if m.lhs == "z" then
+          has_z = true
+          break
+        end
+      end
+      assert.is_true(has_z, "Output buffer should have 'z' keymap")
+    end)
+
+    it("keymaps persist after FileType event", function()
+      panel.open()
+      helpers.wait(100)
+
+      local buf = helpers.get_banjo_buffer()
+
+      -- Simulate ftplugin setting a keymap that would override ours
+      vim.keymap.set("n", "q", ":close<CR>", { buffer = buf })
+
+      -- Trigger FileType event (simulates what happens when ftplugin loads)
+      vim.api.nvim_exec_autocmds("FileType", { buffer = buf })
+      helpers.wait(100)
+
+      -- Check our keymap is still there (callback should have re-established it)
+      local maps = vim.api.nvim_buf_get_keymap(buf, "n")
+      local q_map = nil
+      for _, m in ipairs(maps) do
+        if m.lhs == "q" then
+          q_map = m
+          break
+        end
+      end
+
+      assert.truthy(q_map, "Should have 'q' keymap after FileType event")
+      -- Our callback-based keymap won't have rhs set to a string
+      assert.not_equals(":close<CR>", q_map.rhs, "Keymap should be our callback, not the overridden one")
+    end)
+  end)
+
   describe("stream", function()
     it("start_stream opens panel with header", function()
       panel.start_stream("claude")
