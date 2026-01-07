@@ -120,19 +120,19 @@ end
 -- Command argument options with descriptions
 local command_args = {
     mode = {
-        { word = "default", info = "Ask for permission on each action" },
-        { word = "accept_edits", info = "Auto-accept file edits" },
-        { word = "auto_approve", info = "No confirmations needed" },
-        { word = "plan_only", info = "Suggest without executing" },
+        { word = "default", abbr = "Ask permission" },
+        { word = "accept_edits", abbr = "Accept edits" },
+        { word = "auto_approve", abbr = "Approve all" },
+        { word = "plan_only", abbr = "Plan only" },
     },
     model = {
-        { word = "opus", info = "Most capable, best for complex tasks" },
-        { word = "sonnet", info = "Balanced speed and capability" },
-        { word = "haiku", info = "Fastest, good for simple tasks" },
+        { word = "opus", abbr = "Opus (most capable)" },
+        { word = "sonnet", abbr = "Sonnet (balanced)" },
+        { word = "haiku", abbr = "Haiku (fastest)" },
     },
     agent = {
-        { word = "claude", info = "Claude Code (Anthropic)" },
-        { word = "codex", info = "Codex (OpenAI)" },
+        { word = "claude", abbr = "Claude (Anthropic)" },
+        { word = "codex", abbr = "Codex (OpenAI)" },
     },
 }
 
@@ -175,7 +175,7 @@ local function banjo_complete(findstart, base)
                 if base == "" or vim.startswith(arg.word, base) then
                     table.insert(matches, {
                         word = arg.word,
-                        menu = arg.info,
+                        abbr = arg.abbr,
                     })
                 end
             end
