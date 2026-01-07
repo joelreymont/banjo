@@ -357,7 +357,7 @@ pub const Agent = struct {
     const Session = struct {
         id: []const u8,
         cwd: []const u8,
-        cancelled: bool = false,
+        cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         permission_mode: protocol.PermissionMode = .default,
         config: SessionConfig,
         availability: EngineAvailability,
@@ -1097,7 +1097,7 @@ pub const Agent = struct {
 
         const prompt_text = prompt_parts.user_text;
 
-        session.cancelled = false;
+        session.cancelled.store(false, .release);
         log.info("Prompt received for session {s}: {s}", .{ session_id, prompt_text orelse "(empty)" });
 
         const route = session.config.route;
@@ -1687,7 +1687,7 @@ pub const Agent = struct {
                     .codex => try self.runCodexPrompt(session, session_id, codex_prompt, codex_inputs),
                 };
                 stop_reason = mergeStopReason(stop_reason, reason);
-                if (session.cancelled) return .cancelled;
+                if (session.cancelled.load(.acquire)) return .cancelled;
                 continue :state .next_engine;
             },
         }
@@ -2599,7 +2599,7 @@ pub const Agent = struct {
         var state: State = .read_message;
 
         state: while (true) {
-            if (session.cancelled) {
+            if (session.cancelled.load(.acquire)) {
                 return error.Cancelled;
             }
             switch (state) {
@@ -2667,7 +2667,7 @@ pub const Agent = struct {
                 },
             }
 
-            if (session.cancelled) return;
+            if (session.cancelled.load(.acquire)) return;
         }
     }
 
@@ -3217,7 +3217,7 @@ pub const Agent = struct {
         defer parsed.deinit();
 
         if (self.sessions.get(parsed.value.sessionId)) |session| {
-            session.cancelled = true;
+            session.cancelled.store(true, .release);
             self.clearPendingExecuteTools(session);
             if (session.bridge) |*b| {
                 b.deinit();
@@ -3571,7 +3571,7 @@ pub const Agent = struct {
         self.clearSessionId(&session.codex_session_id);
         session.force_new_claude = true;
         session.force_new_codex = true;
-        session.cancelled = false;
+        session.cancelled.store(false, .release);
         self.clearPendingExecuteTools(session);
     }
 
@@ -5570,7 +5570,7 @@ test "Agent handleRequest - cancel" {
 
     // Verify session was marked as cancelled
     const session = agent.sessions.get(session_id).?;
-    try testing.expect(session.cancelled);
+    try testing.expect(session.cancelled.load(.acquire));
 }
 
 // =============================================================================
@@ -5888,7 +5888,7 @@ test "requestWriteTextFile returns false when cancelled" {
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
         .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
-        .cancelled = true, // Session is cancelled
+        .cancelled = std.atomic.Value(bool).init(true), // Session is cancelled
     };
     defer session.deinit(testing.allocator);
 
@@ -5917,7 +5917,7 @@ test "requestReadTextFile returns null when cancelled" {
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
         .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
         .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
-        .cancelled = true, // Session is cancelled
+        .cancelled = std.atomic.Value(bool).init(true), // Session is cancelled
     };
     defer session.deinit(testing.allocator);
 

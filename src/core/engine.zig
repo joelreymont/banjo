@@ -31,12 +31,16 @@ pub const PromptContext = struct {
     allocator: Allocator,
     session_id: []const u8,
     cwd: []const u8,
-    cancelled: *bool,
+    cancelled: *std.atomic.Value(bool),
     nudge: NudgeConfig,
     cb: EditorCallbacks,
 
     // For tagging output with engine prefix (duet mode)
     tag_engine: bool = false,
+
+    pub fn isCancelled(self: *const PromptContext) bool {
+        return self.cancelled.load(.acquire);
+    }
 };
 
 fn mapToolKind(tool_name: []const u8) ToolKind {
@@ -84,7 +88,7 @@ pub fn processClaudeMessages(
     var thought_prefix_pending = false;
 
     while (true) {
-        if (ctx.cancelled.*) {
+        if (ctx.isCancelled()) {
             stop_reason = .cancelled;
             break;
         }
@@ -93,7 +97,7 @@ pub fn processClaudeMessages(
         var msg = bridge.readMessageWithTimeout(deadline_ms) catch |err| {
             if (err == error.Timeout) {
                 ctx.cb.onTimeout();
-                if (ctx.cancelled.*) {
+                if (ctx.isCancelled()) {
                     stop_reason = .cancelled;
                     break;
                 }
@@ -152,7 +156,7 @@ pub fn processClaudeMessages(
                 if (msg.getStopReason()) |reason| {
                     const now_ms = std.time.milliTimestamp();
                     const cooldown_ok = (now_ms - ctx.nudge.last_nudge_ms.*) >= ctx.nudge.cooldown_ms;
-                    const should_nudge = ctx.nudge.enabled and !ctx.cancelled.* and cooldown_ok and
+                    const should_nudge = ctx.nudge.enabled and !ctx.isCancelled() and cooldown_ok and
                         dots.hasPendingTasks(ctx.allocator, ctx.cwd) and
                         (std.mem.eql(u8, reason, "error_max_turns") or
                             std.mem.eql(u8, reason, "success") or
@@ -335,13 +339,13 @@ pub fn processCodexMessages(
     var thought_prefix_pending = false;
 
     while (true) {
-        if (ctx.cancelled.*) return .cancelled;
+        if (ctx.isCancelled()) return .cancelled;
 
         const deadline_ms = std.time.milliTimestamp() + prompt_poll_ms;
         var msg = bridge.readMessageWithTimeout(deadline_ms) catch |err| {
             if (err == error.Timeout) {
                 ctx.cb.onTimeout();
-                if (ctx.cancelled.*) return .cancelled;
+                if (ctx.isCancelled()) return .cancelled;
                 continue;
             }
             if (err == error.EndOfStream) {
@@ -450,7 +454,7 @@ pub fn processCodexMessages(
             const has_blocking_error = msg.turn_error != null and !has_max_turn_error;
             const now_ms = std.time.milliTimestamp();
             const cooldown_ok = (now_ms - ctx.nudge.last_nudge_ms.*) >= ctx.nudge.cooldown_ms;
-            const should_nudge = ctx.nudge.enabled and !ctx.cancelled.* and
+            const should_nudge = ctx.nudge.enabled and !ctx.isCancelled() and
                 !has_blocking_error and cooldown_ok and
                 dots.hasPendingTasks(ctx.allocator, ctx.cwd);
 
@@ -497,5 +501,124 @@ fn sendEngineThought(ctx: *PromptContext, engine: Engine, text: []const u8) !voi
         }
     } else {
         try ctx.cb.sendThought(ctx.session_id, engine, text);
+    }
+}
+
+// Tests
+const testing = std.testing;
+
+test "PromptContext.isCancelled reads atomic flag" {
+    var cancelled = std.atomic.Value(bool).init(false);
+    var last_nudge: i64 = 0;
+
+    const ctx = PromptContext{
+        .allocator = testing.allocator,
+        .session_id = "test",
+        .cwd = "/tmp",
+        .cancelled = &cancelled,
+        .nudge = .{
+            .enabled = false,
+            .cooldown_ms = 0,
+            .last_nudge_ms = &last_nudge,
+        },
+        .cb = undefined,
+    };
+
+    try testing.expect(!ctx.isCancelled());
+
+    cancelled.store(true, .release);
+    try testing.expect(ctx.isCancelled());
+
+    cancelled.store(false, .release);
+    try testing.expect(!ctx.isCancelled());
+}
+
+test "PromptContext.isCancelled sees updates from another thread" {
+    var cancelled = std.atomic.Value(bool).init(false);
+    var last_nudge: i64 = 0;
+
+    const ctx = PromptContext{
+        .allocator = testing.allocator,
+        .session_id = "test",
+        .cwd = "/tmp",
+        .cancelled = &cancelled,
+        .nudge = .{
+            .enabled = false,
+            .cooldown_ms = 0,
+            .last_nudge_ms = &last_nudge,
+        },
+        .cb = undefined,
+    };
+
+    var seen_cancelled = std.atomic.Value(bool).init(false);
+
+    // Reader thread polls isCancelled
+    const reader = try std.Thread.spawn(.{}, struct {
+        fn run(c: *const PromptContext, seen: *std.atomic.Value(bool)) void {
+            const start = std.time.milliTimestamp();
+            while (std.time.milliTimestamp() - start < 1000) {
+                if (c.isCancelled()) {
+                    seen.store(true, .release);
+                    return;
+                }
+                std.Thread.yield() catch {};
+            }
+        }
+    }.run, .{ &ctx, &seen_cancelled });
+
+    // Writer thread sets cancelled after delay
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+    cancelled.store(true, .release);
+
+    reader.join();
+
+    try testing.expect(seen_cancelled.load(.acquire));
+}
+
+test "PromptContext.isCancelled concurrent access is safe" {
+    var cancelled = std.atomic.Value(bool).init(false);
+    var last_nudge: i64 = 0;
+
+    const ctx = PromptContext{
+        .allocator = testing.allocator,
+        .session_id = "test",
+        .cwd = "/tmp",
+        .cancelled = &cancelled,
+        .nudge = .{
+            .enabled = false,
+            .cooldown_ms = 0,
+            .last_nudge_ms = &last_nudge,
+        },
+        .cb = undefined,
+    };
+
+    const num_threads = 4;
+    var threads: [num_threads]std.Thread = undefined;
+    var read_counts: [num_threads]std.atomic.Value(u32) = .{std.atomic.Value(u32).init(0)} ** num_threads;
+
+    // Spawn reader threads
+    for (0..num_threads) |i| {
+        threads[i] = try std.Thread.spawn(.{}, struct {
+            fn run(c: *const PromptContext, count: *std.atomic.Value(u32)) void {
+                var local: u32 = 0;
+                for (0..10000) |_| {
+                    _ = c.isCancelled();
+                    local += 1;
+                }
+                count.store(local, .release);
+            }
+        }.run, .{ &ctx, &read_counts[i] });
+    }
+
+    // Writer toggles cancelled while readers run
+    for (0..1000) |_| {
+        cancelled.store(true, .release);
+        cancelled.store(false, .release);
+    }
+
+    // Wait for readers
+    for (0..num_threads) |i| {
+        threads[i].join();
+        try testing.expectEqual(@as(u32, 10000), read_counts[i].load(.acquire));
     }
 }

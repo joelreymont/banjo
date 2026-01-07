@@ -431,6 +431,19 @@ local function set_output_keymaps(buf, state)
 
     vim.keymap.set("n", "<CR>", jump_to_file, { buffer = buf, noremap = true })
     vim.keymap.set("n", "gf", jump_to_file, { buffer = buf, noremap = true })
+
+    -- 'z' to toggle fold under cursor
+    vim.keymap.set("n", "z", function()
+        pcall(vim.cmd, "normal! za")
+    end, { buffer = buf, noremap = true })
+
+    -- Ctrl-C to cancel
+    vim.keymap.set("n", "<C-c>", function()
+        if state.bridge then
+            state.bridge.cancel()
+            M.append_status("Cancelled")
+        end
+    end, { buffer = buf, noremap = true })
 end
 
 local function setup_output_keymaps()
@@ -947,6 +960,84 @@ end
 
 -- Tool display
 
+-- Format tool input for display (extract meaningful fields, not raw JSON)
+local function format_tool_input(name, input_json)
+    if not input_json or input_json == "" then
+        return nil
+    end
+
+    -- Try to parse JSON
+    local ok, input = pcall(vim.json.decode, input_json)
+    if not ok or type(input) ~= "table" then
+        return nil
+    end
+
+    local lines = {}
+
+    -- Bash/shell commands - show the command
+    if name == "Bash" then
+        if input.command then
+            table.insert(lines, "$ " .. input.command)
+        end
+        if input.description then
+            table.insert(lines, "# " .. input.description)
+        end
+        return #lines > 0 and lines or nil
+    end
+
+    -- Task - show description and prompt
+    if name == "Task" then
+        if input.description then
+            table.insert(lines, input.description)
+        end
+        if input.prompt then
+            -- Truncate long prompts
+            local prompt = input.prompt
+            if #prompt > 200 then
+                prompt = prompt:sub(1, 197) .. "..."
+            end
+            table.insert(lines, prompt)
+        end
+        return #lines > 0 and lines or nil
+    end
+
+    -- WebFetch - show URL
+    if name == "WebFetch" or name == "WebSearch" then
+        if input.url then
+            table.insert(lines, input.url)
+        end
+        if input.query then
+            table.insert(lines, input.query)
+        end
+        return #lines > 0 and lines or nil
+    end
+
+    -- AskUserQuestion - show questions
+    if name == "AskUserQuestion" then
+        if input.questions and type(input.questions) == "table" then
+            for _, q in ipairs(input.questions) do
+                if q.question then
+                    table.insert(lines, "? " .. q.question)
+                end
+            end
+        end
+        return #lines > 0 and lines or nil
+    end
+
+    -- Default: extract common fields
+    if input.file_path then
+        table.insert(lines, input.file_path)
+    end
+    if input.pattern then
+        table.insert(lines, "pattern: " .. input.pattern)
+    end
+    if input.content and #input.content < 100 then
+        table.insert(lines, input.content)
+    end
+
+    return #lines > 0 and lines or nil
+end
+
 function M.show_tool_call(id, name, label, input)
     local state = get_state()
     if not state.output_buf or not vim.api.nvim_buf_is_valid(state.output_buf) then
@@ -961,20 +1052,21 @@ function M.show_tool_call(id, name, label, input)
     local line = string.format("  %s **%s** `%s` ", "○", name, display_label)
     local line_count = vim.api.nvim_buf_line_count(state.output_buf)
 
-    -- If input provided, add it as foldable content
-    if input and input ~= "" then
-        local input_lines = vim.split(input, "\n", { plain = true })
-        -- Indent input lines
-        for i, l in ipairs(input_lines) do
-            input_lines[i] = "    " .. l
+    -- Format input nicely (extract meaningful fields)
+    local formatted_lines = format_tool_input(name, input)
+
+    if formatted_lines and #formatted_lines > 0 then
+        -- Indent formatted lines
+        for i, l in ipairs(formatted_lines) do
+            formatted_lines[i] = "    " .. l
         end
         local all_lines = { line }
-        vim.list_extend(all_lines, input_lines)
+        vim.list_extend(all_lines, formatted_lines)
         vim.api.nvim_buf_set_lines(state.output_buf, line_count, line_count, false, all_lines)
 
         -- Create fold for input (start after header, end at last input line)
         local fold_start = line_count + 1  -- 0-indexed, +1 for first input line
-        local fold_end = line_count + #input_lines
+        local fold_end = line_count + #formatted_lines
         vim.api.nvim_buf_call(state.output_buf, function()
             vim.opt_local.foldmethod = "manual"
             vim.opt_local.foldenable = true

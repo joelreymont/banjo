@@ -23,13 +23,14 @@ pub const Handler = struct {
     stdout: std.io.AnyWriter,
     cwd: []const u8,
     owns_cwd: bool,
-    cancelled: bool = false,
+    cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     nudge_enabled: bool = true,
     last_nudge_ms: i64 = 0,
     claude_session_id: ?[]const u8 = null,
     codex_session_id: ?[]const u8 = null,
     mcp_server: ?*mcp_server_mod.McpServer = null,
-    should_exit: bool = false,
+    should_exit: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    poll_thread: ?std.Thread = null,
 
     // State for engine/model/mode selection
     current_engine: Engine = .claude,
@@ -57,6 +58,11 @@ pub const Handler = struct {
     }
 
     pub fn deinit(self: *Handler) void {
+        // Signal poll thread to exit and wait
+        self.should_exit.store(true, .release);
+        if (self.poll_thread) |thread| {
+            thread.join();
+        }
         if (self.mcp_server) |mcp| {
             mcp.deinit();
         }
@@ -92,8 +98,21 @@ pub const Handler = struct {
             try self.sendStdoutNotification("ready", .{});
         }
 
-        // Main event loop - poll MCP server which handles both MCP and nvim WebSocket
-        while (!self.should_exit) {
+        // Spawn poll thread to receive messages (including cancel) while prompt is processing
+        self.poll_thread = std.Thread.spawn(.{}, pollThreadFn, .{self}) catch |err| {
+            log.err("Failed to spawn poll thread: {}", .{err});
+            return err;
+        };
+
+        // Wait for poll thread to exit (happens when should_exit is set)
+        if (self.poll_thread) |thread| {
+            thread.join();
+            self.poll_thread = null;
+        }
+    }
+
+    fn pollThreadFn(self: *Handler) void {
+        while (!self.should_exit.load(.acquire)) {
             if (self.mcp_server) |mcp| {
                 _ = mcp.poll(100) catch |err| {
                     log.warn("MCP poll error: {}", .{err});
@@ -175,7 +194,7 @@ pub const Handler = struct {
             }
         }
 
-        self.cancelled = false;
+        self.cancelled.store(false, .release);
         self.processPrompt(parsed.value) catch |err| {
             log.err("Prompt processing error: {}", .{err});
             self.sendError("Processing error") catch {};
@@ -193,7 +212,7 @@ pub const Handler = struct {
             }
         }
 
-        self.cancelled = true;
+        self.cancelled.store(true, .release);
         self.sendNotification("status", protocol.StatusUpdate{ .text = "Cancelled" }) catch {};
     }
 
@@ -351,7 +370,7 @@ pub const Handler = struct {
 
     fn handleNvimShutdown(self: *Handler) void {
         log.info("Shutdown requested", .{});
-        self.should_exit = true;
+        self.should_exit.store(true, .release);
     }
 
     fn handleNvimToolResponse(self: *Handler, params: ?std.json.Value) void {
@@ -603,11 +622,36 @@ pub const Handler = struct {
         _ = ctx;
     }
 
+    // Tools that run silently without UI updates (internal housekeeping)
+    const quiet_tools = std.StaticStringMap(void).initComptime(.{
+        .{ "TodoWrite", {} },
+        .{ "TodoRead", {} },
+        .{ "TaskOutput", {} },
+        .{ "Skill", {} },
+        .{ "Read", {} },
+        .{ "Write", {} },
+        .{ "Edit", {} },
+        .{ "MultiEdit", {} },
+        .{ "NotebookRead", {} },
+        .{ "NotebookEdit", {} },
+        .{ "Grep", {} },
+        .{ "Glob", {} },
+        .{ "LSP", {} },
+        .{ "KillShell", {} },
+        .{ "EnterPlanMode", {} },
+        .{ "ExitPlanMode", {} },
+    });
+
     fn cbSendToolCall(ctx: *anyopaque, session_id: []const u8, engine: Engine, tool_name: []const u8, tool_label: []const u8, tool_id: []const u8, kind: ToolKind, input: ?std.json.Value) anyerror!void {
         _ = session_id;
         _ = engine;
         _ = kind;
         const cb_ctx: *CallbackContext = @ptrCast(@alignCast(ctx));
+
+        // Skip UI updates for quiet tools
+        if (quiet_tools.has(tool_name)) {
+            return;
+        }
 
         // Stringify input JSON if present
         var input_str: ?[]const u8 = null;
@@ -657,6 +701,7 @@ pub const Handler = struct {
     }
 
     fn cbOnTimeout(ctx: *anyopaque) void {
+        // Poll thread handles message reception - nothing to do here
         _ = ctx;
     }
 
@@ -742,7 +787,7 @@ pub const Handler = struct {
 
         while (std.time.milliTimestamp() - start_time < timeout_ms) {
             // Check if cancelled
-            if (handler.cancelled) {
+            if (handler.cancelled.load(.acquire)) {
                 return "decline";
             }
 
@@ -792,7 +837,7 @@ test "handler init/deinit" {
     var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
     defer handler.deinit();
 
-    try std.testing.expect(!handler.cancelled);
+    try std.testing.expect(!handler.cancelled.load(.acquire));
     try std.testing.expect(handler.nudge_enabled);
 }
 
@@ -829,11 +874,128 @@ test "handler cancel" {
     var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
     defer handler.deinit();
 
-    try std.testing.expect(!handler.cancelled);
+    try std.testing.expect(!handler.cancelled.load(.acquire));
 
     // Cancel (simulate callback)
-    handler.cancelled = true;
-    try std.testing.expect(handler.cancelled);
+    handler.cancelled.store(true, .release);
+    try std.testing.expect(handler.cancelled.load(.acquire));
+}
+
+test "cancelled flag is atomic - concurrent reads" {
+    const allocator = std.testing.allocator;
+
+    var stdin_buf: [0]u8 = undefined;
+    var stdout_buf: [4096]u8 = undefined;
+    var stdin = std.io.fixedBufferStream(&stdin_buf);
+    var stdout = std.io.fixedBufferStream(&stdout_buf);
+
+    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    defer handler.deinit();
+
+    // Spawn multiple reader threads
+    const num_readers = 4;
+    var readers: [num_readers]std.Thread = undefined;
+    var read_counts: [num_readers]u32 = .{0} ** num_readers;
+
+    for (0..num_readers) |i| {
+        readers[i] = try std.Thread.spawn(.{}, struct {
+            fn run(h: *Handler, count: *u32) void {
+                // Read cancelled flag many times
+                var local_count: u32 = 0;
+                for (0..10000) |_| {
+                    _ = h.cancelled.load(.acquire);
+                    local_count += 1;
+                }
+                count.* = local_count;
+            }
+        }.run, .{ &handler, &read_counts[i] });
+    }
+
+    // Toggle cancelled while readers are running
+    for (0..1000) |_| {
+        handler.cancelled.store(true, .release);
+        handler.cancelled.store(false, .release);
+    }
+
+    // Wait for all readers
+    for (0..num_readers) |i| {
+        readers[i].join();
+        try std.testing.expectEqual(@as(u32, 10000), read_counts[i]);
+    }
+}
+
+test "cancelled flag is atomic - writer thread sets, reader sees it" {
+    const allocator = std.testing.allocator;
+
+    var stdin_buf: [0]u8 = undefined;
+    var stdout_buf: [4096]u8 = undefined;
+    var stdin = std.io.fixedBufferStream(&stdin_buf);
+    var stdout = std.io.fixedBufferStream(&stdout_buf);
+
+    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    defer handler.deinit();
+
+    var seen_true = std.atomic.Value(bool).init(false);
+
+    // Reader thread waits for cancelled to become true
+    const reader = try std.Thread.spawn(.{}, struct {
+        fn run(h: *Handler, seen: *std.atomic.Value(bool)) void {
+            const start = std.time.milliTimestamp();
+            while (std.time.milliTimestamp() - start < 1000) {
+                if (h.cancelled.load(.acquire)) {
+                    seen.store(true, .release);
+                    return;
+                }
+                std.Thread.yield() catch {};
+            }
+        }
+    }.run, .{ &handler, &seen_true });
+
+    // Small delay then set cancelled
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+    handler.cancelled.store(true, .release);
+
+    reader.join();
+
+    // Reader should have seen the cancelled flag
+    try std.testing.expect(seen_true.load(.acquire));
+}
+
+test "should_exit flag stops poll thread" {
+    const allocator = std.testing.allocator;
+
+    var stdin_buf: [0]u8 = undefined;
+    var stdout_buf: [4096]u8 = undefined;
+    var stdin = std.io.fixedBufferStream(&stdin_buf);
+    var stdout = std.io.fixedBufferStream(&stdout_buf);
+
+    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+
+    // Simulate what run() does - spawn poll thread
+    var thread_exited = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(h: *Handler, exited: *std.atomic.Value(bool)) void {
+            while (!h.should_exit.load(.acquire)) {
+                std.Thread.sleep(10 * std.time.ns_per_ms);
+            }
+            exited.store(true, .release);
+        }
+    }.run, .{ &handler, &thread_exited });
+
+    // Verify thread is running
+    try std.testing.expect(!thread_exited.load(.acquire));
+
+    // Signal exit
+    handler.should_exit.store(true, .release);
+
+    // Wait for thread with timeout
+    thread.join();
+
+    // Thread should have exited
+    try std.testing.expect(thread_exited.load(.acquire));
+
+    // Now safe to deinit (thread already joined)
+    handler.deinit();
 }
 
 test "protocol JsonRpcRequest parse" {
