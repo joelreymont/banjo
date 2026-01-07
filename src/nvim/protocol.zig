@@ -147,6 +147,7 @@ pub const ToolCall = struct {
     id: []const u8,
     name: []const u8,
     label: []const u8,
+    input: ?[]const u8 = null,
 };
 
 pub const ToolResult = struct {

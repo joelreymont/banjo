@@ -947,7 +947,7 @@ end
 
 -- Tool display
 
-function M.show_tool_call(id, name, label)
+function M.show_tool_call(id, name, label, input)
     local state = get_state()
     if not state.output_buf or not vim.api.nvim_buf_is_valid(state.output_buf) then
         return
@@ -960,7 +960,30 @@ function M.show_tool_call(id, name, label)
 
     local line = string.format("  %s **%s** `%s` ", "○", name, display_label)
     local line_count = vim.api.nvim_buf_line_count(state.output_buf)
-    vim.api.nvim_buf_set_lines(state.output_buf, line_count, line_count, false, { line })
+
+    -- If input provided, add it as foldable content
+    if input and input ~= "" then
+        local input_lines = vim.split(input, "\n", { plain = true })
+        -- Indent input lines
+        for i, l in ipairs(input_lines) do
+            input_lines[i] = "    " .. l
+        end
+        local all_lines = { line }
+        vim.list_extend(all_lines, input_lines)
+        vim.api.nvim_buf_set_lines(state.output_buf, line_count, line_count, false, all_lines)
+
+        -- Create fold for input (start after header, end at last input line)
+        local fold_start = line_count + 1  -- 0-indexed, +1 for first input line
+        local fold_end = line_count + #input_lines
+        vim.api.nvim_buf_call(state.output_buf, function()
+            vim.opt_local.foldmethod = "manual"
+            vim.opt_local.foldenable = true
+            pcall(vim.cmd, string.format("%d,%dfold", fold_start + 1, fold_end + 1))
+            pcall(vim.cmd, string.format("%dfoldclose", fold_start + 1))
+        end)
+    else
+        vim.api.nvim_buf_set_lines(state.output_buf, line_count, line_count, false, { line })
+    end
 
     -- Store extmark for later update, keyed by tool_id from backend
     if id then

@@ -607,12 +607,26 @@ pub const Handler = struct {
         _ = session_id;
         _ = engine;
         _ = kind;
-        _ = input;
         const cb_ctx: *CallbackContext = @ptrCast(@alignCast(ctx));
+
+        // Stringify input JSON if present
+        var input_str: ?[]const u8 = null;
+        var input_owned: ?[]const u8 = null;
+        defer if (input_owned) |owned| cb_ctx.handler.allocator.free(owned);
+        if (input) |inp| {
+            var out: std.io.Writer.Allocating = .init(cb_ctx.handler.allocator);
+            defer out.deinit();
+            var jw: std.json.Stringify = .{ .writer = &out.writer };
+            jw.write(inp) catch {};
+            input_owned = out.toOwnedSlice() catch null;
+            input_str = input_owned;
+        }
+
         try cb_ctx.handler.sendNotification("tool_call", protocol.ToolCall{
             .id = tool_id,
             .name = tool_name,
             .label = tool_label,
+            .input = input_str,
         });
     }
 
