@@ -1,5 +1,6 @@
 -- Test runner for banjo.nvim
 -- Usage: nvim --headless -u tests/minimal_init.lua -c "luafile tests/run.lua"
+-- Or:    nvim --headless -c "PlenaryBustedDirectory tests/ {minimal_init = 'tests/minimal_init.lua'}"
 
 -- Add tests directory to Lua package path
 local test_dir = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":h")
@@ -8,10 +9,9 @@ package.path = test_dir .. "/?.lua;" .. package.path
 local helpers = require("tests.helpers")
 
 -- Check for plenary
-local has_plenary, plenary = pcall(require, "plenary.busted")
+local has_plenary, _ = pcall(require, "plenary.busted")
 
 -- Find and load all *_spec.lua files
-local test_dir = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":h")
 local spec_files = vim.fn.glob(test_dir .. "/*_spec.lua", false, true)
 
 if #spec_files == 0 then
