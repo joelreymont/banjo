@@ -117,12 +117,29 @@ local function create_input_buffer()
     return state.input_buf
 end
 
+-- Command argument options
+local command_args = {
+    mode = { "default", "accept_edits", "auto_approve", "plan_only" },
+    model = { "opus", "sonnet", "haiku" },
+    agent = { "claude", "codex" },
+}
+
 -- Slash command completion function
 local function banjo_complete(findstart, base)
+    local line = vim.api.nvim_get_current_line()
+    local col = vim.fn.col(".") - 1
+
     if findstart == 1 then
-        -- Find the start of the word to complete
-        local line = vim.api.nvim_get_current_line()
-        local col = vim.fn.col(".") - 1
+        -- Check if we're completing an argument (after command + space)
+        local cmd_match = line:match("^/(%w+)%s+")
+        if cmd_match and command_args[cmd_match] then
+            -- Find start of argument
+            local space_pos = line:find("%s+[^%s]*$")
+            if space_pos then
+                return space_pos  -- 0-indexed position after last space
+            end
+        end
+
         -- Find the start of the slash command
         local start = col
         while start > 0 and line:sub(start, start) ~= "/" do
@@ -133,7 +150,27 @@ local function banjo_complete(findstart, base)
         end
         return -3  -- Cancel completion
     else
-        -- Return matches
+        -- Check if completing command arguments
+        local cmd_match = line:match("^/(%w+)%s+")
+        if cmd_match and command_args[cmd_match] then
+            local matches = {}
+            local args = command_args[cmd_match]
+            local prefix = base or ""
+
+            for _, arg in ipairs(args) do
+                if prefix == "" or vim.startswith(arg, prefix) then
+                    table.insert(matches, {
+                        word = arg,
+                        abbr = arg,
+                        menu = "[" .. cmd_match .. "]",
+                        kind = "argument",
+                    })
+                end
+            end
+            return matches
+        end
+
+        -- Return command matches
         local commands = require("banjo.commands")
         local all_cmds = commands.list_commands()
         local matches = {}
@@ -187,6 +224,24 @@ local function setup_input_keymaps()
         vim.schedule(function()
             vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-x><C-u>", true, false, true), "n", false)
         end)
+    end, { buffer = state.input_buf, noremap = true })
+
+    -- Space triggers argument completion for commands that have arguments
+    vim.keymap.set("i", "<Space>", function()
+        local line = vim.api.nvim_get_current_line()
+        -- Check if line is a command that accepts arguments (no space yet)
+        local cmd = line:match("^/(%w+)$")
+        if cmd and command_args[cmd] then
+            -- Insert space and trigger completion
+            vim.api.nvim_put({ " " }, "c", false, true)
+            vim.api.nvim_set_option_value("completefunc", "v:lua.banjo_complete", { buf = state.input_buf })
+            vim.schedule(function()
+                vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-x><C-u>", true, false, true), "n", false)
+            end)
+        else
+            -- Normal space
+            vim.api.nvim_put({ " " }, "c", false, true)
+        end
     end, { buffer = state.input_buf, noremap = true })
 
     -- Tab for command completion
