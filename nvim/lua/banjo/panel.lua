@@ -73,7 +73,7 @@ local function create_output_buffer()
     vim.api.nvim_set_option_value("buftype", "nofile", { buf = state.output_buf })
     vim.api.nvim_set_option_value("bufhidden", "hide", { buf = state.output_buf })
     vim.api.nvim_set_option_value("swapfile", false, { buf = state.output_buf })
-    vim.api.nvim_set_option_value("filetype", "banjo_output", { buf = state.output_buf })
+    vim.api.nvim_set_option_value("filetype", "markdown", { buf = state.output_buf })
     vim.api.nvim_set_option_value("modifiable", true, { buf = state.output_buf })
 
     -- Use per-tab buffer name to support multiple tabs
