@@ -945,13 +945,14 @@ function M.show_tool_call(id, name, label)
         display_label = display_label:sub(1, 47) .. "..."
     end
 
-    local line = string.format("  %s **%s** `%s`", "○", name, display_label)
+    local line = string.format("  %s **%s** `%s` ", "○", name, display_label)
     local line_count = vim.api.nvim_buf_line_count(state.output_buf)
-    vim.api.nvim_buf_set_lines(state.output_buf, line_count, line_count, false, { line, "" })
+    -- Add blank line before tool call to separate from previous output
+    vim.api.nvim_buf_set_lines(state.output_buf, line_count, line_count, false, { "", line })
 
     -- Store extmark for later update, keyed by tool_id from backend
     if id then
-        local mark_id = vim.api.nvim_buf_set_extmark(state.output_buf, ns_tools, line_count, 0, {})
+        local mark_id = vim.api.nvim_buf_set_extmark(state.output_buf, ns_tools, line_count + 1, 0, {})
         state.tool_extmarks[id] = { mark_id = mark_id, line = line_count }
     end
 
