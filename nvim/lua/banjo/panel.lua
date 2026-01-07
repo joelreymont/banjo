@@ -375,10 +375,14 @@ local function setup_output_keymaps()
         end
     end, { buffer = state.output_buf, noremap = true })
 
-    -- 'q' to close panel
-    vim.keymap.set("n", "q", function()
-        M.close()
-    end, { buffer = state.output_buf, noremap = true })
+    -- 'q' to close panel (use vim.schedule to run after ftplugin)
+    vim.schedule(function()
+        if state.output_buf and vim.api.nvim_buf_is_valid(state.output_buf) then
+            vim.keymap.set("n", "q", function()
+                M.close()
+            end, { buffer = state.output_buf, noremap = true })
+        end
+    end)
 
     -- 'z' to toggle fold at cursor
     vim.keymap.set("n", "z", "za", { buffer = state.output_buf, noremap = true })
