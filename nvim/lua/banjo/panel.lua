@@ -104,8 +104,54 @@ local function create_input_buffer()
     -- Set initial prompt indicator
     vim.api.nvim_buf_set_lines(state.input_buf, 0, -1, false, { "" })
 
+    -- Disable nvim's built-in completion sources
+    vim.api.nvim_set_option_value("omnifunc", "", { buf = state.input_buf })
+    vim.api.nvim_set_option_value("completefunc", "", { buf = state.input_buf })
+
     return state.input_buf
 end
+
+-- Slash command completion function
+local function banjo_complete(findstart, base)
+    if findstart == 1 then
+        -- Find the start of the word to complete
+        local line = vim.api.nvim_get_current_line()
+        local col = vim.fn.col(".") - 1
+        -- Find the start of the slash command
+        local start = col
+        while start > 0 and line:sub(start, start) ~= "/" do
+            start = start - 1
+        end
+        if start > 0 and line:sub(start, start) == "/" then
+            return start - 1  -- 0-indexed
+        end
+        return -3  -- Cancel completion
+    else
+        -- Return matches
+        local commands = require("banjo.commands")
+        local all_cmds = commands.list_commands()
+        local matches = {}
+
+        -- base includes the "/" prefix
+        local prefix = base:sub(2)  -- Remove leading "/"
+
+        for _, cmd in ipairs(all_cmds) do
+            if prefix == "" or vim.startswith(cmd, prefix) then
+                table.insert(matches, {
+                    word = "/" .. cmd,
+                    abbr = "/" .. cmd,
+                    menu = "[Banjo]",
+                    kind = "command",
+                })
+            end
+        end
+
+        return matches
+    end
+end
+
+-- Register the completion function globally so it can be called by completefunc
+_G.banjo_complete = banjo_complete
 
 local function setup_input_keymaps()
     local state = get_state()
@@ -124,6 +170,18 @@ local function setup_input_keymaps()
 
     -- Shift-Enter for literal newline in insert mode
     vim.keymap.set("i", "<S-CR>", "<CR>", { buffer = state.input_buf, noremap = true })
+
+    -- Slash triggers completion menu for commands
+    vim.keymap.set("i", "/", function()
+        -- Insert the slash first
+        vim.api.nvim_put({ "/" }, "c", false, true)
+        -- Set our completion function and trigger completion
+        vim.api.nvim_set_option_value("completefunc", "v:lua.banjo_complete", { buf = state.input_buf })
+        -- Trigger completion after a small delay to let the "/" be inserted
+        vim.schedule(function()
+            vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-x><C-u>", true, false, true), "n", false)
+        end)
+    end, { buffer = state.input_buf, noremap = true })
 
     -- Tab for command completion
     vim.keymap.set("i", "<Tab>", function()
