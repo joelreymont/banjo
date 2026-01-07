@@ -8,7 +8,7 @@ local ns_links = vim.api.nvim_create_namespace("banjo_links")
 
 -- Global config
 local config = {
-    width = 80,
+    width = 50,
     position = "right",
     input_height = 3,
     title = " Banjo ",

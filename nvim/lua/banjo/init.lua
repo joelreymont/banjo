@@ -7,10 +7,7 @@ local panel = require("banjo.panel")
 local default_config = {
     binary_path = nil, -- Will be auto-detected
     auto_start = true,
-    panel = {
-        width = 80,
-        position = "right",
-    },
+    panel = {},
     keymap_prefix = "<leader>a",  -- "a" for agent, avoids conflict with buffer keymaps
     keymaps = true,
 }
