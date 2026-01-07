@@ -937,7 +937,7 @@ function M.show_tool_call(id, name, label)
         display_label = display_label:sub(1, 47) .. "..."
     end
 
-    local line = string.format("  %s **%s** `%s`", "⏳", name, display_label)
+    local line = string.format("  %s **%s** `%s`", "~", name, display_label)
     local line_count = vim.api.nvim_buf_line_count(state.output_buf)
     vim.api.nvim_buf_set_lines(state.output_buf, line_count, line_count, false, { line })
 
@@ -956,13 +956,13 @@ function M.show_tool_result(id, status)
         return
     end
 
-    local icon = "✓"
+    local icon = "+"
     if status == "failed" then
-        icon = "✗"
+        icon = "x"
     elseif status == "running" then
-        icon = "▶"
+        icon = ">"
     elseif status == "pending" then
-        icon = "⏳"
+        icon = "~"
     end
 
     -- Try to find and update existing tool line by exact ID match
@@ -974,7 +974,7 @@ function M.show_tool_result(id, status)
             local line_num = mark[1]
             local current_line = vim.api.nvim_buf_get_lines(state.output_buf, line_num, line_num + 1, false)[1] or ""
             -- Replace icon
-            local new_line = current_line:gsub("^%s*[⏳▶✓✗]", "  " .. icon)
+            local new_line = current_line:gsub("^%s*[~>+x]", "  " .. icon)
             vim.api.nvim_buf_set_lines(state.output_buf, line_num, line_num + 1, false, { new_line })
             return
         end
