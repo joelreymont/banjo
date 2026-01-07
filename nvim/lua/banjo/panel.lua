@@ -150,20 +150,20 @@ local function banjo_complete(findstart, base)
         end
         return -3  -- Cancel completion
     else
+        -- Safety check for base
+        base = base or ""
+
         -- Check if completing command arguments
         local cmd_match = line:match("^/(%w+)%s+")
         if cmd_match and command_args[cmd_match] then
             local matches = {}
             local args = command_args[cmd_match]
-            local prefix = base or ""
 
             for _, arg in ipairs(args) do
-                if prefix == "" or vim.startswith(arg, prefix) then
+                if base == "" or vim.startswith(arg, base) then
                     table.insert(matches, {
                         word = arg,
-                        abbr = arg,
                         menu = "[" .. cmd_match .. "]",
-                        kind = "argument",
                     })
                 end
             end
@@ -175,16 +175,17 @@ local function banjo_complete(findstart, base)
         local all_cmds = commands.list_commands()
         local matches = {}
 
-        -- base includes the "/" prefix
-        local prefix = base:sub(2)  -- Remove leading "/"
+        -- base includes the "/" prefix, remove it for matching
+        local prefix = ""
+        if #base > 0 and base:sub(1, 1) == "/" then
+            prefix = base:sub(2)
+        end
 
         for _, cmd in ipairs(all_cmds) do
             if prefix == "" or vim.startswith(cmd, prefix) then
                 table.insert(matches, {
                     word = "/" .. cmd,
-                    abbr = "/" .. cmd,
                     menu = "[Banjo]",
-                    kind = "command",
                 })
             end
         end
