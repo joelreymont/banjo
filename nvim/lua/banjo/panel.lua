@@ -209,35 +209,35 @@ end
 -- Register the completion function globally so it can be called by completefunc
 _G.banjo_complete = banjo_complete
 
-local function setup_input_keymaps()
-    local state = get_state()
-    if not state.input_buf or not vim.api.nvim_buf_is_valid(state.input_buf) then
+-- Set input buffer keymaps (called on buffer creation and BufEnter to ensure precedence)
+local function set_input_keymaps(buf, state)
+    if not buf or not vim.api.nvim_buf_is_valid(buf) then
         return
     end
 
     -- Enter to submit
     vim.keymap.set("i", "<CR>", function()
         M.submit_input()
-    end, { buffer = state.input_buf, noremap = true })
+    end, { buffer = buf, noremap = true })
 
     vim.keymap.set("n", "<CR>", function()
         M.submit_input()
-    end, { buffer = state.input_buf, noremap = true })
+    end, { buffer = buf, noremap = true })
 
     -- Shift-Enter for literal newline in insert mode
-    vim.keymap.set("i", "<S-CR>", "<CR>", { buffer = state.input_buf, noremap = true })
+    vim.keymap.set("i", "<S-CR>", "<CR>", { buffer = buf, noremap = true })
 
     -- Slash triggers completion menu for commands
     vim.keymap.set("i", "/", function()
         -- Insert the slash first
         vim.api.nvim_put({ "/" }, "c", false, true)
         -- Set our completion function and trigger completion
-        vim.api.nvim_set_option_value("completefunc", "v:lua.banjo_complete", { buf = state.input_buf })
+        vim.api.nvim_set_option_value("completefunc", "v:lua.banjo_complete", { buf = buf })
         -- Trigger completion after a small delay to let the "/" be inserted
         vim.schedule(function()
             vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-x><C-u>", true, false, true), "n", false)
         end)
-    end, { buffer = state.input_buf, noremap = true })
+    end, { buffer = buf, noremap = true })
 
     -- Space triggers argument completion for commands that have arguments
     vim.keymap.set("i", "<Space>", function()
@@ -247,7 +247,7 @@ local function setup_input_keymaps()
         if cmd and command_args[cmd] then
             -- Insert space and trigger completion
             vim.api.nvim_put({ " " }, "c", false, true)
-            vim.api.nvim_set_option_value("completefunc", "v:lua.banjo_complete", { buf = state.input_buf })
+            vim.api.nvim_set_option_value("completefunc", "v:lua.banjo_complete", { buf = buf })
             vim.schedule(function()
                 vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-x><C-u>", true, false, true), "n", false)
             end)
@@ -255,7 +255,7 @@ local function setup_input_keymaps()
             -- Normal space
             vim.api.nvim_put({ " " }, "c", false, true)
         end
-    end, { buffer = state.input_buf, noremap = true })
+    end, { buffer = buf, noremap = true })
 
     -- Tab navigates completion menu or triggers completion
     vim.keymap.set("i", "<Tab>", function()
@@ -267,13 +267,13 @@ local function setup_input_keymaps()
         local line = vim.api.nvim_get_current_line()
         if vim.startswith(line, "/") then
             -- On a slash command: trigger completion
-            vim.api.nvim_set_option_value("completefunc", "v:lua.banjo_complete", { buf = state.input_buf })
+            vim.api.nvim_set_option_value("completefunc", "v:lua.banjo_complete", { buf = buf })
             return vim.api.nvim_replace_termcodes("<C-x><C-u>", true, false, true)
         end
 
         -- Default: insert tab
         return vim.api.nvim_replace_termcodes("<Tab>", true, false, true)
-    end, { buffer = state.input_buf, expr = true })
+    end, { buffer = buf, expr = true })
 
     -- Shift-Tab navigates completion menu backwards
     vim.keymap.set("i", "<S-Tab>", function()
@@ -281,7 +281,7 @@ local function setup_input_keymaps()
             return vim.api.nvim_replace_termcodes("<C-p>", true, false, true)
         end
         return vim.api.nvim_replace_termcodes("<S-Tab>", true, false, true)
-    end, { buffer = state.input_buf, expr = true })
+    end, { buffer = buf, expr = true })
 
     -- Ctrl-C to cancel
     vim.keymap.set({ "n", "i" }, "<C-c>", function()
@@ -289,17 +289,17 @@ local function setup_input_keymaps()
             state.bridge.cancel()
             M.append_status("Cancelled")
         end
-    end, { buffer = state.input_buf, noremap = true })
+    end, { buffer = buf, noremap = true })
 
     -- Escape to leave insert mode (standard vim behavior)
-    vim.keymap.set("i", "<Esc>", "<Esc>", { buffer = state.input_buf, noremap = true })
+    vim.keymap.set("i", "<Esc>", "<Esc>", { buffer = buf, noremap = true })
 
     -- 'o' to focus output (mirrors 'i' in output to focus input)
     vim.keymap.set("n", "o", function()
         if state.output_win and vim.api.nvim_win_is_valid(state.output_win) then
             vim.api.nvim_set_current_win(state.output_win)
         end
-    end, { buffer = state.input_buf, noremap = true })
+    end, { buffer = buf, noremap = true })
 
     -- Up/Down for history navigation
     vim.keymap.set({ "n", "i" }, "<Up>", function()
@@ -318,7 +318,7 @@ local function setup_input_keymaps()
                 M.set_input_text(entry)
             end
         end
-    end, { buffer = state.input_buf, noremap = true })
+    end, { buffer = buf, noremap = true })
 
     vim.keymap.set({ "n", "i" }, "<Down>", function()
         local history = require("banjo.history")
@@ -339,7 +339,34 @@ local function setup_input_keymaps()
                 M.set_input_text(entry)
             end
         end
-    end, { buffer = state.input_buf, noremap = true })
+    end, { buffer = buf, noremap = true })
+end
+
+local function setup_input_keymaps()
+    local state = get_state()
+    if not state.input_buf or not vim.api.nvim_buf_is_valid(state.input_buf) then
+        return
+    end
+
+    local my_tabid = vim.api.nvim_get_current_tabpage()
+    local group_name = string.format("BanjoInput_%d_%d", my_tabid, state.input_buf)
+    local augroup = vim.api.nvim_create_augroup(group_name, { clear = true })
+
+    -- Re-establish keymaps on BufEnter to ensure they override any plugin keymaps
+    vim.api.nvim_create_autocmd("BufEnter", {
+        group = augroup,
+        buffer = state.input_buf,
+        callback = function()
+            vim.schedule(function()
+                set_input_keymaps(state.input_buf, state)
+            end)
+        end,
+    })
+
+    -- Set keymaps now (deferred to run after any other setup)
+    vim.schedule(function()
+        set_input_keymaps(state.input_buf, state)
+    end)
 end
 
 -- Set output buffer keymaps (called on buffer creation and BufEnter to ensure precedence)
@@ -360,9 +387,6 @@ local function set_output_keymaps(buf, state)
     vim.keymap.set("n", "q", function()
         M.close()
     end, { buffer = buf, noremap = true })
-
-    -- 'z' to toggle fold at cursor
-    vim.keymap.set("n", "z", "za", { buffer = buf, noremap = true })
 
     -- <CR> or gf to jump to file path under cursor
     local function jump_to_file()

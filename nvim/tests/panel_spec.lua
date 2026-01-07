@@ -185,22 +185,6 @@ describe("banjo panel", function()
       assert.is_true(has_i, "Output buffer should have 'i' keymap")
     end)
 
-    it("sets z keymap on output buffer", function()
-      panel.open()
-      helpers.wait(100)
-
-      local buf = helpers.get_banjo_buffer()
-      local maps = vim.api.nvim_buf_get_keymap(buf, "n")
-      local has_z = false
-      for _, m in ipairs(maps) do
-        if m.lhs == "z" then
-          has_z = true
-          break
-        end
-      end
-      assert.is_true(has_z, "Output buffer should have 'z' keymap")
-    end)
-
     it("keymaps persist after FileType event", function()
       panel.open()
       helpers.wait(100)
