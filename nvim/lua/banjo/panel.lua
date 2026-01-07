@@ -513,6 +513,7 @@ local function create_panel()
     -- Output window options
     vim.api.nvim_set_option_value("wrap", true, { win = state.output_win })
     vim.api.nvim_set_option_value("linebreak", true, { win = state.output_win })
+    vim.api.nvim_set_option_value("breakindent", true, { win = state.output_win })
     vim.api.nvim_set_option_value("number", false, { win = state.output_win })
     vim.api.nvim_set_option_value("relativenumber", false, { win = state.output_win })
     vim.api.nvim_set_option_value("signcolumn", "no", { win = state.output_win })
