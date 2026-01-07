@@ -5,6 +5,10 @@
 local plugin_root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":h:h")
 vim.opt.rtp:prepend(plugin_root)
 
+-- Add tests directory to Lua package path
+local tests_dir = plugin_root .. "/tests"
+package.path = tests_dir .. "/?.lua;" .. package.path
+
 -- Find plenary (required for test framework)
 local plenary_paths = {
     vim.fn.expand("~/.local/share/nvim/site/pack/*/start/plenary.nvim"),

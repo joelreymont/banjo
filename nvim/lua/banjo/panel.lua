@@ -76,6 +76,12 @@ local function create_output_buffer()
     vim.api.nvim_set_option_value("filetype", "markdown", { buf = state.output_buf })
     vim.api.nvim_set_option_value("modifiable", true, { buf = state.output_buf })
 
+    -- Disable completions for output buffer (prevent blink.cmp and other plugins)
+    vim.api.nvim_set_option_value("omnifunc", "", { buf = state.output_buf })
+    vim.api.nvim_set_option_value("completefunc", "", { buf = state.output_buf })
+    vim.b[state.output_buf].cmp_enabled = false
+    vim.b[state.output_buf].blink_cmp_enabled = false
+
     -- Use per-tab buffer name to support multiple tabs
     local tabid = vim.api.nvim_get_current_tabpage()
     vim.api.nvim_buf_set_name(state.output_buf, string.format("Banjo-%d", tabid))
