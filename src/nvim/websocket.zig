@@ -138,9 +138,14 @@ pub const ClientKind = enum {
     nvim, // Neovim plugin (no auth)
 };
 
+pub const HandshakeOutcome = struct {
+    client_kind: ClientKind,
+    remainder: ?[]u8 = null,
+};
+
 /// Perform WebSocket handshake on a socket.
 /// Returns the client kind based on path.
-pub fn performHandshakeWithPath(allocator: Allocator, socket_fd: std.posix.socket_t, expected_auth_token: []const u8) !ClientKind {
+pub fn performHandshakeWithPath(allocator: Allocator, socket_fd: std.posix.socket_t, expected_auth_token: []const u8) !HandshakeOutcome {
     var header_buf: [4096]u8 = undefined;
     var total_read: usize = 0;
 
@@ -161,13 +166,8 @@ pub fn performHandshakeWithPath(allocator: Allocator, socket_fd: std.posix.socke
         }
     }
 
-    // Check if headers were complete (didn't just fill buffer without finding \r\n\r\n)
-    if (std.mem.indexOf(u8, header_buf[0..total_read], "\r\n\r\n") == null) {
-        return error.HeadersTooLarge;
-    }
-
-    const headers = header_buf[0..total_read];
-    const parsed = try parseHttpHeaders(allocator, headers);
+    const split = try splitHeaders(header_buf[0..total_read]);
+    const parsed = try parseHttpHeaders(allocator, split.headers);
     defer {
         if (parsed.auth_token) |t| allocator.free(t);
         allocator.free(parsed.ws_key);
@@ -212,16 +212,34 @@ pub fn performHandshakeWithPath(allocator: Allocator, socket_fd: std.posix.socke
     _ = try std.posix.write(socket_fd, &accept_key);
     _ = try std.posix.write(socket_fd, response_end);
 
-    return client_kind;
+    var remainder: ?[]u8 = null;
+    if (split.remainder.len > 0) {
+        remainder = try allocator.dupe(u8, split.remainder);
+    }
+
+    return .{
+        .client_kind = client_kind,
+        .remainder = remainder,
+    };
 }
 
 /// Perform WebSocket handshake on a socket (MCP auth required).
 /// Legacy function for backwards compatibility.
 pub fn performHandshake(allocator: Allocator, socket_fd: std.posix.socket_t, expected_auth_token: []const u8) !void {
-    const kind = try performHandshakeWithPath(allocator, socket_fd, expected_auth_token);
-    if (kind != .mcp) {
+    const outcome = try performHandshakeWithPath(allocator, socket_fd, expected_auth_token);
+    defer if (outcome.remainder) |extra| allocator.free(extra);
+    if (outcome.client_kind != .mcp) {
         return error.InvalidPath;
     }
+}
+
+fn splitHeaders(buffer: []const u8) !struct { headers: []const u8, remainder: []const u8 } {
+    const header_end = std.mem.indexOf(u8, buffer, "\r\n\r\n") orelse return error.HeadersTooLarge;
+    const headers_end = header_end + 4;
+    return .{
+        .headers = buffer[0..headers_end],
+        .remainder = buffer[headers_end..],
+    };
 }
 
 fn parseHttpHeaders(allocator: Allocator, headers: []const u8) !HandshakeResult {
@@ -386,4 +404,49 @@ test "parseFrame close" {
 test "parseFrame reserved opcode" {
     var data = [_]u8{ 0x83, 0x00 }; // Reserved opcode 0x3
     try testing.expectError(error.ReservedOpcode, parseFrame(&data));
+}
+
+test "performHandshakeWithPath preserves trailing bytes" {
+    const listener = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    defer std.posix.close(listener);
+
+    var addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    try std.posix.bind(listener, &addr.any, addr.getOsSockLen());
+    try std.posix.listen(listener, 1);
+
+    var bound_addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
+    var addr_len: std.posix.socklen_t = bound_addr.getOsSockLen();
+    try std.posix.getsockname(listener, &bound_addr.any, &addr_len);
+    const port = bound_addr.getPort();
+
+    const client = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    defer std.posix.close(client);
+    var connect_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+    try std.posix.connect(client, &connect_addr.any, connect_addr.getOsSockLen());
+
+    const server = try std.posix.accept(listener, null, null, 0);
+    defer std.posix.close(server);
+
+    const auth = "token-123";
+    const request =
+        "GET /nvim HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "x-claude-code-ide-authorization: token-123\r\n" ++
+        "\r\n";
+    const extra = [_]u8{ 0x81, 0x00 };
+    var write_buf: [request.len + extra.len]u8 = undefined;
+    @memcpy(write_buf[0..request.len], request);
+    @memcpy(write_buf[request.len..], &extra);
+    _ = try std.posix.write(client, &write_buf);
+
+    const outcome = try performHandshakeWithPath(testing.allocator, server, auth);
+    defer if (outcome.remainder) |bytes| testing.allocator.free(bytes);
+
+    try testing.expectEqual(ClientKind.nvim, outcome.client_kind);
+    try testing.expect(outcome.remainder != null);
+    try testing.expectEqualSlices(u8, &extra, outcome.remainder.?);
 }

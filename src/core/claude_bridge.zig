@@ -2,26 +2,18 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const config = @import("config");
+const constants = @import("constants.zig");
 const log = std.log.scoped(.cli_bridge);
 const executable = @import("executable.zig");
 const io_utils = @import("io_utils.zig");
 const test_utils = @import("test_utils.zig");
 
 const max_json_line_bytes: usize = 4 * 1024 * 1024;
-const nvim_debug = config.nvim_debug;
+const debug_log = @import("../util/debug_log.zig");
 
 fn bridgeDebugLog(comptime fmt: []const u8, args: anytype) void {
-    if (nvim_debug) {
-        var buf: [4096]u8 = undefined;
-        const f = std.fs.cwd().openFile("/tmp/banjo-nvim-debug.log", .{ .mode = .write_only }) catch return;
-        defer f.close();
-        f.seekFromEnd(0) catch return;
-        const msg = std.fmt.bufPrint(&buf, "[BRIDGE] " ++ fmt ++ "\n", args) catch return;
-        _ = f.write(msg) catch {};
-        f.sync() catch {};
-    }
+    debug_log.write("BRIDGE", fmt, args);
 }
-const live_snapshot_timeout_ms: i64 = 60_000;
 
 /// Stream JSON message types from Claude Code
 pub const MessageType = enum {
@@ -238,9 +230,11 @@ pub const StreamMessage = struct {
 
     fn getEnvelope(self: *const StreamMessage) ?StreamEnvelope {
         if (self.envelope) |env| return env;
-        return std.json.parseFromValueLeaky(StreamEnvelope, self.arenaAllocator(), self.raw, .{
+        const parsed = std.json.parseFromValueLeaky(StreamEnvelope, self.arenaAllocator(), self.raw, .{
             .ignore_unknown_fields = true,
-        }) catch null;
+        }) catch return null;
+        @constCast(self).envelope = parsed;
+        return parsed;
     }
 
     /// Get content from message (works for assistant and system messages)
@@ -513,7 +507,7 @@ pub const Bridge = struct {
     cwd: []const u8,
     session_id: ?[]const u8 = null,
     stdout_reader: ?std.fs.File.Reader = null,
-    stdout_buf: [64 * 1024]u8 = undefined,
+    stdout_buf: [constants.stdout_buffer_size]u8 = undefined,
     message_queue: std.ArrayList(StreamMessage) = .empty,
     queue_head: usize = 0,
     queue_mutex: std.Thread.Mutex = .{},
@@ -600,19 +594,8 @@ pub const Bridge = struct {
         defer if (env) |*e| e.deinit();
 
         if (opts.permission_socket_path) |socket_path| {
-            env = std.process.EnvMap.init(self.allocator);
-
-            // Copy current environment
-            var env_iter = std.process.getEnvMap(self.allocator) catch null;
-            if (env_iter) |*iter| {
-                defer iter.deinit();
-                var it = iter.iterator();
-                while (it.next()) |entry| {
-                    try env.?.put(entry.key_ptr.*, entry.value_ptr.*);
-                }
-            }
-
-            // Add our socket path
+            // Get current environment and add our socket path
+            env = try std.process.getEnvMap(self.allocator);
             try env.?.put("BANJO_PERMISSION_SOCKET", socket_path);
             child.env_map = &env.?;
             log.info("Set BANJO_PERMISSION_SOCKET={s}", .{socket_path});
@@ -808,6 +791,7 @@ pub const Bridge = struct {
         }
     }
 
+    // Note: Pattern mirrors codex_bridge.clearPendingMessages
     fn clearQueue(self: *Bridge) void {
         self.queue_mutex.lock();
         defer self.queue_mutex.unlock();
@@ -888,6 +872,27 @@ test "StreamMessage parsing" {
 
     try testing.expectEqualStrings("Hello", msg.getContent().?);
     try testing.expect(!msg.isToolUse());
+}
+
+test "StreamMessage getEnvelope caches parsed envelope" {
+    const json =
+        \\{"type":"assistant","message":{"content":[{"type":"text","text":"Cache"}]}}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json, .{});
+
+    var msg = StreamMessage{
+        .type = .assistant,
+        .subtype = null,
+        .raw = parsed.value,
+        .arena = arena,
+    };
+    defer msg.deinit();
+
+    try testing.expect(msg.envelope == null);
+    _ = msg.getEnvelope() orelse return error.TestUnexpectedResult;
+    try testing.expect(msg.envelope != null);
 }
 
 test "StreamMessage tool use parsing" {
@@ -986,7 +991,7 @@ fn collectClaudeSnapshot(allocator: Allocator, prompt: []const u8) ![]u8 {
     defer if (stop_reason_buf) |buf| allocator.free(buf);
     var saw_result = false;
 
-    const deadline = std.time.milliTimestamp() + live_snapshot_timeout_ms;
+    const deadline = std.time.milliTimestamp() + constants.live_snapshot_timeout_ms;
     while (true) {
         if (std.time.milliTimestamp() > deadline) return error.Timeout;
         var msg = (try readClaudeMessageWithTimeout(&bridge, deadline)) orelse {
@@ -1093,9 +1098,9 @@ fn collectClaudeControlProbe(allocator: Allocator, input: StreamControlInput) ![
     stdin.close();
     child.stdin = null;
 
-    const stdout = try child.stdout.?.readToEndAlloc(allocator, 64 * 1024);
+    const stdout = try child.stdout.?.readToEndAlloc(allocator, constants.stdout_buffer_size);
     defer allocator.free(stdout);
-    const stderr = try child.stderr.?.readToEndAlloc(allocator, 64 * 1024);
+    const stderr = try child.stderr.?.readToEndAlloc(allocator, constants.stdout_buffer_size);
     defer allocator.free(stderr);
 
     const term = try child.wait();

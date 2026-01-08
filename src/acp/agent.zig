@@ -23,6 +23,9 @@ const CallbackToolKind = callbacks_mod.ToolKind;
 const CallbackToolStatus = callbacks_mod.ToolStatus;
 const notes_commands = @import("../notes/commands.zig");
 const permission_socket = @import("../core/permission_socket.zig");
+const constants = @import("../core/constants.zig");
+const tool_categories = @import("../core/tool_categories.zig");
+const lsp_uri = @import("../lsp/uri.zig");
 const config = @import("config");
 const test_env = @import("../util/test_env.zig");
 const ToolProxy = @import("../tools/proxy.zig").ToolProxy;
@@ -38,7 +41,6 @@ const max_codex_image_bytes: usize = 8 * 1024 * 1024; // guard against massive b
 const resource_line_limit: u32 = 200; // limit resource excerpt lines to reduce UI spam
 const max_tool_preview_bytes: usize = 1024; // keep tool call previews readable in the panel
 const default_model_id = "sonnet";
-const response_timeout_ms: i64 = 30_000;
 const prompt_poll_ms: i64 = 250;
 
 const SessionConfig = struct {
@@ -321,6 +323,17 @@ pub const Agent = struct {
         }
     };
 
+    // Session lifecycle:
+    //   session/create -> Session created with bridges initialized
+    //   session/prompt -> Sets handling_prompt=true, runs engine, sends updates
+    //   session/cancel -> Sets cancelled=true, engine checks flag and stops
+    //   session/destroy -> Cleans up bridges and state
+    //
+    // Permission flow:
+    //   Tool invoked -> Check tool_categories.isSafe() -> auto-approve if safe
+    //   Not safe -> Check always_allowed_tools -> auto-approve if previously allowed
+    //   Not allowed -> Send permission request to client
+    //   Client responds -> Store in always_allowed_tools if "allow_always"
     const Session = struct {
         id: []const u8,
         cwd: []const u8,
@@ -443,6 +456,10 @@ pub const Agent = struct {
         agent: *Agent,
         session: *Session,
         session_id: []const u8,
+
+        inline fn from(ctx: *anyopaque) *PromptCallbackContext {
+            return @ptrCast(@alignCast(ctx));
+        }
     };
 
     // Convert callback ToolKind to protocol ToolKind
@@ -485,32 +502,32 @@ pub const Agent = struct {
     };
 
     fn cbSendText(ctx: *anyopaque, session_id: []const u8, engine: Engine, text: []const u8) anyerror!void {
-        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        const pctx = PromptCallbackContext.from(ctx);
         return pctx.agent.sendEngineText(pctx.session, session_id, engine, text);
     }
 
     fn cbSendTextRaw(ctx: *anyopaque, session_id: []const u8, text: []const u8) anyerror!void {
-        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        const pctx = PromptCallbackContext.from(ctx);
         return pctx.agent.sendEngineTextRaw(session_id, text);
     }
 
     fn cbSendTextPrefix(ctx: *anyopaque, session_id: []const u8, engine: Engine) anyerror!void {
-        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        const pctx = PromptCallbackContext.from(ctx);
         return pctx.agent.sendEngineTextPrefix(pctx.session, session_id, engine);
     }
 
     fn cbSendThought(ctx: *anyopaque, session_id: []const u8, engine: Engine, text: []const u8) anyerror!void {
-        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        const pctx = PromptCallbackContext.from(ctx);
         return pctx.agent.sendEngineThought(pctx.session, session_id, engine, text);
     }
 
     fn cbSendThoughtRaw(ctx: *anyopaque, session_id: []const u8, text: []const u8) anyerror!void {
-        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        const pctx = PromptCallbackContext.from(ctx);
         return pctx.agent.sendEngineThoughtRaw(session_id, text);
     }
 
     fn cbSendThoughtPrefix(ctx: *anyopaque, session_id: []const u8, engine: Engine) anyerror!void {
-        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        const pctx = PromptCallbackContext.from(ctx);
         return pctx.agent.sendEngineThoughtPrefix(pctx.session, session_id, engine);
     }
 
@@ -524,7 +541,7 @@ pub const Agent = struct {
         kind: CallbackToolKind,
         input: ?std.json.Value,
     ) anyerror!void {
-        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        const pctx = PromptCallbackContext.from(ctx);
         return pctx.agent.handleEngineToolCall(
             pctx.session,
             session_id,
@@ -546,7 +563,7 @@ pub const Agent = struct {
         status: CallbackToolStatus,
         raw: ?std.json.Value,
     ) anyerror!void {
-        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        const pctx = PromptCallbackContext.from(ctx);
         return pctx.agent.handleEngineToolResult(
             pctx.session,
             session_id,
@@ -559,17 +576,17 @@ pub const Agent = struct {
     }
 
     fn cbSendUserMessage(ctx: *anyopaque, session_id: []const u8, text: []const u8) anyerror!void {
-        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        const pctx = PromptCallbackContext.from(ctx);
         return pctx.agent.sendUserMessage(session_id, text);
     }
 
     fn cbOnTimeout(ctx: *anyopaque) void {
-        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        const pctx = PromptCallbackContext.from(ctx);
         pctx.agent.pollClientMessages(pctx.session);
     }
 
     fn cbOnSessionId(ctx: *anyopaque, engine: Engine, cli_session_id: []const u8) void {
-        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        const pctx = PromptCallbackContext.from(ctx);
         switch (engine) {
             .claude => pctx.agent.captureSessionId(&pctx.session.cli_session_id, "Claude", cli_session_id),
             .codex => pctx.agent.captureSessionId(&pctx.session.codex_session_id, "Codex", cli_session_id),
@@ -577,12 +594,12 @@ pub const Agent = struct {
     }
 
     fn cbOnSlashCommands(ctx: *anyopaque, session_id: []const u8, commands: []const []const u8) anyerror!void {
-        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        const pctx = PromptCallbackContext.from(ctx);
         return pctx.agent.sendAvailableCommands(session_id, commands);
     }
 
     fn cbCheckAuthRequired(ctx: *anyopaque, session_id: []const u8, engine: Engine, content: []const u8) anyerror!?EditorCallbacks.StopReason {
-        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        const pctx = PromptCallbackContext.from(ctx);
         if (isAuthRequiredContent(content)) {
             _ = try pctx.agent.handleAuthRequired(session_id, pctx.session, engine);
             return .auth_required;
@@ -591,7 +608,7 @@ pub const Agent = struct {
     }
 
     fn cbSendContinuePrompt(ctx: *anyopaque, engine: Engine, prompt: []const u8) anyerror!bool {
-        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        const pctx = PromptCallbackContext.from(ctx);
         switch (engine) {
             .claude => {
                 _ = pctx.agent.sendClaudePromptWithRestart(pctx.session, pctx.session_id, prompt) catch |err| {
@@ -612,7 +629,7 @@ pub const Agent = struct {
     }
 
     fn cbOnApprovalRequest(ctx: *anyopaque, request_id: std.json.Value, kind: callbacks_mod.ApprovalKind, params: ?std.json.Value) anyerror!?[]const u8 {
-        const pctx: *PromptCallbackContext = @ptrCast(@alignCast(ctx));
+        const pctx = PromptCallbackContext.from(ctx);
 
         // Map to protocol types
         const title = switch (kind) {
@@ -1132,13 +1149,15 @@ pub const Agent = struct {
             defer queued.deinit(self.allocator);
 
             // Parse the queued JSON params
-            const parsed_value = std.json.parseFromSlice(std.json.Value, self.allocator, queued.params_json, .{}) catch |err| {
-                log.warn("Failed to parse queued prompt params: {}", .{err});
+            const parsed_value = std.json.parseFromSlice(std.json.Value, self.allocator, queued.params_json, .{}) catch |parse_err| {
+                log.warn("Failed to parse queued prompt params: {}", .{parse_err});
                 self.writer.writeResponse(jsonrpc.Response.err(
                     queued.request_id,
                     jsonrpc.Error.InternalError,
                     "Failed to process queued prompt",
-                )) catch {};
+                )) catch |write_err| {
+                    log.warn("Failed to write error response: {}", .{write_err});
+                };
                 continue;
             };
             defer parsed_value.deinit();
@@ -1157,7 +1176,9 @@ pub const Agent = struct {
                     queued.request_id,
                     jsonrpc.Error.InternalError,
                     "Failed to process queued prompt",
-                )) catch {};
+                )) catch |write_err| {
+                    log.warn("Failed to write error response: {}", .{write_err});
+                };
             };
         }
     }
@@ -1981,27 +2002,6 @@ pub const Agent = struct {
         });
     }
 
-    // Tools that run silently without UI updates (internal housekeeping)
-    // Task and AskUserQuestion are NOT quiet - user should see subagent spawns and questions
-    const quiet_tools = std.StaticStringMap(void).initComptime(.{
-        .{ "TodoWrite", {} },
-        .{ "TodoRead", {} },
-        .{ "TaskOutput", {} },
-        .{ "Skill", {} },
-        .{ "Read", {} },
-        .{ "Write", {} },
-        .{ "Edit", {} },
-        .{ "MultiEdit", {} },
-        .{ "NotebookRead", {} },
-        .{ "NotebookEdit", {} },
-        .{ "Grep", {} },
-        .{ "Glob", {} },
-        .{ "LSP", {} },
-        .{ "KillShell", {} },
-        .{ "EnterPlanMode", {} },
-        .{ "ExitPlanMode", {} },
-    });
-
     fn sendEngineToolCall(
         self: *Agent,
         session: *Session,
@@ -2013,7 +2013,7 @@ pub const Agent = struct {
         raw_input: ?std.json.Value,
     ) !void {
         // Skip UI updates for internal service tools, track ID to also skip result
-        if (quiet_tools.has(tool_name)) {
+        if (tool_categories.isQuiet(tool_name)) {
             try self.trackQuietTool(session, engine, tool_id);
             return;
         }
@@ -2532,7 +2532,7 @@ pub const Agent = struct {
         var parsed: ?jsonrpc.ParsedMessage = null;
         defer if (parsed) |*msg| msg.deinit();
 
-        const deadline_ms = std.time.milliTimestamp() + response_timeout_ms;
+        const deadline_ms = std.time.milliTimestamp() + constants.rpc_timeout_ms;
 
         const State = enum {
             read_message,
@@ -2712,12 +2712,23 @@ pub const Agent = struct {
             .writer = &out.writer,
             .options = .{ .emit_null_optional_fields = false },
         };
-        jw.write(PermissionSocketResponse{ .decision = decision, .message = message }) catch return;
-        out.writer.writeAll("\n") catch return;
-        const json = out.toOwnedSlice() catch return;
+        jw.write(PermissionSocketResponse{ .decision = decision, .message = message }) catch |err| {
+            log.warn("Failed to serialize permission response: {}", .{err});
+            return;
+        };
+        out.writer.writeAll("\n") catch |err| {
+            log.warn("Failed to write newline: {}", .{err});
+            return;
+        };
+        const json = out.toOwnedSlice() catch |err| {
+            log.warn("Failed to get permission response: {}", .{err});
+            return;
+        };
         defer self.allocator.free(json);
 
-        _ = std.posix.write(fd, json) catch {};
+        _ = std.posix.write(fd, json) catch |err| {
+            log.warn("Failed to send permission response: {}", .{err});
+        };
     }
 
     const AskUserQuestionSocketResponse = struct {
@@ -2871,28 +2882,6 @@ pub const Agent = struct {
         }) catch tool_name;
     }
 
-    // Tools that are always safe and should be auto-approved regardless of mode
-    const always_approve_tools = std.StaticStringMap(void).initComptime(.{
-        .{ "TodoWrite", {} },
-        .{ "TodoRead", {} },
-        .{ "Task", {} },
-        .{ "TaskOutput", {} },
-        .{ "AskUserQuestion", {} },
-        // Read-only tools
-        .{ "Read", {} },
-        .{ "Grep", {} },
-        .{ "Glob", {} },
-        .{ "LSP", {} },
-    });
-
-    // Edit tools auto-approved in acceptEdits mode
-    const edit_tools = std.StaticStringMap(void).initComptime(.{
-        .{ "Write", {} },
-        .{ "Edit", {} },
-        .{ "MultiEdit", {} },
-        .{ "NotebookEdit", {} },
-    });
-
     const PermissionAction = enum { allow_once, allow_always, deny };
     const permission_option_map = std.StaticStringMap(PermissionAction).initComptime(.{
         .{ "allow_once", .allow_once },
@@ -2902,7 +2891,7 @@ pub const Agent = struct {
 
     fn requestPermissionFromClient(self: *Agent, session: *Session, req: PermissionHookRequest) !PermissionDecision {
         // Auto-approve safe internal and read-only tools
-        if (always_approve_tools.has(req.tool_name)) {
+        if (tool_categories.isSafe(req.tool_name)) {
             return .{ .behavior = "allow", .message = null };
         }
 
@@ -2913,7 +2902,7 @@ pub const Agent = struct {
 
         // In acceptEdits mode, also auto-approve edit tools
         if (session.permission_mode == .acceptEdits) {
-            if (edit_tools.has(req.tool_name)) {
+            if (tool_categories.isEdit(req.tool_name)) {
                 return .{ .behavior = "allow", .message = null };
             }
         }
@@ -3617,7 +3606,7 @@ pub const Agent = struct {
         });
 
         // If nudge was just enabled and there are pending dots, trigger immediately
-        if (should_trigger and dots.hasPendingTasks(self.allocator, session.cwd)) {
+        if (should_trigger and dots.hasPendingTasks(self.allocator, session.cwd).has_tasks) {
             session.last_nudge_ms = std.time.milliTimestamp();
             log.info("Nudge enabled with pending dots, triggering continuation", .{});
             try self.sendUserMessage(session_id, "🔄 continue working on pending dots");
@@ -3762,36 +3751,18 @@ pub const Agent = struct {
     /// Parse file:// URI into path and line number, with URL decoding
     fn parseFileUri(allocator: Allocator, uri: []const u8) ?FileUri {
         if (!std.mem.startsWith(u8, uri, "file:///")) return null;
-        const path_start = 7; // skip "file://"
-        const hash_idx = std.mem.indexOfScalar(u8, uri, '#') orelse uri.len;
-        const raw_path = uri[path_start..hash_idx];
-        if (raw_path.len == 0) return null;
-
-        // URL decode path (handle %XX sequences)
-        const needs_decode = std.mem.indexOf(u8, raw_path, "%") != null;
-        const path = if (needs_decode) blk: {
-            var decoded: std.ArrayListUnmanaged(u8) = .empty;
-            errdefer decoded.deinit(allocator);
-            var i: usize = 0;
-            while (i < raw_path.len) {
-                if (raw_path[i] == '%') {
-                    if (i + 2 < raw_path.len) {
-                        const hex = raw_path[i + 1 .. i + 3];
-                        if (std.fmt.parseInt(u8, hex, 16)) |byte| {
-                            decoded.append(allocator, byte) catch return null;
-                            i += 3;
-                            continue;
-                        } else |_| {}
-                    }
-                }
-                decoded.append(allocator, raw_path[i]) catch return null;
-                i += 1;
-            }
-            break :blk decoded.toOwnedSlice(allocator) catch return null;
-        } else allocator.dupe(u8, raw_path) catch return null;
+        const uri_path = (lsp_uri.uriToPath(allocator, uri) catch return null) orelse return null;
+        var path: []const u8 = undefined;
+        if (uri_path.owned) {
+            path = uri_path.path;
+        } else {
+            path = allocator.dupe(u8, uri_path.path) catch return null;
+        }
+        errdefer allocator.free(path);
 
         var line: u32 = 1;
         var line_specified = false;
+        const hash_idx = std.mem.indexOfScalar(u8, uri, '#') orelse uri.len;
         if (hash_idx + 2 < uri.len and uri[hash_idx + 1] == 'L') {
             const line_part = uri[hash_idx + 2 ..];
             const colon_idx = std.mem.indexOfScalar(u8, line_part, ':') orelse line_part.len;
@@ -4301,6 +4272,29 @@ const TestWriter = struct {
     }
 };
 
+/// Options for creating test sessions
+const TestSessionOptions = struct {
+    id: []const u8 = "test-session",
+    cwd: []const u8 = ".",
+    route: types.Route = .claude,
+    permission_mode: protocol.PermissionMode = .default,
+};
+
+/// Create a test session with common defaults
+fn createTestSession(allocator: Allocator, opts: TestSessionOptions) !Agent.Session {
+    return Agent.Session{
+        .id = try allocator.dupe(u8, opts.id),
+        .cwd = try allocator.dupe(u8, opts.cwd),
+        .config = .{ .auto_resume = true, .route = opts.route, .primary_agent = .claude },
+        .availability = .{ .claude = true, .codex = true },
+        .permission_mode = opts.permission_mode,
+        .pending_execute_tools = std.StringHashMap(void).init(allocator),
+        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(allocator),
+        .always_allowed_tools = std.StringHashMap(void).init(allocator),
+        .quiet_tool_ids = std.StringHashMap(void).init(allocator),
+    };
+}
+
 const expected_modes_json =
     "{\"availableModes\":[" ++
     "{\"id\":\"default\",\"name\":\"Default\",\"description\":\"Ask before executing tools\"}," ++
@@ -4676,17 +4670,7 @@ test "permission socket auto-approves in bypass mode" {
     var agent = Agent.init(testing.allocator, tw.writer.stream, null);
     defer agent.deinit();
 
-    var session = Agent.Session{
-        .id = try testing.allocator.dupe(u8, "test-session"),
-        .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
-        .availability = .{ .claude = true, .codex = true },
-        .permission_mode = .bypassPermissions,
-        .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
-        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
-        .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
-        .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
-    };
+    var session = try createTestSession(testing.allocator, .{ .permission_mode = .bypassPermissions });
     defer session.deinit(testing.allocator);
 
     // Create permission socket
@@ -4696,7 +4680,7 @@ test "permission socket auto-approves in bypass mode" {
 
     // Connect to socket like Claude's hook would
     const client = std.net.connectUnixSocket(session.permission_socket_path.?) catch |err| {
-        std.debug.print("Failed to connect: {}\n", .{err});
+        log.err("Failed to connect to permission socket: {}", .{err});
         return err;
     };
     defer client.close();
@@ -4737,17 +4721,7 @@ test "permission socket forwards to client in default mode" {
     var agent = Agent.init(testing.allocator, tw.writer.stream, &reader);
     defer agent.deinit();
 
-    var session = Agent.Session{
-        .id = try testing.allocator.dupe(u8, "test-session"),
-        .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
-        .availability = .{ .claude = true, .codex = true },
-        .permission_mode = .default, // NOT bypass
-        .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
-        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
-        .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
-        .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
-    };
+    var session = try createTestSession(testing.allocator, .{}); // default mode
     defer session.deinit(testing.allocator);
 
     // Create permission socket
@@ -4755,7 +4729,7 @@ test "permission socket forwards to client in default mode" {
 
     // Connect to socket
     const client = std.net.connectUnixSocket(session.permission_socket_path.?) catch |err| {
-        std.debug.print("Failed to connect: {}\n", .{err});
+        log.err("Failed to connect to permission socket: {}", .{err});
         return err;
     };
     defer client.close();

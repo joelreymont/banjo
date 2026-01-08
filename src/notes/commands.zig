@@ -3,6 +3,7 @@ const mem = std.mem;
 const fs = std.fs;
 const Allocator = mem.Allocator;
 const comments = @import("comments.zig");
+const lsp_uri = @import("../lsp/uri.zig");
 
 const log = std.log.scoped(.notes);
 
@@ -369,7 +370,15 @@ fn scanForLanguages(allocator: Allocator, dir_path: []const u8, detected: *std.S
 
 /// Parse Zed URL format: [@filename (line:col)](file:///absolute/path#Lline:col)
 /// Returns: file_path, line_number, or null if not a valid Zed URL
-pub fn parseZedUrl(url: []const u8) ?struct { file_path: []const u8, line: u32 } {
+pub fn parseZedUrl(allocator: Allocator, url: []const u8) ?struct {
+    file_path: []const u8,
+    line: u32,
+    owned: bool,
+
+    pub fn deinit(self: @This(), alloc: Allocator) void {
+        if (self.owned) alloc.free(self.file_path);
+    }
+} {
     // Look for file:// pattern (file:/// = file:// + /path)
     const file_prefix = "file://";
     const file_start = mem.indexOf(u8, url, file_prefix) orelse return null;
@@ -377,7 +386,10 @@ pub fn parseZedUrl(url: []const u8) ?struct { file_path: []const u8, line: u32 }
 
     // Find #L which marks the line number
     const hash_idx = mem.indexOf(u8, url[path_start..], "#L") orelse return null;
-    const file_path = url[path_start .. path_start + hash_idx];
+    const uri_slice = url[file_start..];
+    const parsed_path = (lsp_uri.uriToPath(allocator, uri_slice) catch return null) orelse return null;
+    errdefer if (parsed_path.owned) allocator.free(parsed_path.path);
+    const file_path = parsed_path.path;
 
     // Parse line number after #L
     const line_start = path_start + hash_idx + 2; // skip "#L"
@@ -390,7 +402,7 @@ pub fn parseZedUrl(url: []const u8) ?struct { file_path: []const u8, line: u32 }
 
     const line = std.fmt.parseInt(u32, url[line_start..line_end], 10) catch return null;
 
-    return .{ .file_path = file_path, .line = line };
+    return .{ .file_path = file_path, .line = line, .owned = parsed_path.owned };
 }
 
 // =============================================================================
@@ -401,24 +413,26 @@ const testing = std.testing;
 
 test "parseZedUrl extracts file path and line" {
     const url = "[@main.zig (42:1)](file:///Users/joel/project/src/main.zig#L42:1)";
-    const result = parseZedUrl(url);
+    const result = parseZedUrl(testing.allocator, url);
     try testing.expect(result != null);
+    defer result.?.deinit(testing.allocator);
     try testing.expectEqualStrings("/Users/joel/project/src/main.zig", result.?.file_path);
     try testing.expectEqual(@as(u32, 42), result.?.line);
 }
 
 test "parseZedUrl handles line without column" {
     const url = "file:///path/to/file.zig#L100";
-    const result = parseZedUrl(url);
+    const result = parseZedUrl(testing.allocator, url);
     try testing.expect(result != null);
+    defer result.?.deinit(testing.allocator);
     try testing.expectEqualStrings("/path/to/file.zig", result.?.file_path);
     try testing.expectEqual(@as(u32, 100), result.?.line);
 }
 
 test "parseZedUrl returns null for invalid format" {
-    try testing.expect(parseZedUrl("not a url") == null);
-    try testing.expect(parseZedUrl("file:///path/no-line") == null);
-    try testing.expect(parseZedUrl("https://example.com#L1") == null);
+    try testing.expect(parseZedUrl(testing.allocator, "not a url") == null);
+    try testing.expect(parseZedUrl(testing.allocator, "file:///path/no-line") == null);
+    try testing.expect(parseZedUrl(testing.allocator, "https://example.com#L1") == null);
 }
 
 test "setup creates .zed/settings.json with detected languages" {

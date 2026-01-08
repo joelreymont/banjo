@@ -4,6 +4,7 @@ const Allocator = mem.Allocator;
 const protocol = @import("protocol.zig");
 const comments = @import("../notes/comments.zig");
 const summary = @import("summary.zig");
+const lsp_uri = @import("uri.zig");
 
 /// Diagnostic with ownership info for deferred cleanup
 pub const OwnedDiagnostic = struct {
@@ -28,10 +29,6 @@ pub const OwnedDiagnostic = struct {
         }
     }
 };
-
-fn pathToUri(allocator: Allocator, path: []const u8) ![]const u8 {
-    return try std.fmt.allocPrint(allocator, "file://{s}", .{path});
-}
 
 /// Index of all notes for backlink lookup
 pub const NoteIndex = struct {
@@ -295,7 +292,7 @@ pub fn noteToDiagnostic(
                     const bl_summary = summary.getSummary(bl_note.content, .{ .max_len = 80, .prefer_word_boundary = false });
                     const bl_msg = try std.fmt.allocPrint(allocator, "Linked from: {s}", .{bl_summary});
                     errdefer allocator.free(bl_msg);
-                    const bl_uri = try pathToUri(allocator, bl_note.file_path);
+                    const bl_uri = try lsp_uri.pathToUri(allocator, bl_note.file_path);
 
                     uris[valid_count] = bl_uri;
                     related[valid_count] = .{
