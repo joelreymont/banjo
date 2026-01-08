@@ -682,46 +682,19 @@ pub const McpServer = struct {
     }
 
     fn sendResult(self: *McpServer, id: ?std.json.Value, result: anytype) !void {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-
-        const response = mcp_types.JsonRpcResponse{
-            .id = id,
-            .result = try jsonValueFromTyped(arena.allocator(), result),
-        };
-        try self.sendMcpTypedResponse(response);
+        try self.sendMcpResultDirect(id, result);
     }
 
     fn sendToolResult(self: *McpServer, id: std.json.Value, json_text: []const u8) !void {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-
-        // MCP tool results must be wrapped in content array
-        const content = [_]mcp_types.ContentItem{
-            .{ .text = json_text },
-        };
+        const content = [_]mcp_types.ContentItem{.{ .text = json_text }};
         const tool_result = mcp_types.ToolCallResult{ .content = &content };
-        const response = mcp_types.JsonRpcResponse{
-            .id = id,
-            .result = try jsonValueFromTyped(arena.allocator(), tool_result),
-        };
-        try self.sendMcpTypedResponse(response);
+        try self.sendMcpResultDirect(id, tool_result);
     }
 
     fn sendToolResultOptional(self: *McpServer, id: ?std.json.Value, json_text: []const u8) !void {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-
-        // MCP tool results must be wrapped in content array
-        const content = [_]mcp_types.ContentItem{
-            .{ .text = json_text },
-        };
+        const content = [_]mcp_types.ContentItem{.{ .text = json_text }};
         const tool_result = mcp_types.ToolCallResult{ .content = &content };
-        const response = mcp_types.JsonRpcResponse{
-            .id = id,
-            .result = try jsonValueFromTyped(arena.allocator(), tool_result),
-        };
-        try self.sendMcpTypedResponse(response);
+        try self.sendMcpResultDirect(id, tool_result);
     }
 
     fn sendToolError(self: *McpServer, id: ?std.json.Value, message: []const u8) !void {
@@ -733,23 +706,9 @@ pub const McpServer = struct {
     }
 
     fn sendToolErrorImpl(self: *McpServer, id: ?std.json.Value, message: []const u8) !void {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-
-        // MCP errors are returned as isError content per spec
-        const content = [_]mcp_types.ContentItem{
-            .{ .text = message },
-        };
-        const error_result = ToolErrorResult{
-            .content = &content,
-            .isError = true,
-        };
-
-        const response = mcp_types.JsonRpcResponse{
-            .id = id,
-            .result = try jsonValueFromTyped(arena.allocator(), error_result),
-        };
-        try self.sendMcpTypedResponse(response);
+        const content = [_]mcp_types.ContentItem{.{ .text = message }};
+        const error_result = ToolErrorResult{ .content = &content, .isError = true };
+        try self.sendMcpResultDirect(id, error_result);
     }
 
     const ToolErrorResult = struct {
@@ -758,44 +717,41 @@ pub const McpServer = struct {
     };
 
     fn sendMcpError(self: *McpServer, id: ?std.json.Value, code: i32, message: []const u8) !void {
-        const response = mcp_types.JsonRpcResponse{
-            .id = id,
-            .@"error" = .{
-                .code = code,
-                .message = message,
-            },
-        };
-        try self.sendMcpTypedResponse(response);
-    }
-
-    fn sendMcpTypedResponse(self: *McpServer, response: mcp_types.JsonRpcResponse) !void {
         var out: std.io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
 
-        var jw: std.json.Stringify = .{
-            .writer = &out.writer,
-            .options = .{ .emit_null_optional_fields = false },
-        };
-        try jw.write(response);
+        try out.writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+        var jw: std.json.Stringify = .{ .writer = &out.writer };
+        try jw.write(id);
+        try out.writer.writeAll(",\"error\":{\"code\":");
+        try jw.write(code);
+        try out.writer.writeAll(",\"message\":");
+        try jw.write(message);
+        try out.writer.writeAll("}}");
 
         const buf = try out.toOwnedSlice();
         defer self.allocator.free(buf);
         try self.sendMcpWebSocketMessage(buf);
     }
 
-    fn jsonValueFromTyped(allocator: Allocator, value: anytype) !std.json.Value {
-        var out: std.io.Writer.Allocating = .init(allocator);
+    /// Send a JSON-RPC response with result, serializing directly without std.json.Value round-trip
+    fn sendMcpResultDirect(self: *McpServer, id: anytype, result: anytype) !void {
+        var out: std.io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
 
-        var jw: std.json.Stringify = .{ .writer = &out.writer };
-        try jw.write(value);
+        try out.writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+        var jw: std.json.Stringify = .{
+            .writer = &out.writer,
+            .options = .{ .emit_null_optional_fields = false },
+        };
+        try jw.write(id);
+        try out.writer.writeAll(",\"result\":");
+        try jw.write(result);
+        try out.writer.writeAll("}");
 
-        const json_str = try out.toOwnedSlice();
-        defer allocator.free(json_str);
-
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_str, .{});
-        // Don't deinit - caller owns the value
-        return parsed.value;
+        const buf = try out.toOwnedSlice();
+        defer self.allocator.free(buf);
+        try self.sendMcpWebSocketMessage(buf);
     }
 
     fn sendMcpWebSocketMessage(self: *McpServer, message: []const u8) !void {
