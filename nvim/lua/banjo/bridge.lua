@@ -4,6 +4,14 @@ local panel = require("banjo.panel")
 
 local M = {}
 
+-- Debug logging
+local function lua_debug(msg)
+    local ok, _ = pcall(function()
+        local line = os.date("%H:%M:%S ") .. msg
+        vim.fn.writefile({line}, "/tmp/banjo-lua-debug.log", "a")
+    end)
+end
+
 -- Per-tab bridge b.state (indexed by tabpage handle)
 local bridges = {}
 
@@ -47,10 +55,13 @@ local function get_bridge()
 end
 
 function M.start(binary_path, cwd)
+    lua_debug("[bridge] M.start called")
     local b = get_bridge()
     if b.client and ws_client.is_connected(b.client) then
+        lua_debug("[bridge] already connected, returning")
         return
     end
+    lua_debug("[bridge] starting binary: " .. binary_path)
 
     -- Save for reconnection
     b.reconnect.binary_path = binary_path
@@ -66,6 +77,9 @@ function M.start(binary_path, cwd)
         stdout_buffered = false,
         on_stdout = vim.schedule_wrap(function(_, data)
             M._on_stdout(data, my_tabid)
+        end),
+        on_stderr = vim.schedule_wrap(function(_, data)
+            M._on_stderr(data, my_tabid)
         end),
         on_exit = vim.schedule_wrap(function(_, code)
             M._on_exit(code, my_tabid)
@@ -181,12 +195,15 @@ end
 -- Process stdout from binary (only used for initial ready notification)
 -- Note: vim.fn.jobstart sends data as array of lines (newlines stripped)
 function M._on_stdout(data, tabid)
+    lua_debug("[bridge] _on_stdout called")
     local b = bridges[tabid]
     if not b then return end
     for _, line in ipairs(data) do
         if line ~= "" then
+            lua_debug("[bridge] stdout line: " .. line:sub(1, 100))
             local ok, msg = pcall(vim.json.decode, line)
             if ok and msg.method == "ready" and msg.params and msg.params.mcp_port then
+                lua_debug("[bridge] got ready notification, port=" .. tostring(msg.params.mcp_port))
                 b.mcp_port = msg.params.mcp_port
                 M._connect_websocket(b.mcp_port, tabid)
             elseif not ok then
@@ -196,7 +213,20 @@ function M._on_stdout(data, tabid)
     end
 end
 
+-- Process stderr from binary (debug/error output)
+function M._on_stderr(data, tabid)
+    local b = bridges[tabid]
+    if not b then return end
+    for _, line in ipairs(data) do
+        if line ~= "" then
+            -- Show debug logs in nvim messages (use :messages to see)
+            vim.notify("Banjo: " .. line, vim.log.levels.INFO)
+        end
+    end
+end
+
 function M._connect_websocket(port, tabid)
+    lua_debug("[bridge] _connect_websocket: port=" .. tostring(port))
     local b = bridges[tabid]
     if not b then return end
     local my_tabid = tabid
@@ -773,9 +803,23 @@ function M._send_tool_response(correlation_id, result, err)
     ws_client.send(b.client, vim.json.encode(response))
 end
 
+local function lua_debug(msg)
+    local f = io.open("/tmp/banjo-lua-debug.log", "a")
+    if f then
+        f:write(os.date("%H:%M:%S ") .. msg .. "\n")
+        f:close()
+    end
+end
+
 function M._send_notification(method, params)
+    lua_debug("_send_notification: " .. method)
     local b = get_bridge()
-    if not b.client or not ws_client.is_connected(b.client) then
+    if not b.client then
+        lua_debug("  no client!")
+        return
+    end
+    if not ws_client.is_connected(b.client) then
+        lua_debug("  not connected, state=" .. tostring(b.client.state))
         return
     end
 
@@ -784,7 +828,9 @@ function M._send_notification(method, params)
         method = method,
         params = params,
     })
+    lua_debug("  sending: " .. msg:sub(1, 100))
     ws_client.send(b.client, msg)
+    lua_debug("  sent!")
 end
 
 function M.send_prompt(text, files)

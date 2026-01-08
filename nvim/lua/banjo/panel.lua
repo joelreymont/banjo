@@ -1,6 +1,22 @@
 -- Banjo panel: Chat UI with output section and input field
 local M = {}
 
+-- Debug logging
+local function lua_debug(msg)
+    local ok, err = pcall(function()
+        local line = os.date("%H:%M:%S ") .. "[panel] " .. msg
+        vim.fn.writefile({line}, "/tmp/banjo-lua-debug.log", "a")
+    end)
+    if not ok then
+        vim.notify("lua_debug error: " .. tostring(err), vim.log.levels.ERROR)
+    end
+end
+
+-- Log on module load (deferred to ensure vim is ready)
+vim.schedule(function()
+    lua_debug("MODULE LOADED")
+end)
+
 -- Global namespaces (process-wide identifiers)
 local ns_id = vim.api.nvim_create_namespace("banjo")
 local ns_tools = vim.api.nvim_create_namespace("banjo_tools")
@@ -576,8 +592,10 @@ end
 -- Public API
 
 function M.open()
+    lua_debug("M.open called")
     local state = get_state()
     create_panel()
+    lua_debug("M.open done, input_buf=" .. tostring(state.input_buf))
 end
 
 function M.close()
@@ -634,17 +652,21 @@ end
 -- Input handling
 
 function M.submit_input()
+    lua_debug("submit_input called")
     local state = get_state()
     if not state.input_buf or not vim.api.nvim_buf_is_valid(state.input_buf) then
+        lua_debug("  no valid input_buf")
         return
     end
 
     local lines = vim.api.nvim_buf_get_lines(state.input_buf, 0, -1, false)
     local text = table.concat(lines, "\n")
     text = vim.trim(text)
+    lua_debug("  text length: " .. #text)
 
     -- Validate input
     if text == "" then
+        lua_debug("  empty text, returning")
         return
     end
 
@@ -686,9 +708,13 @@ function M.submit_input()
     M.append_user_message(text)
 
     -- Send to backend
+    lua_debug("  checking bridge: " .. tostring(state.bridge ~= nil))
     if state.bridge then
+        lua_debug("  calling bridge.send_prompt")
         state.bridge.send_prompt(text)
+        lua_debug("  send_prompt returned")
     else
+        lua_debug("  no bridge!")
         M.append_status("Not connected")
     end
 end
@@ -972,6 +998,14 @@ end
 -- Tool display
 
 -- Format tool input for display (extract meaningful fields, not raw JSON)
+-- Split a string by newlines and add each line to the table with optional prefix
+local function add_lines(tbl, text, prefix)
+    prefix = prefix or ""
+    for line in text:gmatch("[^\n]+") do
+        table.insert(tbl, prefix .. line)
+    end
+end
+
 local function format_tool_input(name, input_json)
     if not input_json or input_json == "" then
         return nil
@@ -988,10 +1022,10 @@ local function format_tool_input(name, input_json)
     -- Bash/shell commands - show the command
     if name == "Bash" then
         if input.command then
-            table.insert(lines, "$ " .. input.command)
+            add_lines(lines, input.command, "$ ")
         end
         if input.description then
-            table.insert(lines, "# " .. input.description)
+            add_lines(lines, input.description, "# ")
         end
         return #lines > 0 and lines or nil
     end
@@ -999,7 +1033,7 @@ local function format_tool_input(name, input_json)
     -- Task - show description and prompt
     if name == "Task" then
         if input.description then
-            table.insert(lines, input.description)
+            add_lines(lines, input.description)
         end
         if input.prompt then
             -- Truncate long prompts
@@ -1007,7 +1041,7 @@ local function format_tool_input(name, input_json)
             if #prompt > 200 then
                 prompt = prompt:sub(1, 197) .. "..."
             end
-            table.insert(lines, prompt)
+            add_lines(lines, prompt)
         end
         return #lines > 0 and lines or nil
     end
@@ -1015,10 +1049,10 @@ local function format_tool_input(name, input_json)
     -- WebFetch - show URL
     if name == "WebFetch" or name == "WebSearch" then
         if input.url then
-            table.insert(lines, input.url)
+            add_lines(lines, input.url)
         end
         if input.query then
-            table.insert(lines, input.query)
+            add_lines(lines, input.query)
         end
         return #lines > 0 and lines or nil
     end
@@ -1028,7 +1062,7 @@ local function format_tool_input(name, input_json)
         if input.questions and type(input.questions) == "table" then
             for _, q in ipairs(input.questions) do
                 if q.question then
-                    table.insert(lines, "? " .. q.question)
+                    add_lines(lines, q.question, "? ")
                 end
             end
         end
@@ -1037,13 +1071,13 @@ local function format_tool_input(name, input_json)
 
     -- Default: extract common fields
     if input.file_path then
-        table.insert(lines, input.file_path)
+        add_lines(lines, input.file_path)
     end
     if input.pattern then
-        table.insert(lines, "pattern: " .. input.pattern)
+        add_lines(lines, input.pattern, "pattern: ")
     end
     if input.content and #input.content < 100 then
-        table.insert(lines, input.content)
+        add_lines(lines, input.content)
     end
 
     return #lines > 0 and lines or nil
