@@ -5,8 +5,25 @@ const posix = std.posix;
 const lockfile = @import("lockfile.zig");
 const websocket = @import("websocket.zig");
 const mcp_types = @import("mcp_types.zig");
+const config = @import("config");
 
 const log = std.log.scoped(.mcp_server);
+
+// Comptime debug logging
+const nvim_debug = config.nvim_debug;
+
+var mcp_debug_buf: [4096]u8 = undefined;
+
+fn debugLog(comptime fmt: []const u8, args: anytype) void {
+    if (nvim_debug) {
+        const f = std.fs.cwd().openFile("/tmp/banjo-nvim-debug.log", .{ .mode = .write_only }) catch return;
+        defer f.close();
+        f.seekFromEnd(0) catch return;
+        const msg = std.fmt.bufPrint(&mcp_debug_buf, "[MCP] " ++ fmt ++ "\n", args) catch return;
+        _ = f.write(msg) catch {};
+        f.sync() catch {};
+    }
+}
 
 pub const McpServer = struct {
     allocator: Allocator,
@@ -199,6 +216,7 @@ pub const McpServer = struct {
             self.checkTimeouts();
             return true;
         }
+        debugLog("poll: ready={d}, nfds={d}, nvim_connected={}", .{ ready, nfds, self.nvim_client_socket != null });
 
         // Handle events
         for (fds[0..nfds]) |fd| {
@@ -213,6 +231,7 @@ pub const McpServer = struct {
                         self.closeMcpClient();
                     };
                 } else if (self.nvim_client_socket != null and fd.fd == self.nvim_client_socket.?) {
+                    debugLog("poll: nvim socket has data", .{});
                     self.handleNvimClientMessage() catch |err| {
                         log.warn("Nvim client message failed: {}", .{err});
                         self.closeNvimClient();
@@ -282,6 +301,7 @@ pub const McpServer = struct {
                 self.nvim_client_socket = client;
                 self.nvim_read_buffer.clearRetainingCapacity();
                 log.info("Neovim connected", .{});
+                debugLog("nvim_client_socket set to fd={d}", .{client});
             },
         }
     }
@@ -339,15 +359,20 @@ pub const McpServer = struct {
     }
 
     fn handleNvimClientMessage(self: *McpServer) !void {
+        debugLog("handleNvimClientMessage: entry", .{});
         const client = self.nvim_client_socket orelse return;
 
         // Read available data into buffer
         var temp_buf: [4096]u8 = undefined;
         const n = posix.read(client, &temp_buf) catch |err| switch (err) {
-            error.WouldBlock => return,
+            error.WouldBlock => {
+                debugLog("handleNvimClientMessage: WouldBlock", .{});
+                return;
+            },
             else => return err,
         };
         if (n == 0) return error.ConnectionClosed;
+        debugLog("handleNvimClientMessage: read {d} bytes", .{n});
 
         try self.nvim_read_buffer.appendSlice(self.allocator, temp_buf[0..n]);
 
@@ -390,12 +415,14 @@ pub const McpServer = struct {
     }
 
     fn handleNvimJsonRpcMessage(self: *McpServer, payload: []const u8) void {
+        debugLog("handleNvimJsonRpcMessage: payload={d} bytes", .{payload.len});
         const parsed = std.json.parseFromSlice(mcp_types.JsonRpcRequest, self.allocator, payload, .{
             .ignore_unknown_fields = true,
         }) catch {
             log.warn("Failed to parse nvim JSON-RPC message", .{});
             return;
         };
+        debugLog("handleNvimJsonRpcMessage: method={s}", .{parsed.value.method});
         defer parsed.deinit();
 
         const req = parsed.value;

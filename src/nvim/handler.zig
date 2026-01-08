@@ -14,8 +14,30 @@ const ApprovalKind = callbacks_mod.ApprovalKind;
 const engine_mod = @import("../core/engine.zig");
 const claude_bridge = @import("../core/claude_bridge.zig");
 const codex_bridge = @import("../core/codex_bridge.zig");
+const config = @import("config");
 
 const log = std.log.scoped(.nvim);
+
+// Comptime debug logging for nvim handler troubleshooting
+const nvim_debug = config.nvim_debug;
+
+var debug_file: ?std.fs.File = null;
+var debug_buf: [4096]u8 = undefined;
+
+fn initDebugLog() void {
+    if (nvim_debug and debug_file == null) {
+        debug_file = std.fs.cwd().createFile("/tmp/banjo-nvim-debug.log", .{ .truncate = true }) catch null;
+    }
+}
+
+fn debugLog(comptime fmt: []const u8, args: anytype) void {
+    if (nvim_debug) {
+        if (debug_file) |f| {
+            const msg = std.fmt.bufPrint(&debug_buf, "[DEBUG] " ++ fmt ++ "\n", args) catch return;
+            _ = f.write(msg) catch {};
+        }
+    }
+}
 
 pub const Handler = struct {
     allocator: Allocator,
@@ -110,6 +132,9 @@ pub const Handler = struct {
     }
 
     pub fn run(self: *Handler) !void {
+        initDebugLog();
+        debugLog("Handler.run starting", .{});
+
         // Start MCP server for Claude CLI discovery and nvim WebSocket
         self.mcp_server = mcp_server_mod.McpServer.init(self.allocator, self.cwd) catch |err| {
             log.err("Failed to init MCP server: {}", .{err});
@@ -138,8 +163,10 @@ pub const Handler = struct {
         };
 
         // Main thread: wait for and process prompts
+        debugLog("Main loop starting", .{});
         while (!self.should_exit.load(.acquire)) {
             // Wait for a prompt to be queued
+            debugLog("Main loop waiting for prompt...", .{});
             self.prompt_mutex.lock();
             while (self.pending_prompt == null and !self.should_exit.load(.acquire)) {
                 self.prompt_ready.wait(&self.prompt_mutex);
@@ -149,10 +176,13 @@ pub const Handler = struct {
             const prompt = self.pending_prompt;
             self.pending_prompt = null;
             self.prompt_mutex.unlock();
+            debugLog("Main loop woke up, prompt={}", .{prompt != null});
 
             // Process it (if we got one and not exiting)
             if (prompt) |p| {
+                debugLog("Processing prompt: {d} bytes", .{p.text.len});
                 self.processQueuedPrompt(p);
+                debugLog("Prompt processing complete", .{});
             }
         }
 
@@ -164,6 +194,7 @@ pub const Handler = struct {
     }
 
     fn processQueuedPrompt(self: *Handler, prompt: PendingPrompt) void {
+        debugLog("processQueuedPrompt: entry", .{});
         defer {
             self.allocator.free(prompt.text);
             if (prompt.cwd) |c| self.allocator.free(c);
@@ -171,6 +202,7 @@ pub const Handler = struct {
 
         // Emit session_start if not already in a session
         if (!self.session_active) {
+            debugLog("processQueuedPrompt: starting new session", .{});
             self.session_active = true;
             self.sendNotification("session_start", protocol.SessionEvent{}) catch {};
             if (self.mcp_server) |mcp| {
@@ -185,10 +217,13 @@ pub const Handler = struct {
             .cwd = prompt.cwd,
         };
 
+        debugLog("processQueuedPrompt: calling processPrompt", .{});
         self.processPrompt(req) catch |err| {
+            debugLog("processQueuedPrompt: error!", .{});
             log.err("Prompt processing error: {}", .{err});
             self.sendError("Processing error") catch {};
         };
+        debugLog("processQueuedPrompt: processPrompt returned", .{});
 
         // Process any pending continuation (from nudge/dots)
         while (self.pending_continuation) |continuation| {
@@ -219,19 +254,23 @@ pub const Handler = struct {
     }
 
     fn pollThreadFn(self: *Handler) void {
+        debugLog("pollThreadFn starting", .{});
         while (!self.should_exit.load(.acquire)) {
             if (self.mcp_server) |mcp| {
                 _ = mcp.poll(100) catch |err| {
                     log.warn("MCP poll error: {}", .{err});
+                    continue;
                 };
             } else {
                 std.Thread.sleep(100 * std.time.ns_per_ms);
             }
         }
+        debugLog("pollThreadFn exiting", .{});
     }
 
     fn nvimMessageCallback(ctx: *anyopaque, method: []const u8, params: ?std.json.Value) void {
         const self: *Handler = @ptrCast(@alignCast(ctx));
+        debugLog("nvimMessageCallback: method={s}", .{method});
 
         const method_map = std.StaticStringMap(NvimMethod).initComptime(.{
             .{ "prompt", .prompt },
@@ -282,7 +321,11 @@ pub const Handler = struct {
     };
 
     fn handleNvimPrompt(self: *Handler, params: ?std.json.Value) void {
-        const p = params orelse return;
+        debugLog("handleNvimPrompt: entry", .{});
+        const p = params orelse {
+            debugLog("handleNvimPrompt: no params", .{});
+            return;
+        };
         const parsed = std.json.parseFromValue(protocol.PromptRequest, self.allocator, p, .{
             .ignore_unknown_fields = true,
         }) catch |err| {
@@ -290,6 +333,8 @@ pub const Handler = struct {
             return;
         };
         defer parsed.deinit();
+
+        debugLog("handleNvimPrompt: parsed text={d} bytes", .{parsed.value.text.len});
 
         // Clone the prompt data since we're queuing it
         const text = self.allocator.dupe(u8, parsed.value.text) catch {
@@ -299,15 +344,19 @@ pub const Handler = struct {
         const cwd = if (parsed.value.cwd) |c| self.allocator.dupe(u8, c) catch null else null;
 
         // Queue the prompt and signal main thread
+        debugLog("handleNvimPrompt: queuing prompt", .{});
         self.prompt_mutex.lock();
         // If there's already a pending prompt, free it (shouldn't happen normally)
         if (self.pending_prompt) |old| {
+            debugLog("handleNvimPrompt: replacing existing prompt!", .{});
             self.allocator.free(old.text);
             if (old.cwd) |c| self.allocator.free(c);
         }
         self.pending_prompt = .{ .text = text, .cwd = cwd };
         self.prompt_mutex.unlock();
+        debugLog("handleNvimPrompt: signaling main thread", .{});
         self.prompt_ready.signal();
+        debugLog("handleNvimPrompt: done", .{});
     }
 
     fn handleNvimCancel(self: *Handler) void {
@@ -533,8 +582,10 @@ pub const Handler = struct {
     }
 
     fn processPrompt(self: *Handler, prompt_req: protocol.PromptRequest) !void {
+        debugLog("processPrompt: entry, engine={s}", .{@tagName(self.current_engine)});
         const engine = self.current_engine;
 
+        debugLog("processPrompt: sending stream_start notification", .{});
         try self.sendNotification("stream_start", protocol.StreamStart{ .engine = engine });
 
         var cb_ctx = CallbackContext{ .handler = self };
@@ -559,25 +610,32 @@ pub const Handler = struct {
 
         switch (engine) {
             .claude => {
+                debugLog("processPrompt: initializing claude bridge", .{});
                 var bridge = claude_bridge.Bridge.init(self.allocator, prompt_ctx.cwd);
                 defer bridge.deinit();
 
+                debugLog("processPrompt: starting claude bridge", .{});
                 bridge.start(.{
                     .permission_mode = self.permission_mode.toCliArg(),
                     .model = self.current_model,
                 }) catch |err| {
+                    debugLog("processPrompt: bridge.start failed!", .{});
                     log.err("Failed to start Claude bridge: {}", .{err});
                     try self.sendError("Failed to start Claude");
                     return;
                 };
+                debugLog("processPrompt: bridge started, sending prompt", .{});
 
                 bridge.sendPrompt(prompt_req.text) catch |err| {
+                    debugLog("processPrompt: sendPrompt failed!", .{});
                     log.err("Failed to send prompt: {}", .{err});
                     try self.sendError("Failed to send prompt");
                     return;
                 };
+                debugLog("processPrompt: prompt sent, processing messages", .{});
 
                 _ = engine_mod.processClaudeMessages(&prompt_ctx, &bridge) catch |err| {
+                    debugLog("processPrompt: processClaudeMessages error!", .{});
                     log.err("Claude processing error: {}", .{err});
                 };
             },
@@ -621,8 +679,13 @@ pub const Handler = struct {
 
     /// Send notification via WebSocket to nvim client
     fn sendNotification(self: *Handler, method: []const u8, params: anytype) !void {
-        const mcp = self.mcp_server orelse return error.NotConnected;
+        debugLog("sendNotification: method={s}", .{method});
+        const mcp = self.mcp_server orelse {
+            debugLog("sendNotification: NotConnected!", .{});
+            return error.NotConnected;
+        };
         try mcp.sendNvimNotification(method, params);
+        debugLog("sendNotification: sent", .{});
     }
 
     /// Send notification via stdout (used for initial ready message before WebSocket connects)

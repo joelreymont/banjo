@@ -70,6 +70,11 @@ function M.setup(opts)
         M.stop()
     end, { desc = "Stop Banjo" })
 
+    vim.api.nvim_create_user_command("BanjoRestart", function()
+        M.stop()
+        M.start()
+    end, { desc = "Restart Banjo" })
+
     vim.api.nvim_create_user_command("BanjoClear", function()
         panel.clear()
     end, { desc = "Clear Banjo panel" })

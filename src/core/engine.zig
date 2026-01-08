@@ -16,8 +16,23 @@ const codex_bridge = @import("codex_bridge.zig");
 const CodexBridge = codex_bridge.CodexBridge;
 const CodexMessage = codex_bridge.CodexMessage;
 const dots = @import("dots.zig");
+const config = @import("config");
 
 const log = std.log.scoped(.engine);
+const nvim_debug = config.nvim_debug;
+
+var engine_debug_buf: [4096]u8 = undefined;
+
+fn engineDebugLog(comptime fmt: []const u8, args: anytype) void {
+    if (nvim_debug) {
+        const f = std.fs.cwd().openFile("/tmp/banjo-nvim-debug.log", .{ .mode = .write_only }) catch return;
+        defer f.close();
+        f.seekFromEnd(0) catch return;
+        const msg = std.fmt.bufPrint(&engine_debug_buf, "[ENGINE] " ++ fmt ++ "\n", args) catch return;
+        _ = f.write(msg) catch {};
+        f.sync() catch {};
+    }
+}
 
 const prompt_poll_ms: i64 = 250;
 
@@ -78,6 +93,7 @@ pub fn processClaudeMessages(
     ctx: *PromptContext,
     bridge: *Bridge,
 ) !StopReason {
+    engineDebugLog("processClaudeMessages: entry", .{});
     const start_ms = std.time.milliTimestamp();
     const engine: Engine = .claude;
 
@@ -86,9 +102,11 @@ pub fn processClaudeMessages(
     var msg_count: u32 = 0;
     var stream_prefix_pending = false;
     var thought_prefix_pending = false;
+    var timeout_count: u32 = 0;
 
     while (true) {
         if (ctx.isCancelled()) {
+            engineDebugLog("processClaudeMessages: cancelled", .{});
             stop_reason = .cancelled;
             break;
         }
@@ -96,6 +114,10 @@ pub fn processClaudeMessages(
         const deadline_ms = std.time.milliTimestamp() + prompt_poll_ms;
         var msg = bridge.readMessageWithTimeout(deadline_ms) catch |err| {
             if (err == error.Timeout) {
+                timeout_count += 1;
+                if (timeout_count == 1 or timeout_count % 20 == 0) {
+                    engineDebugLog("processClaudeMessages: timeout #{d}", .{timeout_count});
+                }
                 ctx.cb.onTimeout();
                 if (ctx.isCancelled()) {
                     stop_reason = .cancelled;
@@ -104,32 +126,43 @@ pub fn processClaudeMessages(
                 continue;
             }
             if (err == error.EndOfStream) {
+                engineDebugLog("processClaudeMessages: EndOfStream", .{});
                 log.info("Claude bridge closed", .{});
                 break;
             }
+            engineDebugLog("processClaudeMessages: read error", .{});
             log.warn("Claude read error: {}", .{err});
             break;
         } orelse {
+            engineDebugLog("processClaudeMessages: null/EOF", .{});
             log.info("Claude bridge returned null (EOF)", .{});
             break;
         };
         defer msg.deinit();
 
         msg_count += 1;
+        timeout_count = 0;
         const msg_time_ms = elapsedMs(start_ms);
         if (first_response_ms == 0) first_response_ms = msg_time_ms;
-        log.debug("Claude msg #{d} ({s}) at {d}ms", .{ msg_count, @tagName(msg.type), msg_time_ms });
+        engineDebugLog("processClaudeMessages: msg #{d} type={s}", .{ msg_count, @tagName(msg.type) });
 
         switch (msg.type) {
             .assistant => {
+                const has_content = msg.getContent() != null;
+                const has_tool_use = msg.getToolUse() != null;
+                const has_tool_result = msg.getToolResult() != null;
+                engineDebugLog("assistant msg: content={}, tool_use={}, tool_result={}", .{ has_content, has_tool_use, has_tool_result });
+
                 if (msg.getContent()) |content| {
                     if (first_response_ms == 0) {
                         first_response_ms = msg_time_ms;
                     }
+                    engineDebugLog("sending text: {d} bytes", .{content.len});
                     try sendEngineText(ctx, engine, content);
                 }
 
                 if (msg.getToolUse()) |tool| {
+                    engineDebugLog("tool_use: {s}", .{tool.name});
                     try ctx.cb.sendToolCall(
                         ctx.session_id,
                         engine,
@@ -153,39 +186,56 @@ pub fn processClaudeMessages(
                 }
             },
             .result => {
-                if (msg.getStopReason()) |reason| {
+                engineDebugLog("result handler entry", .{});
+                const stop_reason_opt = msg.getStopReason();
+                engineDebugLog("result: stop_reason={?s}", .{stop_reason_opt});
+                if (stop_reason_opt) |reason| {
                     const now_ms = std.time.milliTimestamp();
                     const cooldown_ok = (now_ms - ctx.nudge.last_nudge_ms.*) >= ctx.nudge.cooldown_ms;
+                    const has_dots = dots.hasPendingTasks(ctx.allocator, ctx.cwd);
+                    const reason_ok = std.mem.eql(u8, reason, "error_max_turns") or
+                        std.mem.eql(u8, reason, "success") or
+                        std.mem.eql(u8, reason, "end_turn");
                     const should_nudge = ctx.nudge.enabled and !ctx.isCancelled() and cooldown_ok and
-                        dots.hasPendingTasks(ctx.allocator, ctx.cwd) and
-                        (std.mem.eql(u8, reason, "error_max_turns") or
-                            std.mem.eql(u8, reason, "success") or
-                            std.mem.eql(u8, reason, "end_turn"));
+                        has_dots and reason_ok;
+
+                    log.info("Nudge check: enabled={}, cancelled={}, cooldown_ok={}, has_dots={}, reason={s}, reason_ok={}", .{
+                        ctx.nudge.enabled,
+                        ctx.isCancelled(),
+                        cooldown_ok,
+                        has_dots,
+                        reason,
+                        reason_ok,
+                    });
 
                     if (should_nudge) {
                         ctx.nudge.last_nudge_ms.* = now_ms;
                         log.info("Claude Code stopped ({s}); pending dots, nudging", .{reason});
                         try ctx.cb.sendUserMessage(ctx.session_id, "🔄 continue working on pending dots");
                         const nudge_prompt = "clean up dots, then pick a dot and work on it";
-                        const should_continue = try ctx.cb.sendContinuePrompt(.claude, nudge_prompt);
-                        if (should_continue) {
-                            stream_prefix_pending = true;
-                            thought_prefix_pending = true;
-                            continue;
-                        } else {
-                            stop_reason = mapCliStopReason(reason);
-                            break;
-                        }
+                        // Queue continuation - handler will process it after we break
+                        _ = try ctx.cb.sendContinuePrompt(.claude, nudge_prompt);
+                        // Don't continue loop - Claude is done, break and let handler start new session
                     } else if (!cooldown_ok) {
                         log.info("Claude Code stopped ({s}); not nudging due to cooldown", .{reason});
                     }
                     stop_reason = mapCliStopReason(reason);
                 }
+                engineDebugLog("result: breaking out of loop", .{});
                 break;
             },
             .stream_event => {
-                if (msg.getStreamEventType()) |event_type| {
-                    switch (event_type) {
+                const event_type = msg.getStreamEventType();
+                const has_text = msg.getStreamTextDelta() != null;
+                const has_thinking = msg.getStreamThinkingDelta() != null;
+                engineDebugLog("stream_event: type={?s}, text={}, thinking={}", .{
+                    if (event_type) |et| @tagName(et) else null,
+                    has_text,
+                    has_thinking,
+                });
+
+                if (event_type) |et| {
+                    switch (et) {
                         .message_start => {
                             stream_prefix_pending = true;
                             thought_prefix_pending = true;
@@ -202,6 +252,7 @@ pub fn processClaudeMessages(
                         first_response_ms = msg_time_ms;
                         log.info("First Claude stream response at {d}ms", .{msg_time_ms});
                     }
+                    engineDebugLog("stream text delta: {d} bytes", .{text.len});
                     if (stream_prefix_pending and ctx.tag_engine) {
                         try ctx.cb.sendTextRaw(ctx.session_id, enginePrefix(engine));
                         stream_prefix_pending = false;
@@ -463,14 +514,9 @@ pub fn processCodexMessages(
                 log.info("Codex turn completed; pending dots, nudging to continue", .{});
                 try ctx.cb.sendUserMessage(ctx.session_id, "🔄 continue working on pending dots");
                 const nudge_prompt = "continue with the next dot task";
-                const should_continue = try ctx.cb.sendContinuePrompt(.codex, nudge_prompt);
-                if (should_continue) {
-                    stream_prefix_pending = true;
-                    thought_prefix_pending = true;
-                    continue;
-                } else {
-                    break;
-                }
+                // Queue continuation - handler will process it after we break
+                _ = try ctx.cb.sendContinuePrompt(.codex, nudge_prompt);
+                // Don't continue loop - Codex is done, break and let handler start new session
             } else if (has_blocking_error) {
                 log.info("Codex turn completed; not nudging due to error", .{});
             } else if (!cooldown_ok) {

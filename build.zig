@@ -4,6 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const live_cli_tests = b.option(bool, "live_cli_tests", "Enable live CLI snapshot tests") orelse false;
+    const nvim_debug = b.option(bool, "nvim_debug", "Enable verbose nvim handler debug logging") orelse false;
     const test_filter = b.option([]const u8, "test_filter", "Run only tests matching this filter");
     const sanitize_opt = b.option(bool, "sanitize", "Enable AddressSanitizer for tests") orelse false;
     const sanitize: ?std.zig.SanitizeC = if (sanitize_opt) .full else null;
@@ -18,6 +19,7 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "version", version);
     options.addOption([]const u8, "git_hash", std.mem.trim(u8, git_hash, "\n\r "));
     options.addOption(bool, "live_cli_tests", live_cli_tests);
+    options.addOption(bool, "nvim_debug", nvim_debug);
 
     // Main module
     const main_mod = b.createModule(.{

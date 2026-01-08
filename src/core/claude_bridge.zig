@@ -8,6 +8,20 @@ const io_utils = @import("io_utils.zig");
 const test_utils = @import("test_utils.zig");
 
 const max_json_line_bytes: usize = 4 * 1024 * 1024;
+const nvim_debug = config.nvim_debug;
+
+var bridge_debug_buf: [4096]u8 = undefined;
+
+fn bridgeDebugLog(comptime fmt: []const u8, args: anytype) void {
+    if (nvim_debug) {
+        const f = std.fs.cwd().openFile("/tmp/banjo-nvim-debug.log", .{ .mode = .write_only }) catch return;
+        defer f.close();
+        f.seekFromEnd(0) catch return;
+        const msg = std.fmt.bufPrint(&bridge_debug_buf, "[BRIDGE] " ++ fmt ++ "\n", args) catch return;
+        _ = f.write(msg) catch {};
+        f.sync() catch {};
+    }
+}
 const live_snapshot_timeout_ms: i64 = 60_000;
 
 /// Stream JSON message types from Claude Code
@@ -605,22 +619,27 @@ pub const Bridge = struct {
             log.info("Set BANJO_PERMISSION_SOCKET={s}", .{socket_path});
         }
 
+        bridgeDebugLog("start: spawning claude process", .{});
         try child.spawn();
         errdefer {
             _ = child.kill() catch {};
             _ = child.wait() catch {};
         }
+        bridgeDebugLog("start: spawned, pid={d}", .{child.id});
         self.process = child;
         if (self.process.?.stdout) |stdout| {
             self.stdout_reader = stdout.reader(&self.stdout_buf);
+            bridgeDebugLog("start: stdout reader initialized", .{});
         } else {
             self.stdout_reader = null;
+            bridgeDebugLog("start: no stdout!", .{});
         }
         self.queue_mutex.lock();
         self.reader_closed = false;
         self.queue_mutex.unlock();
         self.stop_requested.store(false, .release);
         self.clearQueue();
+        bridgeDebugLog("start: starting reader thread", .{});
         self.startReaderThread() catch |err| {
             self.stop();
             return err;
@@ -692,7 +711,6 @@ pub const Bridge = struct {
         _ = self.process orelse return error.NotStarted;
         const reader = if (self.stdout_reader) |*stdout_reader| &stdout_reader.interface else return error.NoStdout;
 
-        log.debug("Waiting for CLI stdout...", .{});
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         var keep_arena = false;
         defer if (!keep_arena) arena.deinit();
@@ -727,8 +745,6 @@ pub const Bridge = struct {
             log.debug("CLI returned empty line", .{});
             return null;
         }
-
-        log.debug("CLI stdout: {s}", .{line});
 
         const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), line, .{});
         const envelope = std.json.parseFromValueLeaky(StreamEnvelope, arena.allocator(), parsed.value, .{
@@ -805,12 +821,25 @@ pub const Bridge = struct {
     }
 
     fn readerMain(self: *Bridge) void {
+        bridgeDebugLog("readerMain: starting", .{});
+        var msg_count: u32 = 0;
         while (true) {
-            if (self.stop_requested.load(.acquire)) break;
+            if (self.stop_requested.load(.acquire)) {
+                bridgeDebugLog("readerMain: stop requested", .{});
+                break;
+            }
+            bridgeDebugLog("readerMain: waiting for message...", .{});
             var msg = self.readMessageRaw() catch |err| {
+                bridgeDebugLog("readerMain: readMessageRaw error", .{});
                 log.err("Claude reader failed: {}", .{err});
                 break;
-            } orelse break;
+            } orelse {
+                bridgeDebugLog("readerMain: readMessageRaw returned null", .{});
+                break;
+            };
+
+            msg_count += 1;
+            bridgeDebugLog("readerMain: got message #{d}, type={s}", .{ msg_count, @tagName(msg.type) });
 
             self.queue_mutex.lock();
             self.message_queue.append(self.allocator, msg) catch |err| {
@@ -823,6 +852,7 @@ pub const Bridge = struct {
             self.queue_cond.signal();
         }
 
+        bridgeDebugLog("readerMain: exiting, closing reader", .{});
         self.queue_mutex.lock();
         self.reader_closed = true;
         self.queue_mutex.unlock();
