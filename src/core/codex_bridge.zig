@@ -9,6 +9,7 @@ const io_utils = @import("io_utils.zig");
 const test_utils = @import("test_utils.zig");
 
 const max_json_line_bytes: usize = 4 * 1024 * 1024;
+const auth_markers = [_][]const u8{ "/login", "login", "log in", "authenticate" };
 
 pub const TurnError = struct {
     code: ?[]const u8 = null,
@@ -35,6 +36,13 @@ pub const TurnError = struct {
             containsMaxTurnMarker(self.message);
     }
 };
+
+fn containsAuthMarker(text: []const u8) bool {
+    for (auth_markers) |marker| {
+        if (std.mem.indexOf(u8, text, marker) != null) return true;
+    }
+    return false;
+}
 
 pub const CodexMessage = struct {
     event_type: EventType,
@@ -166,6 +174,12 @@ const RpcEnvelope = struct {
     params: ?std.json.Value = null,
     result: ?std.json.Value = null,
     @"error": ?std.json.Value = null,
+};
+
+const RpcError = struct {
+    code: ?i64 = null,
+    message: ?[]const u8 = null,
+    data: ?std.json.Value = null,
 };
 
 const InitializeParams = struct {
@@ -389,9 +403,13 @@ const ResponsePayload = struct {
     value: std.json.Value,
 };
 
+const ResponseError = struct {
+    auth_required: bool = false,
+};
+
 const ResponseEntry = union(enum) {
     ok: ResponsePayload,
-    err: void,
+    err: ResponseError,
 };
 
 pub const CodexBridge = struct {
@@ -707,8 +725,10 @@ pub const CodexBridge = struct {
                 .err => {
                     const id_value = rpc_message.id orelse continue;
                     const id = parseRequestId(id_value) orelse continue;
+                    const err_value = rpc_message.err orelse continue;
+                    const auth_required = isAuthRequiredError(&rpc_message.arena, err_value);
                     log.err("Codex app-server error response for request {d}", .{id});
-                    self.storeResponse(id, .{ .err = {} });
+                    self.storeResponse(id, .{ .err = .{ .auth_required = auth_required } });
                 },
                 .unknown => {},
             }
@@ -842,7 +862,8 @@ pub const CodexBridge = struct {
                     .ok => |payload| {
                         return payload;
                     },
-                    .err => {
+                    .err => |err| {
+                        if (err.auth_required) return error.AuthRequired;
                         return error.RequestFailed;
                     },
                 }
@@ -1264,6 +1285,17 @@ fn parseRpcRequestId(value: std.json.Value) ?CodexMessage.RpcRequestId {
     };
 }
 
+fn isAuthRequiredError(arena: *std.heap.ArenaAllocator, err_value: std.json.Value) bool {
+    const parsed = std.json.parseFromValueLeaky(RpcError, arena.allocator(), err_value, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| {
+        log.warn("Failed to parse Codex error: {}", .{err});
+        return false;
+    };
+    const message = parsed.message orelse return false;
+    return containsAuthMarker(message);
+}
+
 fn serverRequestKind(method: []const u8) ServerRequestKind {
     const map = std.StaticStringMap(ServerRequestKind).initComptime(.{
         .{ "item/commandExecution/requestApproval", .command_execution },
@@ -1494,6 +1526,22 @@ test "CodexMessage item completed suppressed after agent delta" {
     arena_completed.deinit();
 }
 
+test "Codex error auth detection" {
+    const json =
+        \\{"id":1,"error":{"code":401,"message":"Please login to authenticate"}}
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const parsed = try std.json.parseFromSlice(RpcEnvelope, arena.allocator(), json, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const err_value = parsed.value.@"error" orelse return error.TestExpectedEqual;
+    try testing.expect(isAuthRequiredError(&arena, err_value));
+}
+
 const LiveSnapshotError = error{
     Timeout,
     UnexpectedEof,
@@ -1501,8 +1549,7 @@ const LiveSnapshotError = error{
 };
 
 fn isAuthRequiredText(text: []const u8) bool {
-    return std.mem.indexOf(u8, text, "login") != null or
-        std.mem.indexOf(u8, text, "authenticate") != null;
+    return containsAuthMarker(text);
 }
 
 fn collectCodexSnapshot(allocator: Allocator, prompt: []const u8) ![]u8 {

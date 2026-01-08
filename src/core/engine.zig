@@ -27,12 +27,38 @@ fn engineDebugLog(comptime fmt: []const u8, args: anytype) void {
 }
 
 const prompt_poll_ms: i64 = 250;
+const auth_markers = [_][]const u8{ "/login", "login", "log in", "authenticate" };
 
 pub const NudgeConfig = struct {
     enabled: bool = true,
     cooldown_ms: i64 = constants.nudge_cooldown_ms,
     last_nudge_ms: *i64,
 };
+
+fn containsAuthMarker(text: []const u8) bool {
+    for (auth_markers) |marker| {
+        if (std.mem.indexOf(u8, text, marker) != null) return true;
+    }
+    return false;
+}
+
+fn authMarkerTextFromTurnError(err: codex_bridge.TurnError) ?[]const u8 {
+    if (err.message) |msg| {
+        if (containsAuthMarker(msg)) return msg;
+    }
+    if (err.code) |code| {
+        if (containsAuthMarker(code)) return code;
+    }
+    if (err.type) |err_type| {
+        if (containsAuthMarker(err_type)) return err_type;
+    }
+    return null;
+}
+
+fn maybeAuthRequired(ctx: *PromptContext, engine: Engine, text: []const u8) !?StopReason {
+    if (!containsAuthMarker(text)) return null;
+    return try ctx.cb.checkAuthRequired(ctx.session_id, engine, text);
+}
 
 pub const PromptContext = struct {
     allocator: Allocator,
@@ -367,6 +393,7 @@ pub fn processCodexMessages(
     var msg_count: u32 = 0;
     var stream_prefix_pending = false;
     var thought_prefix_pending = false;
+    var stop_reason: StopReason = .end_turn;
 
     while (true) {
         if (ctx.isCancelled()) return .cancelled;
@@ -396,6 +423,10 @@ pub fn processCodexMessages(
 
         if (msg.event_type == .agent_message_delta) {
             if (msg.text) |text| {
+                if (try maybeAuthRequired(ctx, engine, text)) |auth_stop| {
+                    stop_reason = auth_stop;
+                    break;
+                }
                 if (first_response_ms == 0) first_response_ms = msg_time_ms;
                 if (stream_prefix_pending and ctx.tag_engine) {
                     try ctx.cb.sendTextRaw(ctx.session_id, engine.prefix());
@@ -408,6 +439,10 @@ pub fn processCodexMessages(
 
         if (msg.event_type == .reasoning_delta) {
             if (msg.text) |text| {
+                if (try maybeAuthRequired(ctx, engine, text)) |auth_stop| {
+                    stop_reason = auth_stop;
+                    break;
+                }
                 if (first_response_ms == 0) first_response_ms = msg_time_ms;
                 if (thought_prefix_pending and ctx.tag_engine) {
                     try ctx.cb.sendThoughtRaw(ctx.session_id, engine.prefix());
@@ -468,18 +503,35 @@ pub fn processCodexMessages(
         }
 
         if (msg.getThought()) |text| {
+            if (try maybeAuthRequired(ctx, engine, text)) |auth_stop| {
+                stop_reason = auth_stop;
+                break;
+            }
             if (first_response_ms == 0) first_response_ms = msg_time_ms;
             try sendEngineThought(ctx, engine, text);
             continue;
         }
 
         if (msg.getText()) |text| {
+            if (try maybeAuthRequired(ctx, engine, text)) |auth_stop| {
+                stop_reason = auth_stop;
+                break;
+            }
             if (first_response_ms == 0) first_response_ms = msg_time_ms;
             try sendEngineText(ctx, engine, text);
             continue;
         }
 
         if (msg.event_type == .turn_completed) {
+            if (msg.turn_error) |err| {
+                if (authMarkerTextFromTurnError(err)) |auth_text| {
+                    if (try maybeAuthRequired(ctx, engine, auth_text)) |auth_stop| {
+                        stop_reason = auth_stop;
+                        break;
+                    }
+                }
+            }
+
             const has_max_turn_error = if (msg.turn_error) |err| isCodexMaxTurnError(err) else false;
             const has_blocking_error = msg.turn_error != null and !has_max_turn_error;
             const now_ms = std.time.milliTimestamp();
@@ -508,7 +560,7 @@ pub fn processCodexMessages(
 
     const total_ms = elapsedMs(start_ms);
     log.info("Codex prompt complete: {d} msgs, first response at {d}ms, total {d}ms", .{ msg_count, first_response_ms, total_ms });
-    return .end_turn;
+    return stop_reason;
 }
 
 fn sendEngineThought(ctx: *PromptContext, engine: Engine, text: []const u8) !void {

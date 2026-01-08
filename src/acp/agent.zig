@@ -42,6 +42,7 @@ const resource_line_limit: u32 = 200; // limit resource excerpt lines to reduce 
 const max_tool_preview_bytes: usize = 1024; // keep tool call previews readable in the panel
 const default_model_id = "sonnet";
 const prompt_poll_ms: i64 = 250;
+const auth_markers = [_][]const u8{ "/login", "login", "log in", "authenticate" };
 
 const SessionConfig = struct {
     auto_resume: bool,
@@ -55,10 +56,16 @@ fn autoResumeFromEnv() bool {
     return falsey_env_values.get(val) == null;
 }
 
+fn containsAuthMarker(text: []const u8) bool {
+    for (auth_markers) |marker| {
+        if (std.mem.indexOf(u8, text, marker) != null) return true;
+    }
+    return false;
+}
+
 /// Check if content indicates authentication is required
 fn isAuthRequiredContent(content: []const u8) bool {
-    return std.mem.indexOf(u8, content, "/login") != null or
-        std.mem.indexOf(u8, content, "authenticate") != null;
+    return containsAuthMarker(content);
 }
 
 /// Map CLI result subtypes to ACP stop reasons
@@ -820,9 +827,9 @@ pub const Agent = struct {
             },
             .authMethods = &.{
                 .{
-                    .id = "claude-login",
-                    .name = "Log in with Claude Code",
-                    .description = "Run `claude /login` in the terminal",
+                    .id = "external-auth",
+                    .name = "Authenticate in terminal",
+                    .description = "Authenticate with Claude Code or Codex outside Zed, then retry.",
                 },
             },
         };
@@ -1659,6 +1666,7 @@ pub const Agent = struct {
 
     fn mergeStopReason(current: protocol.StopReason, next: protocol.StopReason) protocol.StopReason {
         if (next == .cancelled) return .cancelled;
+        if (next == .auth_required) return .auth_required;
         if (current == .end_turn) return next;
         return current;
     }
@@ -1743,11 +1751,17 @@ pub const Agent = struct {
     }
 
     fn startCodexBridge(self: *Agent, session: *Session, session_id: []const u8) !void {
-        session.codex_bridge.?.start(buildCodexStartOptions(session)) catch |err| {
-            log.err("Failed to start Codex: {}", .{err});
-            session.codex_bridge = null;
-            try self.sendEngineText(session, session_id, .codex, "Failed to start Codex. Please ensure it is installed and in PATH.");
-            return error.BridgeStartFailed;
+        session.codex_bridge.?.start(buildCodexStartOptions(session)) catch |err| switch (err) {
+            error.AuthRequired => {
+                _ = try self.handleAuthRequired(session_id, session, .codex);
+                return err;
+            },
+            else => {
+                log.err("Failed to start Codex: {}", .{err});
+                session.codex_bridge = null;
+                try self.sendEngineText(session, session_id, .codex, "Failed to start Codex. Please ensure it is installed and in PATH.");
+                return error.BridgeStartFailed;
+            },
         };
         session.force_new_codex = false;
         const start_ms = std.time.milliTimestamp();
@@ -1798,18 +1812,21 @@ pub const Agent = struct {
         inputs: []const CodexUserInput,
     ) !*CodexBridge {
         const codex_bridge = try self.ensureCodexBridge(session, session_id);
-        codex_bridge.sendPrompt(inputs) catch |err| {
-            log.warn("Codex sendPrompt failed ({}), restarting", .{err});
-            codex_bridge.stop();
-            try self.startCodexBridge(session, session_id);
-            if (session.codex_bridge) |*restarted| {
-                restarted.sendPrompt(inputs) catch |retry_err| {
-                    log.err("Codex sendPrompt retry failed: {}", .{retry_err});
-                    return retry_err;
-                };
-            } else {
-                return error.BridgeStartFailed;
-            }
+        codex_bridge.sendPrompt(inputs) catch |err| switch (err) {
+            error.AuthRequired => return err,
+            else => {
+                log.warn("Codex sendPrompt failed ({}), restarting", .{err});
+                codex_bridge.stop();
+                try self.startCodexBridge(session, session_id);
+                if (session.codex_bridge) |*restarted| {
+                    restarted.sendPrompt(inputs) catch |retry_err| {
+                        log.err("Codex sendPrompt retry failed: {}", .{retry_err});
+                        return retry_err;
+                    };
+                } else {
+                    return error.BridgeStartFailed;
+                }
+            },
         };
         return &session.codex_bridge.?;
     }
@@ -1853,7 +1870,7 @@ pub const Agent = struct {
             .cancelled => .cancelled,
             .max_tokens => .max_tokens,
             .max_turn_requests => .max_turn_requests,
-            .auth_required => .end_turn,
+            .auth_required => .auth_required,
         };
     }
 
@@ -1879,7 +1896,13 @@ pub const Agent = struct {
         const inputs = input_list.items;
         if (inputs.len == 0) return .end_turn;
 
-        const codex_bridge = try self.sendCodexPromptWithRestart(session, session_id, inputs);
+        const codex_bridge = self.sendCodexPromptWithRestart(session, session_id, inputs) catch |err| switch (err) {
+            error.AuthRequired => {
+                _ = try self.handleAuthRequired(session_id, session, .codex);
+                return .auth_required;
+            },
+            else => return err,
+        };
 
         var cb_ctx = PromptCallbackContext{
             .agent = self,
@@ -3484,13 +3507,30 @@ pub const Agent = struct {
 
     /// Handle authentication required - notify user and stop bridge
     fn handleAuthRequired(self: *Agent, session_id: []const u8, session: *Session, engine: Engine) !protocol.StopReason {
+        const engine_label = switch (engine) {
+            .claude => "Claude Code",
+            .codex => "Codex",
+        };
+        var buf: [160]u8 = undefined;
+        const message = std.fmt.bufPrint(
+            &buf,
+            "{s} requires authentication. Authenticate in a terminal, then retry.",
+            .{engine_label},
+        ) catch "Authentication required. Authenticate in a terminal, then retry.";
+
         log.warn("Auth required for session {s}", .{session_id});
-        try self.sendEngineText(session, session_id, engine, "Authentication required. Please run `claude /login` in your terminal, then try again.");
-        if (session.bridge) |*b| {
-            b.stop();
+        try self.sendEngineText(session, session_id, engine, message);
+        switch (engine) {
+            .claude => {
+                if (session.bridge) |*b| b.stop();
+                session.bridge = null;
+            },
+            .codex => {
+                if (session.codex_bridge) |*b| b.stop();
+                session.codex_bridge = null;
+            },
         }
-        session.bridge = null;
-        return .end_turn;
+        return .auth_required;
     }
 
     /// Handle /version command
@@ -4327,8 +4367,8 @@ fn expectedInitializeResponse(comptime request_id: i64, comptime image_capable: 
         "\"},\"agentCapabilities\":{\"promptCapabilities\":{\"image\":" ++ image_str ++ ",\"audio\":false,\"embeddedContext\":true}," ++
         "\"mcpCapabilities\":{\"http\":false,\"sse\":false}," ++
         "\"sessionCapabilities\":{}," ++
-        "\"loadSession\":false},\"authMethods\":[{\"id\":\"claude-login\",\"name\":\"Log in with Claude Code\"," ++
-        "\"description\":\"Run `claude /login` in the terminal\"}]}," ++
+        "\"loadSession\":false},\"authMethods\":[{\"id\":\"external-auth\",\"name\":\"Authenticate in terminal\"," ++
+        "\"description\":\"Authenticate with Claude Code or Codex outside Zed, then retry.\"}]}," ++
         "\"id\":" ++ request_id_str ++ "}\n";
 }
 
@@ -5695,6 +5735,10 @@ test "Agent handleRequest - authenticate returns success" {
         \\{"jsonrpc":"2.0","result":{},"id":1}
         \\
     ).diff(tw.getOutput(), true);
+}
+
+test "toProtocolStopReason maps auth_required" {
+    try testing.expectEqual(protocol.StopReason.auth_required, Agent.toProtocolStopReason(.auth_required));
 }
 
 test "isUnsupportedCommand filters correctly" {
