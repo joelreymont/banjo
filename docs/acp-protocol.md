@@ -226,6 +226,7 @@ const StopReason = enum {
     cancelled,
     max_tokens,
     max_turn_requests,
+    auth_required,
     refusal,
 };
 ```

@@ -31,9 +31,9 @@ JSON-RPC 2.0 over stdio between Zed and agents.
     },
     "authMethods": [
       {
-        "id": "claude-login",
-        "name": "Log in with Claude Code",
-        "description": "Run `claude /login` in the terminal"
+        "id": "external-auth",
+        "name": "Authenticate in terminal",
+        "description": "Authenticate with Claude Code or Codex outside Zed, then retry."
       }
     ]
   },

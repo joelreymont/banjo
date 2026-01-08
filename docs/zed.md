@@ -7,7 +7,7 @@ Banjo Duet runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) an
 1. Open Zed → Extensions → Search "Banjo Duet" → Install
 2. Open Agent Panel (`Cmd+?`) → Select "Banjo Duet"
 
-> **Requires Claude Code or Codex installed.** Run `claude /login` if you haven't already.
+> **Requires Claude Code or Codex installed.** Authenticate in a terminal before using Banjo Duet.
 
 ## Features
 
