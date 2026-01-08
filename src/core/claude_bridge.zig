@@ -10,14 +10,13 @@ const test_utils = @import("test_utils.zig");
 const max_json_line_bytes: usize = 4 * 1024 * 1024;
 const nvim_debug = config.nvim_debug;
 
-var bridge_debug_buf: [4096]u8 = undefined;
-
 fn bridgeDebugLog(comptime fmt: []const u8, args: anytype) void {
     if (nvim_debug) {
+        var buf: [4096]u8 = undefined;
         const f = std.fs.cwd().openFile("/tmp/banjo-nvim-debug.log", .{ .mode = .write_only }) catch return;
         defer f.close();
         f.seekFromEnd(0) catch return;
-        const msg = std.fmt.bufPrint(&bridge_debug_buf, "[BRIDGE] " ++ fmt ++ "\n", args) catch return;
+        const msg = std.fmt.bufPrint(&buf, "[BRIDGE] " ++ fmt ++ "\n", args) catch return;
         _ = f.write(msg) catch {};
         f.sync() catch {};
     }
