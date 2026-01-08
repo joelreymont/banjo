@@ -8,7 +8,13 @@ const DotTask = struct {
     status: []const u8,
 };
 
-pub fn hasPendingTasks(allocator: Allocator, cwd: []const u8) bool {
+/// Result of checking for pending tasks
+pub const PendingTasksResult = struct {
+    has_tasks: bool,
+    error_msg: ?[]const u8 = null, // Static string describing error, null if success
+};
+
+pub fn hasPendingTasks(allocator: Allocator, cwd: []const u8) PendingTasksResult {
     var args = [_][]const u8{ "dot", "ls", "--json" };
     var child = std.process.Child.init(&args, allocator);
     child.cwd = cwd;
@@ -18,45 +24,46 @@ pub fn hasPendingTasks(allocator: Allocator, cwd: []const u8) bool {
 
     child.spawn() catch |err| {
         log.warn("dot ls failed to start: {}", .{err});
-        return false;
+        return .{ .has_tasks = false, .error_msg = "dot CLI not found or failed to start" };
     };
     errdefer {
         _ = child.kill() catch {};
         _ = child.wait() catch {};
     }
 
-    const stdout = child.stdout orelse return false;
-    const stderr = child.stderr orelse return false;
+    const stdout = child.stdout orelse return .{ .has_tasks = false, .error_msg = "no stdout from dot" };
+    const stderr = child.stderr orelse return .{ .has_tasks = false, .error_msg = "no stderr from dot" };
     const out = stdout.readToEndAlloc(allocator, max_dot_output_bytes) catch |err| {
         log.warn("dot ls stdout read failed: {}", .{err});
-        return false;
+        return .{ .has_tasks = false, .error_msg = "failed to read dot output" };
     };
     defer allocator.free(out);
     const err_out = stderr.readToEndAlloc(allocator, max_dot_output_bytes) catch |err| {
         log.warn("dot ls stderr read failed: {}", .{err});
-        return false;
+        return .{ .has_tasks = false, .error_msg = "failed to read dot stderr" };
     };
     defer allocator.free(err_out);
 
     const term = child.wait() catch |err| {
         log.warn("dot ls wait failed: {}", .{err});
-        return false;
+        return .{ .has_tasks = false, .error_msg = "dot process wait failed" };
     };
     switch (term) {
         .Exited => |code| if (code != 0) {
             log.warn("dot ls exited with code {d}: {s}", .{ code, err_out });
-            return false;
+            return .{ .has_tasks = false, .error_msg = "dot ls exited with error" };
         },
         else => {
             log.warn("dot ls did not exit cleanly: {}", .{term});
-            return false;
+            return .{ .has_tasks = false, .error_msg = "dot ls terminated abnormally" };
         },
     }
 
-    return outputHasPendingTasks(allocator, out) catch |err| {
+    const has = outputHasPendingTasks(allocator, out) catch |err| {
         log.warn("dot ls output parse failed: {}", .{err});
-        return false;
+        return .{ .has_tasks = false, .error_msg = "failed to parse dot output" };
     };
+    return .{ .has_tasks = has };
 }
 
 pub fn outputHasPendingTasks(allocator: Allocator, output: []const u8) !bool {

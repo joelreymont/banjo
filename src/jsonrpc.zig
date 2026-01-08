@@ -285,6 +285,60 @@ pub fn serializeTypedNotification(
     return try out.toOwnedSlice();
 }
 
+/// Serialize a response with anytype for id and result (for MCP and other flexible protocols)
+pub fn serializeResponseAny(
+    allocator: Allocator,
+    id: anytype,
+    result: anytype,
+    options: std.json.Stringify.Options,
+) ![]u8 {
+    var out: std.io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var jw: std.json.Stringify = .{
+        .writer = &out.writer,
+        .options = options,
+    };
+
+    try jw.beginObject();
+    try jw.objectField("jsonrpc");
+    try jw.write("2.0");
+    try jw.objectField("id");
+    try jw.write(id);
+    try jw.objectField("result");
+    try jw.write(result);
+    try jw.endObject();
+
+    return try out.toOwnedSlice();
+}
+
+/// Serialize a JSON-RPC error response
+pub fn serializeError(
+    allocator: Allocator,
+    id: anytype,
+    code: i32,
+    message: []const u8,
+) ![]u8 {
+    var out: std.io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var jw: std.json.Stringify = .{ .writer = &out.writer };
+
+    try jw.beginObject();
+    try jw.objectField("jsonrpc");
+    try jw.write("2.0");
+    try jw.objectField("id");
+    try jw.write(id);
+    try jw.objectField("error");
+    try jw.beginObject();
+    try jw.objectField("code");
+    try jw.write(code);
+    try jw.objectField("message");
+    try jw.write(message);
+    try jw.endObject();
+    try jw.endObject();
+
+    return try out.toOwnedSlice();
+}
+
 /// Serialize a notification to JSON using std.json.Stringify
 pub fn serializeNotification(allocator: Allocator, notification: Notification) ![]u8 {
     var out: std.io.Writer.Allocating = .init(allocator);

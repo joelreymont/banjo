@@ -17,27 +17,20 @@ const CodexBridge = codex_bridge.CodexBridge;
 const CodexMessage = codex_bridge.CodexMessage;
 const dots = @import("dots.zig");
 const config = @import("config");
+const constants = @import("constants.zig");
 
 const log = std.log.scoped(.engine);
-const nvim_debug = config.nvim_debug;
+const debug_log = @import("../util/debug_log.zig");
 
 fn engineDebugLog(comptime fmt: []const u8, args: anytype) void {
-    if (nvim_debug) {
-        var buf: [4096]u8 = undefined;
-        const f = std.fs.cwd().openFile("/tmp/banjo-nvim-debug.log", .{ .mode = .write_only }) catch return;
-        defer f.close();
-        f.seekFromEnd(0) catch return;
-        const msg = std.fmt.bufPrint(&buf, "[ENGINE] " ++ fmt ++ "\n", args) catch return;
-        _ = f.write(msg) catch {};
-        f.sync() catch {};
-    }
+    debug_log.write("ENGINE", fmt, args);
 }
 
 const prompt_poll_ms: i64 = 250;
 
 pub const NudgeConfig = struct {
     enabled: bool = true,
-    cooldown_ms: i64 = 30_000,
+    cooldown_ms: i64 = constants.nudge_cooldown_ms,
     last_nudge_ms: *i64,
 };
 
@@ -184,7 +177,7 @@ pub fn processClaudeMessages(
                 if (stop_reason_opt) |reason| {
                     const now_ms = std.time.milliTimestamp();
                     const cooldown_ok = (now_ms - ctx.nudge.last_nudge_ms.*) >= ctx.nudge.cooldown_ms;
-                    const has_dots = dots.hasPendingTasks(ctx.allocator, ctx.cwd);
+                    const has_dots = dots.hasPendingTasks(ctx.allocator, ctx.cwd).has_tasks;
                     const reason_ok = std.mem.eql(u8, reason, "error_max_turns") or
                         std.mem.eql(u8, reason, "success") or
                         std.mem.eql(u8, reason, "end_turn");
@@ -304,22 +297,32 @@ pub fn processClaudeMessages(
     return stop_reason;
 }
 
-fn sendEngineText(ctx: *PromptContext, engine: Engine, text: []const u8) !void {
+fn sendTaggedContent(
+    ctx: *PromptContext,
+    engine: Engine,
+    text: []const u8,
+    comptime buf_size: usize,
+    comptime send_fn: fn (EditorCallbacks, []const u8, Engine, []const u8) anyerror!void,
+) !void {
     if (ctx.tag_engine) {
-        var buf: [4096]u8 = undefined;
+        var buf: [buf_size]u8 = undefined;
         const prefix = engine.prefix();
         if (prefix.len + text.len <= buf.len) {
             @memcpy(buf[0..prefix.len], prefix);
             @memcpy(buf[prefix.len..][0..text.len], text);
-            try ctx.cb.sendText(ctx.session_id, engine, buf[0 .. prefix.len + text.len]);
+            try send_fn(ctx.cb, ctx.session_id, engine, buf[0 .. prefix.len + text.len]);
         } else {
             const tagged = try std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ prefix, text });
             defer ctx.allocator.free(tagged);
-            try ctx.cb.sendText(ctx.session_id, engine, tagged);
+            try send_fn(ctx.cb, ctx.session_id, engine, tagged);
         }
     } else {
-        try ctx.cb.sendText(ctx.session_id, engine, text);
+        try send_fn(ctx.cb, ctx.session_id, engine, text);
     }
+}
+
+fn sendEngineText(ctx: *PromptContext, engine: Engine, text: []const u8) !void {
+    return sendTaggedContent(ctx, engine, text, constants.large_buffer_size, EditorCallbacks.sendText);
 }
 
 fn mapCliStopReason(cli_reason: []const u8) StopReason {
@@ -483,7 +486,7 @@ pub fn processCodexMessages(
             const cooldown_ok = (now_ms - ctx.nudge.last_nudge_ms.*) >= ctx.nudge.cooldown_ms;
             const should_nudge = ctx.nudge.enabled and !ctx.isCancelled() and
                 !has_blocking_error and cooldown_ok and
-                dots.hasPendingTasks(ctx.allocator, ctx.cwd);
+                dots.hasPendingTasks(ctx.allocator, ctx.cwd).has_tasks;
 
             if (should_nudge) {
                 ctx.nudge.last_nudge_ms.* = now_ms;
@@ -509,21 +512,7 @@ pub fn processCodexMessages(
 }
 
 fn sendEngineThought(ctx: *PromptContext, engine: Engine, text: []const u8) !void {
-    if (ctx.tag_engine) {
-        var buf: [4096]u8 = undefined;
-        const prefix = engine.prefix();
-        if (prefix.len + text.len <= buf.len) {
-            @memcpy(buf[0..prefix.len], prefix);
-            @memcpy(buf[prefix.len..][0..text.len], text);
-            try ctx.cb.sendThought(ctx.session_id, engine, buf[0 .. prefix.len + text.len]);
-        } else {
-            const tagged = try std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ prefix, text });
-            defer ctx.allocator.free(tagged);
-            try ctx.cb.sendThought(ctx.session_id, engine, tagged);
-        }
-    } else {
-        try ctx.cb.sendThought(ctx.session_id, engine, text);
-    }
+    return sendTaggedContent(ctx, engine, text, constants.small_buffer_size, EditorCallbacks.sendThought);
 }
 
 // Tests
