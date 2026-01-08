@@ -39,6 +39,7 @@
 
 - Primary: snapshots (ohsnap) + property tests (quickcheck) with a real oracle.
 - `std.testing` only for trivial cases, error paths, or when no structured output exists.
+- **NEVER use `testing.expect` to decompose structures field-by-field** - use ohsnap snapshots instead.
 - Always run `zig build test` after major changes or adding tests.
 
 ## Zed Logs (macOS)

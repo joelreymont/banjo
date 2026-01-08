@@ -814,38 +814,22 @@ pub const McpServer = struct {
         var out: std.io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
 
-        var jw: std.json.Stringify = .{
-            .writer = &out.writer,
-            .options = .{ .emit_null_optional_fields = false },
-        };
-
-        // Build notification structure
+        // Write JSON directly in one pass to avoid serialize-parse-serialize round-trip
         const T = @TypeOf(params);
         if (T == @TypeOf(.{})) {
-            try jw.write(.{
-                .jsonrpc = "2.0",
-                .method = method,
-            });
+            try out.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"");
+            try out.writer.writeAll(method);
+            try out.writer.writeAll("\"}");
         } else {
-            // Serialize params to json.Value first
-            var param_out: std.io.Writer.Allocating = .init(self.allocator);
-            defer param_out.deinit();
-            var param_jw: std.json.Stringify = .{
-                .writer = &param_out.writer,
+            try out.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"");
+            try out.writer.writeAll(method);
+            try out.writer.writeAll("\",\"params\":");
+            var jw: std.json.Stringify = .{
+                .writer = &out.writer,
                 .options = .{ .emit_null_optional_fields = false },
             };
-            try param_jw.write(params);
-            const param_json = try param_out.toOwnedSlice();
-            defer self.allocator.free(param_json);
-
-            var param_parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, param_json, .{});
-            defer param_parsed.deinit();
-
-            try jw.write(.{
-                .jsonrpc = "2.0",
-                .method = method,
-                .params = param_parsed.value,
-            });
+            try jw.write(params);
+            try out.writer.writeAll("}");
         }
 
         const buf = try out.toOwnedSlice();

@@ -3,6 +3,20 @@ const std = @import("std");
 pub const Engine = enum {
     claude,
     codex,
+
+    pub fn label(self: Engine) []const u8 {
+        return switch (self) {
+            .claude => "Claude",
+            .codex => "Codex",
+        };
+    }
+
+    pub fn prefix(self: Engine) []const u8 {
+        return switch (self) {
+            .claude => "[Claude] ",
+            .codex => "[Codex] ",
+        };
+    }
 };
 
 pub const Route = enum {

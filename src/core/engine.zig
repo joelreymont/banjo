@@ -74,13 +74,6 @@ fn mapToolKind(tool_name: []const u8) ToolKind {
     return map.get(tool_name) orelse .other;
 }
 
-fn enginePrefix(engine: Engine) []const u8 {
-    return switch (engine) {
-        .claude => "[Claude] ",
-        .codex => "[Codex] ",
-    };
-}
-
 fn elapsedMs(start_ms: i64) u64 {
     const now = std.time.milliTimestamp();
     if (now <= start_ms) return 0;
@@ -254,14 +247,14 @@ pub fn processClaudeMessages(
                     }
                     engineDebugLog("stream text delta: {d} bytes", .{text.len});
                     if (stream_prefix_pending and ctx.tag_engine) {
-                        try ctx.cb.sendTextRaw(ctx.session_id, enginePrefix(engine));
+                        try ctx.cb.sendTextRaw(ctx.session_id, engine.prefix());
                         stream_prefix_pending = false;
                     }
                     try ctx.cb.sendTextRaw(ctx.session_id, text);
                 }
                 if (msg.getStreamThinkingDelta()) |thinking| {
                     if (thought_prefix_pending and ctx.tag_engine) {
-                        try ctx.cb.sendThoughtRaw(ctx.session_id, enginePrefix(engine));
+                        try ctx.cb.sendThoughtRaw(ctx.session_id, engine.prefix());
                         thought_prefix_pending = false;
                     }
                     try ctx.cb.sendThoughtRaw(ctx.session_id, thinking);
@@ -315,7 +308,7 @@ pub fn processClaudeMessages(
 fn sendEngineText(ctx: *PromptContext, engine: Engine, text: []const u8) !void {
     if (ctx.tag_engine) {
         var buf: [4096]u8 = undefined;
-        const prefix = enginePrefix(engine);
+        const prefix = engine.prefix();
         if (prefix.len + text.len <= buf.len) {
             @memcpy(buf[0..prefix.len], prefix);
             @memcpy(buf[prefix.len..][0..text.len], text);
@@ -341,24 +334,8 @@ fn mapCliStopReason(cli_reason: []const u8) StopReason {
     return map.get(cli_reason) orelse .end_turn;
 }
 
-const max_turn_markers = [_][]const u8{
-    "max_turn",
-    "max_turns",
-    "max_turn_requests",
-};
-
-fn containsMaxTurnMarker(text: ?[]const u8) bool {
-    const haystack = text orelse return false;
-    for (max_turn_markers) |marker| {
-        if (std.mem.indexOf(u8, haystack, marker) != null) return true;
-    }
-    return false;
-}
-
 fn isCodexMaxTurnError(err: codex_bridge.TurnError) bool {
-    return containsMaxTurnMarker(err.code) or
-        containsMaxTurnMarker(err.type) or
-        containsMaxTurnMarker(err.message);
+    return err.isMaxTurnError();
 }
 
 fn exitCodeStatus(exit_code: ?i64) ToolStatus {
@@ -419,7 +396,7 @@ pub fn processCodexMessages(
             if (msg.text) |text| {
                 if (first_response_ms == 0) first_response_ms = msg_time_ms;
                 if (stream_prefix_pending and ctx.tag_engine) {
-                    try ctx.cb.sendTextRaw(ctx.session_id, enginePrefix(engine));
+                    try ctx.cb.sendTextRaw(ctx.session_id, engine.prefix());
                     stream_prefix_pending = false;
                 }
                 try ctx.cb.sendTextRaw(ctx.session_id, text);
@@ -431,7 +408,7 @@ pub fn processCodexMessages(
             if (msg.text) |text| {
                 if (first_response_ms == 0) first_response_ms = msg_time_ms;
                 if (thought_prefix_pending and ctx.tag_engine) {
-                    try ctx.cb.sendThoughtRaw(ctx.session_id, enginePrefix(engine));
+                    try ctx.cb.sendThoughtRaw(ctx.session_id, engine.prefix());
                     thought_prefix_pending = false;
                 }
                 try ctx.cb.sendThoughtRaw(ctx.session_id, text);
@@ -535,7 +512,7 @@ pub fn processCodexMessages(
 fn sendEngineThought(ctx: *PromptContext, engine: Engine, text: []const u8) !void {
     if (ctx.tag_engine) {
         var buf: [4096]u8 = undefined;
-        const prefix = enginePrefix(engine);
+        const prefix = engine.prefix();
         if (prefix.len + text.len <= buf.len) {
             @memcpy(buf[0..prefix.len], prefix);
             @memcpy(buf[prefix.len..][0..text.len], text);

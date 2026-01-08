@@ -22,6 +22,7 @@ const EditorCallbacks = callbacks_mod.EditorCallbacks;
 const CallbackToolKind = callbacks_mod.ToolKind;
 const CallbackToolStatus = callbacks_mod.ToolStatus;
 const notes_commands = @import("../notes/commands.zig");
+const permission_socket = @import("../core/permission_socket.zig");
 const config = @import("config");
 const test_env = @import("../util/test_env.zig");
 const ToolProxy = @import("../tools/proxy.zig").ToolProxy;
@@ -68,26 +69,6 @@ fn mapCliStopReason(cli_reason: []const u8) protocol.StopReason {
         .{ "error_max_budget_usd", .max_turn_requests },
     });
     return map.get(cli_reason) orelse .end_turn;
-}
-
-const max_turn_markers = [_][]const u8{
-    "max_turn",
-    "max_turns",
-    "max_turn_requests",
-};
-
-fn containsMaxTurnMarker(text: ?[]const u8) bool {
-    const haystack = text orelse return false;
-    for (max_turn_markers) |marker| {
-        if (std.mem.indexOf(u8, haystack, marker) != null) return true;
-    }
-    return false;
-}
-
-fn isCodexMaxTurnError(err: codex_cli.TurnError) bool {
-    return containsMaxTurnMarker(err.code) or
-        containsMaxTurnMarker(err.type) or
-        containsMaxTurnMarker(err.message);
 }
 
 fn replaceFirst(allocator: Allocator, input: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
@@ -211,20 +192,6 @@ fn generateSessionIdWithAllocator(allocator: Allocator) ![]const u8 {
     std.crypto.random.bytes(&uuid_bytes);
     const hex = std.fmt.bytesToHex(uuid_bytes, .lower);
     return allocator.dupe(u8, &hex);
-}
-
-fn engineLabel(engine: Engine) []const u8 {
-    return switch (engine) {
-        .claude => "Claude",
-        .codex => "Codex",
-    };
-}
-
-fn enginePrefix(engine: Engine) []const u8 {
-    return switch (engine) {
-        .claude => "[Claude] ",
-        .codex => "[Codex] ",
-    };
 }
 
 fn mapToolKind(tool_name: []const u8) protocol.SessionUpdate.ToolKind {
@@ -453,33 +420,9 @@ pub const Agent = struct {
         }
 
         fn createPermissionSocket(self: *Session, allocator: Allocator) !void {
-            // Create socket path: /tmp/banjo-{session_id}.sock
-            const path = try std.fmt.allocPrint(allocator, "/tmp/banjo-{s}.sock", .{self.id});
-            errdefer allocator.free(path);
-
-            // Remove existing socket file if present
-            std.fs.cwd().deleteFile(path) catch {};
-
-            // Create non-blocking Unix domain socket with CLOEXEC to prevent fd inheritance
-            const sock = try std.posix.socket(
-                std.posix.AF.UNIX,
-                std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC,
-                0,
-            );
-            errdefer std.posix.close(sock);
-
-            // Bind to path
-            var addr: std.posix.sockaddr.un = .{ .path = undefined };
-            @memset(&addr.path, 0);
-            const path_len = @min(path.len, addr.path.len - 1);
-            @memcpy(addr.path[0..path_len], path[0..path_len]);
-
-            try std.posix.bind(sock, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
-            try std.posix.listen(sock, 1);
-
-            self.permission_socket = sock;
-            self.permission_socket_path = path;
-            log.info("Created permission socket at {s}", .{path});
+            const result = try permission_socket.create(allocator, self.id);
+            self.permission_socket = result.socket;
+            self.permission_socket_path = result.path;
         }
 
         /// Check if a tool is allowed based on settings
@@ -1992,7 +1935,7 @@ pub const Agent = struct {
 
     fn sendEngineTextPrefix(self: *Agent, session: *Session, session_id: []const u8, engine: Engine) !void {
         if (!self.shouldTagEngine(session)) return;
-        const prefix = enginePrefix(engine);
+        const prefix = engine.prefix();
         try self.sendSessionUpdate(session_id, .{
             .sessionUpdate = .agent_message_chunk,
             .content = .{ .type = "text", .text = prefix },
@@ -2015,7 +1958,7 @@ pub const Agent = struct {
 
     fn sendEngineThoughtPrefix(self: *Agent, session: *Session, session_id: []const u8, engine: Engine) !void {
         if (!self.shouldTagEngine(session)) return;
-        const prefix = enginePrefix(engine);
+        const prefix = engine.prefix();
         try self.sendSessionUpdate(session_id, .{
             .sessionUpdate = .agent_thought_chunk,
             .content = .{ .type = "text", .text = prefix },
@@ -2120,10 +2063,10 @@ pub const Agent = struct {
                     title_owned = owned;
                     break :blk owned;
                 }
-                if (std.fmt.bufPrint(&title_buf, "[{s}] {s}: {s}", .{ engineLabel(engine), tool_name, preview }) catch null) |title| {
+                if (std.fmt.bufPrint(&title_buf, "[{s}] {s}: {s}", .{ engine.label(), tool_name, preview }) catch null) |title| {
                     break :blk title;
                 }
-                const owned = try std.fmt.allocPrint(self.allocator, "[{s}] {s}: {s}", .{ engineLabel(engine), tool_name, preview });
+                const owned = try std.fmt.allocPrint(self.allocator, "[{s}] {s}: {s}", .{ engine.label(), tool_name, preview });
                 title_owned = owned;
                 break :blk owned;
             }
@@ -2756,14 +2699,25 @@ pub const Agent = struct {
         message: ?[]const u8,
     };
 
+    const PermissionSocketResponse = struct {
+        decision: []const u8,
+        message: ?[]const u8 = null,
+    };
+
     fn sendPermissionResponse(self: *Agent, fd: std.posix.fd_t, decision: []const u8, message: ?[]const u8) void {
-        _ = self;
-        var buf: [512]u8 = undefined;
-        const response = if (message) |msg|
-            std.fmt.bufPrint(&buf, "{{\"decision\":\"{s}\",\"message\":\"{s}\"}}\n", .{ decision, msg }) catch return
-        else
-            std.fmt.bufPrint(&buf, "{{\"decision\":\"{s}\"}}\n", .{decision}) catch return;
-        _ = std.posix.write(fd, response) catch {};
+        var out: std.io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+
+        var jw: std.json.Stringify = .{
+            .writer = &out.writer,
+            .options = .{ .emit_null_optional_fields = false },
+        };
+        jw.write(PermissionSocketResponse{ .decision = decision, .message = message }) catch return;
+        out.writer.writeAll("\n") catch return;
+        const json = out.toOwnedSlice() catch return;
+        defer self.allocator.free(json);
+
+        _ = std.posix.write(fd, json) catch {};
     }
 
     const AskUserQuestionSocketResponse = struct {
@@ -3184,16 +3138,16 @@ pub const Agent = struct {
     }
 
     fn tagText(self: *Agent, engine: Engine, text: []const u8) ![]const u8 {
-        return std.fmt.allocPrint(self.allocator, "[{s}] {s}", .{ engineLabel(engine), text });
+        return std.fmt.allocPrint(self.allocator, "[{s}] {s}", .{ engine.label(), text });
     }
 
     fn tagToolId(self: *Agent, engine: Engine, tool_id: []const u8) ![]const u8 {
-        return std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ engineLabel(engine), tool_id });
+        return std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ engine.label(), tool_id });
     }
 
     fn formatTagged(self: *Agent, buf: []u8, engine: Engine, text: []const u8) ?[]const u8 {
         _ = self;
-        const prefix = engineLabel(engine);
+        const prefix = engine.label();
         const needed = prefix.len + text.len + 3;
         if (needed > buf.len) return null;
         return std.fmt.bufPrint(buf, "[{s}] {s}", .{ prefix, text }) catch null;
@@ -3201,7 +3155,7 @@ pub const Agent = struct {
 
     fn formatToolId(self: *Agent, buf: []u8, engine: Engine, tool_id: []const u8) ?[]const u8 {
         _ = self;
-        const prefix = engineLabel(engine);
+        const prefix = engine.label();
         const needed = prefix.len + tool_id.len + 1;
         if (needed > buf.len) return null;
         return std.fmt.bufPrint(buf, "{s}:{s}", .{ prefix, tool_id }) catch null;
@@ -4432,15 +4386,14 @@ test "replaceFirst returns copy when needle not found" {
     try testing.expectEqualStrings("hello world", result);
 }
 
-test "max turn marker helpers detect max turn errors" {
-    try testing.expect(containsMaxTurnMarker("error_max_turns"));
-    try testing.expect(containsMaxTurnMarker("max_turn_requests"));
-    try testing.expect(!containsMaxTurnMarker("budget_exceeded"));
-
-    try testing.expect(isCodexMaxTurnError(.{ .code = "max_turns", .message = null, .type = null }));
-    try testing.expect(isCodexMaxTurnError(.{ .code = null, .message = "max_turn_requests", .type = null }));
-    try testing.expect(isCodexMaxTurnError(.{ .code = null, .message = null, .type = "error_max_turns" }));
-    try testing.expect(!isCodexMaxTurnError(.{ .code = "budget", .message = null, .type = null }));
+test "TurnError.isMaxTurnError detects max turn errors" {
+    const TurnError = codex_cli.TurnError;
+    try testing.expect((TurnError{ .code = "max_turns" }).isMaxTurnError());
+    try testing.expect((TurnError{ .code = "max_turn_requests" }).isMaxTurnError());
+    try testing.expect((TurnError{ .message = "max_turn_requests" }).isMaxTurnError());
+    try testing.expect((TurnError{ .type = "error_max_turns" }).isMaxTurnError());
+    try testing.expect(!(TurnError{ .code = "budget" }).isMaxTurnError());
+    try testing.expect(!(TurnError{ .code = "budget_exceeded" }).isMaxTurnError());
 }
 
 fn createFakeBinary(allocator: Allocator, dir: *std.testing.TmpDir, name: []const u8) ![]u8 {

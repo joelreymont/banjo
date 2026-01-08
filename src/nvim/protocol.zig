@@ -36,6 +36,16 @@ pub const PermissionMode = enum {
             .plan_only => "plan",
         };
     }
+
+    /// Returns the Codex approvalPolicy value, or null for default (interactive)
+    pub fn toCodexApprovalPolicy(self: PermissionMode) ?[]const u8 {
+        return switch (self) {
+            .default => null,
+            .accept_edits => null,
+            .auto_approve => "never",
+            .plan_only => null,
+        };
+    }
 };
 
 // Request from Lua to Zig
@@ -68,6 +78,11 @@ pub const SetPermissionModeRequest = struct {
 pub const ApprovalResponseRequest = struct {
     id: []const u8,
     decision: []const u8, // "approve" or "decline"
+};
+
+pub const PermissionResponseRequest = struct {
+    id: []const u8,
+    decision: []const u8, // "allow", "allow_always", "deny"
 };
 
 pub const PromptRequest = struct {
@@ -159,7 +174,7 @@ pub const ToolResult = struct {
 pub const PermissionRequest = struct {
     id: []const u8,
     tool_name: []const u8,
-    input: std.json.Value,
+    tool_input: ?[]const u8 = null, // JSON string preview of tool input
 };
 
 pub const SessionIdUpdate = struct {
