@@ -1,4 +1,5 @@
 const std = @import("std");
+const permission_mode = @import("../core/permission_mode.zig");
 
 pub const ProtocolVersion = 1;
 
@@ -574,10 +575,4 @@ pub const SetConfigOptionResponse = struct {
     configOptions: []const SessionConfigOption,
 };
 
-pub const PermissionMode = enum {
-    default,
-    acceptEdits,
-    bypassPermissions,
-    dontAsk,
-    plan,
-};
+pub const PermissionMode = permission_mode.PermissionMode;

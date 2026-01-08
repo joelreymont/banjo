@@ -106,7 +106,10 @@ fn ensurePermissionHookInDir(allocator: Allocator, home: []const u8) HookConfigR
 
     // Ensure ~/.claude directory exists
     const claude_dir = std.fs.path.join(aa, &.{ home, ".claude" }) catch return .failed;
-    std.fs.cwd().makePath(claude_dir) catch {};
+    std.fs.cwd().makePath(claude_dir) catch |err| {
+        log.warn("Failed to create Claude settings dir {s}: {}", .{ claude_dir, err });
+        return .failed;
+    };
 
     // Write back with pretty-printing
     const json = std.json.Stringify.valueAlloc(aa, root, .{

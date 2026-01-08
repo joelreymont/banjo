@@ -227,12 +227,20 @@ pub const UserInput = struct {
     path: ?[]const u8 = null,
 };
 
+const WorkspaceWriteSandboxPolicy = struct {
+    type: []const u8 = "workspaceWrite",
+    writableRoots: ?[]const []const u8 = null,
+    networkAccess: ?bool = null,
+    excludeSlashTmp: ?bool = null,
+    excludeTmpdirEnvVar: ?bool = null,
+};
+
 const TurnStartParams = struct {
     threadId: []const u8,
     input: []const UserInput,
     cwd: ?[]const u8 = null,
     approvalPolicy: ?[]const u8 = null,
-    sandboxPolicy: ?std.json.Value = null,
+    sandboxPolicy: ?WorkspaceWriteSandboxPolicy = null,
     model: ?[]const u8 = null,
     effort: ?[]const u8 = null,
     summary: ?[]const u8 = null,
@@ -529,8 +537,14 @@ pub const CodexBridge = struct {
 
         try child.spawn();
         errdefer {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            _ = child.kill() catch |err| blk: {
+                log.warn("Failed to kill Codex child: {}", .{err});
+                break :blk std.process.Child.Term{ .Unknown = 0 };
+            };
+            _ = child.wait() catch |err| blk: {
+                log.warn("Failed to wait for Codex child: {}", .{err});
+                break :blk std.process.Child.Term{ .Unknown = 0 };
+            };
         }
         self.process = child;
         self.stdout_file = self.process.?.stdout;
@@ -568,8 +582,14 @@ pub const CodexBridge = struct {
     pub fn stop(self: *CodexBridge) void {
         self.stop_requested.store(true, .release);
         if (self.process) |*proc| {
-            _ = proc.kill() catch {};
-            _ = proc.wait() catch {};
+            _ = proc.kill() catch |err| blk: {
+                log.warn("Failed to kill Codex process: {}", .{err});
+                break :blk std.process.Child.Term{ .Unknown = 0 };
+            };
+            _ = proc.wait() catch |err| blk: {
+                log.warn("Failed to wait for Codex process: {}", .{err});
+                break :blk std.process.Child.Term{ .Unknown = 0 };
+            };
             self.process = null;
             self.stdout_file = null;
         }
@@ -593,17 +613,32 @@ pub const CodexBridge = struct {
         const thread_id = self.thread_id orelse return error.NotStarted;
         const request_id = self.nextRequestId();
 
+        var resolved_root: ?[]const u8 = null;
+        defer if (resolved_root) |root| self.allocator.free(root);
+        const root = if (std.fs.path.isAbsolute(self.cwd)) self.cwd else blk: {
+            resolved_root = std.fs.cwd().realpathAlloc(self.allocator, self.cwd) catch null;
+            break :blk resolved_root;
+        };
+
+        var sandbox_policy = WorkspaceWriteSandboxPolicy{};
+        var writable_roots: [1][]const u8 = undefined;
+        if (root) |abs_root| {
+            writable_roots[0] = abs_root;
+            sandbox_policy.writableRoots = writable_roots[0..];
+        }
+
         const params = TurnStartParams{
             .threadId = thread_id,
             .input = inputs,
             .approvalPolicy = self.approval_policy,
+            .sandboxPolicy = sandbox_policy,
         };
 
         try self.sendRequest(request_id, "turn/start", params);
         var response = try self.waitForResponse(request_id);
         defer response.arena.deinit();
 
-        const turn_id = extractTurnId(response.arena.allocator(), response.value) orelse {
+        const turn_id = extractTurnId(&response.arena, response.value) orelse {
             return error.InvalidResponse;
         };
         try self.setTurnId(turn_id);
@@ -761,13 +796,14 @@ pub const CodexBridge = struct {
             .model = model,
             .cwd = self.cwd,
             .approvalPolicy = self.approval_policy,
+            .sandbox = "workspace-write",
             .experimentalRawEvents = false,
         };
         try self.sendRequest(request_id, "thread/start", params);
         var response = try self.waitForResponse(request_id);
         defer response.arena.deinit();
 
-        const thread_id = extractThreadId(response.arena.allocator(), response.value) orelse {
+        const thread_id = extractThreadId(&response.arena, response.value) orelse {
             return error.InvalidResponse;
         };
         try self.setThreadId(thread_id);
@@ -783,7 +819,7 @@ pub const CodexBridge = struct {
         var response = try self.waitForResponse(request_id);
         defer response.arena.deinit();
 
-        const resumed_id = extractThreadId(response.arena.allocator(), response.value) orelse {
+        const resumed_id = extractThreadId(&response.arena, response.value) orelse {
             return error.InvalidResponse;
         };
         try self.setThreadId(resumed_id);
@@ -1130,7 +1166,7 @@ pub const CodexBridge = struct {
             .item_started, .item_completed => {
                 const parsed = parseNotificationParams(arena, ItemEventParams, params) orelse return null;
                 if (!self.matchesCurrentTurn(parsed.turnId)) return null;
-                const item = parseItem(arena.allocator(), parsed.item) orelse return null;
+                const item = parseItem(arena, parsed.item) orelse return null;
                 const event_type: CodexMessage.EventType = if (kind == .item_started) .item_started else .item_completed;
 
                 if (event_type == .item_completed and item.kind == .agent_message) {
@@ -1190,8 +1226,8 @@ fn parseRequestId(value: std.json.Value) ?i64 {
     };
 }
 
-fn extractThreadId(allocator: Allocator, value: std.json.Value) ?[]const u8 {
-    const parsed = std.json.parseFromValueLeaky(ThreadStartResponse, allocator, value, .{
+fn extractThreadId(arena: *std.heap.ArenaAllocator, value: std.json.Value) ?[]const u8 {
+    const parsed = std.json.parseFromValueLeaky(ThreadStartResponse, arena.allocator(), value, .{
         .ignore_unknown_fields = true,
     }) catch |err| {
         log.warn("Failed to parse thread start response: {}", .{err});
@@ -1200,8 +1236,8 @@ fn extractThreadId(allocator: Allocator, value: std.json.Value) ?[]const u8 {
     return parsed.thread.id;
 }
 
-fn extractTurnId(allocator: Allocator, value: std.json.Value) ?[]const u8 {
-    const parsed = std.json.parseFromValueLeaky(TurnStartResponse, allocator, value, .{
+fn extractTurnId(arena: *std.heap.ArenaAllocator, value: std.json.Value) ?[]const u8 {
+    const parsed = std.json.parseFromValueLeaky(TurnStartResponse, arena.allocator(), value, .{
         .ignore_unknown_fields = true,
     }) catch |err| {
         log.warn("Failed to parse turn start response: {}", .{err});
@@ -1211,7 +1247,7 @@ fn extractTurnId(allocator: Allocator, value: std.json.Value) ?[]const u8 {
     return parsed.turnId;
 }
 
-fn parseItem(allocator: Allocator, item: ItemData) ?CodexMessage.Item {
+fn parseItem(arena: *std.heap.ArenaAllocator, item: ItemData) ?CodexMessage.Item {
     const kind = parseItemKind(item.type);
 
     var parsed = CodexMessage.Item{
@@ -1226,11 +1262,11 @@ fn parseItem(allocator: Allocator, item: ItemData) ?CodexMessage.Item {
 
     if (kind == .reasoning) {
         if (item.summary) |summary_val| {
-            parsed.text = joinStringLines(allocator, summary_val.lines, "\n");
+            parsed.text = joinStringLines(arena, summary_val.lines, "\n");
         }
         if (parsed.text == null) {
             if (item.content) |content_val| {
-                parsed.text = joinStringLines(allocator, content_val.lines, "\n");
+                parsed.text = joinStringLines(arena, content_val.lines, "\n");
             }
         }
         return parsed;
@@ -1363,9 +1399,10 @@ const ServerRequestKind = enum {
     }
 };
 
-fn joinStringLines(allocator: Allocator, lines: []const []const u8, sep: []const u8) ?[]const u8 {
+fn joinStringLines(arena: *std.heap.ArenaAllocator, lines: []const []const u8, sep: []const u8) ?[]const u8 {
     if (lines.len == 0) return null;
 
+    const allocator = arena.allocator();
     var total_len: usize = 0;
     for (lines) |line| {
         total_len += line.len;
@@ -1450,6 +1487,34 @@ test "CodexMessage thread started parsing" {
     defer msg.deinit();
 
     try testing.expectEqualStrings("thr_123", msg.getSessionId().?);
+}
+
+test "Codex sandbox policy encoded" {
+    const inputs = [_]UserInput{.{ .type = "text", .text = "hi" }};
+    var roots = [_][]const u8{"/tmp"};
+    const policy = WorkspaceWriteSandboxPolicy{ .writableRoots = roots[0..] };
+    const turn_params = TurnStartParams{
+        .threadId = "thread-1",
+        .input = &inputs,
+        .sandboxPolicy = policy,
+    };
+    const turn_json = try std.json.Stringify.valueAlloc(testing.allocator, turn_params, .{
+        .emit_null_optional_fields = false,
+    });
+    defer testing.allocator.free(turn_json);
+    try testing.expect(std.mem.indexOf(u8, turn_json, "\"sandboxPolicy\"") != null);
+    try testing.expect(std.mem.indexOf(u8, turn_json, "\"type\":\"workspaceWrite\"") != null);
+    try testing.expect(std.mem.indexOf(u8, turn_json, "\"writableRoots\":[\"/tmp\"]") != null);
+
+    const thread_params = ThreadStartParams{
+        .cwd = "/tmp",
+        .sandbox = "workspace-write",
+    };
+    const thread_json = try std.json.Stringify.valueAlloc(testing.allocator, thread_params, .{
+        .emit_null_optional_fields = false,
+    });
+    defer testing.allocator.free(thread_json);
+    try testing.expect(std.mem.indexOf(u8, thread_json, "\"sandbox\":\"workspace-write\"") != null);
 }
 
 test "CodexMessage reasoning summary parsing" {
@@ -1540,6 +1605,27 @@ test "Codex error auth detection" {
 
     const err_value = parsed.value.@"error" orelse return error.TestExpectedEqual;
     try testing.expect(isAuthRequiredError(&arena, err_value));
+}
+
+test "Codex error auth detection ignores non-auth message" {
+    const json =
+        \\{"id":2,"error":{"code":401,"message":"Request failed"}}
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const parsed = try std.json.parseFromSlice(RpcEnvelope, arena.allocator(), json, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const err_value = parsed.value.@"error" orelse return error.TestExpectedEqual;
+    try testing.expect(!isAuthRequiredError(&arena, err_value));
+}
+
+test "Codex auth marker detection for text" {
+    try testing.expect(isAuthRequiredText("Please login to continue"));
+    try testing.expect(!isAuthRequiredText("All good"));
 }
 
 const LiveSnapshotError = error{

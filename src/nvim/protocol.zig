@@ -1,52 +1,10 @@
 const std = @import("std");
 const types = @import("../core/types.zig");
+const permission_mode = @import("../core/permission_mode.zig");
 const Engine = types.Engine;
 
 // Permission modes for Claude Code
-pub const PermissionMode = enum {
-    default,
-    accept_edits,
-    auto_approve,
-    plan_only,
-
-    pub fn toString(self: PermissionMode) []const u8 {
-        return switch (self) {
-            .default => "Default",
-            .accept_edits => "Accept Edits",
-            .auto_approve => "Auto-approve",
-            .plan_only => "Plan Only",
-        };
-    }
-
-    pub fn toCliFlag(self: PermissionMode) ?[]const u8 {
-        return switch (self) {
-            .default => null,
-            .accept_edits => "--allowedTools",
-            .auto_approve => "--dangerouslySkipPermissions",
-            .plan_only => "--plan",
-        };
-    }
-
-    /// Returns the value for --permission-mode CLI arg, or null for default
-    pub fn toCliArg(self: PermissionMode) ?[]const u8 {
-        return switch (self) {
-            .default => null,
-            .accept_edits => "acceptEdits",
-            .auto_approve => "bypassPermissions",
-            .plan_only => "plan",
-        };
-    }
-
-    /// Returns the Codex approvalPolicy value, or null for default (interactive)
-    pub fn toCodexApprovalPolicy(self: PermissionMode) ?[]const u8 {
-        return switch (self) {
-            .default => null,
-            .accept_edits => null,
-            .auto_approve => "never",
-            .plan_only => null,
-        };
-    }
-};
+pub const PermissionMode = permission_mode.PermissionMode;
 
 // Request from Lua to Zig
 pub const Request = union(enum) {

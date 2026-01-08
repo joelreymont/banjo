@@ -604,8 +604,14 @@ pub const Bridge = struct {
         bridgeDebugLog("start: spawning claude process", .{});
         try child.spawn();
         errdefer {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            _ = child.kill() catch |err| blk: {
+                log.warn("Failed to kill Claude child: {}", .{err});
+                break :blk std.process.Child.Term{ .Unknown = 0 };
+            };
+            _ = child.wait() catch |err| blk: {
+                log.warn("Failed to wait for Claude child: {}", .{err});
+                break :blk std.process.Child.Term{ .Unknown = 0 };
+            };
         }
         bridgeDebugLog("start: spawned, pid={d}", .{child.id});
         self.process = child;
@@ -648,8 +654,14 @@ pub const Bridge = struct {
     pub fn stop(self: *Bridge) void {
         self.stop_requested.store(true, .release);
         if (self.process) |*proc| {
-            _ = proc.kill() catch {};
-            _ = proc.wait() catch {};
+            _ = proc.kill() catch |err| blk: {
+                log.warn("Failed to kill Claude process: {}", .{err});
+                break :blk std.process.Child.Term{ .Unknown = 0 };
+            };
+            _ = proc.wait() catch |err| blk: {
+                log.warn("Failed to wait for Claude process: {}", .{err});
+                break :blk std.process.Child.Term{ .Unknown = 0 };
+            };
             self.process = null;
             self.stdout_reader = null;
         }
@@ -852,6 +864,28 @@ test "MessageType.fromString" {
     try testing.expectEqual(MessageType.assistant, MessageType.fromString("assistant"));
     try testing.expectEqual(MessageType.result, MessageType.fromString("result"));
     try testing.expectEqual(MessageType.unknown, MessageType.fromString("invalid"));
+}
+
+test "SystemSubtype.fromString parses auth_required" {
+    try testing.expectEqual(SystemSubtype.auth_required, SystemSubtype.fromString("auth_required").?);
+}
+
+test "StreamMessage getSystemSubtype returns auth_required" {
+    const json =
+        \\{"type":"system","subtype":"auth_required"}
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json, .{});
+
+    var msg = StreamMessage{
+        .type = .system,
+        .subtype = "auth_required",
+        .raw = parsed.value,
+        .arena = arena,
+    };
+    defer msg.deinit();
+
+    try testing.expectEqual(SystemSubtype.auth_required, msg.getSystemSubtype().?);
 }
 
 test "StreamMessage parsing" {
@@ -1081,8 +1115,14 @@ fn collectClaudeControlProbe(allocator: Allocator, input: StreamControlInput) ![
 
     try child.spawn();
     errdefer {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        _ = child.kill() catch |err| blk: {
+            log.warn("Failed to kill Claude child: {}", .{err});
+            break :blk std.process.Child.Term{ .Unknown = 0 };
+        };
+        _ = child.wait() catch |err| blk: {
+            log.warn("Failed to wait for Claude child: {}", .{err});
+            break :blk std.process.Child.Term{ .Unknown = 0 };
+        };
     }
 
     const stdin = child.stdin orelse return error.NoStdin;

@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const log = std.log.scoped(.nvim_lockfile);
 
 pub const LockFile = struct {
     path: []const u8,
@@ -13,7 +14,9 @@ pub const LockFile = struct {
     }
 
     pub fn remove(self: *LockFile) void {
-        std.fs.deleteFileAbsolute(self.path) catch {};
+        std.fs.deleteFileAbsolute(self.path) catch |err| {
+            log.warn("Failed to remove lock file {s}: {}", .{ self.path, err });
+        };
     }
 };
 
@@ -42,7 +45,9 @@ pub fn create(allocator: Allocator, port: u16, cwd: []const u8, auth_token: *con
             return error.PortAlreadyInUse;
         }
         // Stale lock file, delete it
-        std.fs.deleteFileAbsolute(path) catch {};
+        std.fs.deleteFileAbsolute(path) catch |err| {
+            log.warn("Failed to remove stale lock file {s}: {}", .{ path, err });
+        };
     } else |_| {}
 
     const pid = getPid();

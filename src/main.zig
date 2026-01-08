@@ -137,7 +137,9 @@ fn parseArgs(allocator: std.mem.Allocator) !CliOptions {
 
 fn printHookHelp() void {
     const stderr = std.fs.File.stderr().deprecatedWriter();
-    stderr.writeAll("Usage: banjo hook <permission>\n") catch {};
+    stderr.writeAll("Usage: banjo hook <permission>\n") catch |err| {
+        log.warn("Failed to write hook help: {}", .{err});
+    };
 }
 
 fn printHelp() void {
@@ -162,7 +164,9 @@ fn printHelp() void {
         \\  --permission-mode <mode>    Permission mode: default, plan, etc.
         \\  -h, --help                  Show this help
         \\
-    ) catch {};
+    ) catch |err| {
+        log.warn("Failed to write help: {}", .{err});
+    };
 }
 
 // Hook input/output types for Claude Code PreToolUse hook

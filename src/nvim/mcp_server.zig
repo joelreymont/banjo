@@ -668,7 +668,9 @@ pub const McpServer = struct {
                 };
                 defer id_parsed.deinit();
 
-                self.sendToolErrorWithId(id_parsed.value, "Tool request timed out") catch {};
+                self.sendToolErrorWithId(id_parsed.value, "Tool request timed out") catch |err| {
+                    log.warn("Failed to send tool timeout error: {}", .{err});
+                };
                 pending.deinit(self.allocator);
             }
         }
