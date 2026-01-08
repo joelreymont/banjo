@@ -24,7 +24,6 @@ const log = std.log.scoped(.nvim);
 const nvim_debug = config.nvim_debug;
 
 var debug_file: ?std.fs.File = null;
-var debug_buf: [4096]u8 = undefined;
 
 fn initDebugLog() void {
     if (nvim_debug and debug_file == null) {
@@ -35,7 +34,8 @@ fn initDebugLog() void {
 fn debugLog(comptime fmt: []const u8, args: anytype) void {
     if (nvim_debug) {
         if (debug_file) |f| {
-            const msg = std.fmt.bufPrint(&debug_buf, "[DEBUG] " ++ fmt ++ "\n", args) catch return;
+            var buf: [4096]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "[DEBUG] " ++ fmt ++ "\n", args) catch return;
             _ = f.write(msg) catch {};
         }
     }
@@ -144,6 +144,11 @@ pub const Handler = struct {
         if (self.pending_permission_response) |resp| self.allocator.free(resp);
         self.closePermissionSocket();
         if (self.nvim_session_id) |sid| self.allocator.free(sid);
+        // Free owned keys before deinit
+        var it = self.always_allowed_tools.keyIterator();
+        while (it.next()) |key| {
+            self.allocator.free(key.*);
+        }
         self.always_allowed_tools.deinit();
         if (self.owns_cwd) {
             self.allocator.free(self.cwd);
@@ -708,16 +713,13 @@ pub const Handler = struct {
         defer parsed.deinit();
 
         // Validate model name
-        const valid_models = [_][]const u8{ "sonnet", "opus", "haiku" };
-        var is_valid = false;
-        for (valid_models) |m| {
-            if (std.mem.eql(u8, parsed.value.model, m)) {
-                is_valid = true;
-                break;
-            }
-        }
+        const valid_models = std.StaticStringMap(void).initComptime(.{
+            .{ "sonnet", {} },
+            .{ "opus", {} },
+            .{ "haiku", {} },
+        });
 
-        if (is_valid) {
+        if (valid_models.has(parsed.value.model)) {
             // Free old model if owned
             if (self.current_model) |old| {
                 self.allocator.free(old);
@@ -1839,7 +1841,9 @@ test "checkPermissionAutoApprove always_allowed_tools" {
     try std.testing.expect(handler.checkPermissionAutoApprove("Bash") == null);
 
     // Add to always_allowed_tools (simulates "Allow Always" selection)
-    try handler.always_allowed_tools.put("Bash", {});
+    // Key must be allocated since deinit frees all keys
+    const key = try allocator.dupe(u8, "Bash");
+    try handler.always_allowed_tools.put(key, {});
 
     // Now Bash should be approved
     try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Bash").?);

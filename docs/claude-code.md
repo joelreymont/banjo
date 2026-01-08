@@ -256,11 +256,11 @@ Skills add specialized knowledge or workflows to Claude Code. They are invoked v
 ### File Structure
 
 ```
-~/.claude/skills/<skill-name>/skill.md    # Global (all projects)
-.claude/skills/<skill-name>/skill.md      # Project-specific
+~/.claude/skills/<skill-name>/SKILL.md    # Global (all projects)
+.claude/skills/<skill-name>/SKILL.md      # Project-specific
 ```
 
-**Note**: Skills are directories containing a `skill.md` file, not single files like agents.
+**Note**: Skills are directories containing a `SKILL.md` file (uppercase, case-sensitive), not single files like agents.
 
 ### YAML Frontmatter
 
@@ -285,11 +285,20 @@ description: Brief description of what this Skill does
 | `agent` | No | Agent type: `Explore`, `general-purpose`, etc. |
 | `allowed-tools` | No | Comma-separated list of allowed tools |
 
-### Skill Visibility
+### Skill Loading and Priority
 
+Skills are discovered at startup - Claude loads only name and description initially, then activates the full SKILL.md when the request matches.
+
+**Loading priority (higher wins):**
+1. **Managed** - Enterprise/organization-level
+2. **Personal** - `~/.claude/skills/` (applies to all projects)
+3. **Project** - `.claude/skills/`
+4. **Plugin** - Bundled with plugins
+
+**Visibility:**
 - Skills are **user-invocable by default** - they appear in the slash command menu
 - Set `user-invocable: false` to hide a skill from the menu
-- Project-local skills (`.claude/skills/`) take precedence over global skills
+- Personal skills in `~/.claude/skills/` are automatically available in ALL projects
 
 ### Example Skill
 

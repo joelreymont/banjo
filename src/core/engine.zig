@@ -21,14 +21,13 @@ const config = @import("config");
 const log = std.log.scoped(.engine);
 const nvim_debug = config.nvim_debug;
 
-var engine_debug_buf: [4096]u8 = undefined;
-
 fn engineDebugLog(comptime fmt: []const u8, args: anytype) void {
     if (nvim_debug) {
+        var buf: [4096]u8 = undefined;
         const f = std.fs.cwd().openFile("/tmp/banjo-nvim-debug.log", .{ .mode = .write_only }) catch return;
         defer f.close();
         f.seekFromEnd(0) catch return;
-        const msg = std.fmt.bufPrint(&engine_debug_buf, "[ENGINE] " ++ fmt ++ "\n", args) catch return;
+        const msg = std.fmt.bufPrint(&buf, "[ENGINE] " ++ fmt ++ "\n", args) catch return;
         _ = f.write(msg) catch {};
         f.sync() catch {};
     }
