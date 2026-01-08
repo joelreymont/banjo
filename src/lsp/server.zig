@@ -6,6 +6,7 @@ const diagnostics = @import("diagnostics.zig");
 const comments = @import("../notes/comments.zig");
 const jsonrpc = @import("../jsonrpc.zig");
 const summary = @import("summary.zig");
+const lsp_uri = @import("uri.zig");
 
 const log = std.log.scoped(.lsp);
 
@@ -89,6 +90,31 @@ pub const Server = struct {
         self.pending_diagnostics.deinit();
         self.pending_note_index.deinit();
         self.note_index.deinit();
+    }
+
+    /// Parse request params or send null response on failure
+    fn parseParams(self: *Server, comptime T: type, request: jsonrpc.Request) ?std.json.Parsed(T) {
+        const p = request.params orelse {
+            self.transport.writeTypedResponse(request.id, null) catch {};
+            return null;
+        };
+        return std.json.parseFromValue(T, self.allocator, p, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            self.transport.writeTypedResponse(request.id, null) catch {};
+            return null;
+        };
+    }
+
+    /// Parse notification params or log warning on failure (no response sent)
+    fn parseNotificationParams(self: *Server, comptime T: type, request: jsonrpc.Request) ?std.json.Parsed(T) {
+        const p = request.params orelse return null;
+        return std.json.parseFromValue(T, self.allocator, p, .{
+            .ignore_unknown_fields = true,
+        }) catch |err| {
+            log.warn("{s} parse failed: {}", .{ request.method, err });
+            return null;
+        };
     }
 
     /// Main server loop
@@ -294,18 +320,7 @@ pub const Server = struct {
     }
 
     fn handleDidOpen(self: *Server, request: jsonrpc.Request) !void {
-        const params = if (request.params) |p| blk: {
-            const parsed = std.json.parseFromValue(
-                protocol.DidOpenTextDocumentParams,
-                self.allocator,
-                p,
-                .{ .ignore_unknown_fields = true },
-            ) catch |err| {
-                log.warn("DidOpen parse failed: {}", .{err});
-                return;
-            };
-            break :blk parsed;
-        } else return;
+        const params = self.parseNotificationParams(protocol.DidOpenTextDocumentParams, request) orelse return;
         defer params.deinit();
 
         const uri = params.value.textDocument.uri;
@@ -331,18 +346,7 @@ pub const Server = struct {
     }
 
     fn handleDidChange(self: *Server, request: jsonrpc.Request) !void {
-        const params = if (request.params) |p| blk: {
-            const parsed = std.json.parseFromValue(
-                protocol.DidChangeTextDocumentParams,
-                self.allocator,
-                p,
-                .{ .ignore_unknown_fields = true },
-            ) catch |err| {
-                log.warn("DidChange parse failed: {}", .{err});
-                return;
-            };
-            break :blk parsed;
-        } else return;
+        const params = self.parseNotificationParams(protocol.DidChangeTextDocumentParams, request) orelse return;
         defer params.deinit();
 
         const uri = params.value.textDocument.uri;
@@ -388,7 +392,9 @@ pub const Server = struct {
     }
 
     fn updateNoteIndexForUri(self: *Server, uri: []const u8, content: []const u8) !void {
-        const file_path = uriToPath(uri) orelse uri;
+        const uri_path = try lsp_uri.uriToPath(self.allocator, uri);
+        defer if (uri_path) |parsed| parsed.deinit(self.allocator);
+        const file_path = if (uri_path) |parsed| parsed.path else uri;
         self.note_index.removeNotesByFile(file_path) catch |err| {
             log.warn("Failed to remove notes for {s}: {}", .{ file_path, err });
         };
@@ -398,18 +404,7 @@ pub const Server = struct {
     }
 
     fn handleDidClose(self: *Server, request: jsonrpc.Request) !void {
-        const params = if (request.params) |p| blk: {
-            const parsed = std.json.parseFromValue(
-                protocol.DidCloseTextDocumentParams,
-                self.allocator,
-                p,
-                .{ .ignore_unknown_fields = true },
-            ) catch |err| {
-                log.warn("Failed to parse didClose params: {}", .{err});
-                return;
-            };
-            break :blk parsed;
-        } else return;
+        const params = self.parseNotificationParams(protocol.DidCloseTextDocumentParams, request) orelse return;
         defer params.deinit();
 
         const uri = params.value.textDocument.uri;
@@ -433,18 +428,7 @@ pub const Server = struct {
     }
 
     fn handleDidSave(self: *Server, request: jsonrpc.Request) !void {
-        const params = if (request.params) |p| blk: {
-            const parsed = std.json.parseFromValue(
-                protocol.DidSaveTextDocumentParams,
-                self.allocator,
-                p,
-                .{ .ignore_unknown_fields = true },
-            ) catch |err| {
-                log.warn("Failed to parse didSave params: {}", .{err});
-                return;
-            };
-            break :blk parsed;
-        } else return;
+        const params = self.parseNotificationParams(protocol.DidSaveTextDocumentParams, request) orelse return;
         defer params.deinit();
 
         const uri = params.value.textDocument.uri;
@@ -457,21 +441,7 @@ pub const Server = struct {
     }
 
     fn handleHover(self: *Server, request: jsonrpc.Request) !void {
-        const params = if (request.params) |p| blk: {
-            const parsed = std.json.parseFromValue(
-                protocol.HoverParams,
-                self.allocator,
-                p,
-                .{ .ignore_unknown_fields = true },
-            ) catch {
-                try self.transport.writeTypedResponse(request.id, null);
-                return;
-            };
-            break :blk parsed;
-        } else {
-            try self.transport.writeTypedResponse(request.id, null);
-            return;
-        };
+        const params = self.parseParams(protocol.HoverParams, request) orelse return;
         defer params.deinit();
 
         const uri = params.value.textDocument.uri;
@@ -516,7 +486,7 @@ pub const Server = struct {
                             const bl_summary = summary.getSummary(bl_note.content, .{ .max_len = 40, .prefer_word_boundary = true });
                             try hover_content.writer.print("> {s}\n", .{bl_summary});
 
-                            const bl_uri = pathToUri(self.allocator, bl_note.file_path) catch null;
+                            const bl_uri = lsp_uri.pathToUri(self.allocator, bl_note.file_path) catch null;
                             if (bl_uri) |uri_str| {
                                 defer self.allocator.free(uri_str);
                                 if (self.documents.get(uri_str)) |doc_content| {
@@ -556,21 +526,7 @@ pub const Server = struct {
     }
 
     fn handleDefinition(self: *Server, request: jsonrpc.Request) !void {
-        const params = if (request.params) |p| blk: {
-            const parsed = std.json.parseFromValue(
-                protocol.TextDocumentPositionParams,
-                self.allocator,
-                p,
-                .{ .ignore_unknown_fields = true },
-            ) catch {
-                try self.transport.writeTypedResponse(request.id, @as(?protocol.Location, null));
-                return;
-            };
-            break :blk parsed;
-        } else {
-            try self.transport.writeTypedResponse(request.id, @as(?protocol.Location, null));
-            return;
-        };
+        const params = self.parseParams(protocol.TextDocumentPositionParams, request) orelse return;
         defer params.deinit();
 
         const uri = params.value.textDocument.uri;
@@ -596,7 +552,7 @@ pub const Server = struct {
         // Look up the target note
         if (self.note_index.getNote(target_id)) |note| {
             const target_line: u32 = if (note.line > 0) note.line - 1 else 0;
-            const target_uri = try pathToUri(self.allocator, note.file_path);
+            const target_uri = try lsp_uri.pathToUri(self.allocator, note.file_path);
             defer self.allocator.free(target_uri);
             const location = protocol.Location{
                 .uri = target_uri,
@@ -665,7 +621,7 @@ pub const Server = struct {
         for (backlink_ids) |bl_id| {
             if (self.note_index.getNote(bl_id)) |bl_note| {
                 const bl_line: u32 = if (bl_note.line > 0) bl_note.line - 1 else 0;
-                const bl_uri = try pathToUri(self.allocator, bl_note.file_path);
+                const bl_uri = try lsp_uri.pathToUri(self.allocator, bl_note.file_path);
                 try uris.append(self.allocator, bl_uri);
                 try locations.append(self.allocator, .{
                     .uri = bl_uri,
@@ -791,7 +747,9 @@ pub const Server = struct {
         const self_note_id = if (self_note) |note| note.id else null;
 
         // Get current file path from URI
-        const current_path = uriToPath(uri) orelse uri;
+        const uri_path = try lsp_uri.uriToPath(self.allocator, uri);
+        defer if (uri_path) |parsed| parsed.deinit(self.allocator);
+        const current_path = if (uri_path) |parsed| parsed.path else uri;
 
         const NoteEntry = struct {
             id: []const u8,
@@ -983,7 +941,9 @@ pub const Server = struct {
 
         const uri = params.value.textDocument.uri;
         const line = params.value.range.start.line; // 0-indexed for edits
-        const file_path = uriToPath(uri) orelse {
+        const uri_path = try lsp_uri.uriToPath(self.allocator, uri);
+        defer if (uri_path) |parsed| parsed.deinit(self.allocator);
+        const file_path = if (uri_path) |parsed| parsed.path else {
             try self.transport.writeTypedResponse(request.id, &[_]protocol.CodeAction{});
             return;
         };
@@ -1143,7 +1103,9 @@ pub const Server = struct {
         const is_comment = if (args.len > 2 and args[2] == .bool) args[2].bool else true;
 
         const content = self.documents.get(uri) orelse return;
-        const file_path = uriToPath(uri) orelse return;
+        const uri_path = try lsp_uri.uriToPath(self.allocator, uri);
+        defer if (uri_path) |parsed| parsed.deinit(self.allocator);
+        const file_path = if (uri_path) |parsed| parsed.path else return;
 
         // Generate note ID
         const note_id = comments.generateNoteId();
@@ -1212,7 +1174,7 @@ pub const Server = struct {
         for (backlink_ids) |bl_id| {
             if (self.note_index.getNote(bl_id)) |bl_note| {
                 const bl_line: u32 = if (bl_note.line > 0) bl_note.line - 1 else 0;
-                const bl_uri = try pathToUri(self.allocator, bl_note.file_path);
+                const bl_uri = try lsp_uri.pathToUri(self.allocator, bl_note.file_path);
                 try uris.append(self.allocator, bl_uri);
                 try locations.append(self.allocator, .{
                     .uri = bl_uri,
@@ -1412,7 +1374,9 @@ pub const Server = struct {
         while (it.next()) |entry| {
             const uri = entry.key_ptr.*;
             const content = entry.value_ptr.*;
-            const file_path = uriToPath(uri) orelse continue;
+            const uri_path = try lsp_uri.uriToPath(self.allocator, uri);
+            defer if (uri_path) |parsed| parsed.deinit(self.allocator);
+            const file_path = if (uri_path) |parsed| parsed.path else continue;
 
             const path_copy = try self.allocator.dupe(u8, file_path);
             const put_result = try open_paths.getOrPut(path_copy);
@@ -1427,8 +1391,10 @@ pub const Server = struct {
         }
 
         if (self.root_uri) |root_uri| {
-            if (uriToPath(root_uri)) |root_path| {
-                try self.scanProjectNotes(root_path, &open_paths);
+            const root_path = try lsp_uri.uriToPath(self.allocator, root_uri);
+            defer if (root_path) |parsed| parsed.deinit(self.allocator);
+            if (root_path) |parsed| {
+                try self.scanProjectNotes(parsed.path, &open_paths);
             }
         }
     }
@@ -1577,35 +1543,30 @@ fn findNoteIdAtPosition(line: []const u8, char: u32) ?[]const u8 {
     return findNoteIdAtLink(line, char);
 }
 
-fn uriToPath(uri: []const u8) ?[]const u8 {
-    if (mem.startsWith(u8, uri, "file://")) {
-        return uri[7..];
-    }
-    return null;
-}
-
-fn pathToUri(allocator: Allocator, path: []const u8) ![]const u8 {
-    return try std.fmt.allocPrint(allocator, "file://{s}", .{path});
-}
-
 /// Check if line contains TODO, FIXME, BUG, HACK, XXX patterns
 fn hasTodoPattern(line: []const u8) ?[]const u8 {
     const patterns = [_][]const u8{ "TODO:", "FIXME:", "BUG:", "HACK:", "XXX:", "NOTE:" };
-    const upper_line = blk: {
-        var buf: [256]u8 = undefined;
-        const len = @min(line.len, buf.len);
-        for (line[0..len], 0..) |c, i| {
-            buf[i] = std.ascii.toUpper(c);
-        }
-        break :blk buf[0..len];
-    };
-
     for (patterns) |pattern| {
-        if (mem.indexOf(u8, upper_line, pattern) != null) {
-            return pattern;
-        }
+        if (containsPatternIgnoreCase(line, pattern)) return pattern;
     }
     return null;
+}
+
+fn containsPatternIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or haystack.len < needle.len) return false;
+    const last = haystack.len - needle.len;
+    var i: usize = 0;
+    while (i <= last) : (i += 1) {
+        var matched = true;
+        for (needle, 0..) |want, j| {
+            if (std.ascii.toUpper(haystack[i + j]) != want) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) return true;
+    }
+    return false;
 }
 
 fn castU32(value: usize) ?u32 {
@@ -1771,11 +1732,19 @@ fn getLineContext(content: []const u8, line_num: u32, context_lines: u32) LineCo
 const testing = std.testing;
 
 test "uriToPath strips file:// prefix" {
-    try testing.expectEqualStrings("/home/user/test.zig", uriToPath("file:///home/user/test.zig").?);
+    const parsed = try lsp_uri.uriToPath(testing.allocator, "file:///home/user/test.zig") orelse return error.TestUnexpectedResult;
+    defer parsed.deinit(testing.allocator);
+    try testing.expectEqualStrings("/home/user/test.zig", parsed.path);
 }
 
 test "uriToPath returns null for non-file URIs" {
-    try testing.expect(uriToPath("http://example.com") == null);
+    try testing.expect((try lsp_uri.uriToPath(testing.allocator, "http://example.com")) == null);
+}
+
+test "hasTodoPattern scans full line" {
+    const prefix = "a" ** 300;
+    const line = prefix ++ " TODO: refactor this function";
+    try testing.expectEqualStrings("TODO:", hasTodoPattern(line).?);
 }
 
 test "getLineContent returns correct line" {

@@ -5,24 +5,16 @@ const posix = std.posix;
 const lockfile = @import("lockfile.zig");
 const websocket = @import("websocket.zig");
 const mcp_types = @import("mcp_types.zig");
+const constants = @import("../core/constants.zig");
+const jsonrpc = @import("../jsonrpc.zig");
 const config = @import("config");
 
 const log = std.log.scoped(.mcp_server);
-
-// Comptime debug logging
-const nvim_debug = config.nvim_debug;
-
-var mcp_debug_buf: [4096]u8 = undefined;
+const debug_log = @import("../util/debug_log.zig");
+const json_util = @import("../util/json.zig");
 
 fn debugLog(comptime fmt: []const u8, args: anytype) void {
-    if (nvim_debug) {
-        const f = std.fs.cwd().openFile("/tmp/banjo-nvim-debug.log", .{ .mode = .write_only }) catch return;
-        defer f.close();
-        f.seekFromEnd(0) catch return;
-        const msg = std.fmt.bufPrint(&mcp_debug_buf, "[MCP] " ++ fmt ++ "\n", args) catch return;
-        _ = f.write(msg) catch {};
-        f.sync() catch {};
-    }
+    debug_log.write("MCP", fmt, args);
 }
 
 pub const McpServer = struct {
@@ -157,7 +149,9 @@ pub const McpServer = struct {
         if (self.mcp_client_socket) |sock| {
             const close_frame = websocket.encodeFrame(self.allocator, .close, "") catch null;
             if (close_frame) |frame| {
-                _ = posix.write(sock, frame) catch {};
+                _ = posix.write(sock, frame) catch |err| {
+                    log.debug("Failed to send close frame to MCP client: {}", .{err});
+                };
                 self.allocator.free(frame);
             }
             posix.close(sock);
@@ -168,7 +162,9 @@ pub const McpServer = struct {
         if (self.nvim_client_socket) |sock| {
             const close_frame = websocket.encodeFrame(self.allocator, .close, "") catch null;
             if (close_frame) |frame| {
-                _ = posix.write(sock, frame) catch {};
+                _ = posix.write(sock, frame) catch |err| {
+                    log.debug("Failed to send close frame to nvim client: {}", .{err});
+                };
                 self.allocator.free(frame);
             }
             posix.close(sock);
@@ -275,13 +271,14 @@ pub const McpServer = struct {
         errdefer posix.close(client);
 
         // Perform WebSocket handshake and determine client type
-        const client_kind = websocket.performHandshakeWithPath(self.allocator, client, &self.auth_token) catch |err| {
+        const outcome = websocket.performHandshakeWithPath(self.allocator, client, &self.auth_token) catch |err| {
             log.warn("WebSocket handshake failed: {}", .{err});
             posix.close(client);
             return;
         };
+        defer if (outcome.remainder) |extra| self.allocator.free(extra);
 
-        switch (client_kind) {
+        switch (outcome.client_kind) {
             .mcp => {
                 // Close existing MCP client if any
                 if (self.mcp_client_socket) |old| {
@@ -290,6 +287,9 @@ pub const McpServer = struct {
                 }
                 self.mcp_client_socket = client;
                 self.mcp_read_buffer.clearRetainingCapacity();
+                if (outcome.remainder) |extra| {
+                    try self.mcp_read_buffer.appendSlice(self.allocator, extra);
+                }
                 log.info("Claude CLI connected", .{});
             },
             .nvim => {
@@ -300,6 +300,9 @@ pub const McpServer = struct {
                 }
                 self.nvim_client_socket = client;
                 self.nvim_read_buffer.clearRetainingCapacity();
+                if (outcome.remainder) |extra| {
+                    try self.nvim_read_buffer.appendSlice(self.allocator, extra);
+                }
                 log.info("Neovim connected", .{});
                 debugLog("nvim_client_socket set to fd={d}", .{client});
             },
@@ -520,7 +523,7 @@ pub const McpServer = struct {
             errdefer self.allocator.free(correlation_id);
 
             // Serialize ID to owned string
-            const id_json = try serializeToJson(self.allocator, id.?);
+            const id_json = try json_util.serializeToJson(self.allocator, id.?);
             errdefer self.allocator.free(id_json);
 
             // Dupe tool name
@@ -531,15 +534,13 @@ pub const McpServer = struct {
                 .correlation_id = correlation_id,
                 .mcp_request_id_json = id_json,
                 .tool_name = owned_tool_name,
-                .deadline_ms = std.time.milliTimestamp() + TOOL_REQUEST_TIMEOUT_MS,
+                .deadline_ms = std.time.milliTimestamp() + constants.tool_request_timeout_ms,
             });
             callback(owned_tool_name, correlation_id, tool_args);
         } else {
             try self.sendToolError(id, "Tool handler not available");
         }
     }
-
-    const TOOL_REQUEST_TIMEOUT_MS: i64 = 30_000;
 
     fn handleLocalTool(self: *McpServer, id: ?std.json.Value, tool_name: []const u8, args: ?std.json.Value) !void {
         const local_tools = std.StaticStringMap(LocalTool).initComptime(.{
@@ -555,7 +556,7 @@ pub const McpServer = struct {
             .get_workspace_folders => {
                 const folders = [_][]const u8{self.cwd};
                 const result = mcp_types.WorkspaceFoldersResult{ .folders = &folders };
-                const json_str = try serializeToJson(self.allocator, result);
+                const json_str = try json_util.serializeToJson(self.allocator, result);
                 defer self.allocator.free(json_str);
                 try self.sendToolResultOptional(id, json_str);
             },
@@ -564,7 +565,7 @@ pub const McpServer = struct {
                     sel.toResult()
                 else
                     mcp_types.SelectionResult{};
-                const json_str = try serializeToJson(self.allocator, result);
+                const json_str = try json_util.serializeToJson(self.allocator, result);
                 defer self.allocator.free(json_str);
                 try self.sendToolResultOptional(id, json_str);
             },
@@ -572,14 +573,6 @@ pub const McpServer = struct {
                 try self.sendToolError(id, "Jupyter kernel execution not supported in Neovim");
             },
         }
-    }
-
-    fn serializeToJson(allocator: Allocator, value: anytype) ![]u8 {
-        var out: std.io.Writer.Allocating = .init(allocator);
-        defer out.deinit();
-        var jw: std.json.Stringify = .{ .writer = &out.writer };
-        try jw.write(value);
-        return out.toOwnedSlice();
     }
 
     const LocalTool = enum {
@@ -717,41 +710,16 @@ pub const McpServer = struct {
     };
 
     fn sendMcpError(self: *McpServer, id: ?std.json.Value, code: i32, message: []const u8) !void {
-        var out: std.io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-
-        try out.writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
-        var jw: std.json.Stringify = .{ .writer = &out.writer };
-        try jw.write(id);
-        try out.writer.writeAll(",\"error\":{\"code\":");
-        try jw.write(code);
-        try out.writer.writeAll(",\"message\":");
-        try jw.write(message);
-        try out.writer.writeAll("}}");
-
-        const buf = try out.toOwnedSlice();
-        defer self.allocator.free(buf);
-        try self.sendMcpWebSocketMessage(buf);
+        const json = try jsonrpc.serializeError(self.allocator, id, code, message);
+        defer self.allocator.free(json);
+        try self.sendMcpWebSocketMessage(json);
     }
 
     /// Send a JSON-RPC response with result, serializing directly without std.json.Value round-trip
     fn sendMcpResultDirect(self: *McpServer, id: anytype, result: anytype) !void {
-        var out: std.io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-
-        try out.writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
-        var jw: std.json.Stringify = .{
-            .writer = &out.writer,
-            .options = .{ .emit_null_optional_fields = false },
-        };
-        try jw.write(id);
-        try out.writer.writeAll(",\"result\":");
-        try jw.write(result);
-        try out.writer.writeAll("}");
-
-        const buf = try out.toOwnedSlice();
-        defer self.allocator.free(buf);
-        try self.sendMcpWebSocketMessage(buf);
+        const json = try jsonrpc.serializeResponseAny(self.allocator, id, result, .{ .emit_null_optional_fields = false });
+        defer self.allocator.free(json);
+        try self.sendMcpWebSocketMessage(json);
     }
 
     fn sendMcpWebSocketMessage(self: *McpServer, message: []const u8) !void {
@@ -767,31 +735,15 @@ pub const McpServer = struct {
     pub fn sendNvimNotification(self: *McpServer, method: []const u8, params: anytype) !void {
         const client = self.nvim_client_socket orelse return error.NotConnected;
 
-        var out: std.io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
+        const json = try jsonrpc.serializeTypedNotification(
+            self.allocator,
+            method,
+            params,
+            .{ .emit_null_optional_fields = false },
+        );
+        defer self.allocator.free(json);
 
-        // Write JSON directly in one pass to avoid serialize-parse-serialize round-trip
-        const T = @TypeOf(params);
-        if (T == @TypeOf(.{})) {
-            try out.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"");
-            try out.writer.writeAll(method);
-            try out.writer.writeAll("\"}");
-        } else {
-            try out.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"");
-            try out.writer.writeAll(method);
-            try out.writer.writeAll("\",\"params\":");
-            var jw: std.json.Stringify = .{
-                .writer = &out.writer,
-                .options = .{ .emit_null_optional_fields = false },
-            };
-            try jw.write(params);
-            try out.writer.writeAll("}");
-        }
-
-        const buf = try out.toOwnedSlice();
-        defer self.allocator.free(buf);
-
-        const frame = try websocket.encodeFrame(self.allocator, .text, buf);
+        const frame = try websocket.encodeFrame(self.allocator, .text, json);
         defer self.allocator.free(frame);
 
         _ = try posix.write(client, frame);
