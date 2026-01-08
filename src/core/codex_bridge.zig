@@ -14,6 +14,26 @@ pub const TurnError = struct {
     code: ?[]const u8 = null,
     message: ?[]const u8 = null,
     type: ?[]const u8 = null,
+
+    const max_turn_markers = [_][]const u8{
+        "max_turn",
+        "max_turns",
+        "max_turn_requests",
+    };
+
+    fn containsMaxTurnMarker(text: ?[]const u8) bool {
+        const haystack = text orelse return false;
+        for (max_turn_markers) |marker| {
+            if (std.mem.indexOf(u8, haystack, marker) != null) return true;
+        }
+        return false;
+    }
+
+    pub fn isMaxTurnError(self: TurnError) bool {
+        return containsMaxTurnMarker(self.code) or
+            containsMaxTurnMarker(self.type) or
+            containsMaxTurnMarker(self.message);
+    }
 };
 
 pub const CodexMessage = struct {

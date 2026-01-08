@@ -14,6 +14,8 @@ const ApprovalKind = callbacks_mod.ApprovalKind;
 const engine_mod = @import("../core/engine.zig");
 const claude_bridge = @import("../core/claude_bridge.zig");
 const codex_bridge = @import("../core/codex_bridge.zig");
+const settings = @import("../core/settings.zig");
+const permission_socket = @import("../core/permission_socket.zig");
 const config = @import("config");
 
 const log = std.log.scoped(.nvim);
@@ -66,6 +68,17 @@ pub const Handler = struct {
     pending_approval_id: ?[]const u8 = null,
     pending_approval_response: ?[]const u8 = null,
 
+    // Permission socket for Claude Code hook (like ACP agent)
+    permission_socket: ?std.posix.socket_t = null,
+    permission_socket_path: ?[]const u8 = null,
+    nvim_session_id: ?[]const u8 = null,
+    always_allowed_tools: std.StringHashMap(void),
+
+    // Pending permission request (for Claude Code)
+    pending_permission_id: ?[]const u8 = null,
+    pending_permission_response: ?[]const u8 = null,
+    permission_client_fd: ?std.posix.socket_t = null,
+
     // Message queue for decoupling poll thread from processing
     pending_prompt: ?PendingPrompt = null,
     prompt_mutex: std.Thread.Mutex = .{},
@@ -94,6 +107,7 @@ pub const Handler = struct {
             .stdout = stdout,
             .cwd = cwd,
             .owns_cwd = owns_cwd,
+            .always_allowed_tools = std.StringHashMap(void).init(allocator),
         };
     }
 
@@ -126,8 +140,46 @@ pub const Handler = struct {
         if (self.current_model) |model| self.allocator.free(model);
         if (self.pending_approval_id) |id| self.allocator.free(id);
         if (self.pending_approval_response) |resp| self.allocator.free(resp);
+        if (self.pending_permission_id) |id| self.allocator.free(id);
+        if (self.pending_permission_response) |resp| self.allocator.free(resp);
+        self.closePermissionSocket();
+        if (self.nvim_session_id) |sid| self.allocator.free(sid);
+        self.always_allowed_tools.deinit();
         if (self.owns_cwd) {
             self.allocator.free(self.cwd);
+        }
+    }
+
+    fn generateSessionId(self: *Handler) ![]const u8 {
+        var buf: [16]u8 = undefined;
+        std.crypto.random.bytes(&buf);
+        const hex = std.fmt.bytesToHex(buf, .lower);
+        return try std.fmt.allocPrint(self.allocator, "nvim-{s}", .{&hex});
+    }
+
+    fn createPermissionSocket(self: *Handler) !void {
+        if (self.nvim_session_id == null) {
+            self.nvim_session_id = try self.generateSessionId();
+        }
+
+        const result = try permission_socket.create(self.allocator, self.nvim_session_id.?);
+        self.permission_socket = result.socket;
+        self.permission_socket_path = result.path;
+    }
+
+    fn closePermissionSocket(self: *Handler) void {
+        if (self.permission_client_fd) |fd| {
+            std.posix.close(fd);
+            self.permission_client_fd = null;
+        }
+        if (self.permission_socket) |sock| {
+            std.posix.close(sock);
+            self.permission_socket = null;
+        }
+        if (self.permission_socket_path) |path| {
+            std.fs.cwd().deleteFile(path) catch {};
+            self.allocator.free(path);
+            self.permission_socket_path = null;
         }
     }
 
@@ -135,11 +187,22 @@ pub const Handler = struct {
         initDebugLog();
         debugLog("Handler.run starting", .{});
 
+        // Configure permission hook and create socket for Claude Code
+        const hook_result = settings.ensurePermissionHook(self.allocator);
+        self.createPermissionSocket() catch |err| {
+            log.warn("Failed to create permission socket: {}", .{err});
+        };
+
         // Start MCP server for Claude CLI discovery and nvim WebSocket
         self.mcp_server = mcp_server_mod.McpServer.init(self.allocator, self.cwd) catch |err| {
             log.err("Failed to init MCP server: {}", .{err});
             return err;
         };
+
+        // Notify user if permission hook was newly configured
+        if (hook_result == .configured) {
+            log.info("Configured Banjo permission hook - restart Claude Code for interactive prompts", .{});
+        }
 
         if (self.mcp_server) |mcp| {
             // Set up nvim message callback
@@ -264,8 +327,216 @@ pub const Handler = struct {
             } else {
                 std.Thread.sleep(100 * std.time.ns_per_ms);
             }
+            // Poll permission socket for Claude Code hook requests
+            self.pollPermissionSocket();
         }
         debugLog("pollThreadFn exiting", .{});
+    }
+
+    // Auto-approve these safe tools (matches ACP agent behavior)
+    const always_approve_tools = std.StaticStringMap(void).initComptime(.{
+        .{ "TodoWrite", {} },
+        .{ "TodoRead", {} },
+        .{ "Task", {} },
+        .{ "TaskOutput", {} },
+        .{ "AskUserQuestion", {} },
+        .{ "Read", {} },
+        .{ "Grep", {} },
+        .{ "Glob", {} },
+        .{ "LSP", {} },
+    });
+
+    // Edit tools - auto-approve in acceptEdits mode
+    const edit_tools = std.StaticStringMap(void).initComptime(.{
+        .{ "Write", {} },
+        .{ "Edit", {} },
+        .{ "MultiEdit", {} },
+        .{ "NotebookEdit", {} },
+    });
+
+    const PermissionHookRequest = struct {
+        tool_name: []const u8,
+        tool_input: std.json.Value,
+        tool_use_id: []const u8,
+        session_id: []const u8,
+    };
+
+    fn pollPermissionSocket(self: *Handler) void {
+        const sock = self.permission_socket orelse return;
+
+        // Non-blocking accept
+        const client_fd = std.posix.accept(sock, null, null, std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC) catch |err| {
+            if (err == error.WouldBlock) return;
+            log.warn("Permission socket accept error: {}", .{err});
+            return;
+        };
+        defer std.posix.close(client_fd);
+
+        // Read request from hook
+        var buf: [16384]u8 = undefined;
+        var total_read: usize = 0;
+
+        // Read until newline or buffer full
+        while (total_read < buf.len - 1) {
+            const n = std.posix.read(client_fd, buf[total_read..]) catch |err| {
+                if (err == error.WouldBlock) {
+                    std.Thread.sleep(10 * std.time.ns_per_ms);
+                    continue;
+                }
+                log.warn("Permission socket read error: {}", .{err});
+                return;
+            };
+            if (n == 0) break;
+            total_read += n;
+            if (std.mem.indexOfScalar(u8, buf[0..total_read], '\n') != null) break;
+        }
+
+        if (total_read == 0) return;
+
+        // Parse JSON request
+        const json_str = std.mem.trimRight(u8, buf[0..total_read], "\n\r");
+        const parsed = std.json.parseFromSlice(PermissionHookRequest, self.allocator, json_str, .{
+            .ignore_unknown_fields = true,
+        }) catch |err| {
+            log.warn("Failed to parse permission request: {}", .{err});
+            self.sendPermissionResponse(client_fd, "deny", null);
+            return;
+        };
+        defer parsed.deinit();
+        const req = parsed.value;
+
+        log.info("Permission request for tool: {s}", .{req.tool_name});
+
+        // Check auto-approve conditions
+        const decision = self.checkPermissionAutoApprove(req.tool_name);
+        if (decision) |d| {
+            log.info("Auto-approving {s}: {s}", .{ req.tool_name, d });
+            self.sendPermissionResponse(client_fd, d, null);
+            return;
+        }
+
+        // Need to prompt user - store pending state
+        if (self.pending_permission_id) |old| self.allocator.free(old);
+        self.pending_permission_id = self.allocator.dupe(u8, req.tool_use_id) catch {
+            self.sendPermissionResponse(client_fd, "deny", "out of memory");
+            return;
+        };
+        self.pending_permission_response = null;
+
+        // Format tool_input for display
+        const tool_input_str = std.json.Stringify.valueAlloc(self.allocator, req.tool_input, .{}) catch null;
+        defer if (tool_input_str) |s| self.allocator.free(s);
+
+        // Send permission_request notification to Lua UI
+        self.sendNotification("permission_request", protocol.PermissionRequest{
+            .id = req.tool_use_id,
+            .tool_name = req.tool_name,
+            .tool_input = tool_input_str,
+        }) catch |err| {
+            log.err("Failed to send permission_request: {}", .{err});
+            self.sendPermissionResponse(client_fd, "deny", "notification failed");
+            return;
+        };
+
+        // Wait for response with 30s timeout
+        const timeout_ms: i64 = 30_000;
+        const start_time = std.time.milliTimestamp();
+
+        while (std.time.milliTimestamp() - start_time < timeout_ms) {
+            // Check if cancelled
+            if (self.cancelled.load(.acquire)) {
+                self.sendPermissionResponse(client_fd, "deny", "cancelled");
+                return;
+            }
+
+            // Check if we have a response
+            if (self.pending_permission_response) |response| {
+                // Clean up pending state
+                if (self.pending_permission_id) |pid| {
+                    self.allocator.free(pid);
+                    self.pending_permission_id = null;
+                }
+
+                // Handle "allow_always" - add to always_allowed_tools
+                if (std.mem.eql(u8, response, "allow_always")) {
+                    const tool_name_copy = self.allocator.dupe(u8, req.tool_name) catch null;
+                    if (tool_name_copy) |name| {
+                        self.always_allowed_tools.put(name, {}) catch {
+                            self.allocator.free(name);
+                        };
+                    }
+                    self.sendPermissionResponse(client_fd, "allow", null);
+                } else {
+                    self.sendPermissionResponse(client_fd, response, null);
+                }
+
+                self.allocator.free(response);
+                self.pending_permission_response = null;
+                return;
+            }
+
+            // Poll MCP server for incoming messages from Lua
+            if (self.mcp_server) |mcp| {
+                _ = mcp.poll(100) catch {};
+            } else {
+                std.Thread.sleep(100 * std.time.ns_per_ms);
+            }
+        }
+
+        // Timeout - clean up and deny
+        log.warn("Permission request timed out for {s}", .{req.tool_use_id});
+        if (self.pending_permission_id) |pid| {
+            self.allocator.free(pid);
+            self.pending_permission_id = null;
+        }
+        self.sendPermissionResponse(client_fd, "deny", "timeout");
+    }
+
+    fn checkPermissionAutoApprove(self: *Handler, tool_name: []const u8) ?[]const u8 {
+        // Always auto-approve safe tools
+        if (always_approve_tools.has(tool_name)) {
+            return "allow";
+        }
+
+        // User previously selected "Allow Always" for this tool
+        if (self.always_allowed_tools.contains(tool_name)) {
+            return "allow";
+        }
+
+        // Auto-approve in bypass mode
+        if (self.permission_mode == .auto_approve) {
+            return "allow";
+        }
+
+        // Auto-approve edit tools in acceptEdits mode
+        if (self.permission_mode == .accept_edits and edit_tools.has(tool_name)) {
+            return "allow";
+        }
+
+        return null;
+    }
+
+    const PermissionResponse = struct {
+        decision: []const u8,
+        reason: ?[]const u8 = null,
+    };
+
+    fn sendPermissionResponse(self: *Handler, client_fd: std.posix.socket_t, decision: []const u8, reason: ?[]const u8) void {
+        var out: std.io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+
+        var jw: std.json.Stringify = .{
+            .writer = &out.writer,
+            .options = .{ .emit_null_optional_fields = false },
+        };
+        jw.write(PermissionResponse{ .decision = decision, .reason = reason }) catch return;
+        out.writer.writeAll("\n") catch return;
+        const json = out.toOwnedSlice() catch return;
+        defer self.allocator.free(json);
+
+        _ = std.posix.write(client_fd, json) catch |err| {
+            log.warn("Failed to send permission response: {}", .{err});
+        };
     }
 
     fn nvimMessageCallback(ctx: *anyopaque, method: []const u8, params: ?std.json.Value) void {
@@ -281,6 +552,7 @@ pub const Handler = struct {
             .{ "set_permission_mode", .set_permission_mode },
             .{ "get_state", .get_state },
             .{ "approval_response", .approval_response },
+            .{ "permission_response", .permission_response },
             .{ "shutdown", .shutdown },
             .{ "tool_response", .tool_response },
             .{ "selection_changed", .selection_changed },
@@ -300,6 +572,7 @@ pub const Handler = struct {
             .set_permission_mode => self.handleNvimSetPermissionMode(params),
             .get_state => self.handleNvimGetState(),
             .approval_response => self.handleNvimApprovalResponse(params),
+            .permission_response => self.handleNvimPermissionResponse(params),
             .shutdown => self.handleNvimShutdown(),
             .tool_response => self.handleNvimToolResponse(params),
             .selection_changed => self.handleNvimSelectionChanged(params),
@@ -315,6 +588,7 @@ pub const Handler = struct {
         set_permission_mode,
         get_state,
         approval_response,
+        permission_response,
         shutdown,
         tool_response,
         selection_changed,
@@ -371,6 +645,22 @@ pub const Handler = struct {
         }
 
         self.cancelled.store(true, .release);
+
+        // Clear pending prompt to prevent queued work from starting after cancel
+        self.prompt_mutex.lock();
+        if (self.pending_prompt) |p| {
+            self.allocator.free(p.text);
+            if (p.cwd) |c| self.allocator.free(c);
+            self.pending_prompt = null;
+        }
+        self.prompt_mutex.unlock();
+
+        // Clear pending continuation
+        if (self.pending_continuation) |c| {
+            self.allocator.free(c.text);
+            self.pending_continuation = null;
+        }
+
         self.sendNotification("status", protocol.StatusUpdate{ .text = "Cancelled" }) catch {};
     }
 
@@ -504,6 +794,33 @@ pub const Handler = struct {
         }
     }
 
+    fn handleNvimPermissionResponse(self: *Handler, params: ?std.json.Value) void {
+        const p = params orelse return;
+        const parsed = std.json.parseFromValue(protocol.PermissionResponseRequest, self.allocator, p, .{
+            .ignore_unknown_fields = true,
+        }) catch |err| {
+            log.warn("Invalid permission_response params: {}", .{err});
+            return;
+        };
+        defer parsed.deinit();
+
+        // Check if this matches the pending permission request
+        if (self.pending_permission_id) |pending_id| {
+            if (std.mem.eql(u8, pending_id, parsed.value.id)) {
+                // Store the response
+                if (self.pending_permission_response) |old| {
+                    self.allocator.free(old);
+                }
+                self.pending_permission_response = self.allocator.dupe(u8, parsed.value.decision) catch null;
+                log.info("Received permission response: {s} for {s}", .{ parsed.value.decision, parsed.value.id });
+            } else {
+                log.warn("Permission response ID mismatch: expected {s}, got {s}", .{ pending_id, parsed.value.id });
+            }
+        } else {
+            log.warn("Received permission response but no pending request", .{});
+        }
+    }
+
     fn sendStateNotification(self: *Handler) void {
         const engine_str: []const u8 = switch (self.current_engine) {
             .claude => "claude",
@@ -618,6 +935,7 @@ pub const Handler = struct {
                 bridge.start(.{
                     .permission_mode = self.permission_mode.toCliArg(),
                     .model = self.current_model,
+                    .permission_socket_path = self.permission_socket_path,
                 }) catch |err| {
                     debugLog("processPrompt: bridge.start failed!", .{});
                     log.err("Failed to start Claude bridge: {}", .{err});
@@ -643,7 +961,9 @@ pub const Handler = struct {
                 var bridge = codex_bridge.CodexBridge.init(self.allocator, prompt_ctx.cwd);
                 defer bridge.deinit();
 
-                bridge.start(.{}) catch |err| {
+                bridge.start(.{
+                    .approval_policy = self.permission_mode.toCodexApprovalPolicy(),
+                }) catch |err| {
                     log.err("Failed to start Codex bridge: {}", .{err});
                     try self.sendError("Failed to start Codex");
                     return;
@@ -693,35 +1013,22 @@ pub const Handler = struct {
         var out: std.io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
 
-        var jw: std.json.Stringify = .{
-            .writer = &out.writer,
-            .options = .{ .emit_null_optional_fields = false },
-        };
-
+        // Write JSON directly in one pass to avoid serialize-parse-serialize round-trip
         const T = @TypeOf(params);
         if (T == @TypeOf(.{})) {
-            try jw.write(protocol.JsonRpcNotification{
-                .method = method,
-                .params = null,
-            });
+            try out.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"");
+            try out.writer.writeAll(method);
+            try out.writer.writeAll("\"}");
         } else {
-            var param_out: std.io.Writer.Allocating = .init(self.allocator);
-            defer param_out.deinit();
-            var param_jw: std.json.Stringify = .{
-                .writer = &param_out.writer,
+            try out.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"");
+            try out.writer.writeAll(method);
+            try out.writer.writeAll("\",\"params\":");
+            var jw: std.json.Stringify = .{
+                .writer = &out.writer,
                 .options = .{ .emit_null_optional_fields = false },
             };
-            try param_jw.write(params);
-            const param_json = try param_out.toOwnedSlice();
-            defer self.allocator.free(param_json);
-
-            var param_parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, param_json, .{});
-            defer param_parsed.deinit();
-
-            try jw.write(protocol.JsonRpcNotification{
-                .method = method,
-                .params = param_parsed.value,
-            });
+            try jw.write(params);
+            try out.writer.writeAll("}");
         }
 
         try out.writer.writeAll("\n");
@@ -1367,4 +1674,189 @@ test "protocol StreamChunk serialization" {
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"text\":\"Hello\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"is_thought\":true") != null);
+}
+
+test "generateSessionId format" {
+    const allocator = std.testing.allocator;
+
+    var stdin_buf: [0]u8 = undefined;
+    var stdout_buf: [1024]u8 = undefined;
+    var stdin = std.io.fixedBufferStream(&stdin_buf);
+    var stdout = std.io.fixedBufferStream(&stdout_buf);
+
+    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    defer handler.deinit();
+
+    const session_id = try handler.generateSessionId();
+    defer allocator.free(session_id);
+
+    // Format: "nvim-{32 hex chars}"
+    try std.testing.expect(std.mem.startsWith(u8, session_id, "nvim-"));
+    try std.testing.expectEqual(@as(usize, 37), session_id.len); // "nvim-" (5) + 32 hex chars
+
+    // Verify hex chars are valid
+    for (session_id[5..]) |c| {
+        try std.testing.expect(std.ascii.isHex(c));
+    }
+}
+
+test "generateSessionId uniqueness" {
+    const allocator = std.testing.allocator;
+
+    var stdin_buf: [0]u8 = undefined;
+    var stdout_buf: [1024]u8 = undefined;
+    var stdin = std.io.fixedBufferStream(&stdin_buf);
+    var stdout = std.io.fixedBufferStream(&stdout_buf);
+
+    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    defer handler.deinit();
+
+    const id1 = try handler.generateSessionId();
+    defer allocator.free(id1);
+    const id2 = try handler.generateSessionId();
+    defer allocator.free(id2);
+
+    // Two calls should produce different IDs
+    try std.testing.expect(!std.mem.eql(u8, id1, id2));
+}
+
+test "permission socket create and close" {
+    const allocator = std.testing.allocator;
+
+    var stdin_buf: [0]u8 = undefined;
+    var stdout_buf: [1024]u8 = undefined;
+    var stdin = std.io.fixedBufferStream(&stdin_buf);
+    var stdout = std.io.fixedBufferStream(&stdout_buf);
+
+    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+
+    // Create socket
+    try handler.createPermissionSocket();
+
+    // Verify socket was created
+    try std.testing.expect(handler.permission_socket != null);
+    try std.testing.expect(handler.permission_socket_path != null);
+    try std.testing.expect(handler.nvim_session_id != null);
+
+    // Socket path should match session ID
+    try std.testing.expect(std.mem.indexOf(u8, handler.permission_socket_path.?, handler.nvim_session_id.?) != null);
+
+    // Socket file should exist
+    const stat = std.fs.cwd().statFile(handler.permission_socket_path.?) catch null;
+    try std.testing.expect(stat != null);
+
+    // Close socket
+    handler.closePermissionSocket();
+
+    // Verify cleanup
+    try std.testing.expect(handler.permission_socket == null);
+    try std.testing.expect(handler.permission_socket_path == null);
+
+    handler.deinit();
+}
+
+test "checkPermissionAutoApprove safe tools" {
+    const allocator = std.testing.allocator;
+
+    var stdin_buf: [0]u8 = undefined;
+    var stdout_buf: [1024]u8 = undefined;
+    var stdin = std.io.fixedBufferStream(&stdin_buf);
+    var stdout = std.io.fixedBufferStream(&stdout_buf);
+
+    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    defer handler.deinit();
+
+    // Safe tools should always be approved
+    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Read").?);
+    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Glob").?);
+    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Grep").?);
+    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("TodoWrite").?);
+    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Task").?);
+    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("LSP").?);
+
+    // Dangerous tools should NOT be auto-approved in default mode
+    try std.testing.expect(handler.checkPermissionAutoApprove("Bash") == null);
+    try std.testing.expect(handler.checkPermissionAutoApprove("Write") == null);
+    try std.testing.expect(handler.checkPermissionAutoApprove("Edit") == null);
+}
+
+test "checkPermissionAutoApprove auto_approve mode" {
+    const allocator = std.testing.allocator;
+
+    var stdin_buf: [0]u8 = undefined;
+    var stdout_buf: [1024]u8 = undefined;
+    var stdin = std.io.fixedBufferStream(&stdin_buf);
+    var stdout = std.io.fixedBufferStream(&stdout_buf);
+
+    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    defer handler.deinit();
+
+    // Set auto_approve mode
+    handler.permission_mode = .auto_approve;
+
+    // All tools should be approved
+    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Bash").?);
+    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Write").?);
+    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Edit").?);
+}
+
+test "checkPermissionAutoApprove accept_edits mode" {
+    const allocator = std.testing.allocator;
+
+    var stdin_buf: [0]u8 = undefined;
+    var stdout_buf: [1024]u8 = undefined;
+    var stdin = std.io.fixedBufferStream(&stdin_buf);
+    var stdout = std.io.fixedBufferStream(&stdout_buf);
+
+    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    defer handler.deinit();
+
+    // Set accept_edits mode
+    handler.permission_mode = .accept_edits;
+
+    // Edit tools should be approved
+    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Write").?);
+    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Edit").?);
+    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("MultiEdit").?);
+    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("NotebookEdit").?);
+
+    // Bash should NOT be auto-approved in accept_edits mode
+    try std.testing.expect(handler.checkPermissionAutoApprove("Bash") == null);
+}
+
+test "checkPermissionAutoApprove always_allowed_tools" {
+    const allocator = std.testing.allocator;
+
+    var stdin_buf: [0]u8 = undefined;
+    var stdout_buf: [1024]u8 = undefined;
+    var stdin = std.io.fixedBufferStream(&stdin_buf);
+    var stdout = std.io.fixedBufferStream(&stdout_buf);
+
+    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    defer handler.deinit();
+
+    // Bash normally requires permission
+    try std.testing.expect(handler.checkPermissionAutoApprove("Bash") == null);
+
+    // Add to always_allowed_tools (simulates "Allow Always" selection)
+    try handler.always_allowed_tools.put("Bash", {});
+
+    // Now Bash should be approved
+    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Bash").?);
+}
+
+test "protocol PermissionResponseRequest parse" {
+    const allocator = std.testing.allocator;
+
+    const input =
+        \\{"id":"perm-123","decision":"allow_always"}
+    ;
+
+    var parsed = try std.json.parseFromSlice(protocol.PermissionResponseRequest, allocator, input, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("perm-123", parsed.value.id);
+    try std.testing.expectEqualStrings("allow_always", parsed.value.decision);
 }
