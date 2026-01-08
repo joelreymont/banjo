@@ -418,7 +418,7 @@ test "ensurePermissionHook with temp directory" {
 
     // Create .claude subdirectory
     tmp_dir.dir.makePath(".claude") catch |err| {
-        std.debug.print("Failed to create .claude: {}\n", .{err});
+        log.err("Failed to create .claude: {}", .{err});
         return err;
     };
 

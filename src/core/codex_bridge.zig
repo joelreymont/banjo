@@ -2,13 +2,13 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const config = @import("config");
+const constants = @import("constants.zig");
 const log = std.log.scoped(.codex_bridge);
 const executable = @import("executable.zig");
 const io_utils = @import("io_utils.zig");
 const test_utils = @import("test_utils.zig");
 
 const max_json_line_bytes: usize = 4 * 1024 * 1024;
-const rpc_timeout_ms: i64 = 30_000;
 
 pub const TurnError = struct {
     code: ?[]const u8 = null,
@@ -399,7 +399,7 @@ pub const CodexBridge = struct {
     process: ?std.process.Child = null,
     cwd: []const u8,
     stdout_file: ?std.fs.File = null,
-    next_request_id: i64 = 1,
+    next_request_id: std.atomic.Value(i64) = std.atomic.Value(i64).init(1),
     thread_id: ?[]const u8 = null,
     current_turn_id: ?[]const u8 = null,
     approval_policy: ?[]const u8 = null,
@@ -832,7 +832,7 @@ pub const CodexBridge = struct {
     }
 
     fn waitForResponse(self: *CodexBridge, request_id: i64) !ResponsePayload {
-        const deadline = std.time.milliTimestamp() + rpc_timeout_ms;
+        const deadline = std.time.milliTimestamp() + constants.rpc_timeout_ms;
         self.queue_mutex.lock();
         defer self.queue_mutex.unlock();
 
@@ -1141,9 +1141,7 @@ pub const CodexBridge = struct {
     }
 
     fn nextRequestId(self: *CodexBridge) i64 {
-        const id = self.next_request_id;
-        self.next_request_id += 1;
-        return id;
+        return self.next_request_id.fetchAdd(1, .monotonic);
     }
 
     fn matchesCurrentTurn(self: *CodexBridge, turn_id: ?[]const u8) bool {
@@ -1521,7 +1519,7 @@ fn collectCodexSnapshot(allocator: Allocator, prompt: []const u8) ![]u8 {
     defer text_buf.deinit(allocator);
     var saw_delta = false;
 
-    const deadline = std.time.milliTimestamp() + 60_000;
+    const deadline = std.time.milliTimestamp() + constants.test_timeout_ms;
     while (true) {
         if (std.time.milliTimestamp() > deadline) return error.Timeout;
         var msg = (try readCodexMessageWithTimeout(&bridge, deadline)) orelse return error.UnexpectedEof;

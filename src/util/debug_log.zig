@@ -1,51 +1,80 @@
 const std = @import("std");
 const config = @import("config");
 
-/// Shared debug logger for nvim components.
-/// Writes to /tmp/banjo-nvim-debug.log when nvim_debug is enabled.
-pub const DebugLog = struct {
+/// Debug log file path - exported for use by other modules
+pub const path = "/tmp/banjo-nvim-debug.log";
+
+/// Write a debug message to the log file with stderr fallback.
+/// Opens the file, seeks to end, writes, and closes each call.
+/// This is thread-safe as each call uses its own file handle.
+pub fn write(comptime prefix: []const u8, comptime fmt: []const u8, args: anytype) void {
+    if (!config.nvim_debug) return;
+
+    var buf: [4096]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "[" ++ prefix ++ "] " ++ fmt ++ "\n", args) catch return;
+
+    const f = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch {
+        std.io.getStdErr().writer().writeAll(msg) catch {};
+        return;
+    };
+    defer f.close();
+
+    f.seekFromEnd(0) catch {
+        std.io.getStdErr().writer().writeAll(msg) catch {};
+        return;
+    };
+
+    _ = f.write(msg) catch {
+        std.io.getStdErr().writer().writeAll(msg) catch {};
+    };
+    f.sync() catch {};
+}
+
+/// Persistent debug logger for use in a single module.
+/// More efficient for high-frequency logging but requires init/deinit.
+pub const PersistentLog = struct {
     file: ?std.fs.File = null,
-    buf: [4096]u8 = undefined,
 
-    const path = "/tmp/banjo-nvim-debug.log";
-
-    /// Initialize the debug log file. Call once at startup.
-    pub fn init(self: *DebugLog) void {
+    /// Initialize by creating the log file.
+    pub fn init(self: *PersistentLog) void {
         if (config.nvim_debug and self.file == null) {
             self.file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch null;
         }
     }
 
-    /// Close the debug log file.
-    pub fn deinit(self: *DebugLog) void {
+    /// Close the log file.
+    pub fn deinit(self: *PersistentLog) void {
         if (self.file) |f| {
             f.close();
             self.file = null;
         }
     }
 
-    /// Write a debug message with the given prefix.
-    pub fn log(self: *DebugLog, comptime prefix: []const u8, comptime fmt: []const u8, args: anytype) void {
+    /// Write a message with the given prefix.
+    pub fn write(self: *PersistentLog, comptime prefix: []const u8, comptime fmt: []const u8, args: anytype) void {
         if (!config.nvim_debug) return;
+
+        var buf: [4096]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "[" ++ prefix ++ "] " ++ fmt ++ "\n", args) catch return;
+
         if (self.file) |f| {
-            const msg = std.fmt.bufPrint(&self.buf, "[" ++ prefix ++ "] " ++ fmt ++ "\n", args) catch return;
-            _ = f.write(msg) catch {};
+            _ = f.write(msg) catch {
+                std.io.getStdErr().writer().writeAll(msg) catch {};
+            };
+        } else {
+            std.io.getStdErr().writer().writeAll(msg) catch {};
         }
     }
 };
 
-/// Global debug logger instance.
-/// Initialize with debug_logger.init() at startup.
-pub var debug_logger: DebugLog = .{};
-
-/// Convenience function for logging with a prefix.
-pub fn log(comptime prefix: []const u8, comptime fmt: []const u8, args: anytype) void {
-    debug_logger.log(prefix, fmt, args);
+test "debug_log write compiles" {
+    // Just verify the function compiles - don't actually write in tests
+    if (false) {
+        write("TEST", "hello {s}", .{"world"});
+    }
 }
 
-test "DebugLog basic usage" {
-    var logger: DebugLog = .{};
-    // Don't actually init in tests (would create file)
-    // Just verify struct compiles
+test "PersistentLog compiles" {
+    const logger: PersistentLog = .{};
     _ = logger;
 }
