@@ -92,18 +92,64 @@ pub const Server = struct {
         self.note_index.deinit();
     }
 
-    /// Parse request params or send null response on failure
+    /// Parse request params or send fallback response on failure.
     fn parseParams(self: *Server, comptime T: type, request: jsonrpc.Request) ?std.json.Parsed(T) {
+        return self.parseParamsOrRespond(T, request, null);
+    }
+
+    fn parseParamsOrRespond(
+        self: *Server,
+        comptime T: type,
+        request: jsonrpc.Request,
+        fallback: anytype,
+    ) ?std.json.Parsed(T) {
         const p = request.params orelse {
-            self.transport.writeTypedResponse(request.id, null) catch {};
+            self.sendFallbackResponse(request, fallback);
             return null;
         };
         return std.json.parseFromValue(T, self.allocator, p, .{
             .ignore_unknown_fields = true,
-        }) catch {
-            self.transport.writeTypedResponse(request.id, null) catch {};
+        }) catch |err| {
+            log.warn("{s} params parse failed: {}", .{ request.method, err });
+            self.sendFallbackResponse(request, fallback);
             return null;
         };
+    }
+
+    fn parseOptionalParamsOrInvalid(
+        self: *Server,
+        comptime T: type,
+        request: jsonrpc.Request,
+        message: []const u8,
+    ) ?std.json.Parsed(T) {
+        const p = request.params orelse return null;
+        return std.json.parseFromValue(T, self.allocator, p, .{
+            .ignore_unknown_fields = true,
+        }) catch |err| {
+            log.warn("{s} params parse failed: {}", .{ request.method, err });
+            self.sendInvalidParams(request, message);
+            return null;
+        };
+    }
+
+    fn sendFallbackResponse(self: *Server, request: jsonrpc.Request, fallback: anytype) void {
+        if (request.id) |id| {
+            self.transport.writeTypedResponse(id, fallback) catch |err| {
+                log.warn("Failed to send {s} fallback response: {}", .{ request.method, err });
+            };
+        }
+    }
+
+    fn sendInvalidParams(self: *Server, request: jsonrpc.Request, message: []const u8) void {
+        if (request.id) |id| {
+            self.transport.writeResponse(jsonrpc.Response.err(
+                id,
+                jsonrpc.Error.InvalidParams,
+                message,
+            )) catch |err| {
+                log.warn("Failed to send {s} invalid params response: {}", .{ request.method, err });
+            };
+        }
     }
 
     /// Parse notification params or log warning on failure (no response sent)
@@ -253,22 +299,12 @@ pub const Server = struct {
 
     fn handleInitialize(self: *Server, request: jsonrpc.Request) !void {
         // Parse params
-        const params = if (request.params) |p| blk: {
-            const parsed = std.json.parseFromValue(
-                protocol.InitializeParams,
-                self.allocator,
-                p,
-                .{ .ignore_unknown_fields = true },
-            ) catch {
-                try self.transport.writeResponse(jsonrpc.Response.err(
-                    request.id,
-                    jsonrpc.Error.InvalidParams,
-                    "Invalid initialize params",
-                ));
-                return;
-            };
-            break :blk parsed;
-        } else null;
+        const params = self.parseOptionalParamsOrInvalid(
+            protocol.InitializeParams,
+            request,
+            "Invalid initialize params",
+        );
+        if (params == null and request.params != null) return;
         defer if (params) |p| p.deinit();
 
         // Store root URI
@@ -568,21 +604,11 @@ pub const Server = struct {
     }
 
     fn handleReferences(self: *Server, request: jsonrpc.Request) !void {
-        const params = if (request.params) |p| blk: {
-            const parsed = std.json.parseFromValue(
-                protocol.ReferenceParams,
-                self.allocator,
-                p,
-                .{ .ignore_unknown_fields = true },
-            ) catch {
-                try self.transport.writeTypedResponse(request.id, &[_]protocol.Location{});
-                return;
-            };
-            break :blk parsed;
-        } else {
-            try self.transport.writeTypedResponse(request.id, &[_]protocol.Location{});
-            return;
-        };
+        const params = self.parseParamsOrRespond(
+            protocol.ReferenceParams,
+            request,
+            &[_]protocol.Location{},
+        ) orelse return;
         defer params.deinit();
 
         const uri = params.value.textDocument.uri;
@@ -638,21 +664,11 @@ pub const Server = struct {
 
     fn handleCompletion(self: *Server, request: jsonrpc.Request) !void {
         log.info("handleCompletion called", .{});
-        const params = if (request.params) |p| blk: {
-            const parsed = std.json.parseFromValue(
-                protocol.CompletionParams,
-                self.allocator,
-                p,
-                .{ .ignore_unknown_fields = true },
-            ) catch {
-                try self.transport.writeTypedResponse(request.id, protocol.CompletionList{ .items = &.{} });
-                return;
-            };
-            break :blk parsed;
-        } else {
-            try self.transport.writeTypedResponse(request.id, protocol.CompletionList{ .items = &.{} });
-            return;
-        };
+        const params = self.parseParamsOrRespond(
+            protocol.CompletionParams,
+            request,
+            protocol.CompletionList{ .items = &.{} },
+        ) orelse return;
         defer params.deinit();
 
         const uri = params.value.textDocument.uri;
@@ -814,21 +830,11 @@ pub const Server = struct {
     }
 
     fn handleSemanticTokens(self: *Server, request: jsonrpc.Request) !void {
-        const params = if (request.params) |p| blk: {
-            const parsed = std.json.parseFromValue(
-                struct { textDocument: protocol.TextDocumentIdentifier },
-                self.allocator,
-                p,
-                .{ .ignore_unknown_fields = true },
-            ) catch {
-                try self.transport.writeTypedResponse(request.id, protocol.SemanticTokens{ .data = &.{} });
-                return;
-            };
-            break :blk parsed;
-        } else {
-            try self.transport.writeTypedResponse(request.id, protocol.SemanticTokens{ .data = &.{} });
-            return;
-        };
+        const params = self.parseParamsOrRespond(
+            struct { textDocument: protocol.TextDocumentIdentifier },
+            request,
+            protocol.SemanticTokens{ .data = &.{} },
+        ) orelse return;
         defer params.deinit();
 
         const uri = params.value.textDocument.uri;

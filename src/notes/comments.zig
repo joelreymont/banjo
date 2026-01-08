@@ -1,6 +1,7 @@
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
+const log = std.log.scoped(.comments);
 
 pub const link_prefix = "@[";
 
@@ -603,14 +604,18 @@ pub fn insertAtLine(allocator: Allocator, file_path: []const u8, line_num: u32, 
     const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
     tmp_file.writeAll(new_content.items) catch |err| {
         tmp_file.close();
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        std.fs.deleteFileAbsolute(tmp_path) catch |cleanup_err| {
+            log.warn("Failed to remove temp file {s}: {}", .{ tmp_path, cleanup_err });
+        };
         return err;
     };
     tmp_file.close();
 
     // Atomic rename
     std.fs.renameAbsolute(tmp_path, file_path) catch |err| {
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        std.fs.deleteFileAbsolute(tmp_path) catch |cleanup_err| {
+            log.warn("Failed to remove temp file {s}: {}", .{ tmp_path, cleanup_err });
+        };
         return err;
     };
 }

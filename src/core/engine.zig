@@ -570,6 +570,161 @@ fn sendEngineThought(ctx: *PromptContext, engine: Engine, text: []const u8) !voi
 // Tests
 const testing = std.testing;
 
+test "maybeAuthRequired invokes callback on auth marker" {
+    const AuthCtx = struct {
+        called: bool = false,
+        last_session_id: ?[]const u8 = null,
+        last_engine: ?Engine = null,
+        last_content: ?[]const u8 = null,
+    };
+
+    const Callbacks = struct {
+        fn sendText(_: *anyopaque, _: []const u8, _: Engine, _: []const u8) anyerror!void {}
+        fn sendTextRaw(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {}
+        fn sendTextPrefix(_: *anyopaque, _: []const u8, _: Engine) anyerror!void {}
+        fn sendThought(_: *anyopaque, _: []const u8, _: Engine, _: []const u8) anyerror!void {}
+        fn sendThoughtRaw(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {}
+        fn sendThoughtPrefix(_: *anyopaque, _: []const u8, _: Engine) anyerror!void {}
+        fn sendToolCall(_: *anyopaque, _: []const u8, _: Engine, _: []const u8, _: []const u8, _: []const u8, _: ToolKind, _: ?std.json.Value) anyerror!void {}
+        fn sendToolResult(_: *anyopaque, _: []const u8, _: Engine, _: []const u8, _: ?[]const u8, _: ToolStatus, _: ?std.json.Value) anyerror!void {}
+        fn sendUserMessage(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {}
+        fn onTimeout(_: *anyopaque) void {}
+        fn onSessionId(_: *anyopaque, _: Engine, _: []const u8) void {}
+        fn onSlashCommands(_: *anyopaque, _: []const u8, _: []const []const u8) anyerror!void {}
+        fn checkAuthRequired(ctx: *anyopaque, session_id: []const u8, engine: Engine, content: []const u8) anyerror!?StopReason {
+            const auth_ctx: *AuthCtx = @ptrCast(@alignCast(ctx));
+            auth_ctx.called = true;
+            auth_ctx.last_session_id = session_id;
+            auth_ctx.last_engine = engine;
+            auth_ctx.last_content = content;
+            return .auth_required;
+        }
+        fn sendContinuePrompt(_: *anyopaque, _: Engine, _: []const u8) anyerror!bool {
+            return false;
+        }
+        fn onApprovalRequest(_: *anyopaque, _: std.json.Value, _: ApprovalKind, _: ?std.json.Value) anyerror!?[]const u8 {
+            return null;
+        }
+    };
+
+    const vtable = EditorCallbacks.VTable{
+        .sendText = Callbacks.sendText,
+        .sendTextRaw = Callbacks.sendTextRaw,
+        .sendTextPrefix = Callbacks.sendTextPrefix,
+        .sendThought = Callbacks.sendThought,
+        .sendThoughtRaw = Callbacks.sendThoughtRaw,
+        .sendThoughtPrefix = Callbacks.sendThoughtPrefix,
+        .sendToolCall = Callbacks.sendToolCall,
+        .sendToolResult = Callbacks.sendToolResult,
+        .sendUserMessage = Callbacks.sendUserMessage,
+        .onTimeout = Callbacks.onTimeout,
+        .onSessionId = Callbacks.onSessionId,
+        .onSlashCommands = Callbacks.onSlashCommands,
+        .checkAuthRequired = Callbacks.checkAuthRequired,
+        .sendContinuePrompt = Callbacks.sendContinuePrompt,
+        .onApprovalRequest = Callbacks.onApprovalRequest,
+    };
+
+    var auth_ctx = AuthCtx{};
+    const cbs = EditorCallbacks{ .ctx = @ptrCast(&auth_ctx), .vtable = &vtable };
+
+    var cancelled = std.atomic.Value(bool).init(false);
+    var last_nudge: i64 = 0;
+    var ctx = PromptContext{
+        .allocator = testing.allocator,
+        .session_id = "session",
+        .cwd = "/tmp",
+        .cancelled = &cancelled,
+        .nudge = .{ .enabled = false, .cooldown_ms = 0, .last_nudge_ms = &last_nudge },
+        .cb = cbs,
+        .tag_engine = false,
+    };
+
+    const stop = try maybeAuthRequired(&ctx, .claude, "Please login to continue.");
+    try testing.expectEqual(StopReason.auth_required, stop.?);
+    try testing.expect(auth_ctx.called);
+    try testing.expectEqualStrings("session", auth_ctx.last_session_id.?);
+    try testing.expectEqual(Engine.claude, auth_ctx.last_engine.?);
+    try testing.expectEqualStrings("Please login to continue.", auth_ctx.last_content.?);
+}
+
+test "maybeAuthRequired ignores non-auth text" {
+    const AuthCtx = struct { called: bool = false };
+    const Callbacks = struct {
+        fn sendText(_: *anyopaque, _: []const u8, _: Engine, _: []const u8) anyerror!void {}
+        fn sendTextRaw(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {}
+        fn sendTextPrefix(_: *anyopaque, _: []const u8, _: Engine) anyerror!void {}
+        fn sendThought(_: *anyopaque, _: []const u8, _: Engine, _: []const u8) anyerror!void {}
+        fn sendThoughtRaw(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {}
+        fn sendThoughtPrefix(_: *anyopaque, _: []const u8, _: Engine) anyerror!void {}
+        fn sendToolCall(_: *anyopaque, _: []const u8, _: Engine, _: []const u8, _: []const u8, _: []const u8, _: ToolKind, _: ?std.json.Value) anyerror!void {}
+        fn sendToolResult(_: *anyopaque, _: []const u8, _: Engine, _: []const u8, _: ?[]const u8, _: ToolStatus, _: ?std.json.Value) anyerror!void {}
+        fn sendUserMessage(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {}
+        fn onTimeout(_: *anyopaque) void {}
+        fn onSessionId(_: *anyopaque, _: Engine, _: []const u8) void {}
+        fn onSlashCommands(_: *anyopaque, _: []const u8, _: []const []const u8) anyerror!void {}
+        fn checkAuthRequired(ctx: *anyopaque, _: []const u8, _: Engine, _: []const u8) anyerror!?StopReason {
+            const auth_ctx: *AuthCtx = @ptrCast(@alignCast(ctx));
+            auth_ctx.called = true;
+            return .auth_required;
+        }
+        fn sendContinuePrompt(_: *anyopaque, _: Engine, _: []const u8) anyerror!bool {
+            return false;
+        }
+        fn onApprovalRequest(_: *anyopaque, _: std.json.Value, _: ApprovalKind, _: ?std.json.Value) anyerror!?[]const u8 {
+            return null;
+        }
+    };
+
+    const vtable = EditorCallbacks.VTable{
+        .sendText = Callbacks.sendText,
+        .sendTextRaw = Callbacks.sendTextRaw,
+        .sendTextPrefix = Callbacks.sendTextPrefix,
+        .sendThought = Callbacks.sendThought,
+        .sendThoughtRaw = Callbacks.sendThoughtRaw,
+        .sendThoughtPrefix = Callbacks.sendThoughtPrefix,
+        .sendToolCall = Callbacks.sendToolCall,
+        .sendToolResult = Callbacks.sendToolResult,
+        .sendUserMessage = Callbacks.sendUserMessage,
+        .onTimeout = Callbacks.onTimeout,
+        .onSessionId = Callbacks.onSessionId,
+        .onSlashCommands = Callbacks.onSlashCommands,
+        .checkAuthRequired = Callbacks.checkAuthRequired,
+        .sendContinuePrompt = Callbacks.sendContinuePrompt,
+        .onApprovalRequest = Callbacks.onApprovalRequest,
+    };
+
+    var auth_ctx = AuthCtx{};
+    const cbs = EditorCallbacks{ .ctx = @ptrCast(&auth_ctx), .vtable = &vtable };
+
+    var cancelled = std.atomic.Value(bool).init(false);
+    var last_nudge: i64 = 0;
+    var ctx = PromptContext{
+        .allocator = testing.allocator,
+        .session_id = "session",
+        .cwd = "/tmp",
+        .cancelled = &cancelled,
+        .nudge = .{ .enabled = false, .cooldown_ms = 0, .last_nudge_ms = &last_nudge },
+        .cb = cbs,
+        .tag_engine = false,
+    };
+
+    const stop = try maybeAuthRequired(&ctx, .claude, "All good.");
+    try testing.expect(stop == null);
+    try testing.expect(!auth_ctx.called);
+}
+
+test "authMarkerTextFromTurnError finds auth marker" {
+    const err = codex_bridge.TurnError{ .message = "Please login to continue." };
+    const found = authMarkerTextFromTurnError(err) orelse return error.TestExpectedEqual;
+    try testing.expectEqualStrings("Please login to continue.", found);
+}
+
+test "authMarkerTextFromTurnError returns null when missing" {
+    const err = codex_bridge.TurnError{ .message = "No issues here." };
+    try testing.expect(authMarkerTextFromTurnError(err) == null);
+}
+
 test "PromptContext.isCancelled reads atomic flag" {
     var cancelled = std.atomic.Value(bool).init(false);
     var last_nudge: i64 = 0;
@@ -624,7 +779,9 @@ test "PromptContext.isCancelled sees updates from another thread" {
                     seen.store(true, .release);
                     return;
                 }
-                std.Thread.yield() catch {};
+                std.Thread.yield() catch |err| {
+                    log.warn("Thread yield failed: {}", .{err});
+                };
             }
         }
     }.run, .{ &ctx, &seen_cancelled });

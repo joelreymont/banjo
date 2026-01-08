@@ -17,7 +17,10 @@ pub fn create(allocator: Allocator, session_id: []const u8) !CreateResult {
     errdefer allocator.free(path);
 
     // Remove existing socket file if present
-    std.fs.cwd().deleteFile(path) catch {};
+    std.fs.cwd().deleteFile(path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => log.warn("Failed to remove existing permission socket {s}: {}", .{ path, err }),
+    };
 
     // Create non-blocking Unix domain socket with CLOEXEC to prevent fd inheritance
     const sock = try std.posix.socket(
@@ -44,7 +47,10 @@ pub fn create(allocator: Allocator, session_id: []const u8) !CreateResult {
 /// Close a permission socket and clean up the socket file.
 pub fn close(allocator: Allocator, socket: std.posix.socket_t, path: []const u8) void {
     std.posix.close(socket);
-    std.fs.cwd().deleteFile(path) catch {};
+    std.fs.cwd().deleteFile(path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => log.warn("Failed to remove permission socket {s}: {}", .{ path, err }),
+    };
     allocator.free(path);
 }
 
@@ -71,7 +77,10 @@ pub const PermissionSocket = struct {
         errdefer allocator.free(path);
 
         // Remove existing socket file if present
-        std.fs.cwd().deleteFile(path) catch {};
+        std.fs.cwd().deleteFile(path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => log.warn("Failed to remove existing permission socket {s}: {}", .{ path, err }),
+        };
 
         // Create non-blocking Unix domain socket with CLOEXEC to prevent fd inheritance
         const sock = try std.posix.socket(
@@ -102,7 +111,10 @@ pub const PermissionSocket = struct {
     /// Close the socket and clean up the socket file.
     pub fn close(self: *PermissionSocket) void {
         std.posix.close(self.socket);
-        std.fs.cwd().deleteFile(self.path) catch {};
+        std.fs.cwd().deleteFile(self.path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => log.warn("Failed to remove permission socket {s}: {}", .{ self.path, err }),
+        };
         self.allocator.free(self.path);
     }
 

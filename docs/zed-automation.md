@@ -100,6 +100,13 @@ Zed uses GPUI (Rust), not AppKit/Electron. Accessibility support is limited:
 
 **Workaround for demos**: Use timing-based assertions instead of accessibility queries. Trust that keystrokes execute correctly.
 
+## Headless / Remote E2E
+
+Zed does not support a true headless mode; the CLI always launches a GUI window.
+For remote testing, run on a macOS host with an active window server and drive it
+via hemis-demo/CGEvent (remote desktop or physical session). Expect limited UI
+assertions due to GPUI accessibility constraints.
+
 ## hemis-demo Key Notation
 
 **CRITICAL**: Special keys must use angle brackets or they're typed literally!

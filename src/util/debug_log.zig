@@ -1,5 +1,6 @@
 const std = @import("std");
 const config = @import("config");
+const log = std.log.scoped(.debug_log);
 
 /// Debug log file path - exported for use by other modules
 pub const path = "/tmp/banjo-nvim-debug.log";
@@ -14,20 +15,28 @@ pub fn write(comptime prefix: []const u8, comptime fmt: []const u8, args: anytyp
     const msg = std.fmt.bufPrint(&buf, "[" ++ prefix ++ "] " ++ fmt ++ "\n", args) catch return;
 
     const f = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch {
-        std.io.getStdErr().writer().writeAll(msg) catch {};
+        std.io.getStdErr().writer().writeAll(msg) catch |err| {
+            log.warn("Failed to write debug log to stderr: {}", .{err});
+        };
         return;
     };
     defer f.close();
 
     f.seekFromEnd(0) catch {
-        std.io.getStdErr().writer().writeAll(msg) catch {};
+        std.io.getStdErr().writer().writeAll(msg) catch |err| {
+            log.warn("Failed to write debug log to stderr: {}", .{err});
+        };
         return;
     };
 
     _ = f.write(msg) catch {
-        std.io.getStdErr().writer().writeAll(msg) catch {};
+        std.io.getStdErr().writer().writeAll(msg) catch |err| {
+            log.warn("Failed to write debug log to stderr: {}", .{err});
+        };
     };
-    f.sync() catch {};
+    f.sync() catch |err| {
+        log.warn("Failed to sync debug log file: {}", .{err});
+    };
 }
 
 /// Persistent debug logger for use in a single module.
@@ -59,10 +68,14 @@ pub const PersistentLog = struct {
 
         if (self.file) |f| {
             _ = f.write(msg) catch {
-                std.io.getStdErr().writer().writeAll(msg) catch {};
+                std.io.getStdErr().writer().writeAll(msg) catch |err| {
+                    log.warn("Failed to write debug log to stderr: {}", .{err});
+                };
             };
         } else {
-            std.io.getStdErr().writer().writeAll(msg) catch {};
+            std.io.getStdErr().writer().writeAll(msg) catch |err| {
+                log.warn("Failed to write debug log to stderr: {}", .{err});
+            };
         }
     }
 };

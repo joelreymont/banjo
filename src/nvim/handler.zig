@@ -18,6 +18,7 @@ const settings = @import("../core/settings.zig");
 const permission_socket = @import("../core/permission_socket.zig");
 const tool_categories = @import("../core/tool_categories.zig");
 const constants = @import("../core/constants.zig");
+const session_id_util = @import("../core/session_id.zig");
 const jsonrpc = @import("../jsonrpc.zig");
 const config = @import("config");
 
@@ -174,10 +175,7 @@ pub const Handler = struct {
     }
 
     fn generateSessionId(self: *Handler) ![]const u8 {
-        var buf: [16]u8 = undefined;
-        std.crypto.random.bytes(&buf);
-        const hex = std.fmt.bytesToHex(buf, .lower);
-        return try std.fmt.allocPrint(self.allocator, "nvim-{s}", .{&hex});
+        return session_id_util.generate(self.allocator, "nvim-");
     }
 
     /// Parse notification params or log warning on failure
@@ -211,7 +209,10 @@ pub const Handler = struct {
             self.permission.socket = null;
         }
         if (self.permission.socket_path) |path| {
-            std.fs.cwd().deleteFile(path) catch {};
+            std.fs.cwd().deleteFile(path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => log.warn("Failed to remove permission socket {s}: {}", .{ path, err }),
+            };
             self.allocator.free(path);
             self.permission.socket_path = null;
         }
@@ -301,9 +302,13 @@ pub const Handler = struct {
         if (!self.session_active) {
             debugLog("processQueuedPrompt: starting new session", .{});
             self.session_active = true;
-            self.sendNotification("session_start", protocol.SessionEvent{}) catch {};
+            self.sendNotification("session_start", protocol.SessionEvent{}) catch |err| {
+                log.warn("Failed to send session_start: {}", .{err});
+            };
             if (self.mcp_server) |mcp| {
-                mcp.sendNvimNotification("session_start", protocol.SessionEvent{}) catch {};
+                mcp.sendNvimNotification("session_start", protocol.SessionEvent{}) catch |err| {
+                    log.warn("Failed to send MCP session_start: {}", .{err});
+                };
             }
         }
 
@@ -318,7 +323,9 @@ pub const Handler = struct {
         self.processPrompt(req) catch |err| {
             debugLog("processQueuedPrompt: error!", .{});
             log.err("Prompt processing error: {}", .{err});
-            self.sendError("Processing error") catch {};
+            self.sendError("Processing error") catch |send_err| {
+                log.warn("Failed to send processing error: {}", .{send_err});
+            };
         };
         debugLog("processQueuedPrompt: processPrompt returned", .{});
 
@@ -344,7 +351,9 @@ pub const Handler = struct {
 
             self.processPrompt(cont_req) catch |err| {
                 log.err("Continuation processing error: {}", .{err});
-                self.sendError("Continuation error") catch {};
+                self.sendError("Continuation error") catch |send_err| {
+                    log.warn("Failed to send continuation error: {}", .{send_err});
+                };
                 break;
             };
         }
@@ -542,16 +551,34 @@ pub const Handler = struct {
         }
 
         // Auto-approve in bypass mode
-        if (self.permission.mode == .auto_approve) {
+        if (self.permission.mode == .bypassPermissions) {
             return "allow";
         }
 
         // Auto-approve edit tools in acceptEdits mode
-        if (self.permission.mode == .accept_edits and tool_categories.isEdit(tool_name)) {
+        if (self.permission.mode == .acceptEdits and tool_categories.isEdit(tool_name)) {
             return "allow";
         }
 
         return null;
+    }
+
+    fn codexAutoApprovalDecision(mode: protocol.PermissionMode, kind: ApprovalKind) ?[]const u8 {
+        return switch (mode) {
+            .bypassPermissions, .dontAsk => codexAutoApprovalForKind(kind, true),
+            .acceptEdits => switch (kind) {
+                .file_change, .apply_patch => codexAutoApprovalForKind(kind, true),
+                .command_execution, .exec_command => null,
+            },
+            .default, .plan => null,
+        };
+    }
+
+    fn codexAutoApprovalForKind(kind: ApprovalKind, allow_session: bool) []const u8 {
+        return switch (kind) {
+            .command_execution, .file_change => if (allow_session) "acceptForSession" else "accept",
+            .exec_command, .apply_patch => if (allow_session) "approved_for_session" else "approved",
+        };
     }
 
     const PermissionResponse = struct {
@@ -669,10 +696,14 @@ pub const Handler = struct {
         // Emit session_end if session is active
         if (self.session_active) {
             self.session_active = false;
-            self.sendNotification("session_end", protocol.SessionEvent{}) catch {};
+            self.sendNotification("session_end", protocol.SessionEvent{}) catch |err| {
+                log.warn("Failed to send session_end: {}", .{err});
+            };
             // Forward to MCP server
             if (self.mcp_server) |mcp| {
-                mcp.sendNvimNotification("session_end", protocol.SessionEvent{}) catch {};
+                mcp.sendNvimNotification("session_end", protocol.SessionEvent{}) catch |err| {
+                    log.warn("Failed to send MCP session_end: {}", .{err});
+                };
             }
         }
 
@@ -693,13 +724,17 @@ pub const Handler = struct {
             self.prompt.continuation = null;
         }
 
-        self.sendNotification("status", protocol.StatusUpdate{ .text = "Cancelled" }) catch {};
+        self.sendNotification("status", protocol.StatusUpdate{ .text = "Cancelled" }) catch |err| {
+            log.warn("Failed to send cancel status: {}", .{err});
+        };
     }
 
     fn handleNvimNudgeToggle(self: *Handler) void {
         self.nudge.enabled = !self.nudge.enabled;
         const status = if (self.nudge.enabled) "Nudge enabled" else "Nudge disabled";
-        self.sendNotification("status", protocol.StatusUpdate{ .text = status }) catch {};
+        self.sendNotification("status", protocol.StatusUpdate{ .text = status }) catch |err| {
+            log.warn("Failed to send nudge status: {}", .{err});
+        };
     }
 
     fn handleNvimSetEngine(self: *Handler, params: ?std.json.Value) void {
@@ -715,11 +750,15 @@ pub const Handler = struct {
             self.current_engine = engine;
             self.sendNotification("status", protocol.StatusUpdate{
                 .text = if (engine == .claude) "Engine: Claude" else "Engine: Codex",
-            }) catch {};
+            }) catch |err| {
+                log.warn("Failed to send engine status: {}", .{err});
+            };
             self.sendStateNotification();
         } else {
             log.warn("Unknown engine: {s}", .{parsed.value.engine});
-            self.sendError("Unknown engine") catch {};
+            self.sendError("Unknown engine") catch |err| {
+                log.warn("Failed to send engine error: {}", .{err});
+            };
         }
     }
 
@@ -743,11 +782,15 @@ pub const Handler = struct {
 
             var buf: [64]u8 = undefined;
             const status = std.fmt.bufPrint(&buf, "Model: {s}", .{parsed.value.model}) catch "Model changed";
-            self.sendNotification("status", protocol.StatusUpdate{ .text = status }) catch {};
+            self.sendNotification("status", protocol.StatusUpdate{ .text = status }) catch |err| {
+                log.warn("Failed to send model status: {}", .{err});
+            };
             self.sendStateNotification();
         } else {
             log.warn("Invalid model: {s}", .{parsed.value.model});
-            self.sendError("Invalid model (use: sonnet, opus, haiku)") catch {};
+            self.sendError("Invalid model (use: sonnet, opus, haiku)") catch |err| {
+                log.warn("Failed to send model error: {}", .{err});
+            };
         }
     }
 
@@ -757,20 +800,24 @@ pub const Handler = struct {
 
         const mode_map = std.StaticStringMap(protocol.PermissionMode).initComptime(.{
             .{ "default", .default },
-            .{ "accept_edits", .accept_edits },
-            .{ "auto_approve", .auto_approve },
-            .{ "plan_only", .plan_only },
+            .{ "accept_edits", .acceptEdits },
+            .{ "auto_approve", .bypassPermissions },
+            .{ "plan_only", .plan },
         });
 
         if (mode_map.get(parsed.value.mode)) |mode| {
             self.permission.mode = mode;
             var buf: [64]u8 = undefined;
             const status = std.fmt.bufPrint(&buf, "Mode: {s}", .{mode.toString()}) catch "Mode changed";
-            self.sendNotification("status", protocol.StatusUpdate{ .text = status }) catch {};
+            self.sendNotification("status", protocol.StatusUpdate{ .text = status }) catch |err| {
+                log.warn("Failed to send mode status: {}", .{err});
+            };
             self.sendStateNotification();
         } else {
             log.warn("Unknown mode: {s}", .{parsed.value.mode});
-            self.sendError("Unknown mode (use: default, accept_edits, auto_approve, plan_only)") catch {};
+            self.sendError("Unknown mode (use: default, accept_edits, auto_approve, plan_only)") catch |err| {
+                log.warn("Failed to send mode error: {}", .{err});
+            };
         }
     }
 
@@ -1088,12 +1135,33 @@ pub const Handler = struct {
         var input_owned: ?[]const u8 = null;
         defer if (input_owned) |owned| cb_ctx.handler.allocator.free(owned);
         if (input) |inp| {
-            var out: std.io.Writer.Allocating = .init(cb_ctx.handler.allocator);
-            defer out.deinit();
-            var jw: std.json.Stringify = .{ .writer = &out.writer };
-            jw.write(inp) catch {};
-            input_owned = out.toOwnedSlice() catch null;
-            input_str = input_owned;
+            if (inp != .null) {
+                const input_buf_size: usize = 512;
+                var stack_buf: [input_buf_size]u8 = undefined;
+                var fbs = std.io.fixedBufferStream(&stack_buf);
+                var jw: std.json.Stringify = .{ .writer = fbs.writer() };
+                if (jw.write(inp)) |_| {
+                    input_str = fbs.getWritten();
+                } else |err| switch (err) {
+                    error.NoSpaceLeft => {
+                        var out: std.io.Writer.Allocating = .init(cb_ctx.handler.allocator);
+                        defer out.deinit();
+                        var jw_alloc: std.json.Stringify = .{ .writer = &out.writer };
+                        if (jw_alloc.write(inp)) |_| {
+                            input_owned = out.toOwnedSlice() catch |slice_err| {
+                                log.warn("Failed to allocate tool input: {}", .{slice_err});
+                                null;
+                            };
+                            input_str = input_owned;
+                        } else |write_err| {
+                            log.warn("Failed to stringify tool input: {}", .{write_err});
+                        }
+                    },
+                    else => {
+                        log.warn("Failed to stringify tool input: {}", .{err});
+                    },
+                }
+            }
         }
 
         try cb_ctx.handler.sendNotification("tool_call", protocol.ToolCall{
@@ -1144,13 +1212,16 @@ pub const Handler = struct {
         const cb_ctx = CallbackContext.from(ctx);
 
         // Check if content indicates auth is required
-        if (std.mem.indexOf(u8, content, "/login") != null or
-            std.mem.indexOf(u8, content, "authenticate") != null)
-        {
-            cb_ctx.handler.sendNotification("error_msg", protocol.ErrorMessage{
-                .message = "Authentication required. Please run `claude /login` in your terminal, then try again.",
-            }) catch {};
-            return .auth_required;
+        const auth_markers = [_][]const u8{ "/login", "authenticate" };
+        for (auth_markers) |marker| {
+            if (std.mem.indexOf(u8, content, marker) != null) {
+                cb_ctx.handler.sendNotification("error_msg", protocol.ErrorMessage{
+                    .message = "Authentication required. Please run `claude /login` in your terminal, then try again.",
+                }) catch |err| {
+                    log.warn("Failed to send auth_required error: {}", .{err});
+                };
+                return .auth_required;
+            }
         }
         return null;
     }
@@ -1174,6 +1245,10 @@ pub const Handler = struct {
     fn cbOnApprovalRequest(ctx: *anyopaque, request_id: std.json.Value, kind: ApprovalKind, params: ?std.json.Value) anyerror!?[]const u8 {
         const cb_ctx = CallbackContext.from(ctx);
         const handler = cb_ctx.handler;
+
+        if (codexAutoApprovalDecision(handler.permission.mode, kind)) |decision| {
+            return decision;
+        }
 
         // Convert request_id to string
         var id_buf: [64]u8 = undefined;
@@ -1205,8 +1280,14 @@ pub const Handler = struct {
                 .writer = &out.writer,
                 .options = .{ .emit_null_optional_fields = false },
             };
-            jw.write(p) catch {};
-            args_str = out.toOwnedSlice() catch null;
+            if (jw.write(p)) |_| {
+                args_str = out.toOwnedSlice() catch |err| {
+                    log.warn("Failed to allocate approval params: {}", .{err});
+                    null;
+                };
+            } else |err| {
+                log.warn("Failed to stringify approval params: {}", .{err});
+            }
         }
         defer if (args_str) |a| handler.allocator.free(a);
 
@@ -1392,7 +1473,9 @@ test "cancelled flag is atomic - writer thread sets, reader sees it" {
                     seen.store(true, .release);
                     return;
                 }
-                std.Thread.yield() catch {};
+                std.Thread.yield() catch |err| {
+                    log.warn("Thread yield failed: {}", .{err});
+                };
             }
         }
     }.run, .{ &handler, &seen_true });
@@ -1503,7 +1586,9 @@ test "cancel flag visible across threads during simulated processing" {
 
     // Wait for processing to start
     while (!processing_started.load(.acquire)) {
-        std.Thread.yield() catch {};
+        std.Thread.yield() catch |err| {
+            log.warn("Thread yield failed: {}", .{err});
+        };
     }
 
     // Simulate poll thread receiving cancel (like handleNvimCancel)
@@ -1537,7 +1622,9 @@ test "prompt queue with condition variable wakeup" {
             // Wait with timeout
             const start = std.time.milliTimestamp();
             while (h.prompt.pending == null and std.time.milliTimestamp() - start < 1000) {
-                h.prompt.ready.timedWait(&h.prompt.mutex, 100 * std.time.ns_per_ms) catch {};
+                h.prompt.ready.timedWait(&h.prompt.mutex, 100 * std.time.ns_per_ms) catch |err| {
+                    log.warn("Prompt timedWait failed: {}", .{err});
+                };
             }
             if (h.prompt.pending != null) {
                 got_prompt.store(true, .release);
@@ -1732,8 +1819,8 @@ test "checkPermissionAutoApprove auto_approve mode" {
     var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
     defer handler.deinit();
 
-    // Set auto_approve mode
-    handler.permission.mode = .auto_approve;
+    // Set auto_approve mode (bypassPermissions)
+    handler.permission.mode = .bypassPermissions;
 
     // All tools should be approved
     try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Bash").?);
@@ -1753,7 +1840,7 @@ test "checkPermissionAutoApprove accept_edits mode" {
     defer handler.deinit();
 
     // Set accept_edits mode
-    handler.permission.mode = .accept_edits;
+    handler.permission.mode = .acceptEdits;
 
     // Edit tools should be approved
     try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Write").?);
@@ -1763,6 +1850,42 @@ test "checkPermissionAutoApprove accept_edits mode" {
 
     // Bash should NOT be auto-approved in accept_edits mode
     try std.testing.expect(handler.checkPermissionAutoApprove("Bash") == null);
+}
+
+test "codexAutoApprovalDecision respects permission mode" {
+    const edit_decision = Handler.codexAutoApprovalDecision(.acceptEdits, .file_change) orelse {
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expectEqualStrings("acceptForSession", edit_decision);
+    try std.testing.expect(Handler.codexAutoApprovalDecision(.acceptEdits, .command_execution) == null);
+
+    const exec_decision = Handler.codexAutoApprovalDecision(.bypassPermissions, .exec_command) orelse {
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expectEqualStrings("approved_for_session", exec_decision);
+}
+
+test "cbCheckAuthRequired returns auth_required for marker" {
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    const allocator = std.testing.allocator;
+
+    var stdin_buf: [0]u8 = undefined;
+    var stdout_buf: [1024]u8 = undefined;
+    var stdin = std.io.fixedBufferStream(&stdin_buf);
+    var stdout = std.io.fixedBufferStream(&stdout_buf);
+
+    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    defer handler.deinit();
+
+    var cb_ctx = Handler.CallbackContext{ .handler = &handler };
+    const stop = try Handler.cbCheckAuthRequired(@ptrCast(&cb_ctx), "session", .claude, "authenticate to continue");
+    try std.testing.expectEqual(EditorCallbacks.StopReason.auth_required, stop.?);
+
+    const no_stop = try Handler.cbCheckAuthRequired(@ptrCast(&cb_ctx), "session", .claude, "all good");
+    try std.testing.expect(no_stop == null);
 }
 
 test "checkPermissionAutoApprove always_allowed_tools" {

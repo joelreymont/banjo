@@ -1,6 +1,5 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const builtin = @import("builtin");
 const jsonrpc = @import("../jsonrpc.zig");
 const protocol = @import("protocol.zig");
 const bridge = @import("../core/claude_bridge.zig");
@@ -25,6 +24,7 @@ const notes_commands = @import("../notes/commands.zig");
 const permission_socket = @import("../core/permission_socket.zig");
 const constants = @import("../core/constants.zig");
 const tool_categories = @import("../core/tool_categories.zig");
+const session_id_util = @import("../core/session_id.zig");
 const lsp_uri = @import("../lsp/uri.zig");
 const config = @import("config");
 const test_env = @import("../util/test_env.zig");
@@ -122,10 +122,7 @@ fn resolveDefaultRoute(availability: EngineAvailability) Route {
 }
 
 fn codexApprovalPolicy(mode: protocol.PermissionMode) []const u8 {
-    return switch (mode) {
-        .bypassPermissions, .dontAsk => "never",
-        .default, .acceptEdits, .plan => "on-request",
-    };
+    return mode.toCodexApprovalPolicy() orelse "on-request";
 }
 
 const falsey_env_values = std.StaticStringMap(void).initComptime(.{
@@ -191,16 +188,7 @@ fn detectEngines() EngineAvailability {
 }
 
 fn generateSessionIdWithAllocator(allocator: Allocator) ![]const u8 {
-    if (builtin.is_test) {
-        if (std.posix.getenv("BANJO_TEST_SESSION_ID")) |sid| {
-            return allocator.dupe(u8, sid);
-        }
-    }
-
-    var uuid_bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&uuid_bytes);
-    const hex = std.fmt.bytesToHex(uuid_bytes, .lower);
-    return allocator.dupe(u8, &hex);
+    return session_id_util.generate(allocator, null);
 }
 
 fn mapToolKind(tool_name: []const u8) protocol.SessionUpdate.ToolKind {
@@ -433,7 +421,10 @@ pub const Agent = struct {
                 self.permission_socket = null;
             }
             if (self.permission_socket_path) |path| {
-                std.fs.cwd().deleteFile(path) catch {};
+                std.fs.cwd().deleteFile(path) catch |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => log.warn("Failed to remove permission socket {s}: {}", .{ path, err }),
+                };
                 allocator.free(path);
                 self.permission_socket_path = null;
             }
@@ -637,6 +628,10 @@ pub const Agent = struct {
 
     fn cbOnApprovalRequest(ctx: *anyopaque, request_id: std.json.Value, kind: callbacks_mod.ApprovalKind, params: ?std.json.Value) anyerror!?[]const u8 {
         const pctx = PromptCallbackContext.from(ctx);
+
+        if (codexAutoApprovalDecision(pctx.session.permission_mode, kind)) |decision| {
+            return decision;
+        }
 
         // Map to protocol types
         const title = switch (kind) {
@@ -1604,6 +1599,7 @@ pub const Agent = struct {
         return true;
     }
 
+    // DuetState loops engines in order: start -> next_engine -> run_engine.
     const DuetState = enum { start, next_engine, run_engine };
 
     fn runDuetPrompt(
@@ -3127,6 +3123,27 @@ pub const Agent = struct {
                 return "approved";
             },
         }
+    }
+
+    fn codexAutoApprovalDecision(
+        mode: protocol.PermissionMode,
+        kind: callbacks_mod.ApprovalKind,
+    ) ?[]const u8 {
+        return switch (mode) {
+            .bypassPermissions, .dontAsk => codexAutoApprovalForKind(kind, true),
+            .acceptEdits => switch (kind) {
+                .file_change, .apply_patch => codexAutoApprovalForKind(kind, true),
+                .command_execution, .exec_command => null,
+            },
+            .default, .plan => null,
+        };
+    }
+
+    fn codexAutoApprovalForKind(kind: callbacks_mod.ApprovalKind, allow_session: bool) []const u8 {
+        return switch (kind) {
+            .command_execution, .file_change => if (allow_session) "acceptForSession" else "accept",
+            .exec_command, .apply_patch => if (allow_session) "approved_for_session" else "approved",
+        };
     }
 
     fn shouldTagEngine(self: *Agent, session: *Session) bool {
@@ -5741,6 +5758,12 @@ test "toProtocolStopReason maps auth_required" {
     try testing.expectEqual(protocol.StopReason.auth_required, Agent.toProtocolStopReason(.auth_required));
 }
 
+test "isAuthRequiredContent detects auth markers" {
+    try testing.expect(isAuthRequiredContent("please login to continue"));
+    try testing.expect(isAuthRequiredContent("authenticate to proceed"));
+    try testing.expect(!isAuthRequiredContent("all good here"));
+}
+
 test "isUnsupportedCommand filters correctly" {
     // These should be filtered
     try testing.expect(Agent.isUnsupportedCommand("login"));
@@ -5804,6 +5827,51 @@ test "buildCodexStartOptions honors force_new" {
     const resume_opts = Agent.buildCodexStartOptions(&session);
     try testing.expect(resume_opts.resume_session_id != null);
     try testing.expect(std.mem.eql(u8, resume_opts.resume_session_id.?, "thread-id"));
+}
+
+test "codex auto approval respects permission mode" {
+    const edit_decision = Agent.codexAutoApprovalDecision(.acceptEdits, .file_change) orelse {
+        return error.TestUnexpectedResult;
+    };
+    try testing.expectEqualStrings("acceptForSession", edit_decision);
+    try testing.expect(Agent.codexAutoApprovalDecision(.acceptEdits, .command_execution) == null);
+    try testing.expect(Agent.codexAutoApprovalDecision(.default, .apply_patch) == null);
+
+    const exec_decision = Agent.codexAutoApprovalDecision(.bypassPermissions, .exec_command) orelse {
+        return error.TestUnexpectedResult;
+    };
+    try testing.expectEqualStrings("approved_for_session", exec_decision);
+}
+
+test "handleAuthRequired sends message and clears bridge" {
+    const prev_log_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_log_level;
+
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
+    defer agent.deinit();
+
+    var session = try createTestSession(testing.allocator, .{});
+    defer session.deinit(testing.allocator);
+
+    session.bridge = Bridge.init(testing.allocator, ".");
+    session.codex_bridge = CodexBridge.init(testing.allocator, ".");
+
+    const stop_claude = try agent.handleAuthRequired(session.id, &session, .claude);
+    try testing.expectEqual(protocol.StopReason.auth_required, stop_claude);
+    try testing.expect(session.bridge == null);
+    try testing.expect(session.codex_bridge != null);
+
+    const stop_codex = try agent.handleAuthRequired(session.id, &session, .codex);
+    try testing.expectEqual(protocol.StopReason.auth_required, stop_codex);
+    try testing.expect(session.codex_bridge == null);
+
+    const output = tw.getOutput();
+    try testing.expect(std.mem.indexOf(u8, output, "Claude Code requires authentication") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "Codex requires authentication") != null);
 }
 
 test "prepareFreshSessions clears resume state" {

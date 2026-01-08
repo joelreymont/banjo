@@ -1,9 +1,9 @@
 ---
 title: Optimize cbSendToolCall allocations
-status: open
+status: completed
 priority: 2
 issue-type: task
 created-at: "\"2026-01-08T16:01:12.007425+02:00\""
 ---
 
-Optimizing callback allocations
+Fixed: reduced tool call input allocations with a stack buffer + fallback at `src/nvim/handler.zig:1107`.

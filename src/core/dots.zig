@@ -27,8 +27,14 @@ pub fn hasPendingTasks(allocator: Allocator, cwd: []const u8) PendingTasksResult
         return .{ .has_tasks = false, .error_msg = "dot CLI not found or failed to start" };
     };
     errdefer {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        _ = child.kill() catch |err| blk: {
+            log.warn("Failed to kill dot ls process: {}", .{err});
+            break :blk std.process.Child.Term{ .Unknown = 0 };
+        };
+        _ = child.wait() catch |err| blk: {
+            log.warn("Failed to wait for dot ls process: {}", .{err});
+            break :blk std.process.Child.Term{ .Unknown = 0 };
+        };
     }
 
     const stdout = child.stdout orelse return .{ .has_tasks = false, .error_msg = "no stdout from dot" };
