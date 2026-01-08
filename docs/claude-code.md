@@ -249,8 +249,82 @@ Audio content block:
 ```
 Result: error "Input tag 'audio' ... does not match any of the expected tags".
 
+## Skills
+
+Skills add specialized knowledge or workflows to Claude Code. They are invoked via slash commands (e.g., `/review-loop`).
+
+### File Structure
+
+```
+~/.claude/skills/<skill-name>/skill.md    # Global (all projects)
+.claude/skills/<skill-name>/skill.md      # Project-specific
+```
+
+**Note**: Skills are directories containing a `skill.md` file, not single files like agents.
+
+### YAML Frontmatter
+
+Every skill file MUST start with YAML frontmatter:
+
+```yaml
+---
+name: skill-name
+description: Brief description of what this Skill does
+---
+```
+
+### Available Metadata Fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | Yes | Unique skill name (lowercase, letters/numbers/hyphens) |
+| `description` | Yes | Brief description shown in slash command menu |
+| `user-invocable` | No | Set to `false` to hide from slash command menu. **Default: true** |
+| `context` | No | `fork` to run in separate context (doesn't affect main conversation) |
+| `model` | No | Model override: `opus`, `sonnet`, `haiku` |
+| `agent` | No | Agent type: `Explore`, `general-purpose`, etc. |
+| `allowed-tools` | No | Comma-separated list of allowed tools |
+
+### Skill Visibility
+
+- Skills are **user-invocable by default** - they appear in the slash command menu
+- Set `user-invocable: false` to hide a skill from the menu
+- Project-local skills (`.claude/skills/`) take precedence over global skills
+
+### Example Skill
+
+```yaml
+---
+name: review-loop
+description: Deep code review with Opus. Use when user says "review loop" or "code review".
+context: fork
+model: opus
+---
+
+# Review Loop Skill
+
+Deep code review for performance, DRY compliance, and anti-patterns.
+
+## Instructions
+
+1. Analyze code in forked context
+2. Compile findings with file paths and line numbers
+3. Present report to user
+```
+
+### Skill vs Agent
+
+| Aspect | Skill | Agent |
+|--------|-------|-------|
+| Purpose | Add knowledge/workflow to conversation | Run isolated task |
+| Context | Injected into main context (unless `context: fork`) | Always separate context |
+| Structure | Directory with `skill.md` | Single `.md` file |
+| Invocation | Slash command or automatic | Via Task tool |
+| Location | `.claude/skills/` or `~/.claude/skills/` | `.claude/agents/` or `~/.claude/agents/` |
+
 ## Sources
 
 - [CLI reference](https://code.claude.com/docs/en/cli-reference)
+- [Skills documentation](https://code.claude.com/docs/en/skills)
 - [Subprocess issue #771](https://github.com/anthropics/claude-code/issues/771)
 - [Streaming output #733](https://github.com/anthropics/claude-code/issues/733)
