@@ -444,7 +444,7 @@ pub const PermissionOutcomeKind = enum {
 };
 
 // =============================================================================
-// File System (Agent → Client)
+// File System (Agent -> Client)
 // =============================================================================
 
 pub const ReadTextFileRequest = struct {
@@ -467,7 +467,7 @@ pub const WriteTextFileRequest = struct {
 pub const WriteTextFileResponse = struct {};
 
 // =============================================================================
-// Terminal (Agent → Client)
+// Terminal (Agent -> Client)
 // =============================================================================
 
 pub const CreateTerminalRequest = struct {

@@ -452,7 +452,6 @@ test {
     _ = @import("core/settings.zig");
     _ = @import("core/types.zig");
     _ = @import("tools/proxy.zig");
-    _ = @import("util/quickcheck.zig");
 
     // Notes (comment-based)
     _ = @import("notes/comments.zig");

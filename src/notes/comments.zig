@@ -648,22 +648,40 @@ pub fn getCommentPrefix(file_path: []const u8) []const u8 {
 //
 
 const testing = std.testing;
+const ohsnap = @import("ohsnap");
 
 test "parseNoteLine extracts note ID and content" {
     const alloc = testing.allocator;
     var note = (try parseNoteLine(alloc, "// @banjo[note-123] TODO fix this", 5)).?;
     defer note.deinit(alloc);
-
-    try testing.expectEqualStrings("note-123", note.id);
-    try testing.expectEqualStrings("TODO fix this", note.content);
-    try testing.expectEqual(@as(u32, 5), note.line);
+    const summary = .{
+        .id = note.id,
+        .content = note.content,
+        .line = note.line,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\notes.comments.test.parseNoteLine extracts note ID and content__struct_<^\d+$>
+        \\  .id: []const u8
+        \\    "note-123"
+        \\  .content: []const u8
+        \\    "TODO fix this"
+        \\  .line: u32 = 5
+    ).expectEqual(summary);
 }
 
 test "parseNoteLine returns null for non-note lines" {
     const alloc = testing.allocator;
-    try testing.expect(try parseNoteLine(alloc, "// regular comment", 1) == null);
-    try testing.expect(try parseNoteLine(alloc, "const x = 5;", 1) == null);
-    try testing.expect(try parseNoteLine(alloc, "", 1) == null);
+    const summary = .{
+        .comment = (try parseNoteLine(alloc, "// regular comment", 1)) == null,
+        .code = (try parseNoteLine(alloc, "const x = 5;", 1)) == null,
+        .empty = (try parseNoteLine(alloc, "", 1)) == null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\notes.comments.test.parseNoteLine returns null for non-note lines__struct_<^\d+$>
+        \\  .comment: bool = true
+        \\  .code: bool = true
+        \\  .empty: bool = true
+    ).expectEqual(summary);
 }
 
 test "parseNoteLine handles different comment styles" {
@@ -671,21 +689,36 @@ test "parseNoteLine handles different comment styles" {
 
     var note1 = (try parseNoteLine(alloc, "# @banjo[py-note] Python note", 1)).?;
     defer note1.deinit(alloc);
-    try testing.expectEqualStrings("py-note", note1.id);
-
     var note2 = (try parseNoteLine(alloc, "-- @banjo[sql-note] SQL note", 1)).?;
     defer note2.deinit(alloc);
-    try testing.expectEqualStrings("sql-note", note2.id);
+    const summary = .{
+        .py = note1.id,
+        .sql = note2.id,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\notes.comments.test.parseNoteLine handles different comment styles__struct_<^\d+$>
+        \\  .py: []const u8
+        \\    "py-note"
+        \\  .sql: []const u8
+        \\    "sql-note"
+    ).expectEqual(summary);
 }
 
 test "parseNoteLine extracts links" {
     const alloc = testing.allocator;
     var note = (try parseNoteLine(alloc, "// @banjo[note-1] See @[other note](note-2) and @[third](note-3)", 1)).?;
     defer note.deinit(alloc);
-
-    try testing.expectEqual(@as(usize, 2), note.links.len);
-    try testing.expectEqualStrings("note-2", note.links[0]);
-    try testing.expectEqualStrings("note-3", note.links[1]);
+    const summary = .{
+        .links = note.links,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\notes.comments.test.parseNoteLine extracts links__struct_<^\d+$>
+        \\  .links: []const []const u8
+        \\    [0]: []const u8
+        \\      "note-2"
+        \\    [1]: []const u8
+        \\      "note-3"
+    ).expectEqual(summary);
 }
 
 test "scanFileForNotes finds all notes" {
@@ -704,11 +737,23 @@ test "scanFileForNotes finds all notes" {
         alloc.free(notes);
     }
 
-    try testing.expectEqual(@as(usize, 2), notes.len);
-    try testing.expectEqualStrings("note-1", notes[0].id);
-    try testing.expectEqual(@as(u32, 2), notes[0].line);
-    try testing.expectEqualStrings("note-2", notes[1].id);
-    try testing.expectEqual(@as(u32, 4), notes[1].line);
+    const summary = .{
+        .count = notes.len,
+        .first = .{ .id = notes[0].id, .line = notes[0].line },
+        .second = .{ .id = notes[1].id, .line = notes[1].line },
+    };
+    try (ohsnap{}).snap(@src(),
+        \\notes.comments.test.scanFileForNotes finds all notes__struct_<^\d+$>
+        \\  .count: usize = 2
+        \\  .first: notes.comments.test.scanFileForNotes finds all notes__struct_<^\d+$>
+        \\    .id: []const u8
+        \\      "note-1"
+        \\    .line: u32 = 2
+        \\  .second: notes.comments.test.scanFileForNotes finds all notes__struct_<^\d+$>
+        \\    .id: []const u8
+        \\      "note-2"
+        \\    .line: u32 = 4
+    ).expectEqual(summary);
 }
 
 test "scanFileForNotes captures links in comment blocks" {
@@ -724,64 +769,119 @@ test "scanFileForNotes captures links in comment blocks" {
         alloc.free(notes);
     }
 
-    try testing.expectEqual(@as(usize, 1), notes.len);
-    try testing.expectEqual(@as(usize, 1), notes[0].links.len);
-    try testing.expectEqualStrings("note-2", notes[0].links[0]);
-    try testing.expect(mem.indexOf(u8, notes[0].content, "See @[other](note-2)") != null);
+    const summary = .{
+        .count = notes.len,
+        .links = notes[0].links,
+        .content = notes[0].content,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\notes.comments.test.scanFileForNotes captures links in comment blocks__struct_<^\d+$>
+        \\  .count: usize = 1
+        \\  .links: []const []const u8
+        \\    [0]: []const u8
+        \\      "note-2"
+        \\  .content: []const u8
+        \\    "First line
+        \\See @[other](note-2)"
+    ).expectEqual(summary);
 }
 
 test "getCommentPrefix returns correct prefix" {
-    try testing.expectEqualStrings("//", getCommentPrefix("main.zig"));
-    try testing.expectEqualStrings("//", getCommentPrefix("main.rs"));
-    try testing.expectEqualStrings("#", getCommentPrefix("script.py"));
-    try testing.expectEqualStrings("#", getCommentPrefix("config.yaml"));
-    try testing.expectEqualStrings("--", getCommentPrefix("query.sql"));
+    const summary = .{
+        .zig = getCommentPrefix("main.zig"),
+        .rs = getCommentPrefix("main.rs"),
+        .py = getCommentPrefix("script.py"),
+        .yaml = getCommentPrefix("config.yaml"),
+        .sql = getCommentPrefix("query.sql"),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\notes.comments.test.getCommentPrefix returns correct prefix__struct_<^\d+$>
+        \\  .zig: []const u8
+        \\    "//"
+        \\  .rs: []const u8
+        \\    "//"
+        \\  .py: []const u8
+        \\    "#"
+        \\  .yaml: []const u8
+        \\    "#"
+        \\  .sql: []const u8
+        \\    "--"
+    ).expectEqual(summary);
 }
 
 test "formatNoteComment creates correct format" {
     const alloc = testing.allocator;
     const comment = try formatNoteComment(alloc, "note-123", "TODO fix this", "//");
     defer alloc.free(comment);
-
-    try testing.expectEqualStrings("// @banjo[note-123] TODO fix this", comment);
+    const summary = .{ .comment = comment };
+    try (ohsnap{}).snap(@src(),
+        \\notes.comments.test.formatNoteComment creates correct format__struct_<^\d+$>
+        \\  .comment: []const u8
+        \\    "// @banjo[note-123] TODO fix this"
+    ).expectEqual(summary);
 }
 
 test "generateNoteId returns 12 char hex string" {
     const id = generateNoteId();
-    try testing.expectEqual(@as(usize, 12), id.len);
-    // All chars should be hex
+    var all_hex = true;
     for (id) |c| {
-        try testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
+        if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) {
+            all_hex = false;
+            break;
+        }
     }
+    const summary = .{ .len = id.len, .all_hex = all_hex };
+    try (ohsnap{}).snap(@src(),
+        \\notes.comments.test.generateNoteId returns 12 char hex string__struct_<^\d+$>
+        \\  .len: usize = 12
+        \\  .all_hex: bool = true
+    ).expectEqual(summary);
 }
 
 //
 // Property tests
 //
 
-const quickcheck = @import("../util/quickcheck.zig");
+const zcheck = @import("zcheck");
+const zcheck_seed_base: u64 = 0x9e07_3b1d_c54a_82f1;
+
+const Bytes64 = zcheck.BoundedSlice(u8, 64);
+const Bytes48 = zcheck.BoundedSlice(u8, 48);
+const Bytes32 = zcheck.BoundedSlice(u8, 32);
+
+fn checkWithResult(prop: anytype, config: zcheck.Config, label: []const u8) !void {
+    if (zcheck.checkResult(prop, config)) |failure| {
+        std.debug.print(
+            "zcheck failure: {s}\nseed: {}\noriginal: {any}\nshrunk: {any}\n",
+            .{ label, failure.seed, failure.original, failure.shrunk },
+        );
+        return error.TestUnexpectedResult;
+    }
+}
 
 test "lexer never crashes on arbitrary bytes" {
-    try quickcheck.check(struct {
-        fn prop(args: struct { bytes: [64]u8 }) bool {
-            var lexer = Lexer.init(&args.bytes);
+    try zcheck.check(struct {
+        fn prop(args: struct { bytes: Bytes64 }) bool {
+            const bytes = args.bytes.slice();
+            var lexer = Lexer.init(bytes);
             // Consume all tokens - should never crash
             while (true) {
                 const tok = lexer.next();
                 if (tok.tag == .eof or tok.tag == .not_comment) break;
                 // Bounds check
-                if (tok.end > args.bytes.len) return false;
+                if (tok.end > bytes.len) return false;
                 if (tok.start > tok.end) return false;
             }
             return true;
         }
-    }.prop, .{ .iterations = 1000 });
+    }.prop, .{ .iterations = 1000, .seed = zcheck_seed_base + 1 });
 }
 
 test "lexer terminates on any input" {
-    try quickcheck.check(struct {
-        fn prop(args: struct { bytes: [32]u8 }) bool {
-            var lexer = Lexer.init(&args.bytes);
+    try zcheck.check(struct {
+        fn prop(args: struct { bytes: Bytes32 }) bool {
+            const bytes = args.bytes.slice();
+            var lexer = Lexer.init(bytes);
             var count: usize = 0;
             while (count < 1000) : (count += 1) {
                 const tok = lexer.next();
@@ -789,52 +889,51 @@ test "lexer terminates on any input" {
             }
             return false; // Didn't terminate
         }
-    }.prop, .{ .iterations = 500 });
+    }.prop, .{ .iterations = 500, .seed = zcheck_seed_base + 2 });
 }
 
 test "round-trip: formatNoteComment then parseNoteLine" {
-    try quickcheck.check(struct {
-        fn prop(args: struct { id_bytes: [8]u8, content_seed: u32 }) bool {
-            // Generate hex ID from bytes
-            var id: [16]u8 = undefined;
-            const hex = "0123456789abcdef";
-            for (args.id_bytes, 0..) |b, i| {
-                id[i * 2] = hex[b >> 4];
-                id[i * 2 + 1] = hex[b & 0xf];
+    try checkWithResult(struct {
+        fn prop(args: struct { id: zcheck.Id, content: zcheck.String }) bool {
+            const id = args.id.slice();
+            const raw_content = args.content.slice();
+            var filtered: [zcheck.String.MAX_LEN]u8 = undefined;
+            var len: usize = 0;
+            for (raw_content) |c| {
+                if (std.ascii.isAlphanumeric(c) or c == ' ' or c == '-' or c == '_') {
+                    filtered[len] = c;
+                    len += 1;
+                }
             }
-
-            // Simple content without special chars
-            var content: [8]u8 = undefined;
-            var prng = std.Random.DefaultPrng.init(args.content_seed);
-            const random = prng.random();
-            for (&content) |*c| {
-                c.* = 'a' + random.uintLessThan(u8, 26);
-            }
+            const filtered_content = if (len == 0) "note" else filtered[0..len];
+            const trimmed = std.mem.trim(u8, filtered_content, " \t");
+            const content = if (trimmed.len == 0) "note" else trimmed;
 
             // Format and parse
-            var buf: [128]u8 = undefined;
-            const formatted = std.fmt.bufPrint(&buf, "// @banjo[{s}] {s}", .{ id[0..16], content[0..8] }) catch return true;
+            var buf: [160]u8 = undefined;
+            const formatted = std.fmt.bufPrint(&buf, "// @banjo[{s}] {s}", .{ id, content }) catch return true;
 
             const alloc = testing.allocator;
             var note = parseNoteLine(alloc, formatted, 1) catch return true;
             if (note) |*n| {
                 defer n.deinit(alloc);
                 // ID should match
-                if (!mem.eql(u8, n.id, id[0..16])) return false;
+                if (!mem.eql(u8, n.id, id)) return false;
                 // Content should contain our text
-                if (mem.indexOf(u8, n.content, content[0..8]) == null) return false;
+                if (mem.indexOf(u8, n.content, content) == null) return false;
             } else {
                 return false; // Should have parsed
             }
             return true;
         }
-    }.prop, .{ .iterations = 200 });
+    }.prop, .{ .iterations = 200, .seed = zcheck_seed_base + 3 }, "note roundtrip");
 }
 
 test "lexer slice bounds are always valid" {
-    try quickcheck.check(struct {
-        fn prop(args: struct { bytes: [48]u8 }) bool {
-            var lexer = Lexer.init(&args.bytes);
+    try zcheck.check(struct {
+        fn prop(args: struct { bytes: Bytes48 }) bool {
+            const bytes = args.bytes.slice();
+            var lexer = Lexer.init(bytes);
             while (true) {
                 const tok = lexer.next();
                 switch (tok.tag) {
@@ -842,12 +941,12 @@ test "lexer slice bounds are always valid" {
                     .content, .banjo_marker, .link => {
                         // Verify slice is safe
                         if (tok.start > tok.end) return false;
-                        if (tok.end > args.bytes.len) return false;
+                        if (tok.end > bytes.len) return false;
                         _ = lexer.slice(tok); // Should not panic
                     },
                 }
             }
             return true;
         }
-    }.prop, .{ .iterations = 500 });
+    }.prop, .{ .iterations = 500, .seed = zcheck_seed_base + 4 });
 }

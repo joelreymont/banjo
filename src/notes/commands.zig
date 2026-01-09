@@ -410,29 +410,76 @@ pub fn parseZedUrl(allocator: Allocator, url: []const u8) ?struct {
 // =============================================================================
 
 const testing = std.testing;
+const ohsnap = @import("ohsnap");
 
 test "parseZedUrl extracts file path and line" {
     const url = "[@main.zig (42:1)](file:///Users/joel/project/src/main.zig#L42:1)";
-    const result = parseZedUrl(testing.allocator, url);
-    try testing.expect(result != null);
-    defer result.?.deinit(testing.allocator);
-    try testing.expectEqualStrings("/Users/joel/project/src/main.zig", result.?.file_path);
-    try testing.expectEqual(@as(u32, 42), result.?.line);
+    var result = parseZedUrl(testing.allocator, url);
+    defer if (result) |*item| item.deinit(testing.allocator);
+    const Summary = struct {
+        found: bool,
+        file_path: ?[]const u8,
+        line: ?u32,
+    };
+    const summary: Summary = if (result) |item| .{
+        .found = true,
+        .file_path = item.file_path,
+        .line = item.line,
+    } else .{
+        .found = false,
+        .file_path = null,
+        .line = null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\notes.commands.test.parseZedUrl extracts file path and line.Summary
+        \\  .found: bool = true
+        \\  .file_path: ?[]const u8
+        \\    "/Users/joel/project/src/main.zig"
+        \\  .line: ?u32
+        \\    42
+    ).expectEqual(summary);
 }
 
 test "parseZedUrl handles line without column" {
     const url = "file:///path/to/file.zig#L100";
-    const result = parseZedUrl(testing.allocator, url);
-    try testing.expect(result != null);
-    defer result.?.deinit(testing.allocator);
-    try testing.expectEqualStrings("/path/to/file.zig", result.?.file_path);
-    try testing.expectEqual(@as(u32, 100), result.?.line);
+    var result = parseZedUrl(testing.allocator, url);
+    defer if (result) |*item| item.deinit(testing.allocator);
+    const Summary = struct {
+        found: bool,
+        file_path: ?[]const u8,
+        line: ?u32,
+    };
+    const summary: Summary = if (result) |item| .{
+        .found = true,
+        .file_path = item.file_path,
+        .line = item.line,
+    } else .{
+        .found = false,
+        .file_path = null,
+        .line = null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\notes.commands.test.parseZedUrl handles line without column.Summary
+        \\  .found: bool = true
+        \\  .file_path: ?[]const u8
+        \\    "/path/to/file.zig"
+        \\  .line: ?u32
+        \\    100
+    ).expectEqual(summary);
 }
 
 test "parseZedUrl returns null for invalid format" {
-    try testing.expect(parseZedUrl(testing.allocator, "not a url") == null);
-    try testing.expect(parseZedUrl(testing.allocator, "file:///path/no-line") == null);
-    try testing.expect(parseZedUrl(testing.allocator, "https://example.com#L1") == null);
+    const summary = .{
+        .not_url = parseZedUrl(testing.allocator, "not a url") == null,
+        .missing_line = parseZedUrl(testing.allocator, "file:///path/no-line") == null,
+        .wrong_scheme = parseZedUrl(testing.allocator, "https://example.com#L1") == null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\notes.commands.test.parseZedUrl returns null for invalid format__struct_<^\d+$>
+        \\  .not_url: bool = true
+        \\  .missing_line: bool = true
+        \\  .wrong_scheme: bool = true
+    ).expectEqual(summary);
 }
 
 test "setup creates .zed/settings.json with detected languages" {
@@ -454,10 +501,6 @@ test "setup creates .zed/settings.json with detected languages" {
     var result = try executeCommand(allocator, tmp_path, "/setup");
     defer result.deinit(allocator);
 
-    // Verify success
-    try testing.expect(result.success);
-    try testing.expect(mem.indexOf(u8, result.message, "Created .zed/settings.json") != null);
-
     // Verify .zed/settings.json was created
     const settings = try tmp_dir.dir.openFile(".zed/settings.json", .{});
     defer settings.close();
@@ -465,19 +508,34 @@ test "setup creates .zed/settings.json with detected languages" {
     var buf: [4096]u8 = undefined;
     const len = try settings.readAll(&buf);
     const content = buf[0..len];
-
-    // Verify JSON structure (includes lsp binary path for dev setup)
-    const required_patterns = [_][]const u8{
-        "\"languages\"",
-        "\"Zig\"",
-        "\"Python\"",
-        "\"banjo-notes\"",
-        "\"lsp\"",
-        "\"binary\"",
+    const summary = .{
+        .success = result.success,
+        .message = result.message,
+        .settings = content,
     };
-    for (required_patterns) |pattern| {
-        try testing.expect(mem.indexOf(u8, content, pattern) != null);
-    }
+    try (ohsnap{}).snap(@src(),
+        \\notes.commands.test.setup creates .zed/settings.json with detected languages__struct_<^\d+$>
+        \\  .success: bool = true
+        \\  .message: []const u8
+        \\    "Created .zed/settings.json with banjo-notes enabled for:
+        \\  - Zig
+        \\  - Python
+        \\
+        \\Reload Zed to activate the LSP."
+        \\  .settings: []u8
+        \\    "{
+        \\  "lsp": {
+        \\    "banjo-notes": {
+        \\      "binary": { "path": "/Users/joel/Work/banjo/zig-out/bin/banjo", "arguments": ["--lsp"] }
+        \\    }
+        \\  },
+        \\  "languages": {
+        \\    "Zig": { "language_servers": ["zls", "banjo-notes"] },
+        \\    "Python": { "language_servers": ["pyright", "banjo-notes"] }
+        \\  }
+        \\}
+        \\"
+    ).expectEqual(summary);
 }
 
 test "setup returns error for empty project" {
@@ -494,7 +552,14 @@ test "setup returns error for empty project" {
     var result = try executeCommand(allocator, tmp_path, "/setup");
     defer result.deinit(allocator);
 
-    // Verify failure
-    try testing.expect(!result.success);
-    try testing.expect(mem.indexOf(u8, result.message, "No supported languages") != null);
+    const summary = .{
+        .success = result.success,
+        .message = result.message,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\notes.commands.test.setup returns error for empty project__struct_<^\d+$>
+        \\  .success: bool = false
+        \\  .message: []const u8
+        \\    "No supported languages found in project."
+    ).expectEqual(summary);
 }

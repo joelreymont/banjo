@@ -126,12 +126,27 @@ pub const Snap = struct {
     pub fn diff(snapshot: *const Snap, got: []const u8, test_it: bool) !void {
         // Check for an update first
         const update_idx = std.mem.indexOf(u8, snapshot.text, "<!update>");
+        const update_all = std.posix.getenv("OHSNAP_UPDATE_ALL") != null;
         if (update_idx) |idx| {
             if (idx == 0) {
                 const match = regex_finder.match(snapshot.text);
                 if (match) |_| {
+                    if (update_all) {
+                        _ = patchAndUpdate(snapshot, got) catch |err| switch (err) {
+                            error.SnapUpdated => {},
+                            else => return err,
+                        };
+                        return;
+                    }
                     return try patchAndUpdate(snapshot, got);
                 } else {
+                    if (update_all) {
+                        _ = updateSnap(snapshot, got) catch |err| switch (err) {
+                            error.SnapUpdated => {},
+                            else => return err,
+                        };
+                        return;
+                    }
                     return try updateSnap(snapshot, got);
                 }
             } else {
@@ -214,7 +229,7 @@ pub const Snap = struct {
         {
             var lines = std.mem.splitScalar(u8, got, '\n');
             while (lines.next()) |line| {
-                try file_text_updated.writer(allocator).print("{s}\\\\{s}\n", .{ indent, line });
+                try file_text_updated.writer(arena_allocator).print("{s}\\\\{s}\n", .{ indent, line });
             }
         }
         try file_text_updated.appendSlice(arena_allocator, snapshot_suffix);

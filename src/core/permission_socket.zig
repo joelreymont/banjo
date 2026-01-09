@@ -141,16 +141,13 @@ pub const PermissionSocket = struct {
 
 test "PermissionSocket create and close" {
     const allocator = std.testing.allocator;
+    const ohsnap = @import("ohsnap");
 
     var sock = try PermissionSocket.create(allocator, "test-session-123");
 
-    // Verify socket was created
-    try std.testing.expect(sock.fd() != 0);
-    try std.testing.expect(std.mem.indexOf(u8, sock.getPath(), "test-session-123") != null);
-
-    // Socket file should exist
+    const fd_nonzero = sock.fd() != 0;
+    const path_contains = std.mem.indexOf(u8, sock.getPath(), "test-session-123") != null;
     const stat = std.fs.cwd().statFile(sock.getPath()) catch null;
-    try std.testing.expect(stat != null);
 
     // Close and verify cleanup
     const path_copy = try allocator.dupe(u8, sock.getPath());
@@ -158,7 +155,22 @@ test "PermissionSocket create and close" {
 
     sock.close();
 
-    // Socket file should be removed
     const stat2 = std.fs.cwd().statFile(path_copy) catch null;
-    try std.testing.expect(stat2 == null);
+
+    var out: std.io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.print(
+        "fd_nonzero: {any}\npath_contains: {any}\nstat_present: {any}\nstat_after: {any}\n",
+        .{ fd_nonzero, path_contains, stat != null, stat2 != null },
+    );
+    const snapshot = try out.toOwnedSlice();
+    defer allocator.free(snapshot);
+
+    try (ohsnap{}).snap(@src(),
+        \\fd_nonzero: true
+        \\path_contains: true
+        \\stat_present: true
+        \\stat_after: false
+        \\
+    ).diff(snapshot, true);
 }

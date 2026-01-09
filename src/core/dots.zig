@@ -81,11 +81,19 @@ pub fn outputHasPendingTasks(allocator: Allocator, output: []const u8) !bool {
 }
 
 const testing = std.testing;
+const ohsnap = @import("ohsnap");
 
 test "outputHasPendingTasks detects pending tasks" {
     const has_tasks = try outputHasPendingTasks(testing.allocator, "[{\"status\":\"open\"}]");
-    try testing.expect(has_tasks);
-
     const no_tasks = try outputHasPendingTasks(testing.allocator, "[]");
-    try testing.expect(!no_tasks);
+    var out: std.io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try out.writer.print("has_tasks: {any}\nno_tasks: {any}\n", .{ has_tasks, no_tasks });
+    const summary = try out.toOwnedSlice();
+    defer testing.allocator.free(summary);
+    try (ohsnap{}).snap(@src(),
+        \\has_tasks: true
+        \\no_tasks: false
+        \\
+    ).diff(summary, true);
 }

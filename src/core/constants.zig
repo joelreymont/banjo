@@ -20,6 +20,9 @@ pub const test_timeout_ms: i64 = 60_000;
 /// Socket read timeout for permission hooks (5 seconds)
 pub const socket_read_timeout_ms: i64 = 5_000;
 
+/// WebSocket handshake timeout for MCP/nvim connections (5 seconds)
+pub const websocket_handshake_timeout_ms: i64 = 5_000;
+
 // Buffer sizes
 
 /// Standard buffer for formatting, small messages (4KB)

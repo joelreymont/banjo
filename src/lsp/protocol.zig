@@ -454,7 +454,9 @@ test "Position serializes correctly" {
     try jw.write(pos);
     const json = try out.toOwnedSlice();
     defer testing.allocator.free(json);
-    try testing.expectEqualStrings("{\"line\":10,\"character\":5}", json);
+    try (ohsnap{}).snap(@src(),
+        \\{"line":10,"character":5}
+    ).diff(json, true);
 }
 
 test "Diagnostic serializes with severity" {
@@ -477,11 +479,9 @@ test "Diagnostic serializes with severity" {
     try jw.write(diag);
     const json = try out.toOwnedSlice();
     defer testing.allocator.free(json);
-
-    // Verify key parts
-    try testing.expect(mem.indexOf(u8, json, "\"severity\":3") != null);
-    try testing.expect(mem.indexOf(u8, json, "\"source\":\"banjo\"") != null);
-    try testing.expect(mem.indexOf(u8, json, "\"message\":\"Note: test note\"") != null);
+    try (ohsnap{}).snap(@src(),
+        \\{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":10}},"severity":3,"source":"banjo","message":"Note: test note"}
+    ).diff(json, true);
 }
 
 test "ServerCapabilities serializes" {
@@ -502,10 +502,9 @@ test "ServerCapabilities serializes" {
     try jw.write(caps);
     const json = try out.toOwnedSlice();
     defer testing.allocator.free(json);
-
-    try testing.expect(mem.indexOf(u8, json, "\"openClose\":true") != null);
-    try testing.expect(mem.indexOf(u8, json, "\"change\":1") != null);
-    try testing.expect(mem.indexOf(u8, json, "\"codeActionProvider\":true") != null);
+    try (ohsnap{}).snap(@src(),
+        \\{"textDocumentSync":{"openClose":true,"change":1},"codeActionProvider":true}
+    ).diff(json, true);
 }
 
 test "Transport reads Content-Length message" {
@@ -516,13 +515,30 @@ test "Transport reads Content-Length message" {
     var transport = Transport.init(testing.allocator, fbs.reader().any(), std.io.null_writer.any());
     defer transport.deinit();
 
-    const parsed = try transport.readMessage();
-    try testing.expect(parsed != null);
-    var p = parsed.?;
-    defer p.deinit();
-
-    try testing.expectEqualStrings("initialize", p.request.method);
-    try testing.expectEqual(@as(i64, 1), p.request.id.?.number);
+    var parsed = try transport.readMessage();
+    defer if (parsed) |*item| item.deinit();
+    const Summary = struct {
+        found: bool,
+        method: ?[]const u8,
+        id: ?jsonrpc.Request.Id,
+    };
+    const summary: Summary = if (parsed) |item| .{
+        .found = true,
+        .method = item.request.method,
+        .id = item.request.id,
+    } else .{
+        .found = false,
+        .method = null,
+        .id = null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.protocol.test.Transport reads Content-Length message.Summary
+        \\  .found: bool = true
+        \\  .method: ?[]const u8
+        \\    "initialize"
+        \\  .id: ?jsonrpc.Request.Id
+        \\    .number: i64 = 1
+    ).expectEqual(summary);
 }
 
 test "Transport handles missing Content-Length" {

@@ -28,6 +28,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     main_mod.addOptions("config", options);
+    if (b.lazyDependency("zcheck", .{
+        .target = target,
+        .optimize = optimize,
+    })) |zcheck_dep| {
+        main_mod.addImport("zcheck", zcheck_dep.module("zcheck"));
+    }
 
     // Main executable
     const exe = b.addExecutable(.{
@@ -68,6 +74,12 @@ pub fn build(b: *std.Build) void {
     })) |ohsnap_dep| {
         unit_tests.root_module.addImport("ohsnap", ohsnap_dep.module("ohsnap"));
     }
+    if (b.lazyDependency("zcheck", .{
+        .target = target,
+        .optimize = optimize,
+    })) |zcheck_dep| {
+        unit_tests.root_module.addImport("zcheck", zcheck_dep.module("zcheck"));
+    }
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
@@ -98,6 +110,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     })) |ohsnap_dep| {
         live_tests.root_module.addImport("ohsnap", ohsnap_dep.module("ohsnap"));
+    }
+    if (b.lazyDependency("zcheck", .{
+        .target = target,
+        .optimize = optimize,
+    })) |zcheck_dep| {
+        live_tests.root_module.addImport("zcheck", zcheck_dep.module("zcheck"));
     }
 
     const run_live_tests = b.addRunArtifact(live_tests);
