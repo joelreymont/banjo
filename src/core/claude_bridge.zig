@@ -740,6 +740,12 @@ pub const Bridge = struct {
             return null;
         }
 
+        const msg = try parseStreamMessageLine(&arena, line);
+        keep_arena = true;
+        return msg;
+    }
+
+    fn parseStreamMessageLine(arena: *std.heap.ArenaAllocator, line: []const u8) !StreamMessage {
         const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), line, .{});
         const envelope = std.json.parseFromValueLeaky(StreamEnvelope, arena.allocator(), parsed.value, .{
             .ignore_unknown_fields = true,
@@ -752,13 +758,12 @@ pub const Bridge = struct {
 
         const subtype = if (envelope) |env| env.subtype else null;
 
-        keep_arena = true;
         return StreamMessage{
             .type = msg_type,
             .subtype = subtype,
             .envelope = envelope,
             .raw = parsed.value,
-            .arena = arena,
+            .arena = arena.*,
         };
     }
 
@@ -860,14 +865,32 @@ const testing = std.testing;
 const ohsnap = @import("ohsnap");
 
 test "MessageType.fromString" {
-    try testing.expectEqual(MessageType.system, MessageType.fromString("system"));
-    try testing.expectEqual(MessageType.assistant, MessageType.fromString("assistant"));
-    try testing.expectEqual(MessageType.result, MessageType.fromString("result"));
-    try testing.expectEqual(MessageType.unknown, MessageType.fromString("invalid"));
+    const summary = .{
+        .system = @tagName(MessageType.fromString("system")),
+        .assistant = @tagName(MessageType.fromString("assistant")),
+        .result = @tagName(MessageType.fromString("result")),
+        .invalid = @tagName(MessageType.fromString("invalid")),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.claude_bridge.test.MessageType.fromString__struct_<^\d+$>
+        \\  .system: [:0]const u8
+        \\    "system"
+        \\  .assistant: [:0]const u8
+        \\    "assistant"
+        \\  .result: [:0]const u8
+        \\    "result"
+        \\  .invalid: [:0]const u8
+        \\    "unknown"
+    ).expectEqual(summary);
 }
 
 test "SystemSubtype.fromString parses auth_required" {
-    try testing.expectEqual(SystemSubtype.auth_required, SystemSubtype.fromString("auth_required").?);
+    const summary = .{ .auth_required = @tagName(SystemSubtype.fromString("auth_required").?) };
+    try (ohsnap{}).snap(@src(),
+        \\core.claude_bridge.test.SystemSubtype.fromString parses auth_required__struct_<^\d+$>
+        \\  .auth_required: [:0]const u8
+        \\    "auth_required"
+    ).expectEqual(summary);
 }
 
 test "StreamMessage getSystemSubtype returns auth_required" {
@@ -885,7 +908,33 @@ test "StreamMessage getSystemSubtype returns auth_required" {
     };
     defer msg.deinit();
 
-    try testing.expectEqual(SystemSubtype.auth_required, msg.getSystemSubtype().?);
+    const summary = .{ .subtype = @tagName(msg.getSystemSubtype().?) };
+    try (ohsnap{}).snap(@src(),
+        \\core.claude_bridge.test.StreamMessage getSystemSubtype returns auth_required__struct_<^\d+$>
+        \\  .subtype: [:0]const u8
+        \\    "auth_required"
+    ).expectEqual(summary);
+}
+
+test "parseStreamMessageLine detects auth_required subtype" {
+    const line =
+        \\{"type":"system","subtype":"auth_required","content":"Auth required"}
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var msg = try Bridge.parseStreamMessageLine(&arena, line);
+    defer msg.deinit();
+
+    const summary = .{
+        .type = @tagName(msg.type),
+        .subtype = @tagName(msg.getSystemSubtype().?),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.claude_bridge.test.parseStreamMessageLine detects auth_required subtype__struct_<^\d+$>
+        \\  .type: [:0]const u8
+        \\    "system"
+        \\  .subtype: [:0]const u8
+        \\    "auth_required"
+    ).expectEqual(summary);
 }
 
 test "StreamMessage parsing" {
@@ -904,8 +953,16 @@ test "StreamMessage parsing" {
     };
     defer msg.deinit();
 
-    try testing.expectEqualStrings("Hello", msg.getContent().?);
-    try testing.expect(!msg.isToolUse());
+    const summary = .{
+        .content = msg.getContent(),
+        .is_tool_use = msg.isToolUse(),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.claude_bridge.test.StreamMessage parsing__struct_<^\d+$>
+        \\  .content: ?[]const u8
+        \\    "Hello"
+        \\  .is_tool_use: bool = false
+    ).expectEqual(summary);
 }
 
 test "StreamMessage getEnvelope caches parsed envelope" {
@@ -924,9 +981,15 @@ test "StreamMessage getEnvelope caches parsed envelope" {
     };
     defer msg.deinit();
 
-    try testing.expect(msg.envelope == null);
+    const before = msg.envelope == null;
     _ = msg.getEnvelope() orelse return error.TestUnexpectedResult;
-    try testing.expect(msg.envelope != null);
+    const after = msg.envelope != null;
+    const summary = .{ .before = before, .after = after };
+    try (ohsnap{}).snap(@src(),
+        \\core.claude_bridge.test.StreamMessage getEnvelope caches parsed envelope__struct_<^\d+$>
+        \\  .before: bool = true
+        \\  .after: bool = true
+    ).expectEqual(summary);
 }
 
 test "StreamMessage tool use parsing" {
@@ -945,8 +1008,14 @@ test "StreamMessage tool use parsing" {
     defer msg.deinit();
 
     const tool = msg.getToolUse().?;
-    try testing.expectEqualStrings("tool_1", tool.id);
-    try testing.expectEqualStrings("Read", tool.name);
+    const summary = .{ .id = tool.id, .name = tool.name };
+    try (ohsnap{}).snap(@src(),
+        \\core.claude_bridge.test.StreamMessage tool use parsing__struct_<^\d+$>
+        \\  .id: []const u8
+        \\    "tool_1"
+        \\  .name: []const u8
+        \\    "Read"
+    ).expectEqual(summary);
 }
 
 test "StreamMessage tool result parsing" {
@@ -965,15 +1034,26 @@ test "StreamMessage tool result parsing" {
     defer msg.deinit();
 
     const result = msg.getToolResult().?;
-    try testing.expectEqualStrings("tool_2", result.id);
-    try testing.expectEqualStrings("ok", result.content.?);
-    try testing.expect(!result.is_error);
-
-    // Verify raw JSON is captured
-    try testing.expect(result.raw != .null);
     const raw_obj = result.raw.object;
-    try testing.expectEqualStrings("tool_result", raw_obj.get("type").?.string);
-    try testing.expectEqualStrings("tool_2", raw_obj.get("tool_use_id").?.string);
+    const summary = .{
+        .id = result.id,
+        .content = result.content,
+        .is_error = result.is_error,
+        .raw_type = raw_obj.get("type").?.string,
+        .raw_tool_use_id = raw_obj.get("tool_use_id").?.string,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.claude_bridge.test.StreamMessage tool result parsing__struct_<^\d+$>
+        \\  .id: []const u8
+        \\    "tool_2"
+        \\  .content: ?[]const u8
+        \\    "ok"
+        \\  .is_error: bool = false
+        \\  .raw_type: []const u8
+        \\    "tool_result"
+        \\  .raw_tool_use_id: []const u8
+        \\    "tool_2"
+    ).expectEqual(summary);
 }
 
 test "StreamMessage tool result parsing from user message" {
@@ -992,9 +1072,19 @@ test "StreamMessage tool result parsing from user message" {
     defer msg.deinit();
 
     const result = msg.getToolResult().?;
-    try testing.expectEqualStrings("tool_3", result.id);
-    try testing.expectEqualStrings("fail", result.content.?);
-    try testing.expect(result.is_error);
+    const summary = .{
+        .id = result.id,
+        .content = result.content,
+        .is_error = result.is_error,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.claude_bridge.test.StreamMessage tool result parsing from user message__struct_<^\d+$>
+        \\  .id: []const u8
+        \\    "tool_3"
+        \\  .content: ?[]const u8
+        \\    "fail"
+        \\  .is_error: bool = true
+    ).expectEqual(summary);
 }
 
 const LiveSnapshotError = error{
@@ -1192,7 +1282,8 @@ test "snapshot: Claude Code control messages are rejected" {
 // Property Tests for Message Parsing
 // =============================================================================
 
-const quickcheck = @import("../util/quickcheck.zig");
+const zcheck = @import("zcheck");
+const zcheck_seed_base: u64 = 0x7a2c_14bf_9d03_5e61;
 
 /// Build a test message JSON value
 fn buildTestMessage(
@@ -1240,20 +1331,29 @@ fn buildTestMessage(
 
 test "property: MessageType.fromString covers all variants" {
     // All known types should parse correctly
-    const known_types = [_]struct { str: []const u8, expected: MessageType }{
-        .{ .str = "system", .expected = .system },
-        .{ .str = "assistant", .expected = .assistant },
-        .{ .str = "user", .expected = .user },
-        .{ .str = "result", .expected = .result },
-        .{ .str = "stream_event", .expected = .stream_event },
+    const summary = .{
+        .system = @tagName(MessageType.fromString("system")),
+        .assistant = @tagName(MessageType.fromString("assistant")),
+        .user = @tagName(MessageType.fromString("user")),
+        .result = @tagName(MessageType.fromString("result")),
+        .stream_event = @tagName(MessageType.fromString("stream_event")),
     };
-
-    for (known_types) |t| {
-        try testing.expectEqual(t.expected, MessageType.fromString(t.str));
-    }
+    try (ohsnap{}).snap(@src(),
+        \\core.claude_bridge.test.property: MessageType.fromString covers all variants__struct_<^\d+$>
+        \\  .system: [:0]const u8
+        \\    "system"
+        \\  .assistant: [:0]const u8
+        \\    "assistant"
+        \\  .user: [:0]const u8
+        \\    "user"
+        \\  .result: [:0]const u8
+        \\    "result"
+        \\  .stream_event: [:0]const u8
+        \\    "stream_event"
+    ).expectEqual(summary);
 
     // Unknown strings should return .unknown
-    try quickcheck.check(struct {
+    try zcheck.check(struct {
         fn prop(args: struct { byte1: u8, byte2: u8, byte3: u8 }) bool {
             // Build a random string that's unlikely to match known types
             const random_str = [_]u8{ args.byte1, args.byte2, args.byte3 };
@@ -1265,12 +1365,12 @@ test "property: MessageType.fromString covers all variants" {
                 std.mem.eql(u8, &random_str, "use") or
                 std.mem.eql(u8, &random_str, "res");
         }
-    }.prop, .{});
+    }.prop, .{ .seed = zcheck_seed_base + 1 });
 }
 
 test "property: getToolName/getToolId extraction preserves input values" {
     // Property: for any tool name and id, extraction returns the original values
-    try quickcheck.check(struct {
+    try zcheck.check(struct {
         fn prop(args: struct { name_seed: u32, id_seed: u32 }) bool {
             // Generate deterministic "random" names from seeds
             var name_buf: [16]u8 = undefined;
@@ -1297,11 +1397,11 @@ test "property: getToolName/getToolId extraction preserves input values" {
             const extracted_id = msg.getToolId() orelse return false;
             return std.mem.eql(u8, extracted_name, name) and std.mem.eql(u8, extracted_id, id);
         }
-    }.prop, .{});
+    }.prop, .{ .seed = zcheck_seed_base + 2 });
 }
 
 test "property: getContent extraction preserves input text" {
-    try quickcheck.check(struct {
+    try zcheck.check(struct {
         fn prop(args: struct { text_seed: u32 }) bool {
             // Generate deterministic text from seed (avoid special chars that break JSON)
             var text_buf: [32]u8 = undefined;
@@ -1325,7 +1425,7 @@ test "property: getContent extraction preserves input text" {
             const extracted = msg.getContent() orelse return false;
             return std.mem.eql(u8, extracted, text);
         }
-    }.prop, .{});
+    }.prop, .{ .seed = zcheck_seed_base + 3 });
 }
 
 test "getToolName/getToolId return null for non-tool messages" {
@@ -1339,21 +1439,53 @@ test "getToolName/getToolId return null for non-tool messages" {
     };
     const types = [_]MessageType{ .assistant, .system, .result };
 
-    for (cases, types) |json, msg_type| {
-        const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{}) catch continue;
+    var summaries: [cases.len]struct {
+        msg_type: []const u8,
+        tool_name_null: bool,
+        tool_id_null: bool,
+    } = undefined;
+
+    for (cases, types, 0..) |json, msg_type, idx| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
         defer parsed.deinit();
         const arena = std.heap.ArenaAllocator.init(testing.allocator);
         var msg = StreamMessage{ .type = msg_type, .subtype = null, .raw = parsed.value, .arena = arena };
         defer msg.deinit();
-        try testing.expect(msg.getToolName() == null);
-        try testing.expect(msg.getToolId() == null);
+        summaries[idx] = .{
+            .msg_type = @tagName(msg_type),
+            .tool_name_null = msg.getToolName() == null,
+            .tool_id_null = msg.getToolId() == null,
+        };
     }
+    try (ohsnap{}).snap(@src(),
+        \\[3]core.claude_bridge.test.getToolName/getToolId return null for non-tool messages__struct_<^\d+$>
+        \\  [0]: core.claude_bridge.test.getToolName/getToolId return null for non-tool messages__struct_<^\d+$>
+        \\    .msg_type: []const u8
+        \\      "assistant"
+        \\    .tool_name_null: bool = true
+        \\    .tool_id_null: bool = true
+        \\  [1]: core.claude_bridge.test.getToolName/getToolId return null for non-tool messages__struct_<^\d+$>
+        \\    .msg_type: []const u8
+        \\      "system"
+        \\    .tool_name_null: bool = true
+        \\    .tool_id_null: bool = true
+        \\  [2]: core.claude_bridge.test.getToolName/getToolId return null for non-tool messages__struct_<^\d+$>
+        \\    .msg_type: []const u8
+        \\      "result"
+        \\    .tool_name_null: bool = true
+        \\    .tool_id_null: bool = true
+    ).expectEqual(summaries);
 }
 
 test "property: getStopReason only works for result type" {
     const types = [_]MessageType{ .system, .assistant, .user, .result, .stream_event };
 
-    for (types) |msg_type| {
+    var summaries: [types.len]struct {
+        msg_type: []const u8,
+        reason: ?[]const u8,
+    } = undefined;
+
+    for (types, 0..) |msg_type, idx| {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         const alloc = arena.allocator();
 
@@ -1369,12 +1501,39 @@ test "property: getStopReason only works for result type" {
         defer msg.deinit();
 
         const reason = msg.getStopReason();
-        if (msg_type == .result) {
-            try testing.expect(reason != null);
-        } else {
-            try testing.expect(reason == null);
-        }
+        summaries[idx] = .{
+            .msg_type = @tagName(msg_type),
+            .reason = reason,
+        };
     }
+    try (ohsnap{}).snap(@src(),
+        \\[5]core.claude_bridge.test.property: getStopReason only works for result type__struct_<^\d+$>
+        \\  [0]: core.claude_bridge.test.property: getStopReason only works for result type__struct_<^\d+$>
+        \\    .msg_type: []const u8
+        \\      "system"
+        \\    .reason: ?[]const u8
+        \\      null
+        \\  [1]: core.claude_bridge.test.property: getStopReason only works for result type__struct_<^\d+$>
+        \\    .msg_type: []const u8
+        \\      "assistant"
+        \\    .reason: ?[]const u8
+        \\      null
+        \\  [2]: core.claude_bridge.test.property: getStopReason only works for result type__struct_<^\d+$>
+        \\    .msg_type: []const u8
+        \\      "user"
+        \\    .reason: ?[]const u8
+        \\      null
+        \\  [3]: core.claude_bridge.test.property: getStopReason only works for result type__struct_<^\d+$>
+        \\    .msg_type: []const u8
+        \\      "result"
+        \\    .reason: ?[]const u8
+        \\      "end_turn"
+        \\  [4]: core.claude_bridge.test.property: getStopReason only works for result type__struct_<^\d+$>
+        \\    .msg_type: []const u8
+        \\      "stream_event"
+        \\    .reason: ?[]const u8
+        \\      null
+    ).expectEqual(summaries);
 }
 
 test "property: system messages extract content from content or message field" {
@@ -1390,7 +1549,7 @@ test "property: system messages extract content from content or message field" {
         .arena = arena1,
     };
     defer msg1.deinit();
-    try testing.expectEqualStrings("system_content", msg1.getContent().?);
+    const content_primary = msg1.getContent();
 
     // Test message field fallback
     var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1409,5 +1568,16 @@ test "property: system messages extract content from content or message field" {
         .arena = arena2,
     };
     defer msg2.deinit();
-    try testing.expectEqualStrings("fallback_message", msg2.getContent().?);
+    const content_fallback = msg2.getContent();
+    const summary = .{
+        .content = content_primary,
+        .fallback = content_fallback,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.claude_bridge.test.property: system messages extract content from content or message field__struct_<^\d+$>
+        \\  .content: ?[]const u8
+        \\    "system_content"
+        \\  .fallback: ?[]const u8
+        \\    "fallback_message"
+    ).expectEqual(summary);
 }

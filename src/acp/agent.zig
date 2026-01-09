@@ -25,6 +25,7 @@ const permission_socket = @import("../core/permission_socket.zig");
 const constants = @import("../core/constants.zig");
 const tool_categories = @import("../core/tool_categories.zig");
 const session_id_util = @import("../core/session_id.zig");
+const auth_markers = @import("../core/auth_markers.zig");
 const lsp_uri = @import("../lsp/uri.zig");
 const config = @import("config");
 const test_env = @import("../util/test_env.zig");
@@ -42,7 +43,6 @@ const resource_line_limit: u32 = 200; // limit resource excerpt lines to reduce 
 const max_tool_preview_bytes: usize = 1024; // keep tool call previews readable in the panel
 const default_model_id = "sonnet";
 const prompt_poll_ms: i64 = 250;
-const auth_markers = [_][]const u8{ "/login", "login", "log in", "authenticate" };
 
 const SessionConfig = struct {
     auto_resume: bool,
@@ -56,16 +56,9 @@ fn autoResumeFromEnv() bool {
     return falsey_env_values.get(val) == null;
 }
 
-fn containsAuthMarker(text: []const u8) bool {
-    for (auth_markers) |marker| {
-        if (std.mem.indexOf(u8, text, marker) != null) return true;
-    }
-    return false;
-}
-
 /// Check if content indicates authentication is required
 fn isAuthRequiredContent(content: []const u8) bool {
-    return containsAuthMarker(content);
+    return auth_markers.containsAuthMarker(content);
 }
 
 /// Map CLI result subtypes to ACP stop reasons
@@ -958,7 +951,7 @@ pub const Agent = struct {
                 .sessionUpdate = .agent_message_chunk,
                 .content = .{
                     .type = "text",
-                    .text = "Created `.zed/settings.json` to enable banjo-notes LSP.\n\n**Reload workspace** (Cmd+Shift+P → \"workspace: reload\") to activate note features.",
+                    .text = "Created `.zed/settings.json` to enable banjo-notes LSP.\n\n**Reload workspace** (Cmd+Shift+P -> \"workspace: reload\") to activate note features.",
                 },
             });
         }
@@ -1146,7 +1139,16 @@ pub const Agent = struct {
         session.processing_queue = true;
         defer session.processing_queue = false;
 
+        if (session.cancelled.load(.acquire)) {
+            self.clearPromptQueue(session);
+            return;
+        }
+
         while (session.prompt_queue.items.len > 0) {
+            if (session.cancelled.load(.acquire)) {
+                self.clearPromptQueue(session);
+                return;
+            }
             const queued = session.prompt_queue.orderedRemove(0);
             defer queued.deinit(self.allocator);
 
@@ -3202,6 +3204,9 @@ pub const Agent = struct {
         if (self.sessions.get(parsed.value.sessionId)) |session| {
             session.cancelled.store(true, .release);
             self.clearPendingExecuteTools(session);
+            self.clearPendingEditTools(session);
+            self.clearQuietToolIds(session);
+            self.clearPromptQueue(session);
             if (session.bridge) |*b| {
                 b.deinit();
                 session.bridge = null;
@@ -3462,6 +3467,30 @@ pub const Agent = struct {
         session.pending_execute_tools.clearRetainingCapacity();
     }
 
+    fn clearPendingEditTools(self: *Agent, session: *Session) void {
+        var it = session.pending_edit_tools.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        session.pending_edit_tools.clearRetainingCapacity();
+    }
+
+    fn clearQuietToolIds(self: *Agent, session: *Session) void {
+        var it = session.quiet_tool_ids.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        session.quiet_tool_ids.clearRetainingCapacity();
+    }
+
+    fn clearPromptQueue(self: *Agent, session: *Session) void {
+        for (session.prompt_queue.items) |item| {
+            item.deinit(self.allocator);
+        }
+        session.prompt_queue.clearRetainingCapacity();
+    }
+
     fn handleResumeSession(self: *Agent, request: jsonrpc.Request) !void {
         const parsed = std.json.parseFromValue(ResumeSessionParams, self.allocator, request.params orelse .null, .{
             .ignore_unknown_fields = true,
@@ -3666,7 +3695,7 @@ pub const Agent = struct {
         if (should_trigger and dots.hasPendingTasks(self.allocator, session.cwd).has_tasks) {
             session.last_nudge_ms = std.time.milliTimestamp();
             log.info("Nudge enabled with pending dots, triggering continuation", .{});
-            try self.sendUserMessage(session_id, "🔄 continue working on pending dots");
+            try self.sendUserMessage(session_id, "dots: continue working on pending dots");
             _ = try self.triggerNudge(request, session, session_id);
         } else {
             try self.writer.writeTypedResponse(request.id, protocol.PromptResponse{ .stopReason = .end_turn });
@@ -4428,23 +4457,44 @@ test "configFromEnv returns defaults" {
 test "replaceFirst replaces only first occurrence" {
     const result = try replaceFirst(testing.allocator, "foo bar foo", "foo", "baz");
     defer testing.allocator.free(result);
-    try testing.expectEqualStrings("baz bar foo", result);
+    const summary = .{ .result = result };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.replaceFirst replaces only first occurrence__struct_<^\d+$>
+        \\  .result: []u8
+        \\    "baz bar foo"
+    ).expectEqual(summary);
 }
 
 test "replaceFirst returns copy when needle not found" {
     const result = try replaceFirst(testing.allocator, "hello world", "xyz", "abc");
     defer testing.allocator.free(result);
-    try testing.expectEqualStrings("hello world", result);
+    const summary = .{ .result = result };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.replaceFirst returns copy when needle not found__struct_<^\d+$>
+        \\  .result: []u8
+        \\    "hello world"
+    ).expectEqual(summary);
 }
 
 test "TurnError.isMaxTurnError detects max turn errors" {
     const TurnError = codex_cli.TurnError;
-    try testing.expect((TurnError{ .code = "max_turns" }).isMaxTurnError());
-    try testing.expect((TurnError{ .code = "max_turn_requests" }).isMaxTurnError());
-    try testing.expect((TurnError{ .message = "max_turn_requests" }).isMaxTurnError());
-    try testing.expect((TurnError{ .type = "error_max_turns" }).isMaxTurnError());
-    try testing.expect(!(TurnError{ .code = "budget" }).isMaxTurnError());
-    try testing.expect(!(TurnError{ .code = "budget_exceeded" }).isMaxTurnError());
+    const summary = .{
+        .code_max_turns = (TurnError{ .code = "max_turns" }).isMaxTurnError(),
+        .code_max_turn_requests = (TurnError{ .code = "max_turn_requests" }).isMaxTurnError(),
+        .message_max_turn_requests = (TurnError{ .message = "max_turn_requests" }).isMaxTurnError(),
+        .type_error_max_turns = (TurnError{ .type = "error_max_turns" }).isMaxTurnError(),
+        .code_budget = (TurnError{ .code = "budget" }).isMaxTurnError(),
+        .code_budget_exceeded = (TurnError{ .code = "budget_exceeded" }).isMaxTurnError(),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.TurnError.isMaxTurnError detects max turn errors__struct_<^\d+$>
+        \\  .code_max_turns: bool = true
+        \\  .code_max_turn_requests: bool = true
+        \\  .message_max_turn_requests: bool = true
+        \\  .type_error_max_turns: bool = true
+        \\  .code_budget: bool = false
+        \\  .code_budget_exceeded: bool = false
+    ).expectEqual(summary);
 }
 
 fn createFakeBinary(allocator: Allocator, dir: *std.testing.TmpDir, name: []const u8) ![]u8 {
@@ -4467,8 +4517,11 @@ test "detectEngines hides codex when PATH is empty and CODEX_EXECUTABLE is missi
     defer guard_codex.deinit();
 
     const availability = detectEngines();
-    try testing.expect(availability.claude);
-    try testing.expect(!availability.codex);
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.EngineAvailability
+        \\  .claude: bool = true
+        \\  .codex: bool = false
+    ).expectEqual(availability);
 }
 
 test "detectEngines hides claude when PATH is empty and CLAUDE_CODE_EXECUTABLE is missing" {
@@ -4485,8 +4538,11 @@ test "detectEngines hides claude when PATH is empty and CLAUDE_CODE_EXECUTABLE i
     defer guard_claude.deinit();
 
     const availability = detectEngines();
-    try testing.expect(!availability.claude);
-    try testing.expect(availability.codex);
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.EngineAvailability
+        \\  .claude: bool = false
+        \\  .codex: bool = true
+    ).expectEqual(availability);
 }
 
 test "Agent init/deinit" {
@@ -4642,8 +4698,13 @@ test "Agent requestPermission sends request and parses response" {
 
     const outcome = try agent.requestPermission(&session, session.id, "tc-1", "Bash", .execute, .{ .string = "ls" });
     defer if (outcome.optionId) |option_id| testing.allocator.free(option_id);
-    try testing.expectEqual(protocol.PermissionOutcomeKind.selected, outcome.outcome);
-    try testing.expectEqualStrings("allow_once", outcome.optionId.?);
+    try (ohsnap{}).snap(@src(),
+        \\acp.protocol.PermissionOutcome
+        \\  .outcome: acp.protocol.PermissionOutcomeKind
+        \\    .selected
+        \\  .optionId: ?[]const u8
+        \\    "allow_once"
+    ).expectEqual(outcome);
 
     try (ohsnap{}).snap(@src(),
         \\{"jsonrpc":"2.0","method":"session/request_permission","params":{"sessionId":"session-1","toolCall":{"toolCallId":"tc-1","title":"Bash","kind":"execute","status":"pending","rawInput":"ls"},"options":[{"kind":"allow_once","name":"Allow once","optionId":"allow_once"},{"kind":"allow_always","name":"Allow for session","optionId":"allow_always"},{"kind":"reject_once","name":"Deny","optionId":"reject_once"},{"kind":"reject_always","name":"Deny for session","optionId":"reject_always"}]},"id":1}
@@ -4690,12 +4751,25 @@ test "Agent requestPermissionFromClient stores allow_always choice" {
         .session_id = "session-1",
     };
     const decision1 = try agent.requestPermissionFromClient(&session, req);
-    try testing.expectEqualStrings("allow", decision1.behavior);
-    try testing.expect(session.always_allowed_tools.contains("Bash"));
+    const summary1 = .{
+        .behavior = decision1.behavior,
+        .always_allowed = session.always_allowed_tools.contains("Bash"),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.Agent requestPermissionFromClient stores allow_always choice__struct_<^\d+$>
+        \\  .behavior: []const u8
+        \\    "allow"
+        \\  .always_allowed: bool = true
+    ).expectEqual(summary1);
 
     // Second call - should return immediately without prompting
     const decision2 = try agent.requestPermissionFromClient(&session, req);
-    try testing.expectEqualStrings("allow", decision2.behavior);
+    const summary2 = .{ .behavior = decision2.behavior };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.Agent requestPermissionFromClient stores allow_always choice__struct_<^\d+$>
+        \\  .behavior: []const u8
+        \\    "allow"
+    ).expectEqual(summary2);
 }
 
 test "bypass mode skips permission prompts" {
@@ -4716,7 +4790,12 @@ test "bypass mode skips permission prompts" {
     defer session.deinit(testing.allocator);
 
     // In bypass mode, permission requests should be auto-approved
-    try testing.expectEqual(protocol.PermissionMode.bypassPermissions, session.permission_mode);
+    const summary = .{ .mode = @tagName(session.permission_mode) };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.bypass mode skips permission prompts__struct_<^\d+$>
+        \\  .mode: [:0]const u8
+        \\    "bypassPermissions"
+    ).expectEqual(summary);
 }
 
 test "permission socket auto-approves in bypass mode" {
@@ -4732,8 +4811,15 @@ test "permission socket auto-approves in bypass mode" {
 
     // Create permission socket
     try session.createPermissionSocket(testing.allocator);
-    try testing.expect(session.permission_socket != null);
-    try testing.expect(session.permission_socket_path != null);
+    const socket_summary = .{
+        .socket = session.permission_socket != null,
+        .path = session.permission_socket_path != null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.permission socket auto-approves in bypass mode__struct_<^\d+$>
+        \\  .socket: bool = true
+        \\  .path: bool = true
+    ).expectEqual(socket_summary);
 
     // Connect to socket like Claude's hook would
     const client = std.net.connectUnixSocket(session.permission_socket_path.?) catch |err| {
@@ -4755,7 +4841,13 @@ test "permission socket auto-approves in bypass mode" {
     const response = buf[0..n];
 
     // Should be auto-approved
-    try testing.expect(std.mem.indexOf(u8, response, "\"decision\":\"allow\"") != null);
+    const summary = .{ .response = response };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.permission socket auto-approves in bypass mode__struct_<^\d+$>
+        \\  .response: []u8
+        \\    "{"decision":"allow"}
+        \\"
+    ).expectEqual(summary);
 }
 
 test "permission socket forwards to client in default mode" {
@@ -4800,7 +4892,13 @@ test "permission socket forwards to client in default mode" {
 
     // Verify ACP request was sent (check output contains session/request_permission)
     const output = tw.output.items;
-    try testing.expect(std.mem.indexOf(u8, output, "session/request_permission") != null);
+    const summary = .{ .output = output };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.permission socket forwards to client in default mode__struct_<^\d+$>
+        \\  .output: []u8
+        \\    "{"jsonrpc":"2.0","method":"session/request_permission","params":{"sessionId":"test-session","toolCall":{"toolCallId":"hook_tc-1","title":"Bash: ls","kind":"execute","status":"pending","rawInput":{"command":"ls"}},"options":[{"kind":"allow_once","name":"Allow","optionId":"allow_once"},{"kind":"allow_always","name":"Allow Always","optionId":"allow_always"},{"kind":"reject_once","name":"Deny","optionId":"reject_once"}]},"id":1}
+        \\"
+    ).expectEqual(summary);
 }
 
 test "Agent sendEngineText omits prefix in solo mode" {
@@ -4880,20 +4978,30 @@ test "Agent sendEngineToolCall skips quiet tools and tracks ID" {
     // Send a quiet tool (Read) - should produce no output and track ID
     try agent.sendEngineToolCall(&session, session.id, .claude, "tc-quiet", "Read", .read, null);
 
-    // Verify no output was produced
-    try testing.expectEqualStrings("", tw.getOutput());
-
-    // Verify the tool ID was tracked
-    try testing.expect(session.quiet_tool_ids.contains("tc-quiet"));
+    const first_summary = .{
+        .output = tw.getOutput(),
+        .quiet_tracked = session.quiet_tool_ids.contains("tc-quiet"),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.Agent sendEngineToolCall skips quiet tools and tracks ID__struct_<^\d+$>
+        \\  .output: []const u8
+        \\    ""
+        \\  .quiet_tracked: bool = true
+    ).expectEqual(first_summary);
 
     // Send result for the quiet tool - should also produce no output
     try agent.sendEngineToolResult(&session, session.id, .claude, "tc-quiet", "file contents", .completed, null, null, null);
 
-    // Still no output
-    try testing.expectEqualStrings("", tw.getOutput());
-
-    // ID should be consumed
-    try testing.expect(!session.quiet_tool_ids.contains("tc-quiet"));
+    const second_summary = .{
+        .output = tw.getOutput(),
+        .quiet_tracked = session.quiet_tool_ids.contains("tc-quiet"),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.Agent sendEngineToolCall skips quiet tools and tracks ID__struct_<^\d+$>
+        \\  .output: []const u8
+        \\    ""
+        \\  .quiet_tracked: bool = false
+    ).expectEqual(second_summary);
 }
 
 test "Agent requestWriteTextFile sends request" {
@@ -4931,7 +5039,11 @@ test "Agent requestWriteTextFile sends request" {
     defer session.deinit(testing.allocator);
 
     const ok = try agent.requestWriteTextFile(&session, session.id, "foo.txt", "hello");
-    try testing.expect(ok);
+    const summary = .{ .ok = ok };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.Agent requestWriteTextFile sends request__struct_<^\d+$>
+        \\  .ok: bool = true
+    ).expectEqual(summary);
 
     try (ohsnap{}).snap(@src(),
         \\{"jsonrpc":"2.0","method":"fs/write_text_file","params":{"sessionId":"session-1","path":"foo.txt","content":"hello"},"id":1}
@@ -5056,8 +5168,16 @@ test "Agent handleRequest - setMode" {
     ).diff(tw.getOutput(), true);
     // Bridge is NOT killed immediately (would cause use-after-free if prompt is running).
     // Instead, force_new_claude is set so next prompt restarts with new mode.
-    try testing.expect(agent.sessions.get(session_id).?.bridge != null);
-    try testing.expect(agent.sessions.get(session_id).?.force_new_claude);
+    const session_state = agent.sessions.get(session_id).?;
+    const summary = .{
+        .bridge = session_state.bridge != null,
+        .force_new_claude = session_state.force_new_claude,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.Agent handleRequest - setMode__struct_<^\d+$>
+        \\  .bridge: bool = true
+        \\  .force_new_claude: bool = true
+    ).expectEqual(summary);
 }
 
 test "Agent handleRequest - setMode session not found" {
@@ -5292,6 +5412,28 @@ test "Agent handleRequest - resumeSession existing" {
     try agent.handleRequest(create_request);
 
     const session_id = "session-test";
+    const session = agent.sessions.get(session_id).?;
+
+    const exec_tool = try testing.allocator.dupe(u8, "exec-tool");
+    try session.pending_execute_tools.put(exec_tool, {});
+
+    const edit_id = try testing.allocator.dupe(u8, "edit-tool");
+    const edit_info = Agent.EditInfo{
+        .path = try testing.allocator.dupe(u8, "file.txt"),
+        .old_text = try testing.allocator.dupe(u8, "old"),
+        .new_text = try testing.allocator.dupe(u8, "new"),
+    };
+    try session.pending_edit_tools.put(edit_id, edit_info);
+
+    const quiet_id = try testing.allocator.dupe(u8, "quiet-tool");
+    try session.quiet_tool_ids.put(quiet_id, {});
+
+    const params_json = try testing.allocator.dupe(u8, "null");
+    var queued = try Agent.Session.QueuedPrompt.init(testing.allocator, .{ .number = 9 }, params_json);
+    session.prompt_queue.append(testing.allocator, queued) catch |err| {
+        queued.deinit(testing.allocator);
+        return err;
+    };
 
     // Clear output
     tw.output.clearRetainingCapacity();
@@ -5318,13 +5460,15 @@ test "Agent handleRequest - resumeSession existing" {
 // Property Tests for Prompt Handling
 // =============================================================================
 
-const quickcheck = @import("../util/quickcheck.zig");
+const zcheck = @import("zcheck");
+const zcheck_seed_base: u64 = 0xa2c3_4f98_1a2b_3c4d;
 
 fn buildContentBlocks(
     allocator: Allocator,
     num_non_text: u8,
     has_text: bool,
     text_idx: u8,
+    text: []const u8,
 ) ![]protocol.ContentBlock {
     var list: std.ArrayListUnmanaged(protocol.ContentBlock) = .empty;
     errdefer list.deinit(allocator);
@@ -5334,7 +5478,7 @@ fn buildContentBlocks(
 
     for (0..num_non_text + 1) |_| {
         if (has_text and pos == actual_text_pos) {
-            try list.append(allocator, .{ .type = "text", .text = "expected_text" });
+            try list.append(allocator, .{ .type = "text", .text = text });
         }
         if (pos < num_non_text) {
             try list.append(allocator, .{ .type = "image", .data = "aGVsbG8=", .mimeType = "image/png" });
@@ -5346,8 +5490,8 @@ fn buildContentBlocks(
 }
 
 test "property: collectPromptParts finds text regardless of position" {
-    try quickcheck.check(struct {
-        fn prop(args: struct { num_non_text: u4, text_pos: u4 }) bool {
+    try zcheck.check(struct {
+        fn prop(args: struct { num_non_text: u4, text_pos: u4, text: zcheck.String }) bool {
             var tw = TestWriter.init(testing.allocator) catch return false;
             defer tw.deinit();
             var agent = Agent.init(testing.allocator, tw.writer.stream, null);
@@ -5365,19 +5509,20 @@ test "property: collectPromptParts finds text regardless of position" {
             };
             defer session.deinit(testing.allocator);
 
-            const blocks = buildContentBlocks(testing.allocator, args.num_non_text, true, args.text_pos) catch return false;
+            const text = if (args.text.len == 0) "text" else args.text.slice();
+            const blocks = buildContentBlocks(testing.allocator, args.num_non_text, true, args.text_pos, text) catch return false;
             defer testing.allocator.free(blocks);
 
             var parts = agent.collectPromptParts(&session, session.id, blocks) catch return false;
             defer parts.deinit(testing.allocator);
 
-            return parts.user_text != null and std.mem.eql(u8, parts.user_text.?, "expected_text");
+            return parts.user_text != null and std.mem.eql(u8, parts.user_text.?, text);
         }
-    }.prop, .{});
+    }.prop, .{ .seed = zcheck_seed_base + 1 });
 }
 
 test "property: collectPromptParts returns null when no text block" {
-    try quickcheck.check(struct {
+    try zcheck.check(struct {
         fn prop(args: struct { num_non_text: u4 }) bool {
             var tw = TestWriter.init(testing.allocator) catch return false;
             defer tw.deinit();
@@ -5396,7 +5541,7 @@ test "property: collectPromptParts returns null when no text block" {
             };
             defer session.deinit(testing.allocator);
 
-            const blocks = buildContentBlocks(testing.allocator, args.num_non_text, false, 0) catch return false;
+            const blocks = buildContentBlocks(testing.allocator, args.num_non_text, false, 0, "") catch return false;
             defer testing.allocator.free(blocks);
 
             var parts = agent.collectPromptParts(&session, session.id, blocks) catch return false;
@@ -5404,7 +5549,7 @@ test "property: collectPromptParts returns null when no text block" {
 
             return parts.user_text == null;
         }
-    }.prop, .{});
+    }.prop, .{ .seed = zcheck_seed_base + 2 });
 }
 
 test "collectPromptParts handles empty blocks" {
@@ -5428,7 +5573,12 @@ test "collectPromptParts handles empty blocks" {
     const blocks = [_]protocol.ContentBlock{};
     var parts = try agent.collectPromptParts(&session, session.id, blocks[0..]);
     defer parts.deinit(testing.allocator);
-    try testing.expect(parts.user_text == null);
+    const summary = .{ .user_text = parts.user_text };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.collectPromptParts handles empty blocks__struct_<^\d+$>
+        \\  .user_text: ?[]const u8
+        \\    null
+    ).expectEqual(summary);
 }
 
 test "collectPromptParts skips codex image fallback when supported" {
@@ -5469,40 +5619,101 @@ test "collectPromptParts skips codex image fallback when supported" {
 
     var parts = try agent.collectPromptParts(&session, session.id, blocks[0..]);
     defer parts.deinit(testing.allocator);
-
-    try testing.expect(parts.codex_inputs != null);
-    try testing.expect(parts.codex_context == null);
-    try testing.expect(parts.context != null);
-    try testing.expect(std.mem.indexOf(u8, parts.context.?, "Image: image/png") != null);
+    const summary = .{
+        .codex_inputs_len = if (parts.codex_inputs) |inputs| inputs.len else null,
+        .codex_context = parts.codex_context,
+        .context = parts.context,
+        .context_has_image = if (parts.context) |ctx| std.mem.indexOf(u8, ctx, "Image: image/png") != null else false,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.collectPromptParts skips codex image fallback when supported__struct_<^\d+$>
+        \\  .codex_inputs_len: ?usize
+        \\    1
+        \\  .codex_context: ?[]const u8
+        \\    null
+        \\  .context: ?[]const u8
+        \\    "Image: image/png (8 bytes)
+        \\data (base64, truncated):
+        \\aGVsbG8="
+        \\  .context_has_image: bool = true
+    ).expectEqual(summary);
 }
 
 test "route_command_map resolves routes" {
-    try testing.expectEqual(Route.claude, Agent.route_command_map.get("claude").?);
-    try testing.expectEqual(Route.codex, Agent.route_command_map.get("codex").?);
-    try testing.expectEqual(Route.duet, Agent.route_command_map.get("duet").?);
-    try testing.expect(Agent.route_command_map.get("both") == null);
-    try testing.expect(Agent.route_command_map.get("claudeX") == null);
+    const summary = .{
+        .claude = @tagName(Agent.route_command_map.get("claude").?),
+        .codex = @tagName(Agent.route_command_map.get("codex").?),
+        .duet = @tagName(Agent.route_command_map.get("duet").?),
+        .missing_both = Agent.route_command_map.get("both") == null,
+        .missing_claudex = Agent.route_command_map.get("claudeX") == null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.route_command_map resolves routes__struct_<^\d+$>
+        \\  .claude: [:0]const u8
+        \\    "claude"
+        \\  .codex: [:0]const u8
+        \\    "codex"
+        \\  .duet: [:0]const u8
+        \\    "duet"
+        \\  .missing_both: bool = true
+        \\  .missing_claudex: bool = true
+    ).expectEqual(summary);
 }
 
 test "parseFileUri tolerates malformed percent encoding" {
     const uri = "file:///tmp/%ZZ.txt#L2";
-    const info = Agent.parseFileUri(testing.allocator, uri) orelse {
-        try testing.expect(false);
-        return;
+    var info = Agent.parseFileUri(testing.allocator, uri);
+    defer if (info) |*item| item.deinit(testing.allocator);
+    const Summary = struct {
+        found: bool,
+        path: ?[]const u8,
+        line: ?u32,
     };
-    defer info.deinit(testing.allocator);
-    try testing.expectEqualStrings("/tmp/%ZZ.txt", info.path);
-    try testing.expectEqual(@as(u32, 2), info.line);
+    const summary: Summary = if (info) |item| .{
+        .found = true,
+        .path = item.path,
+        .line = item.line,
+    } else .{
+        .found = false,
+        .path = null,
+        .line = null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.parseFileUri tolerates malformed percent encoding.Summary
+        \\  .found: bool = true
+        \\  .path: ?[]const u8
+        \\    "/tmp/%ZZ.txt"
+        \\  .line: ?u32
+        \\    2
+    ).expectEqual(summary);
 }
 
 test "parseFileUri keeps incomplete percent sequence" {
     const uri = "file:///tmp/%";
-    const info = Agent.parseFileUri(testing.allocator, uri) orelse {
-        try testing.expect(false);
-        return;
+    var info = Agent.parseFileUri(testing.allocator, uri);
+    defer if (info) |*item| item.deinit(testing.allocator);
+    const Summary = struct {
+        found: bool,
+        path: ?[]const u8,
+        line: ?u32,
     };
-    defer info.deinit(testing.allocator);
-    try testing.expectEqualStrings("/tmp/%", info.path);
+    const summary: Summary = if (info) |item| .{
+        .found = true,
+        .path = item.path,
+        .line = null,
+    } else .{
+        .found = false,
+        .path = null,
+        .line = null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.parseFileUri keeps incomplete percent sequence.Summary
+        \\  .found: bool = true
+        \\  .path: ?[]const u8
+        \\    "/tmp/%"
+        \\  .line: ?u32
+        \\    null
+    ).expectEqual(summary);
 }
 
 test "Agent handleRequest - cancel" {
@@ -5533,6 +5744,26 @@ test "Agent handleRequest - cancel" {
     try agent.handleRequest(create_request);
 
     const session_id = "session-test";
+    const session = agent.sessions.get(session_id).?;
+
+    const exec_tool = try testing.allocator.dupe(u8, "exec-tool");
+    try session.pending_execute_tools.put(exec_tool, {});
+
+    const edit_id = try testing.allocator.dupe(u8, "edit-tool");
+    const edit_info = Agent.EditInfo{
+        .path = try testing.allocator.dupe(u8, "file.txt"),
+        .old_text = try testing.allocator.dupe(u8, "old"),
+        .new_text = try testing.allocator.dupe(u8, "new"),
+    };
+    try session.pending_edit_tools.put(edit_id, edit_info);
+
+    const quiet_id = try testing.allocator.dupe(u8, "quiet-tool");
+    try session.quiet_tool_ids.put(quiet_id, {});
+
+    const params_json = try testing.allocator.dupe(u8, "null");
+    var queued = try Agent.Session.QueuedPrompt.init(testing.allocator, .{ .number = 9 }, params_json);
+    errdefer queued.deinit(testing.allocator);
+    try session.prompt_queue.append(testing.allocator, queued);
 
     // Clear output
     tw.output.clearRetainingCapacity();
@@ -5549,12 +5780,23 @@ test "Agent handleRequest - cancel" {
     };
     try agent.handleRequest(cancel_request);
 
-    // Cancel is a notification, no response expected
-    try testing.expectEqual(@as(usize, 0), tw.getOutput().len);
-
-    // Verify session was marked as cancelled
-    const session = agent.sessions.get(session_id).?;
-    try testing.expect(session.cancelled.load(.acquire));
+    const summary = .{
+        .output_len = tw.getOutput().len,
+        .cancelled = session.cancelled.load(.acquire),
+        .pending_execute = session.pending_execute_tools.count(),
+        .pending_edit = session.pending_edit_tools.count(),
+        .quiet_tools = session.quiet_tool_ids.count(),
+        .prompt_queue = session.prompt_queue.items.len,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.Agent handleRequest - cancel__struct_<^\d+$>
+        \\  .output_len: usize = 0
+        \\  .cancelled: bool = true
+        \\  .pending_execute: u32 = 0
+        \\  .pending_edit: u32 = 0
+        \\  .quiet_tools: u32 = 0
+        \\  .prompt_queue: usize = 0
+    ).expectEqual(summary);
 }
 
 // =============================================================================
@@ -5684,9 +5926,15 @@ test "Agent handleRequest - prompt queued when already handling" {
 
     try agent.handleRequest(request);
 
-    // Prompt should be queued, no response yet (deadlock prevention)
-    try testing.expectEqual(@as(usize, 0), tw.getOutput().len);
-    try testing.expectEqual(@as(usize, 1), session.prompt_queue.items.len);
+    const summary = .{
+        .output_len = tw.getOutput().len,
+        .queue_len = session.prompt_queue.items.len,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.Agent handleRequest - prompt queued when already handling__struct_<^\d+$>
+        \\  .output_len: usize = 0
+        \\  .queue_len: usize = 1
+    ).expectEqual(summary);
 }
 
 test "Agent handleRequest - setMode missing params" {
@@ -5755,27 +6003,50 @@ test "Agent handleRequest - authenticate returns success" {
 }
 
 test "toProtocolStopReason maps auth_required" {
-    try testing.expectEqual(protocol.StopReason.auth_required, Agent.toProtocolStopReason(.auth_required));
+    const summary = .{ .stop = @tagName(Agent.toProtocolStopReason(.auth_required)) };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.toProtocolStopReason maps auth_required__struct_<^\d+$>
+        \\  .stop: [:0]const u8
+        \\    "auth_required"
+    ).expectEqual(summary);
 }
 
 test "isAuthRequiredContent detects auth markers" {
-    try testing.expect(isAuthRequiredContent("please login to continue"));
-    try testing.expect(isAuthRequiredContent("authenticate to proceed"));
-    try testing.expect(!isAuthRequiredContent("all good here"));
+    const summary = .{
+        .login = isAuthRequiredContent("please login to continue"),
+        .auth = isAuthRequiredContent("authenticate to proceed"),
+        .clean = isAuthRequiredContent("all good here"),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.isAuthRequiredContent detects auth markers__struct_<^\d+$>
+        \\  .login: bool = true
+        \\  .auth: bool = true
+        \\  .clean: bool = false
+    ).expectEqual(summary);
 }
 
 test "isUnsupportedCommand filters correctly" {
-    // These should be filtered
-    try testing.expect(Agent.isUnsupportedCommand("login"));
-    try testing.expect(Agent.isUnsupportedCommand("logout"));
-    try testing.expect(Agent.isUnsupportedCommand("cost"));
-    try testing.expect(Agent.isUnsupportedCommand("context"));
-
-    // These should not be filtered
-    try testing.expect(!Agent.isUnsupportedCommand("model"));
-    try testing.expect(!Agent.isUnsupportedCommand("compact"));
-    try testing.expect(!Agent.isUnsupportedCommand("review"));
-    try testing.expect(!Agent.isUnsupportedCommand("version"));
+    const summary = .{
+        .login = Agent.isUnsupportedCommand("login"),
+        .logout = Agent.isUnsupportedCommand("logout"),
+        .cost = Agent.isUnsupportedCommand("cost"),
+        .context = Agent.isUnsupportedCommand("context"),
+        .model = Agent.isUnsupportedCommand("model"),
+        .compact = Agent.isUnsupportedCommand("compact"),
+        .review = Agent.isUnsupportedCommand("review"),
+        .version = Agent.isUnsupportedCommand("version"),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.isUnsupportedCommand filters correctly__struct_<^\d+$>
+        \\  .login: bool = true
+        \\  .logout: bool = true
+        \\  .cost: bool = true
+        \\  .context: bool = true
+        \\  .model: bool = false
+        \\  .compact: bool = false
+        \\  .review: bool = false
+        \\  .version: bool = false
+    ).expectEqual(summary);
 }
 
 test "buildClaudeStartOptions honors force_new" {
@@ -5795,13 +6066,30 @@ test "buildClaudeStartOptions honors force_new" {
     session.force_new_claude = true;
 
     const forced = Agent.buildClaudeStartOptions(&session);
-    try testing.expect(forced.resume_session_id == null);
-    try testing.expect(!forced.continue_last);
+    const forced_summary = .{
+        .resume_session_id = forced.resume_session_id,
+        .continue_last = forced.continue_last,
+    };
 
     session.force_new_claude = false;
     const resume_opts = Agent.buildClaudeStartOptions(&session);
-    try testing.expect(resume_opts.resume_session_id != null);
-    try testing.expect(std.mem.eql(u8, resume_opts.resume_session_id.?, "resume-id"));
+    const resume_summary = .{
+        .resume_session_id = resume_opts.resume_session_id,
+    };
+    const summary = .{
+        .forced = forced_summary,
+        .resume_opts = resume_summary,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.buildClaudeStartOptions honors force_new__struct_<^\d+$>
+        \\  .forced: acp.agent.test.buildClaudeStartOptions honors force_new__struct_<^\d+$>
+        \\    .resume_session_id: ?[]const u8
+        \\      null
+        \\    .continue_last: bool = false
+        \\  .resume_opts: acp.agent.test.buildClaudeStartOptions honors force_new__struct_<^\d+$>
+        \\    .resume_session_id: ?[]const u8
+        \\      "resume-id"
+    ).expectEqual(summary);
 }
 
 test "buildCodexStartOptions honors force_new" {
@@ -5821,26 +6109,44 @@ test "buildCodexStartOptions honors force_new" {
     session.force_new_codex = true;
 
     const forced = Agent.buildCodexStartOptions(&session);
-    try testing.expect(forced.resume_session_id == null);
+    const forced_summary = .{ .resume_session_id = forced.resume_session_id };
 
     session.force_new_codex = false;
     const resume_opts = Agent.buildCodexStartOptions(&session);
-    try testing.expect(resume_opts.resume_session_id != null);
-    try testing.expect(std.mem.eql(u8, resume_opts.resume_session_id.?, "thread-id"));
+    const resume_summary = .{ .resume_session_id = resume_opts.resume_session_id };
+    const summary = .{
+        .forced = forced_summary,
+        .resume_opts = resume_summary,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.buildCodexStartOptions honors force_new__struct_<^\d+$>
+        \\  .forced: acp.agent.test.buildCodexStartOptions honors force_new__struct_<^\d+$>
+        \\    .resume_session_id: ?[]const u8
+        \\      null
+        \\  .resume_opts: acp.agent.test.buildCodexStartOptions honors force_new__struct_<^\d+$>
+        \\    .resume_session_id: ?[]const u8
+        \\      "thread-id"
+    ).expectEqual(summary);
 }
 
 test "codex auto approval respects permission mode" {
-    const edit_decision = Agent.codexAutoApprovalDecision(.acceptEdits, .file_change) orelse {
-        return error.TestUnexpectedResult;
+    const summary = .{
+        .file_change = Agent.codexAutoApprovalDecision(.acceptEdits, .file_change),
+        .command_execution = Agent.codexAutoApprovalDecision(.acceptEdits, .command_execution),
+        .apply_patch = Agent.codexAutoApprovalDecision(.default, .apply_patch),
+        .exec_command = Agent.codexAutoApprovalDecision(.bypassPermissions, .exec_command),
     };
-    try testing.expectEqualStrings("acceptForSession", edit_decision);
-    try testing.expect(Agent.codexAutoApprovalDecision(.acceptEdits, .command_execution) == null);
-    try testing.expect(Agent.codexAutoApprovalDecision(.default, .apply_patch) == null);
-
-    const exec_decision = Agent.codexAutoApprovalDecision(.bypassPermissions, .exec_command) orelse {
-        return error.TestUnexpectedResult;
-    };
-    try testing.expectEqualStrings("approved_for_session", exec_decision);
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.codex auto approval respects permission mode__struct_<^\d+$>
+        \\  .file_change: ?[]const u8
+        \\    "acceptForSession"
+        \\  .command_execution: ?[]const u8
+        \\    null
+        \\  .apply_patch: ?[]const u8
+        \\    null
+        \\  .exec_command: ?[]const u8
+        \\    "approved_for_session"
+    ).expectEqual(summary);
 }
 
 test "handleAuthRequired sends message and clears bridge" {
@@ -5861,17 +6167,79 @@ test "handleAuthRequired sends message and clears bridge" {
     session.codex_bridge = CodexBridge.init(testing.allocator, ".");
 
     const stop_claude = try agent.handleAuthRequired(session.id, &session, .claude);
-    try testing.expectEqual(protocol.StopReason.auth_required, stop_claude);
-    try testing.expect(session.bridge == null);
-    try testing.expect(session.codex_bridge != null);
+    const summary_claude = .{
+        .stop = @tagName(stop_claude),
+        .bridge_nil = session.bridge == null,
+        .codex_bridge_present = session.codex_bridge != null,
+    };
 
     const stop_codex = try agent.handleAuthRequired(session.id, &session, .codex);
-    try testing.expectEqual(protocol.StopReason.auth_required, stop_codex);
-    try testing.expect(session.codex_bridge == null);
+    const summary_codex = .{
+        .stop = @tagName(stop_codex),
+        .codex_bridge_nil = session.codex_bridge == null,
+    };
 
     const output = tw.getOutput();
-    try testing.expect(std.mem.indexOf(u8, output, "Claude Code requires authentication") != null);
-    try testing.expect(std.mem.indexOf(u8, output, "Codex requires authentication") != null);
+    const summary = .{
+        .claude = summary_claude,
+        .codex = summary_codex,
+        .output = output,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.handleAuthRequired sends message and clears bridge__struct_<^\d+$>
+        \\  .claude: acp.agent.test.handleAuthRequired sends message and clears bridge__struct_<^\d+$>
+        \\    .stop: [:0]const u8
+        \\      "auth_required"
+        \\    .bridge_nil: bool = true
+        \\    .codex_bridge_present: bool = true
+        \\  .codex: acp.agent.test.handleAuthRequired sends message and clears bridge__struct_<^\d+$>
+        \\    .stop: [:0]const u8
+        \\      "auth_required"
+        \\    .codex_bridge_nil: bool = true
+        \\  .output: []const u8
+        \\    "{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"test-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Claude Code requires authentication. Authenticate in a terminal, then retry."}}}}
+        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"test-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Codex requires authentication. Authenticate in a terminal, then retry."}}}}
+        \\"
+    ).expectEqual(summary);
+}
+
+test "cbCheckAuthRequired triggers auth handling" {
+    const prev_log_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_log_level;
+
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
+    defer agent.deinit();
+
+    var session = try createTestSession(testing.allocator, .{});
+    defer session.deinit(testing.allocator);
+
+    var cb_ctx = Agent.PromptCallbackContext{
+        .agent = &agent,
+        .session = &session,
+        .session_id = session.id,
+    };
+
+    const stop = try Agent.cbCheckAuthRequired(@ptrCast(&cb_ctx), session.id, .codex, "Please login to continue");
+    const output = tw.getOutput();
+    const no_stop = try Agent.cbCheckAuthRequired(@ptrCast(&cb_ctx), session.id, .claude, "All good here");
+    const summary = .{
+        .stop = if (stop) |s| @tagName(s) else null,
+        .output = output,
+        .no_stop = no_stop == null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.cbCheckAuthRequired triggers auth handling__struct_<^\d+$>
+        \\  .stop: ?[:0]const u8
+        \\    "auth_required"
+        \\  .output: []const u8
+        \\    "{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"test-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Codex requires authentication. Authenticate in a terminal, then retry."}}}}
+        \\"
+        \\  .no_stop: bool = true
+    ).expectEqual(summary);
 }
 
 test "prepareFreshSessions clears resume state" {
@@ -5898,12 +6266,23 @@ test "prepareFreshSessions clears resume state" {
     try session.pending_execute_tools.put(tool_key, {});
 
     agent.prepareFreshSessions(&session);
-
-    try testing.expect(session.cli_session_id == null);
-    try testing.expect(session.codex_session_id == null);
-    try testing.expect(session.force_new_claude);
-    try testing.expect(session.force_new_codex);
-    try testing.expect(session.pending_execute_tools.count() == 0);
+    const summary = .{
+        .cli_session_id = session.cli_session_id,
+        .codex_session_id = session.codex_session_id,
+        .force_new_claude = session.force_new_claude,
+        .force_new_codex = session.force_new_codex,
+        .pending_execute_tools = session.pending_execute_tools.count(),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.prepareFreshSessions clears resume state__struct_<^\d+$>
+        \\  .cli_session_id: ?[]const u8
+        \\    null
+        \\  .codex_session_id: ?[]const u8
+        \\    null
+        \\  .force_new_claude: bool = true
+        \\  .force_new_codex: bool = true
+        \\  .pending_execute_tools: u32 = 0
+    ).expectEqual(summary);
 }
 
 test "requestWriteTextFile returns false when cancelled" {
@@ -5933,7 +6312,11 @@ test "requestWriteTextFile returns false when cancelled" {
 
     // Should return false (not error) when cancelled
     const result = try agent.requestWriteTextFile(&session, session.id, "test.txt", "content");
-    try testing.expect(!result);
+    const summary = .{ .result = result };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.requestWriteTextFile returns false when cancelled__struct_<^\d+$>
+        \\  .result: bool = false
+    ).expectEqual(summary);
 }
 
 test "requestReadTextFile returns null when cancelled" {
@@ -5962,5 +6345,10 @@ test "requestReadTextFile returns null when cancelled" {
 
     // Should return null (not error) when cancelled
     const result = try agent.requestReadTextFile(&session, session.id, "test.txt", null, null);
-    try testing.expect(result == null);
+    const summary = .{ .result = result };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.requestReadTextFile returns null when cancelled__struct_<^\d+$>
+        \\  .result: ?[]u8
+        \\    null
+    ).expectEqual(summary);
 }

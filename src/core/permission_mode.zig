@@ -1,3 +1,7 @@
+const std = @import("std");
+const testing = std.testing;
+const ohsnap = @import("ohsnap");
+
 pub const PermissionMode = enum {
     default,
     acceptEdits,
@@ -43,3 +47,63 @@ pub const PermissionMode = enum {
         };
     }
 };
+
+test "PermissionMode mappings snapshot" {
+    const modes = [_]PermissionMode{
+        .default,
+        .acceptEdits,
+        .bypassPermissions,
+        .dontAsk,
+        .plan,
+    };
+
+    var out: std.io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    for (modes) |mode| {
+        const cli_flag = mode.toCliFlag() orelse "null";
+        const cli_arg = mode.toCliArg() orelse "null";
+        const policy = mode.toCodexApprovalPolicy() orelse "null";
+        try out.writer.print(
+            "mode: {s}\nlabel: {s}\ncli_flag: {s}\ncli_arg: {s}\ncodex_policy: {s}\n\n",
+            .{ @tagName(mode), mode.toString(), cli_flag, cli_arg, policy },
+        );
+    }
+
+    const snapshot = try out.toOwnedSlice();
+    defer testing.allocator.free(snapshot);
+
+    try (ohsnap{}).snap(@src(),
+        \\mode: default
+        \\label: Default
+        \\cli_flag: null
+        \\cli_arg: null
+        \\codex_policy: null
+        \\
+        \\mode: acceptEdits
+        \\label: Accept Edits
+        \\cli_flag: --allowedTools
+        \\cli_arg: acceptEdits
+        \\codex_policy: null
+        \\
+        \\mode: bypassPermissions
+        \\label: Auto-approve
+        \\cli_flag: --dangerouslySkipPermissions
+        \\cli_arg: bypassPermissions
+        \\codex_policy: never
+        \\
+        \\mode: dontAsk
+        \\label: Don't Ask
+        \\cli_flag: --dangerouslySkipPermissions
+        \\cli_arg: dontAsk
+        \\codex_policy: never
+        \\
+        \\mode: plan
+        \\label: Plan Only
+        \\cli_flag: --plan
+        \\cli_arg: plan
+        \\codex_policy: null
+        \\
+        \\
+    ).diff(snapshot, true);
+}

@@ -13,6 +13,8 @@ const log = std.log.scoped(.mcp_server);
 const debug_log = @import("../util/debug_log.zig");
 const json_util = @import("../util/json.zig");
 
+const max_pending_handshakes: usize = 8;
+
 fn debugLog(comptime fmt: []const u8, args: anytype) void {
     debug_log.write("MCP", fmt, args);
 }
@@ -37,6 +39,7 @@ pub const McpServer = struct {
     // Read buffers for WebSocket frames (separate per client)
     mcp_read_buffer: std.ArrayList(u8) = .empty,
     nvim_read_buffer: std.ArrayList(u8) = .empty,
+    pending_handshakes: std.AutoHashMap(posix.socket_t, PendingHandshake),
 
     // Callback for sending tool requests to nvim
     tool_request_callback: ?*const fn (tool_name: []const u8, correlation_id: []const u8, args: ?std.json.Value) void = null,
@@ -79,6 +82,15 @@ pub const McpServer = struct {
         }
     };
 
+    const PendingHandshake = struct {
+        buffer: std.ArrayListUnmanaged(u8) = .empty,
+        deadline_ms: i64,
+
+        fn deinit(self: *PendingHandshake, allocator: Allocator) void {
+            self.buffer.deinit(allocator);
+        }
+    };
+
     pub fn init(allocator: Allocator, cwd: []const u8) !*McpServer {
         // Create TCP socket
         const sock = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
@@ -111,6 +123,7 @@ pub const McpServer = struct {
             .auth_token = auth_token,
             .cwd = cwd,
             .pending_tool_requests = std.StringHashMap(PendingToolRequest).init(allocator),
+            .pending_handshakes = std.AutoHashMap(posix.socket_t, PendingHandshake).init(allocator),
         };
 
         return self;
@@ -124,6 +137,8 @@ pub const McpServer = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.pending_tool_requests.deinit();
+        self.closePendingHandshakes();
+        self.pending_handshakes.deinit();
         self.mcp_read_buffer.deinit(self.allocator);
         self.nvim_read_buffer.deinit(self.allocator);
         // Free owned selection data
@@ -177,6 +192,7 @@ pub const McpServer = struct {
             self.lock_file = null;
         }
 
+        self.closePendingHandshakes();
         posix.close(self.tcp_socket);
     }
 
@@ -187,12 +203,14 @@ pub const McpServer = struct {
     /// Poll for events with timeout in milliseconds.
     /// Returns true if should continue polling.
     pub fn poll(self: *McpServer, timeout_ms: i32) !bool {
-        var fds: [3]posix.pollfd = undefined;
+        var fds: [max_pending_handshakes + 3]posix.pollfd = undefined;
         var nfds: usize = 0;
 
-        // Always poll TCP accept socket
-        fds[nfds] = .{ .fd = self.tcp_socket, .events = posix.POLL.IN, .revents = 0 };
-        nfds += 1;
+        const can_accept = self.pending_handshakes.count() < max_pending_handshakes;
+        if (can_accept) {
+            fds[nfds] = .{ .fd = self.tcp_socket, .events = posix.POLL.IN, .revents = 0 };
+            nfds += 1;
+        }
 
         // Poll MCP client socket if connected
         if (self.mcp_client_socket) |sock| {
@@ -206,10 +224,20 @@ pub const McpServer = struct {
             nfds += 1;
         }
 
+        if (self.pending_handshakes.count() > 0) {
+            var iter = self.pending_handshakes.iterator();
+            while (iter.next()) |entry| {
+                if (nfds >= fds.len) break;
+                fds[nfds] = .{ .fd = entry.key_ptr.*, .events = posix.POLL.IN, .revents = 0 };
+                nfds += 1;
+            }
+        }
+
         const ready = try posix.poll(fds[0..nfds], timeout_ms);
         if (ready == 0) {
             // Timeout - check for expired requests
             self.checkTimeouts();
+            self.expirePendingHandshakes(std.time.milliTimestamp());
             return true;
         }
         debugLog("poll: ready={d}, nfds={d}, nvim_connected={}", .{ ready, nfds, self.nvim_client_socket != null });
@@ -232,6 +260,8 @@ pub const McpServer = struct {
                         log.warn("Nvim client message failed: {}", .{err});
                         self.closeNvimClient();
                     };
+                } else if (self.pending_handshakes.getPtr(fd.fd)) |pending| {
+                    self.handlePendingHandshake(fd.fd, pending);
                 }
             }
             // Guard: socket may have been closed in error handler above
@@ -244,9 +274,14 @@ pub const McpServer = struct {
                     log.info("Nvim client disconnected", .{});
                     self.closeNvimClient();
                 }
+                if (self.pending_handshakes.contains(fd.fd)) {
+                    log.info("Handshake client disconnected", .{});
+                    self.closePendingHandshake(fd.fd);
+                }
             }
         }
 
+        self.expirePendingHandshakes(std.time.milliTimestamp());
         return true;
     }
 
@@ -266,47 +301,169 @@ pub const McpServer = struct {
         }
     }
 
-    fn acceptConnection(self: *McpServer) !void {
-        const client = try posix.accept(self.tcp_socket, null, null, 0);
-        errdefer posix.close(client);
+    fn closePendingHandshakes(self: *McpServer) void {
+        var iter = self.pending_handshakes.iterator();
+        while (iter.next()) |entry| {
+            posix.close(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.pending_handshakes.clearRetainingCapacity();
+    }
 
-        // Perform WebSocket handshake and determine client type
-        const outcome = websocket.performHandshakeWithPath(self.allocator, client, &self.auth_token) catch |err| {
-            log.warn("WebSocket handshake failed: {}", .{err});
-            posix.close(client);
-            return;
-        };
-        defer if (outcome.remainder) |extra| self.allocator.free(extra);
+    fn closePendingHandshake(self: *McpServer, fd: posix.socket_t) void {
+        if (self.pending_handshakes.fetchRemove(fd)) |entry| {
+            posix.close(entry.key);
+            entry.value.deinit(self.allocator);
+        } else {
+            posix.close(fd);
+        }
+    }
 
-        switch (outcome.client_kind) {
+    fn setNonBlocking(fd: posix.socket_t) !void {
+        var flags = try posix.fcntl(fd, posix.F.GETFL, 0);
+        flags |= 1 << @bitOffsetOf(posix.O, "NONBLOCK");
+        _ = try posix.fcntl(fd, posix.F.SETFL, flags);
+    }
+
+    fn setBlocking(fd: posix.socket_t) !void {
+        var flags = try posix.fcntl(fd, posix.F.GETFL, 0);
+        flags &= ~(1 << @bitOffsetOf(posix.O, "NONBLOCK"));
+        _ = try posix.fcntl(fd, posix.F.SETFL, flags);
+    }
+
+    fn queueHandshake(self: *McpServer, client: posix.socket_t) !void {
+        if (self.pending_handshakes.count() >= max_pending_handshakes) {
+            return error.TooManyPendingHandshakes;
+        }
+
+        try setNonBlocking(client);
+
+        const deadline = std.time.milliTimestamp() + constants.websocket_handshake_timeout_ms;
+        try self.pending_handshakes.put(client, .{ .deadline_ms = deadline });
+    }
+
+    fn finishHandshake(
+        self: *McpServer,
+        client_kind: websocket.ClientKind,
+        client: posix.socket_t,
+        remainder: []const u8,
+    ) !void {
+        switch (client_kind) {
             .mcp => {
-                // Close existing MCP client if any
                 if (self.mcp_client_socket) |old| {
                     log.info("Closing existing MCP client connection", .{});
                     posix.close(old);
                 }
                 self.mcp_client_socket = client;
                 self.mcp_read_buffer.clearRetainingCapacity();
-                if (outcome.remainder) |extra| {
-                    try self.mcp_read_buffer.appendSlice(self.allocator, extra);
+                if (remainder.len > 0) {
+                    try self.mcp_read_buffer.appendSlice(self.allocator, remainder);
                 }
                 log.info("Claude CLI connected", .{});
             },
             .nvim => {
-                // Close existing nvim client if any
                 if (self.nvim_client_socket) |old| {
                     log.info("Closing existing nvim client connection", .{});
                     posix.close(old);
                 }
                 self.nvim_client_socket = client;
                 self.nvim_read_buffer.clearRetainingCapacity();
-                if (outcome.remainder) |extra| {
-                    try self.nvim_read_buffer.appendSlice(self.allocator, extra);
+                if (remainder.len > 0) {
+                    try self.nvim_read_buffer.appendSlice(self.allocator, remainder);
                 }
                 log.info("Neovim connected", .{});
                 debugLog("nvim_client_socket set to fd={d}", .{client});
             },
         }
+    }
+
+    fn handlePendingHandshake(self: *McpServer, fd: posix.socket_t, pending: *PendingHandshake) void {
+        const now = std.time.milliTimestamp();
+        if (pending.deadline_ms <= now) {
+            log.warn("Handshake timed out for fd={d}", .{fd});
+            self.closePendingHandshake(fd);
+            return;
+        }
+
+        var temp_buf: [1024]u8 = undefined;
+        while (true) {
+            const n = posix.read(fd, &temp_buf) catch |err| switch (err) {
+                error.WouldBlock => break,
+                else => {
+                    log.warn("Handshake read failed: {}", .{err});
+                    self.closePendingHandshake(fd);
+                    return;
+                },
+            };
+            if (n == 0) {
+                log.info("Handshake connection closed", .{});
+                self.closePendingHandshake(fd);
+                return;
+            }
+            pending.buffer.appendSlice(self.allocator, temp_buf[0..n]) catch |err| {
+                log.warn("Handshake buffer append failed: {}", .{err});
+                self.closePendingHandshake(fd);
+                return;
+            };
+            if (pending.buffer.items.len > websocket.max_handshake_bytes) {
+                log.warn("Handshake headers too large", .{});
+                self.closePendingHandshake(fd);
+                return;
+            }
+        }
+
+        const parsed = websocket.tryParseHandshake(self.allocator, pending.buffer.items) catch |err| {
+            log.warn("Handshake parse failed: {}", .{err});
+            self.closePendingHandshake(fd);
+            return;
+        } orelse return;
+        defer websocket.deinitHandshakeResult(self.allocator, &parsed.result);
+
+        setBlocking(fd) catch |err| {
+            log.warn("Failed to set blocking for handshake: {}", .{err});
+            self.closePendingHandshake(fd);
+            return;
+        };
+
+        const client_kind = websocket.completeHandshake(fd, parsed.result, self.auth_token[0..]) catch |err| {
+            log.warn("WebSocket handshake failed: {}", .{err});
+            self.closePendingHandshake(fd);
+            return;
+        };
+
+        const remainder = pending.buffer.items[parsed.header_end..];
+        self.finishHandshake(client_kind, fd, remainder) catch |err| {
+            log.warn("Failed to finalize handshake: {}", .{err});
+            self.closePendingHandshake(fd);
+            return;
+        };
+
+        pending.deinit(self.allocator);
+        _ = self.pending_handshakes.remove(fd);
+    }
+
+    fn expirePendingHandshakes(self: *McpServer, now_ms: i64) void {
+        if (self.pending_handshakes.count() == 0) return;
+        var to_remove: std.ArrayListUnmanaged(posix.socket_t) = .empty;
+        defer to_remove.deinit(self.allocator);
+
+        var iter = self.pending_handshakes.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.deadline_ms <= now_ms) {
+                to_remove.append(self.allocator, entry.key_ptr.*) catch {};
+            }
+        }
+
+        for (to_remove.items) |fd| {
+            log.warn("Handshake timed out for fd={d}", .{fd});
+            self.closePendingHandshake(fd);
+        }
+    }
+
+    fn acceptConnection(self: *McpServer) !void {
+        const client = try posix.accept(self.tcp_socket, null, null, 0);
+        errdefer posix.close(client);
+        try self.queueHandshake(client);
     }
 
     fn handleMcpClientMessage(self: *McpServer) !void {
@@ -759,14 +916,42 @@ pub const McpServer = struct {
 
 // Tests
 const testing = std.testing;
+const ohsnap = @import("ohsnap");
+
+test "queueHandshake returns error at capacity without closing socket" {
+    const server = try McpServer.init(testing.allocator, "/tmp");
+    defer server.deinit();
+
+    var pending_fds: [max_pending_handshakes]posix.socket_t = undefined;
+    for (&pending_fds) |*fd| {
+        fd.* = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+        try server.queueHandshake(fd.*);
+    }
+
+    const extra = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    try testing.expectError(error.TooManyPendingHandshakes, server.queueHandshake(extra));
+    _ = try posix.fcntl(extra, posix.F.GETFD, 0);
+    posix.close(extra);
+
+    server.closePendingHandshakes();
+}
 
 test "McpServer init and deinit" {
     const server = try McpServer.init(testing.allocator, "/tmp");
     defer server.deinit();
-
-    try testing.expect(server.port > 0);
-    try testing.expectEqual(@as(?posix.socket_t, null), server.mcp_client_socket);
-    try testing.expectEqual(@as(?posix.socket_t, null), server.nvim_client_socket);
+    const summary = .{
+        .port = server.port,
+        .mcp_socket = server.mcp_client_socket,
+        .nvim_socket = server.nvim_client_socket,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.mcp_server.test.McpServer init and deinit__struct_<^\d+$>
+        \\  .port: u16 = <^\d+$>
+        \\  .mcp_socket: ?i32
+        \\    null
+        \\  .nvim_socket: ?i32
+        \\    null
+    ).expectEqual(summary);
 }
 
 test "McpServer port binding" {
@@ -776,6 +961,15 @@ test "McpServer port binding" {
     const server2 = try McpServer.init(testing.allocator, "/tmp");
     defer server2.deinit();
 
-    // Both should get different ports
-    try testing.expect(server1.port != server2.port);
+    const summary = .{
+        .port1 = server1.port,
+        .port2 = server2.port,
+        .different = server1.port != server2.port,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.mcp_server.test.McpServer port binding__struct_<^\d+$>
+        \\  .port1: u16 = <^\d+$>
+        \\  .port2: u16 = <^\d+$>
+        \\  .different: bool = true
+    ).expectEqual(summary);
 }

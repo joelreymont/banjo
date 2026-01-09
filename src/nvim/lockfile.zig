@@ -183,23 +183,24 @@ pub fn generateUuidV4(out: *[36]u8) void {
 
 // Tests
 const testing = std.testing;
+const ohsnap = @import("ohsnap");
 
 test "generateUuidV4 format" {
     var uuid: [36]u8 = undefined;
     generateUuidV4(&uuid);
 
-    // Check format: 8-4-4-4-12
-    try testing.expectEqual(@as(u8, '-'), uuid[8]);
-    try testing.expectEqual(@as(u8, '-'), uuid[13]);
-    try testing.expectEqual(@as(u8, '-'), uuid[18]);
-    try testing.expectEqual(@as(u8, '-'), uuid[23]);
-
-    // Check version 4 indicator
-    try testing.expect(uuid[14] == '4');
-
-    // Check variant bits (8, 9, a, or b)
     const variant = uuid[19];
-    try testing.expect(variant == '8' or variant == '9' or variant == 'a' or variant == 'b');
+    const summary = .{
+        .dashes_ok = uuid[8] == '-' and uuid[13] == '-' and uuid[18] == '-' and uuid[23] == '-',
+        .version_ok = uuid[14] == '4',
+        .variant_ok = variant == '8' or variant == '9' or variant == 'a' or variant == 'b',
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.lockfile.test.generateUuidV4 format__struct_<^\d+$>
+        \\  .dashes_ok: bool = true
+        \\  .version_ok: bool = true
+        \\  .variant_ok: bool = true
+    ).expectEqual(summary);
 }
 
 test "generateUuidV4 uniqueness" {
@@ -208,17 +209,29 @@ test "generateUuidV4 uniqueness" {
     generateUuidV4(&uuid1);
     generateUuidV4(&uuid2);
 
-    try testing.expect(!std.mem.eql(u8, &uuid1, &uuid2));
+    const summary = .{ .unique = !std.mem.eql(u8, &uuid1, &uuid2) };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.lockfile.test.generateUuidV4 uniqueness__struct_<^\d+$>
+        \\  .unique: bool = true
+    ).expectEqual(summary);
 }
 
 test "isPidAlive self" {
     const self_pid = getPid();
-    try testing.expect(isPidAlive(self_pid));
+    const summary = .{ .alive = isPidAlive(self_pid) };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.lockfile.test.isPidAlive self__struct_<^\d+$>
+        \\  .alive: bool = true
+    ).expectEqual(summary);
 }
 
 test "isPidAlive invalid" {
     // PID 0 is the kernel scheduler, not a user process
     // PID 1 is init/systemd which should exist
     // Use a very high unlikely PID
-    try testing.expect(!isPidAlive(99999999));
+    const summary = .{ .alive = isPidAlive(99999999) };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.lockfile.test.isPidAlive invalid__struct_<^\d+$>
+        \\  .alive: bool = false
+    ).expectEqual(summary);
 }

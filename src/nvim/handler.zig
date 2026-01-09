@@ -19,6 +19,7 @@ const permission_socket = @import("../core/permission_socket.zig");
 const tool_categories = @import("../core/tool_categories.zig");
 const constants = @import("../core/constants.zig");
 const session_id_util = @import("../core/session_id.zig");
+const auth_markers = @import("../core/auth_markers.zig");
 const jsonrpc = @import("../jsonrpc.zig");
 const config = @import("config");
 
@@ -1208,20 +1209,24 @@ pub const Handler = struct {
         };
     }
 
-    fn cbCheckAuthRequired(ctx: *anyopaque, _: []const u8, _: Engine, content: []const u8) anyerror!?EditorCallbacks.StopReason {
+    fn authRequiredMessage(engine: Engine) []const u8 {
+        return switch (engine) {
+            .claude => "Authentication required. Please run `claude /login` in your terminal, then try again.",
+            .codex => "Authentication required. Please run `codex login` in your terminal, then try again.",
+        };
+    }
+
+    fn cbCheckAuthRequired(ctx: *anyopaque, _: []const u8, engine: Engine, content: []const u8) anyerror!?EditorCallbacks.StopReason {
         const cb_ctx = CallbackContext.from(ctx);
 
         // Check if content indicates auth is required
-        const auth_markers = [_][]const u8{ "/login", "authenticate" };
-        for (auth_markers) |marker| {
-            if (std.mem.indexOf(u8, content, marker) != null) {
-                cb_ctx.handler.sendNotification("error_msg", protocol.ErrorMessage{
-                    .message = "Authentication required. Please run `claude /login` in your terminal, then try again.",
-                }) catch |err| {
-                    log.warn("Failed to send auth_required error: {}", .{err});
-                };
-                return .auth_required;
-            }
+        if (auth_markers.containsAuthMarker(content)) {
+            cb_ctx.handler.sendNotification("error_msg", protocol.ErrorMessage{
+                .message = authRequiredMessage(engine),
+            }) catch |err| {
+                log.warn("Failed to send auth_required error: {}", .{err});
+            };
+            return .auth_required;
         }
         return null;
     }
@@ -1353,6 +1358,8 @@ pub const Handler = struct {
     }
 };
 
+const ohsnap = @import("ohsnap");
+
 test "handler init/deinit" {
     const allocator = std.testing.allocator;
 
@@ -1364,8 +1371,15 @@ test "handler init/deinit" {
     var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
     defer handler.deinit();
 
-    try std.testing.expect(!handler.cancelled.load(.acquire));
-    try std.testing.expect(handler.nudge.enabled);
+    const summary = .{
+        .cancelled = handler.cancelled.load(.acquire),
+        .nudge = handler.nudge.enabled,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.handler init/deinit__struct_<^\d+$>
+        \\  .cancelled: bool = false
+        \\  .nudge: bool = true
+    ).expectEqual(summary);
 }
 
 test "handler nudge toggle" {
@@ -1379,15 +1393,26 @@ test "handler nudge toggle" {
     var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
     defer handler.deinit();
 
-    try std.testing.expect(handler.nudge.enabled);
+    const initial = handler.nudge.enabled;
 
     // Toggle nudge (simulate callback)
     handler.nudge.enabled = !handler.nudge.enabled;
-    try std.testing.expect(!handler.nudge.enabled);
+    const after_first = handler.nudge.enabled;
 
     // Toggle again
     handler.nudge.enabled = !handler.nudge.enabled;
-    try std.testing.expect(handler.nudge.enabled);
+    const after_second = handler.nudge.enabled;
+    const summary = .{
+        .initial = initial,
+        .after_first = after_first,
+        .after_second = after_second,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.handler nudge toggle__struct_<^\d+$>
+        \\  .initial: bool = true
+        \\  .after_first: bool = false
+        \\  .after_second: bool = true
+    ).expectEqual(summary);
 }
 
 test "handler cancel" {
@@ -1401,11 +1426,17 @@ test "handler cancel" {
     var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
     defer handler.deinit();
 
-    try std.testing.expect(!handler.cancelled.load(.acquire));
+    const before = handler.cancelled.load(.acquire);
 
     // Cancel (simulate callback)
     handler.cancelled.store(true, .release);
-    try std.testing.expect(handler.cancelled.load(.acquire));
+    const after = handler.cancelled.load(.acquire);
+    const summary = .{ .before = before, .after = after };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.handler cancel__struct_<^\d+$>
+        \\  .before: bool = false
+        \\  .after: bool = true
+    ).expectEqual(summary);
 }
 
 test "cancelled flag is atomic - concurrent reads" {
@@ -1447,8 +1478,16 @@ test "cancelled flag is atomic - concurrent reads" {
     // Wait for all readers
     for (0..num_readers) |i| {
         readers[i].join();
-        try std.testing.expectEqual(@as(u32, 10000), read_counts[i]);
     }
+    const summary = .{ .read_counts = read_counts };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.cancelled flag is atomic - concurrent reads__struct_<^\d+$>
+        \\  .read_counts: [4]u32
+        \\    [0]: u32 = 10000
+        \\    [1]: u32 = 10000
+        \\    [2]: u32 = 10000
+        \\    [3]: u32 = 10000
+    ).expectEqual(summary);
 }
 
 test "cancelled flag is atomic - writer thread sets, reader sees it" {
@@ -1486,8 +1525,11 @@ test "cancelled flag is atomic - writer thread sets, reader sees it" {
 
     reader.join();
 
-    // Reader should have seen the cancelled flag
-    try std.testing.expect(seen_true.load(.acquire));
+    const summary = .{ .seen_true = seen_true.load(.acquire) };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.cancelled flag is atomic - writer thread sets, reader sees it__struct_<^\d+$>
+        \\  .seen_true: bool = true
+    ).expectEqual(summary);
 }
 
 test "should_exit flag stops poll thread" {
@@ -1511,8 +1553,7 @@ test "should_exit flag stops poll thread" {
         }
     }.run, .{ &handler, &thread_exited });
 
-    // Verify thread is running
-    try std.testing.expect(!thread_exited.load(.acquire));
+    const before = thread_exited.load(.acquire);
 
     // Signal exit
     handler.should_exit.store(true, .release);
@@ -1520,8 +1561,13 @@ test "should_exit flag stops poll thread" {
     // Wait for thread with timeout
     thread.join();
 
-    // Thread should have exited
-    try std.testing.expect(thread_exited.load(.acquire));
+    const after = thread_exited.load(.acquire);
+    const summary = .{ .before = before, .after = after };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.should_exit flag stops poll thread__struct_<^\d+$>
+        \\  .before: bool = false
+        \\  .after: bool = true
+    ).expectEqual(summary);
 
     // Now safe to deinit (thread already joined)
     handler.deinit();
@@ -1546,11 +1592,20 @@ test "prompt queueing - main thread sees queued prompt" {
 
     // Verify prompt is queued
     handler.prompt.mutex.lock();
-    try std.testing.expect(handler.prompt.pending != null);
-    try std.testing.expectEqualStrings("test prompt", handler.prompt.pending.?.text);
+    const pending = handler.prompt.pending;
     handler.prompt.mutex.unlock();
 
-    // Clean up
+    const summary = .{
+        .pending = pending != null,
+        .text = if (pending) |item| item.text else null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.prompt queueing - main thread sees queued prompt__struct_<^\d+$>
+        \\  .pending: bool = true
+        \\  .text: ?[]const u8
+        \\    "test prompt"
+    ).expectEqual(summary);
+
     handler.should_exit.store(true, .release);
     handler.deinit();
 }
@@ -1597,8 +1652,11 @@ test "cancel flag visible across threads during simulated processing" {
 
     processor.join();
 
-    // Verify processing saw the cancel
-    try std.testing.expect(processing_saw_cancel.load(.acquire));
+    const summary = .{ .saw_cancel = processing_saw_cancel.load(.acquire) };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.cancel flag visible across threads during simulated processing__struct_<^\d+$>
+        \\  .saw_cancel: bool = true
+    ).expectEqual(summary);
 
     handler.deinit();
 }
@@ -1643,8 +1701,11 @@ test "prompt queue with condition variable wakeup" {
 
     waiter.join();
 
-    // Verify waiter got the prompt
-    try std.testing.expect(waiter_got_prompt.load(.acquire));
+    const summary = .{ .got_prompt = waiter_got_prompt.load(.acquire) };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.prompt queue with condition variable wakeup__struct_<^\d+$>
+        \\  .got_prompt: bool = true
+    ).expectEqual(summary);
 
     handler.deinit();
 }
@@ -1661,8 +1722,16 @@ test "protocol JsonRpcRequest parse" {
     });
     defer parsed.deinit();
 
-    try std.testing.expectEqualStrings("prompt", parsed.value.method);
-    try std.testing.expect(parsed.value.params != null);
+    const summary = .{
+        .method = parsed.value.method,
+        .has_params = parsed.value.params != null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.protocol JsonRpcRequest parse__struct_<^\d+$>
+        \\  .method: []const u8
+        \\    "prompt"
+        \\  .has_params: bool = true
+    ).expectEqual(summary);
 }
 
 test "protocol PromptRequest parse" {
@@ -1677,9 +1746,17 @@ test "protocol PromptRequest parse" {
     });
     defer parsed.deinit();
 
-    try std.testing.expectEqualStrings("hello world", parsed.value.text);
-    try std.testing.expect(parsed.value.cwd != null);
-    try std.testing.expectEqualStrings("/tmp", parsed.value.cwd.?);
+    const summary = .{
+        .text = parsed.value.text,
+        .cwd = parsed.value.cwd,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.protocol PromptRequest parse__struct_<^\d+$>
+        \\  .text: []const u8
+        \\    "hello world"
+        \\  .cwd: ?[]const u8
+        \\    "/tmp"
+    ).expectEqual(summary);
 }
 
 test "protocol StreamChunk serialization" {
@@ -1700,8 +1777,9 @@ test "protocol StreamChunk serialization" {
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
 
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"text\":\"Hello\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"is_thought\":true") != null);
+    try (ohsnap{}).snap(@src(),
+        \\{"text":"Hello","is_thought":true}
+    ).diff(json, true);
 }
 
 test "generateSessionId format" {
@@ -1718,14 +1796,24 @@ test "generateSessionId format" {
     const session_id = try handler.generateSessionId();
     defer allocator.free(session_id);
 
-    // Format: "nvim-{32 hex chars}"
-    try std.testing.expect(std.mem.startsWith(u8, session_id, "nvim-"));
-    try std.testing.expectEqual(@as(usize, 37), session_id.len); // "nvim-" (5) + 32 hex chars
-
-    // Verify hex chars are valid
+    var all_hex = true;
     for (session_id[5..]) |c| {
-        try std.testing.expect(std.ascii.isHex(c));
+        if (!std.ascii.isHex(c)) {
+            all_hex = false;
+            break;
+        }
     }
+    const summary = .{
+        .prefix = std.mem.startsWith(u8, session_id, "nvim-"),
+        .len = session_id.len,
+        .all_hex = all_hex,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.generateSessionId format__struct_<^\d+$>
+        \\  .prefix: bool = true
+        \\  .len: usize = 37
+        \\  .all_hex: bool = true
+    ).expectEqual(summary);
 }
 
 test "generateSessionId uniqueness" {
@@ -1744,8 +1832,11 @@ test "generateSessionId uniqueness" {
     const id2 = try handler.generateSessionId();
     defer allocator.free(id2);
 
-    // Two calls should produce different IDs
-    try std.testing.expect(!std.mem.eql(u8, id1, id2));
+    const summary = .{ .unique = !std.mem.eql(u8, id1, id2) };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.generateSessionId uniqueness__struct_<^\d+$>
+        \\  .unique: bool = true
+    ).expectEqual(summary);
 }
 
 test "permission socket create and close" {
@@ -1761,24 +1852,41 @@ test "permission socket create and close" {
     // Create socket
     try handler.createPermissionSocket();
 
-    // Verify socket was created
-    try std.testing.expect(handler.permission.socket != null);
-    try std.testing.expect(handler.permission.socket_path != null);
-    try std.testing.expect(handler.permission.session_id != null);
-
-    // Socket path should match session ID
-    try std.testing.expect(std.mem.indexOf(u8, handler.permission.socket_path.?, handler.permission.session_id.?) != null);
-
-    // Socket file should exist
-    const stat = std.fs.cwd().statFile(handler.permission.socket_path.?) catch null;
-    try std.testing.expect(stat != null);
+    const path_contains = if (handler.permission.socket_path) |path| blk: {
+        if (handler.permission.session_id) |sid| {
+            break :blk std.mem.indexOf(u8, path, sid) != null;
+        }
+        break :blk false;
+    } else false;
+    const stat = if (handler.permission.socket_path) |path| std.fs.cwd().statFile(path) catch null else null;
+    const before = .{
+        .socket = handler.permission.socket != null,
+        .socket_path_present = handler.permission.socket_path != null,
+        .session_id_present = handler.permission.session_id != null,
+        .path_contains = path_contains,
+        .stat_present = stat != null,
+    };
 
     // Close socket
     handler.closePermissionSocket();
 
-    // Verify cleanup
-    try std.testing.expect(handler.permission.socket == null);
-    try std.testing.expect(handler.permission.socket_path == null);
+    const after = .{
+        .socket = handler.permission.socket != null,
+        .socket_path_present = handler.permission.socket_path != null,
+    };
+    const summary = .{ .before = before, .after = after };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.permission socket create and close__struct_<^\d+$>
+        \\  .before: nvim.handler.test.permission socket create and close__struct_<^\d+$>
+        \\    .socket: bool = true
+        \\    .socket_path_present: bool = true
+        \\    .session_id_present: bool = true
+        \\    .path_contains: bool = true
+        \\    .stat_present: bool = true
+        \\  .after: nvim.handler.test.permission socket create and close__struct_<^\d+$>
+        \\    .socket: bool = false
+        \\    .socket_path_present: bool = false
+    ).expectEqual(summary);
 
     handler.deinit();
 }
@@ -1794,18 +1902,38 @@ test "checkPermissionAutoApprove safe tools" {
     var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
     defer handler.deinit();
 
-    // Safe tools should always be approved
-    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Read").?);
-    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Glob").?);
-    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Grep").?);
-    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("TodoWrite").?);
-    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Task").?);
-    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("LSP").?);
-
-    // Dangerous tools should NOT be auto-approved in default mode
-    try std.testing.expect(handler.checkPermissionAutoApprove("Bash") == null);
-    try std.testing.expect(handler.checkPermissionAutoApprove("Write") == null);
-    try std.testing.expect(handler.checkPermissionAutoApprove("Edit") == null);
+    const summary = .{
+        .read = handler.checkPermissionAutoApprove("Read"),
+        .glob = handler.checkPermissionAutoApprove("Glob"),
+        .grep = handler.checkPermissionAutoApprove("Grep"),
+        .todo = handler.checkPermissionAutoApprove("TodoWrite"),
+        .task = handler.checkPermissionAutoApprove("Task"),
+        .lsp = handler.checkPermissionAutoApprove("LSP"),
+        .bash = handler.checkPermissionAutoApprove("Bash"),
+        .write = handler.checkPermissionAutoApprove("Write"),
+        .edit = handler.checkPermissionAutoApprove("Edit"),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.checkPermissionAutoApprove safe tools__struct_<^\d+$>
+        \\  .read: ?[]const u8
+        \\    "allow"
+        \\  .glob: ?[]const u8
+        \\    "allow"
+        \\  .grep: ?[]const u8
+        \\    "allow"
+        \\  .todo: ?[]const u8
+        \\    "allow"
+        \\  .task: ?[]const u8
+        \\    "allow"
+        \\  .lsp: ?[]const u8
+        \\    "allow"
+        \\  .bash: ?[]const u8
+        \\    null
+        \\  .write: ?[]const u8
+        \\    null
+        \\  .edit: ?[]const u8
+        \\    null
+    ).expectEqual(summary);
 }
 
 test "checkPermissionAutoApprove auto_approve mode" {
@@ -1822,10 +1950,20 @@ test "checkPermissionAutoApprove auto_approve mode" {
     // Set auto_approve mode (bypassPermissions)
     handler.permission.mode = .bypassPermissions;
 
-    // All tools should be approved
-    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Bash").?);
-    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Write").?);
-    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Edit").?);
+    const summary = .{
+        .bash = handler.checkPermissionAutoApprove("Bash"),
+        .write = handler.checkPermissionAutoApprove("Write"),
+        .edit = handler.checkPermissionAutoApprove("Edit"),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.checkPermissionAutoApprove auto_approve mode__struct_<^\d+$>
+        \\  .bash: ?[]const u8
+        \\    "allow"
+        \\  .write: ?[]const u8
+        \\    "allow"
+        \\  .edit: ?[]const u8
+        \\    "allow"
+    ).expectEqual(summary);
 }
 
 test "checkPermissionAutoApprove accept_edits mode" {
@@ -1842,27 +1980,43 @@ test "checkPermissionAutoApprove accept_edits mode" {
     // Set accept_edits mode
     handler.permission.mode = .acceptEdits;
 
-    // Edit tools should be approved
-    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Write").?);
-    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Edit").?);
-    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("MultiEdit").?);
-    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("NotebookEdit").?);
-
-    // Bash should NOT be auto-approved in accept_edits mode
-    try std.testing.expect(handler.checkPermissionAutoApprove("Bash") == null);
+    const summary = .{
+        .write = handler.checkPermissionAutoApprove("Write"),
+        .edit = handler.checkPermissionAutoApprove("Edit"),
+        .multi = handler.checkPermissionAutoApprove("MultiEdit"),
+        .notebook = handler.checkPermissionAutoApprove("NotebookEdit"),
+        .bash = handler.checkPermissionAutoApprove("Bash"),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.checkPermissionAutoApprove accept_edits mode__struct_<^\d+$>
+        \\  .write: ?[]const u8
+        \\    "allow"
+        \\  .edit: ?[]const u8
+        \\    "allow"
+        \\  .multi: ?[]const u8
+        \\    "allow"
+        \\  .notebook: ?[]const u8
+        \\    "allow"
+        \\  .bash: ?[]const u8
+        \\    null
+    ).expectEqual(summary);
 }
 
 test "codexAutoApprovalDecision respects permission mode" {
-    const edit_decision = Handler.codexAutoApprovalDecision(.acceptEdits, .file_change) orelse {
-        return error.TestUnexpectedResult;
+    const summary = .{
+        .file_change = Handler.codexAutoApprovalDecision(.acceptEdits, .file_change),
+        .command_execution = Handler.codexAutoApprovalDecision(.acceptEdits, .command_execution),
+        .exec_command = Handler.codexAutoApprovalDecision(.bypassPermissions, .exec_command),
     };
-    try std.testing.expectEqualStrings("acceptForSession", edit_decision);
-    try std.testing.expect(Handler.codexAutoApprovalDecision(.acceptEdits, .command_execution) == null);
-
-    const exec_decision = Handler.codexAutoApprovalDecision(.bypassPermissions, .exec_command) orelse {
-        return error.TestUnexpectedResult;
-    };
-    try std.testing.expectEqualStrings("approved_for_session", exec_decision);
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.codexAutoApprovalDecision respects permission mode__struct_<^\d+$>
+        \\  .file_change: ?[]const u8
+        \\    "acceptForSession"
+        \\  .command_execution: ?[]const u8
+        \\    null
+        \\  .exec_command: ?[]const u8
+        \\    "approved_for_session"
+    ).expectEqual(summary);
 }
 
 test "cbCheckAuthRequired returns auth_required for marker" {
@@ -1882,10 +2036,17 @@ test "cbCheckAuthRequired returns auth_required for marker" {
 
     var cb_ctx = Handler.CallbackContext{ .handler = &handler };
     const stop = try Handler.cbCheckAuthRequired(@ptrCast(&cb_ctx), "session", .claude, "authenticate to continue");
-    try std.testing.expectEqual(EditorCallbacks.StopReason.auth_required, stop.?);
-
     const no_stop = try Handler.cbCheckAuthRequired(@ptrCast(&cb_ctx), "session", .claude, "all good");
-    try std.testing.expect(no_stop == null);
+    const summary = .{
+        .stop = if (stop) |s| @tagName(s) else null,
+        .no_stop = no_stop == null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.cbCheckAuthRequired returns auth_required for marker__struct_<^\d+$>
+        \\  .stop: ?[:0]const u8
+        \\    "auth_required"
+        \\  .no_stop: bool = true
+    ).expectEqual(summary);
 }
 
 test "checkPermissionAutoApprove always_allowed_tools" {
@@ -1899,16 +2060,22 @@ test "checkPermissionAutoApprove always_allowed_tools" {
     var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
     defer handler.deinit();
 
-    // Bash normally requires permission
-    try std.testing.expect(handler.checkPermissionAutoApprove("Bash") == null);
+    const before = handler.checkPermissionAutoApprove("Bash");
 
     // Add to always_allowed_tools (simulates "Allow Always" selection)
     // Key must be allocated since deinit frees all keys
     const key = try allocator.dupe(u8, "Bash");
     try handler.permission.always_allowed.put(key, {});
 
-    // Now Bash should be approved
-    try std.testing.expectEqualStrings("allow", handler.checkPermissionAutoApprove("Bash").?);
+    const after = handler.checkPermissionAutoApprove("Bash");
+    const summary = .{ .before = before, .after = after };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.checkPermissionAutoApprove always_allowed_tools__struct_<^\d+$>
+        \\  .before: ?[]const u8
+        \\    null
+        \\  .after: ?[]const u8
+        \\    "allow"
+    ).expectEqual(summary);
 }
 
 test "protocol PermissionResponseRequest parse" {
@@ -1923,6 +2090,15 @@ test "protocol PermissionResponseRequest parse" {
     });
     defer parsed.deinit();
 
-    try std.testing.expectEqualStrings("perm-123", parsed.value.id);
-    try std.testing.expectEqualStrings("allow_always", parsed.value.decision);
+    const summary = .{
+        .id = parsed.value.id,
+        .decision = parsed.value.decision,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.protocol PermissionResponseRequest parse__struct_<^\d+$>
+        \\  .id: []const u8
+        \\    "perm-123"
+        \\  .decision: []const u8
+        \\    "allow_always"
+    ).expectEqual(summary);
 }

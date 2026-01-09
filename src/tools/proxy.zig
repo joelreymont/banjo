@@ -209,6 +209,7 @@ pub const ToolProxy = struct {
 
 // Tests
 const testing = std.testing;
+const ohsnap = @import("ohsnap");
 
 test "ToolProxy init/deinit" {
     const writer = jsonrpc.Writer.init(testing.allocator, std.io.null_writer.any());
@@ -223,10 +224,27 @@ test "ToolProxy request tracking" {
 
     // Can't actually send requests without a real writer, but we can test tracking
     try proxy.pending_requests.put(1, .{ .method = "test" });
-    try testing.expect(proxy.isPending(1));
-    try testing.expect(!proxy.isPending(2));
+    const before_pending1 = proxy.isPending(1);
+    const before_pending2 = proxy.isPending(2);
 
     const method = proxy.handleResponse(1);
-    try testing.expectEqualStrings("test", method.?);
-    try testing.expect(!proxy.isPending(1));
+    const method_str = method orelse "null";
+    const pending_after = proxy.isPending(1);
+
+    var out: std.io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try out.writer.print(
+        "pending1: {any}\npending2: {any}\nmethod: {s}\npending_after: {any}\n",
+        .{ before_pending1, before_pending2, method_str, pending_after },
+    );
+    const snapshot = try out.toOwnedSlice();
+    defer testing.allocator.free(snapshot);
+
+    try (ohsnap{}).snap(@src(),
+        \\pending1: true
+        \\pending2: false
+        \\method: test
+        \\pending_after: false
+        \\
+    ).diff(snapshot, true);
 }

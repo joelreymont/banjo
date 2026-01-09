@@ -77,30 +77,37 @@ fn isUnreserved(byte: u8) bool {
 
 // Tests
 const testing = std.testing;
-const quickcheck = @import("../util/quickcheck.zig");
+const ohsnap = @import("ohsnap");
+const zcheck = @import("zcheck");
+const zcheck_seed_base: u64 = 0x2c8f_0d1a_9b42_6e53;
 
 test "uriToPath decodes percent sequences" {
     const uri = "file:///tmp/space%20here.txt";
     const parsed = try uriToPath(testing.allocator, uri) orelse return error.TestUnexpectedResult;
     defer parsed.deinit(testing.allocator);
-
-    try testing.expectEqualStrings("/tmp/space here.txt", parsed.path);
+    const summary = .{ .path = parsed.path };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.uri.test.uriToPath decodes percent sequences__struct_<^\d+$>
+        \\  .path: []const u8
+        \\    "/tmp/space here.txt"
+    ).expectEqual(summary);
 }
 
 test "pathToUri encodes spaces" {
     const uri = try pathToUri(testing.allocator, "/tmp/space here.txt");
     defer testing.allocator.free(uri);
-
-    try testing.expectEqualStrings("file:///tmp/space%20here.txt", uri);
+    try (ohsnap{}).snap(@src(),
+        \\file:///tmp/space%20here.txt
+    ).diff(uri, true);
 }
 
 test "pathToUri and uriToPath roundtrip" {
-    try quickcheck.check(struct {
-        fn property(args: struct { bytes: [16]u8 }) bool {
+    try zcheck.check(struct {
+        fn property(args: struct { path: zcheck.FilePath }) bool {
             var arena = std.heap.ArenaAllocator.init(testing.allocator);
             defer arena.deinit();
 
-            const path = args.bytes[0..];
+            const path = args.path.slice();
             const uri = pathToUri(arena.allocator(), path) catch return false;
             const parsed = uriToPath(arena.allocator(), uri) catch return false;
             if (parsed) |p| {
@@ -108,5 +115,5 @@ test "pathToUri and uriToPath roundtrip" {
             }
             return false;
         }
-    }.property, .{});
+    }.property, .{ .seed = zcheck_seed_base + 1 });
 }

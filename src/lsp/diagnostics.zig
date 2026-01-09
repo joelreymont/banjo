@@ -393,23 +393,38 @@ test "noteToDiagnostic creates info diagnostic" {
 
     var owned = try noteToDiagnostic(testing.allocator, note, "file:///test.zig", null);
     defer owned.deinit(testing.allocator);
-
-    try testing.expectEqual(protocol.DiagnosticSeverity.Information, owned.diagnostic.severity.?);
-    try testing.expectEqual(@as(u32, 9), owned.diagnostic.range.start.line); // 0-indexed
-    try testing.expectEqualStrings("banjo", owned.diagnostic.source.?);
-    try testing.expect(mem.startsWith(u8, owned.diagnostic.message, "Note:"));
+    const snapshot = .{
+        .severity = @tagName(owned.diagnostic.severity.?),
+        .line = owned.diagnostic.range.start.line,
+        .source = owned.diagnostic.source.?,
+        .message = owned.diagnostic.message,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.diagnostics.test.noteToDiagnostic creates info diagnostic__struct_<^\d+$>
+        \\  .severity: [:0]const u8
+        \\    "Information"
+        \\  .line: u32 = 9
+        \\  .source: []const u8
+        \\    "banjo"
+        \\  .message: []const u8
+        \\    "Note: Test note content"
+    ).expectEqual(snapshot);
 }
 
 test "getSummary truncates long text" {
     const long_text = "a" ** 100;
     const summary_text = summary.getSummary(long_text, .{ .max_len = 80, .prefer_word_boundary = false });
-    try testing.expectEqual(@as(usize, 80), summary_text.len);
+    try (ohsnap{}).snap(@src(),
+        \\aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    ).diff(summary_text, true);
 }
 
 test "getSummary stops at newline" {
     const text = "First line\nSecond line";
     const summary_text = summary.getSummary(text, .{ .max_len = 80, .prefer_word_boundary = false });
-    try testing.expectEqualStrings("First line", summary_text);
+    try (ohsnap{}).snap(@src(),
+        \\First line
+    ).diff(summary_text, true);
 }
 
 test "NoteIndex tracks backlinks" {
@@ -436,8 +451,13 @@ test "NoteIndex tracks backlinks" {
 
     // Check backlinks to note-b
     const backlinks = index.getBacklinks("note-b").?;
-    try testing.expectEqual(@as(usize, 1), backlinks.len);
-    try testing.expectEqualStrings("note-a", backlinks[0]);
+    const snapshot = .{ .backlinks = backlinks };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.diagnostics.test.NoteIndex tracks backlinks__struct_<^\d+$>
+        \\  .backlinks: []const []const u8
+        \\    [0]: []const u8
+        \\      "note-a"
+    ).expectEqual(snapshot);
 }
 
 test "NoteIndex avoids duplicate backlinks" {
@@ -454,8 +474,13 @@ test "NoteIndex avoids duplicate backlinks" {
     try index.addNote(note_a, "/test.zig");
 
     const backlinks = index.getBacklinks("note-b").?;
-    try testing.expectEqual(@as(usize, 1), backlinks.len);
-    try testing.expectEqualStrings("note-a", backlinks[0]);
+    const snapshot = .{ .backlinks = backlinks };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.diagnostics.test.NoteIndex avoids duplicate backlinks__struct_<^\d+$>
+        \\  .backlinks: []const []const u8
+        \\    [0]: []const u8
+        \\      "note-a"
+    ).expectEqual(snapshot);
 }
 
 test "NoteIndex removeNotesByFile clears notes and backlinks" {
@@ -472,11 +497,17 @@ test "NoteIndex removeNotesByFile clears notes and backlinks" {
 
     try index.removeNotesByFile("/tmp/a.zig");
 
-    try testing.expect(index.getNote("a") == null);
     const backlinks = index.getBacklinks("b") orelse &.{};
-    for (backlinks) |id| {
-        try testing.expect(!mem.eql(u8, id, "a"));
-    }
+    const snapshot = .{
+        .note_a_present = index.getNote("a") != null,
+        .backlinks = backlinks,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.diagnostics.test.NoteIndex removeNotesByFile clears notes and backlinks__struct_<^\d+$>
+        \\  .note_a_present: bool = false
+        \\  .backlinks: []const []const u8
+        \\    (empty)
+    ).expectEqual(snapshot);
 }
 
 // Snapshot tests

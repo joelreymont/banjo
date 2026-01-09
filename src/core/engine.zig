@@ -18,6 +18,7 @@ const CodexMessage = codex_bridge.CodexMessage;
 const dots = @import("dots.zig");
 const config = @import("config");
 const constants = @import("constants.zig");
+const auth_markers = @import("auth_markers.zig");
 
 const log = std.log.scoped(.engine);
 const debug_log = @import("../util/debug_log.zig");
@@ -27,36 +28,27 @@ fn engineDebugLog(comptime fmt: []const u8, args: anytype) void {
 }
 
 const prompt_poll_ms: i64 = 250;
-const auth_markers = [_][]const u8{ "/login", "login", "log in", "authenticate" };
-
 pub const NudgeConfig = struct {
     enabled: bool = true,
     cooldown_ms: i64 = constants.nudge_cooldown_ms,
     last_nudge_ms: *i64,
 };
 
-fn containsAuthMarker(text: []const u8) bool {
-    for (auth_markers) |marker| {
-        if (std.mem.indexOf(u8, text, marker) != null) return true;
-    }
-    return false;
-}
-
 fn authMarkerTextFromTurnError(err: codex_bridge.TurnError) ?[]const u8 {
     if (err.message) |msg| {
-        if (containsAuthMarker(msg)) return msg;
+        if (auth_markers.containsAuthMarker(msg)) return msg;
     }
     if (err.code) |code| {
-        if (containsAuthMarker(code)) return code;
+        if (auth_markers.containsAuthMarker(code)) return code;
     }
     if (err.type) |err_type| {
-        if (containsAuthMarker(err_type)) return err_type;
+        if (auth_markers.containsAuthMarker(err_type)) return err_type;
     }
     return null;
 }
 
 fn maybeAuthRequired(ctx: *PromptContext, engine: Engine, text: []const u8) !?StopReason {
-    if (!containsAuthMarker(text)) return null;
+    if (!auth_markers.containsAuthMarker(text)) return null;
     return try ctx.cb.checkAuthRequired(ctx.session_id, engine, text);
 }
 
@@ -222,7 +214,7 @@ pub fn processClaudeMessages(
                     if (should_nudge) {
                         ctx.nudge.last_nudge_ms.* = now_ms;
                         log.info("Claude Code stopped ({s}); pending dots, nudging", .{reason});
-                        try ctx.cb.sendUserMessage(ctx.session_id, "🔄 continue working on pending dots");
+                        try ctx.cb.sendUserMessage(ctx.session_id, "dots: continue working on pending dots");
                         const nudge_prompt = "clean up dots, then pick a dot and work on it";
                         // Queue continuation - handler will process it after we break
                         _ = try ctx.cb.sendContinuePrompt(.claude, nudge_prompt);
@@ -543,7 +535,7 @@ pub fn processCodexMessages(
             if (should_nudge) {
                 ctx.nudge.last_nudge_ms.* = now_ms;
                 log.info("Codex turn completed; pending dots, nudging to continue", .{});
-                try ctx.cb.sendUserMessage(ctx.session_id, "🔄 continue working on pending dots");
+                try ctx.cb.sendUserMessage(ctx.session_id, "dots: continue working on pending dots");
                 const nudge_prompt = "continue with the next dot task";
                 // Queue continuation - handler will process it after we break
                 _ = try ctx.cb.sendContinuePrompt(.codex, nudge_prompt);
@@ -569,6 +561,7 @@ fn sendEngineThought(ctx: *PromptContext, engine: Engine, text: []const u8) !voi
 
 // Tests
 const testing = std.testing;
+const ohsnap = @import("ohsnap");
 
 test "maybeAuthRequired invokes callback on auth marker" {
     const AuthCtx = struct {
@@ -641,11 +634,25 @@ test "maybeAuthRequired invokes callback on auth marker" {
     };
 
     const stop = try maybeAuthRequired(&ctx, .claude, "Please login to continue.");
-    try testing.expectEqual(StopReason.auth_required, stop.?);
-    try testing.expect(auth_ctx.called);
-    try testing.expectEqualStrings("session", auth_ctx.last_session_id.?);
-    try testing.expectEqual(Engine.claude, auth_ctx.last_engine.?);
-    try testing.expectEqualStrings("Please login to continue.", auth_ctx.last_content.?);
+    const summary = .{
+        .stop = if (stop) |s| @tagName(s) else null,
+        .called = auth_ctx.called,
+        .session_id = auth_ctx.last_session_id,
+        .engine = if (auth_ctx.last_engine) |eng| @tagName(eng) else null,
+        .content = auth_ctx.last_content,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.engine.test.maybeAuthRequired invokes callback on auth marker__struct_<^\d+$>
+        \\  .stop: ?[:0]const u8
+        \\    "auth_required"
+        \\  .called: bool = true
+        \\  .session_id: ?[]const u8
+        \\    "session"
+        \\  .engine: ?[:0]const u8
+        \\    "claude"
+        \\  .content: ?[]const u8
+        \\    "Please login to continue."
+    ).expectEqual(summary);
 }
 
 test "maybeAuthRequired ignores non-auth text" {
@@ -710,19 +717,34 @@ test "maybeAuthRequired ignores non-auth text" {
     };
 
     const stop = try maybeAuthRequired(&ctx, .claude, "All good.");
-    try testing.expect(stop == null);
-    try testing.expect(!auth_ctx.called);
+    const summary = .{ .stop = if (stop) |s| @tagName(s) else null, .called = auth_ctx.called };
+    try (ohsnap{}).snap(@src(),
+        \\core.engine.test.maybeAuthRequired ignores non-auth text__struct_<^\d+$>
+        \\  .stop: ?[:0]const u8
+        \\    null
+        \\  .called: bool = false
+    ).expectEqual(summary);
 }
 
 test "authMarkerTextFromTurnError finds auth marker" {
     const err = codex_bridge.TurnError{ .message = "Please login to continue." };
-    const found = authMarkerTextFromTurnError(err) orelse return error.TestExpectedEqual;
-    try testing.expectEqualStrings("Please login to continue.", found);
+    const found = authMarkerTextFromTurnError(err);
+    const summary = .{ .text = found };
+    try (ohsnap{}).snap(@src(),
+        \\core.engine.test.authMarkerTextFromTurnError finds auth marker__struct_<^\d+$>
+        \\  .text: ?[]const u8
+        \\    "Please login to continue."
+    ).expectEqual(summary);
 }
 
 test "authMarkerTextFromTurnError returns null when missing" {
     const err = codex_bridge.TurnError{ .message = "No issues here." };
-    try testing.expect(authMarkerTextFromTurnError(err) == null);
+    const summary = .{ .text = authMarkerTextFromTurnError(err) };
+    try (ohsnap{}).snap(@src(),
+        \\core.engine.test.authMarkerTextFromTurnError returns null when missing__struct_<^\d+$>
+        \\  .text: ?[]const u8
+        \\    null
+    ).expectEqual(summary);
 }
 
 test "PromptContext.isCancelled reads atomic flag" {
@@ -742,13 +764,35 @@ test "PromptContext.isCancelled reads atomic flag" {
         .cb = undefined,
     };
 
-    try testing.expect(!ctx.isCancelled());
-
+    const initial = ctx.isCancelled();
     cancelled.store(true, .release);
-    try testing.expect(ctx.isCancelled());
-
+    const after_true = ctx.isCancelled();
     cancelled.store(false, .release);
-    try testing.expect(!ctx.isCancelled());
+    const after_false = ctx.isCancelled();
+    const summary = .{ .initial = initial, .after_true = after_true, .after_false = after_false };
+    try (ohsnap{}).snap(@src(),
+        \\core.engine.test.PromptContext.isCancelled reads atomic flag__struct_<^\d+$>
+        \\  .initial: bool = false
+        \\  .after_true: bool = true
+        \\  .after_false: bool = false
+    ).expectEqual(summary);
+}
+
+test "mapCliStopReason maps cancelled" {
+    const summary = .{
+        .cancelled = mapCliStopReason("cancelled"),
+        .success = mapCliStopReason("success"),
+        .unknown = mapCliStopReason("unknown"),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.engine.test.mapCliStopReason maps cancelled__struct_<^\d+$>
+        \\  .cancelled: core.callbacks.EditorCallbacks.StopReason
+        \\    .cancelled
+        \\  .success: core.callbacks.EditorCallbacks.StopReason
+        \\    .end_turn
+        \\  .unknown: core.callbacks.EditorCallbacks.StopReason
+        \\    .end_turn
+    ).expectEqual(summary);
 }
 
 test "PromptContext.isCancelled sees updates from another thread" {
@@ -792,7 +836,11 @@ test "PromptContext.isCancelled sees updates from another thread" {
 
     reader.join();
 
-    try testing.expect(seen_cancelled.load(.acquire));
+    const summary = .{ .seen = seen_cancelled.load(.acquire) };
+    try (ohsnap{}).snap(@src(),
+        \\core.engine.test.PromptContext.isCancelled sees updates from another thread__struct_<^\d+$>
+        \\  .seen: bool = true
+    ).expectEqual(summary);
 }
 
 test "PromptContext.isCancelled concurrent access is safe" {
@@ -839,6 +887,21 @@ test "PromptContext.isCancelled concurrent access is safe" {
     // Wait for readers
     for (0..num_threads) |i| {
         threads[i].join();
-        try testing.expectEqual(@as(u32, 10000), read_counts[i].load(.acquire));
     }
+    const summary = .{
+        .counts = [_]u32{
+            read_counts[0].load(.acquire),
+            read_counts[1].load(.acquire),
+            read_counts[2].load(.acquire),
+            read_counts[3].load(.acquire),
+        },
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.engine.test.PromptContext.isCancelled concurrent access is safe__struct_<^\d+$>
+        \\  .counts: [4]u32
+        \\    [0]: u32 = 10000
+        \\    [1]: u32 = 10000
+        \\    [2]: u32 = 10000
+        \\    [3]: u32 = 10000
+    ).expectEqual(summary);
 }

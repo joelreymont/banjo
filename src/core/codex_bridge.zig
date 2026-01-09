@@ -7,9 +7,9 @@ const log = std.log.scoped(.codex_bridge);
 const executable = @import("executable.zig");
 const io_utils = @import("io_utils.zig");
 const test_utils = @import("test_utils.zig");
+const auth_markers = @import("auth_markers.zig");
 
 const max_json_line_bytes: usize = 4 * 1024 * 1024;
-const auth_markers = [_][]const u8{ "/login", "login", "log in", "authenticate" };
 
 pub const TurnError = struct {
     code: ?[]const u8 = null,
@@ -36,13 +36,6 @@ pub const TurnError = struct {
             containsMaxTurnMarker(self.message);
     }
 };
-
-fn containsAuthMarker(text: []const u8) bool {
-    for (auth_markers) |marker| {
-        if (std.mem.indexOf(u8, text, marker) != null) return true;
-    }
-    return false;
-}
 
 pub const CodexMessage = struct {
     event_type: EventType,
@@ -939,6 +932,37 @@ pub const CodexBridge = struct {
         };
     };
 
+    fn parseRpcMessageLine(arena: *std.heap.ArenaAllocator, line: []const u8) !RpcMessage {
+        const parsed = try std.json.parseFromSlice(RpcEnvelope, arena.allocator(), line, .{
+            .ignore_unknown_fields = true,
+        });
+
+        const envelope = parsed.value;
+        var kind: RpcMessage.Kind = .unknown;
+
+        if (envelope.method) |_| {
+            if (envelope.id != null) {
+                kind = .request;
+            } else {
+                kind = .notification;
+            }
+        } else if (envelope.result != null and envelope.id != null) {
+            kind = .response;
+        } else if (envelope.@"error" != null and envelope.id != null) {
+            kind = .err;
+        }
+
+        return RpcMessage{
+            .kind = kind,
+            .arena = arena.*,
+            .id = envelope.id,
+            .method = envelope.method,
+            .params = envelope.params,
+            .result = envelope.result,
+            .err = envelope.@"error",
+        };
+    }
+
     fn readRpcMessage(self: *CodexBridge) !?RpcMessage {
         return self.readRpcMessageWithDeadline(null);
     }
@@ -953,35 +977,9 @@ pub const CodexBridge = struct {
 
             const line = (try self.readLine(arena.allocator(), deadline_ms)) orelse return null;
 
-            const parsed = try std.json.parseFromSlice(RpcEnvelope, arena.allocator(), line, .{
-                .ignore_unknown_fields = true,
-            });
-
-            const envelope = parsed.value;
-            var kind: RpcMessage.Kind = .unknown;
-
-            if (envelope.method) |_| {
-                if (envelope.id != null) {
-                    kind = .request;
-                } else {
-                    kind = .notification;
-                }
-            } else if (envelope.result != null and envelope.id != null) {
-                kind = .response;
-            } else if (envelope.@"error" != null and envelope.id != null) {
-                kind = .err;
-            }
-
+            const msg = try parseRpcMessageLine(&arena, line);
             keep_arena = true;
-            return RpcMessage{
-                .kind = kind,
-                .arena = arena,
-                .id = envelope.id,
-                .method = envelope.method,
-                .params = envelope.params,
-                .result = envelope.result,
-                .err = envelope.@"error",
-            };
+            return msg;
         }
     }
 
@@ -1329,7 +1327,7 @@ fn isAuthRequiredError(arena: *std.heap.ArenaAllocator, err_value: std.json.Valu
         return false;
     };
     const message = parsed.message orelse return false;
-    return containsAuthMarker(message);
+    return auth_markers.containsAuthMarker(message);
 }
 
 fn serverRequestKind(method: []const u8) ServerRequestKind {
@@ -1443,7 +1441,12 @@ test "CodexMessage agent message delta parsing" {
     };
     defer msg.deinit();
 
-    try testing.expectEqualStrings("Hello", msg.getText().?);
+    const summary = .{ .text = msg.getText() };
+    try (ohsnap{}).snap(@src(),
+        \\core.codex_bridge.test.CodexMessage agent message delta parsing__struct_<^\d+$>
+        \\  .text: ?[]const u8
+        \\    "Hello"
+    ).expectEqual(summary);
 }
 
 test "CodexMessage command execution item parsing" {
@@ -1464,9 +1467,20 @@ test "CodexMessage command execution item parsing" {
     defer msg.deinit();
 
     const tool = msg.getToolResult().?;
-    try testing.expectEqualStrings("item_2", tool.id);
-    try testing.expectEqualStrings("ok", tool.content.?);
-    try testing.expectEqual(@as(i64, 0), tool.exit_code.?);
+    const summary = .{
+        .id = tool.id,
+        .content = tool.content,
+        .exit_code = tool.exit_code,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.codex_bridge.test.CodexMessage command execution item parsing__struct_<^\d+$>
+        \\  .id: []const u8
+        \\    "item_2"
+        \\  .content: ?[]const u8
+        \\    "ok"
+        \\  .exit_code: ?i64
+        \\    0
+    ).expectEqual(summary);
 }
 
 test "CodexMessage thread started parsing" {
@@ -1486,7 +1500,12 @@ test "CodexMessage thread started parsing" {
     };
     defer msg.deinit();
 
-    try testing.expectEqualStrings("thr_123", msg.getSessionId().?);
+    const summary = .{ .session_id = msg.getSessionId() };
+    try (ohsnap{}).snap(@src(),
+        \\core.codex_bridge.test.CodexMessage thread started parsing__struct_<^\d+$>
+        \\  .session_id: ?[]const u8
+        \\    "thr_123"
+    ).expectEqual(summary);
 }
 
 test "Codex sandbox policy encoded" {
@@ -1502,9 +1521,6 @@ test "Codex sandbox policy encoded" {
         .emit_null_optional_fields = false,
     });
     defer testing.allocator.free(turn_json);
-    try testing.expect(std.mem.indexOf(u8, turn_json, "\"sandboxPolicy\"") != null);
-    try testing.expect(std.mem.indexOf(u8, turn_json, "\"type\":\"workspaceWrite\"") != null);
-    try testing.expect(std.mem.indexOf(u8, turn_json, "\"writableRoots\":[\"/tmp\"]") != null);
 
     const thread_params = ThreadStartParams{
         .cwd = "/tmp",
@@ -1514,7 +1530,17 @@ test "Codex sandbox policy encoded" {
         .emit_null_optional_fields = false,
     });
     defer testing.allocator.free(thread_json);
-    try testing.expect(std.mem.indexOf(u8, thread_json, "\"sandbox\":\"workspace-write\"") != null);
+    const combined = try std.fmt.allocPrint(
+        testing.allocator,
+        "turn: {s}\nthread: {s}\n",
+        .{ turn_json, thread_json },
+    );
+    defer testing.allocator.free(combined);
+    try (ohsnap{}).snap(@src(),
+        \\turn: {"threadId":"thread-1","input":[{"type":"text","text":"hi"}],"sandboxPolicy":{"type":"workspaceWrite","writableRoots":["/tmp"]}}
+        \\thread: {"cwd":"/tmp","sandbox":"workspace-write","experimentalRawEvents":false}
+        \\
+    ).diff(combined, true);
 }
 
 test "CodexMessage reasoning summary parsing" {
@@ -1534,7 +1560,13 @@ test "CodexMessage reasoning summary parsing" {
     };
     defer msg.deinit();
 
-    try testing.expectEqualStrings("First\nSecond", msg.getThought().?);
+    const summary = .{ .thought = msg.getThought() };
+    try (ohsnap{}).snap(@src(),
+        \\core.codex_bridge.test.CodexMessage reasoning summary parsing__struct_<^\d+$>
+        \\  .thought: ?[]const u8
+        \\    "First
+        \\Second"
+    ).expectEqual(summary);
 }
 
 test "CodexMessage tool call parsing from item started" {
@@ -1555,8 +1587,14 @@ test "CodexMessage tool call parsing from item started" {
     defer msg.deinit();
 
     const tool = msg.getToolCall().?;
-    try testing.expectEqualStrings("item_3", tool.id);
-    try testing.expectEqualStrings("/bin/zsh -lc ls", tool.command);
+    const summary = .{ .id = tool.id, .command = tool.command };
+    try (ohsnap{}).snap(@src(),
+        \\core.codex_bridge.test.CodexMessage tool call parsing from item started__struct_<^\d+$>
+        \\  .id: []const u8
+        \\    "item_3"
+        \\  .command: []const u8
+        \\    "/bin/zsh -lc ls"
+    ).expectEqual(summary);
 }
 
 test "CodexMessage item completed suppressed after agent delta" {
@@ -1586,9 +1624,14 @@ test "CodexMessage item completed suppressed after agent delta" {
     var completed_msg = bridge.mapNotification(&arena_completed, parsed_completed.value.method.?, parsed_completed.value.params.?);
     if (completed_msg) |*msg| {
         defer msg.deinit();
-        return error.TestExpectedEqual;
     }
     arena_completed.deinit();
+
+    const summary = .{ .completed_present = completed_msg != null };
+    try (ohsnap{}).snap(@src(),
+        \\core.codex_bridge.test.CodexMessage item completed suppressed after agent delta__struct_<^\d+$>
+        \\  .completed_present: bool = false
+    ).expectEqual(summary);
 }
 
 test "Codex error auth detection" {
@@ -1604,7 +1647,11 @@ test "Codex error auth detection" {
     defer parsed.deinit();
 
     const err_value = parsed.value.@"error" orelse return error.TestExpectedEqual;
-    try testing.expect(isAuthRequiredError(&arena, err_value));
+    const summary = .{ .auth_required = isAuthRequiredError(&arena, err_value) };
+    try (ohsnap{}).snap(@src(),
+        \\core.codex_bridge.test.Codex error auth detection__struct_<^\d+$>
+        \\  .auth_required: bool = true
+    ).expectEqual(summary);
 }
 
 test "Codex error auth detection ignores non-auth message" {
@@ -1620,12 +1667,44 @@ test "Codex error auth detection ignores non-auth message" {
     defer parsed.deinit();
 
     const err_value = parsed.value.@"error" orelse return error.TestExpectedEqual;
-    try testing.expect(!isAuthRequiredError(&arena, err_value));
+    const summary = .{ .auth_required = isAuthRequiredError(&arena, err_value) };
+    try (ohsnap{}).snap(@src(),
+        \\core.codex_bridge.test.Codex error auth detection ignores non-auth message__struct_<^\d+$>
+        \\  .auth_required: bool = false
+    ).expectEqual(summary);
 }
 
 test "Codex auth marker detection for text" {
-    try testing.expect(isAuthRequiredText("Please login to continue"));
-    try testing.expect(!isAuthRequiredText("All good"));
+    const summary = .{
+        .auth = isAuthRequiredText("Please login to continue"),
+        .non_auth = isAuthRequiredText("All good"),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.codex_bridge.test.Codex auth marker detection for text__struct_<^\d+$>
+        \\  .auth: bool = true
+        \\  .non_auth: bool = false
+    ).expectEqual(summary);
+}
+
+test "Codex parseRpcMessageLine detects auth error" {
+    const line =
+        \\{"id":5,"error":{"code":401,"message":"Please LOGIN to authenticate"}}
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var msg = try CodexBridge.parseRpcMessageLine(&arena, line);
+    defer msg.arena.deinit();
+
+    const err_value = msg.err orelse return error.TestExpectedEqual;
+    const summary = .{
+        .kind = @tagName(msg.kind),
+        .auth_required = isAuthRequiredError(&msg.arena, err_value),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.codex_bridge.test.Codex parseRpcMessageLine detects auth error__struct_<^\d+$>
+        \\  .kind: [:0]const u8
+        \\    "err"
+        \\  .auth_required: bool = true
+    ).expectEqual(summary);
 }
 
 const LiveSnapshotError = error{
@@ -1635,7 +1714,7 @@ const LiveSnapshotError = error{
 };
 
 fn isAuthRequiredText(text: []const u8) bool {
-    return containsAuthMarker(text);
+    return auth_markers.containsAuthMarker(text);
 }
 
 fn collectCodexSnapshot(allocator: Allocator, prompt: []const u8) ![]u8 {

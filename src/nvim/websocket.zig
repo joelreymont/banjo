@@ -3,6 +3,17 @@ const Allocator = std.mem.Allocator;
 
 // Maximum frame payload size (16 MB)
 pub const MAX_FRAME_SIZE: u64 = 16 * 1024 * 1024;
+pub const max_handshake_bytes: usize = 4096;
+
+fn bytesToHexLower(allocator: Allocator, bytes: []const u8) ![]u8 {
+    const charset = "0123456789abcdef";
+    const out = try allocator.alloc(u8, bytes.len * 2);
+    for (bytes, 0..) |b, i| {
+        out[i * 2] = charset[b >> 4];
+        out[i * 2 + 1] = charset[b & 0x0f];
+    }
+    return out;
+}
 
 pub const Frame = struct {
     fin: bool,
@@ -45,6 +56,66 @@ pub const HandshakeResult = struct {
     auth_token: ?[]const u8,
     ws_key: []const u8,
 };
+
+pub const HandshakeParse = struct {
+    result: HandshakeResult,
+    header_end: usize,
+};
+
+pub fn deinitHandshakeResult(allocator: Allocator, result: *const HandshakeResult) void {
+    allocator.free(result.path);
+    allocator.free(result.ws_key);
+    if (result.auth_token) |token| allocator.free(token);
+}
+
+pub fn tryParseHandshake(allocator: Allocator, buffer: []const u8) !?HandshakeParse {
+    if (buffer.len > max_handshake_bytes) return error.HeadersTooLarge;
+    const header_end = std.mem.indexOf(u8, buffer, "\r\n\r\n") orelse return null;
+    const headers_end = header_end + 4;
+    const parsed = try parseHttpHeaders(allocator, buffer[0..headers_end]);
+    return .{ .result = parsed, .header_end = headers_end };
+}
+
+pub fn completeHandshake(
+    socket_fd: std.posix.socket_t,
+    parsed: HandshakeResult,
+    expected_auth_token: []const u8,
+) !ClientKind {
+    const client_kind: ClientKind = if (std.mem.eql(u8, parsed.path, "/nvim"))
+        .nvim
+    else
+        .mcp;
+
+    if (client_kind == .mcp) {
+        if (parsed.auth_token) |token| {
+            if (!std.mem.eql(u8, token, expected_auth_token)) {
+                return error.InvalidAuthToken;
+            }
+        } else {
+            return error.MissingAuthToken;
+        }
+    }
+
+    const magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    var hasher = std.crypto.hash.Sha1.init(.{});
+    hasher.update(parsed.ws_key);
+    hasher.update(magic);
+    const digest = hasher.finalResult();
+
+    var accept_key: [28]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&accept_key, &digest);
+
+    const response_template = "HTTP/1.1 101 Switching Protocols\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Accept: ";
+    const response_end = "\r\n\r\n";
+    try writeAll(socket_fd, response_template);
+    try writeAll(socket_fd, &accept_key);
+    try writeAll(socket_fd, response_end);
+
+    return client_kind;
+}
 
 /// Parse WebSocket frame from bytes.
 /// Returns frame and bytes consumed, or error.
@@ -146,7 +217,7 @@ pub const HandshakeOutcome = struct {
 /// Perform WebSocket handshake on a socket.
 /// Returns the client kind based on path.
 pub fn performHandshakeWithPath(allocator: Allocator, socket_fd: std.posix.socket_t, expected_auth_token: []const u8) !HandshakeOutcome {
-    var header_buf: [4096]u8 = undefined;
+    var header_buf: [max_handshake_bytes]u8 = undefined;
     var total_read: usize = 0;
 
     // Read until we see \r\n\r\n
@@ -166,55 +237,14 @@ pub fn performHandshakeWithPath(allocator: Allocator, socket_fd: std.posix.socke
         }
     }
 
-    const split = try splitHeaders(header_buf[0..total_read]);
-    const parsed = try parseHttpHeaders(allocator, split.headers);
-    defer {
-        if (parsed.auth_token) |t| allocator.free(t);
-        allocator.free(parsed.ws_key);
-        allocator.free(parsed.path);
-    }
+    const parsed = (try tryParseHandshake(allocator, header_buf[0..total_read])) orelse return error.HeadersTooLarge;
+    defer deinitHandshakeResult(allocator, &parsed.result);
 
-    // Determine client kind from path
-    const client_kind: ClientKind = if (std.mem.eql(u8, parsed.path, "/nvim"))
-        .nvim
-    else
-        .mcp;
-
-    // Validate auth token for MCP clients only
-    if (client_kind == .mcp) {
-        if (parsed.auth_token) |token| {
-            if (!std.mem.eql(u8, token, expected_auth_token)) {
-                return error.InvalidAuthToken;
-            }
-        } else {
-            return error.MissingAuthToken;
-        }
-    }
-
-    // Compute accept key
-    const magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    var hasher = std.crypto.hash.Sha1.init(.{});
-    hasher.update(parsed.ws_key);
-    hasher.update(magic);
-    const digest = hasher.finalResult();
-
-    var accept_key: [28]u8 = undefined;
-    _ = std.base64.standard.Encoder.encode(&accept_key, &digest);
-
-    // Send upgrade response
-    const response_template = "HTTP/1.1 101 Switching Protocols\r\n" ++
-        "Upgrade: websocket\r\n" ++
-        "Connection: Upgrade\r\n" ++
-        "Sec-WebSocket-Accept: ";
-    const response_end = "\r\n\r\n";
-
-    _ = try std.posix.write(socket_fd, response_template);
-    _ = try std.posix.write(socket_fd, &accept_key);
-    _ = try std.posix.write(socket_fd, response_end);
+    const client_kind = try completeHandshake(socket_fd, parsed.result, expected_auth_token);
 
     var remainder: ?[]u8 = null;
-    if (split.remainder.len > 0) {
-        remainder = try allocator.dupe(u8, split.remainder);
+    if (parsed.header_end < total_read) {
+        remainder = try allocator.dupe(u8, header_buf[parsed.header_end..total_read]);
     }
 
     return .{
@@ -231,15 +261,6 @@ pub fn performHandshake(allocator: Allocator, socket_fd: std.posix.socket_t, exp
     if (outcome.client_kind != .mcp) {
         return error.InvalidPath;
     }
-}
-
-fn splitHeaders(buffer: []const u8) !struct { headers: []const u8, remainder: []const u8 } {
-    const header_end = std.mem.indexOf(u8, buffer, "\r\n\r\n") orelse return error.HeadersTooLarge;
-    const headers_end = header_end + 4;
-    return .{
-        .headers = buffer[0..headers_end],
-        .remainder = buffer[headers_end..],
-    };
 }
 
 fn parseHttpHeaders(allocator: Allocator, headers: []const u8) !HandshakeResult {
@@ -323,17 +344,35 @@ fn parseHeader(line: []const u8, prefix: []const u8) ?[]const u8 {
     return null;
 }
 
+fn writeAll(fd: std.posix.socket_t, buf: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < buf.len) {
+        const n = try std.posix.write(fd, buf[offset..]);
+        if (n == 0) return error.ConnectionClosed;
+        offset += n;
+    }
+}
+
 // Tests
 const testing = std.testing;
+const ohsnap = @import("ohsnap");
 
 test "encodeFrame small payload" {
     const allocator = testing.allocator;
     const frame = try encodeFrame(allocator, .text, "hello");
     defer allocator.free(frame);
-
-    try testing.expectEqual(@as(u8, 0x81), frame[0]); // FIN + text
-    try testing.expectEqual(@as(u8, 5), frame[1]); // length
-    try testing.expectEqualStrings("hello", frame[2..]);
+    const summary = .{
+        .first = frame[0],
+        .len = frame[1],
+        .payload = frame[2..],
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.websocket.test.encodeFrame small payload__struct_<^\d+$>
+        \\  .first: u8 = 129
+        \\  .len: u8 = 5
+        \\  .payload: []u8
+        \\    "hello"
+    ).expectEqual(summary);
 }
 
 test "encodeFrame medium payload" {
@@ -341,11 +380,20 @@ test "encodeFrame medium payload" {
     const payload = "x" ** 200;
     const frame = try encodeFrame(allocator, .text, payload);
     defer allocator.free(frame);
-
-    try testing.expectEqual(@as(u8, 0x81), frame[0]); // FIN + text
-    try testing.expectEqual(@as(u8, 126), frame[1]); // extended length marker
-    try testing.expectEqual(@as(u16, 200), std.mem.readInt(u16, frame[2..4], .big));
-    try testing.expectEqualStrings(payload, frame[4..]);
+    const summary = .{
+        .first = frame[0],
+        .len = frame[1],
+        .extended_len = std.mem.readInt(u16, frame[2..4], .big),
+        .payload = frame[4..],
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.websocket.test.encodeFrame medium payload__struct_<^\d+$>
+        \\  .first: u8 = 129
+        \\  .len: u8 = 126
+        \\  .extended_len: u16 = 200
+        \\  .payload: []u8
+        \\    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    ).expectEqual(summary);
 }
 
 test "parseFrame small unmasked" {
@@ -353,10 +401,21 @@ test "parseFrame small unmasked" {
     var data = [_]u8{ 0x81, 0x05 } ++ "hello".*;
 
     const result = try parseFrame(&data);
-    try testing.expect(result.frame.fin);
-    try testing.expectEqual(Opcode.text, result.frame.opcode);
-    try testing.expectEqualStrings("hello", result.frame.payload);
-    try testing.expectEqual(@as(usize, 7), result.consumed);
+    const summary = .{
+        .fin = result.frame.fin,
+        .opcode = @tagName(result.frame.opcode),
+        .payload = result.frame.payload,
+        .consumed = result.consumed,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.websocket.test.parseFrame small unmasked__struct_<^\d+$>
+        \\  .fin: bool = true
+        \\  .opcode: [:0]const u8
+        \\    "text"
+        \\  .payload: []const u8
+        \\    "hello"
+        \\  .consumed: usize = 7
+    ).expectEqual(summary);
 }
 
 test "parseFrame masked" {
@@ -375,9 +434,19 @@ test "parseFrame masked" {
     @memcpy(data[6..11], &masked);
 
     const result = try parseFrame(&data);
-    try testing.expect(result.frame.fin);
-    try testing.expectEqual(Opcode.text, result.frame.opcode);
-    try testing.expectEqualStrings("hello", result.frame.payload);
+    const summary = .{
+        .fin = result.frame.fin,
+        .opcode = @tagName(result.frame.opcode),
+        .payload = result.frame.payload,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.websocket.test.parseFrame masked__struct_<^\d+$>
+        \\  .fin: bool = true
+        \\  .opcode: [:0]const u8
+        \\    "text"
+        \\  .payload: []const u8
+        \\    "hello"
+    ).expectEqual(summary);
 }
 
 test "parseFrame incomplete" {
@@ -389,21 +458,60 @@ test "parseFrame ping" {
     var data = [_]u8{ 0x89, 0x00 }; // FIN + ping, no payload
 
     const result = try parseFrame(&data);
-    try testing.expectEqual(Opcode.ping, result.frame.opcode);
-    try testing.expectEqual(@as(usize, 0), result.frame.payload.len);
+    const summary = .{
+        .opcode = @tagName(result.frame.opcode),
+        .payload_len = result.frame.payload.len,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.websocket.test.parseFrame ping__struct_<^\d+$>
+        \\  .opcode: [:0]const u8
+        \\    "ping"
+        \\  .payload_len: usize = 0
+    ).expectEqual(summary);
 }
 
 test "parseFrame close" {
     var data = [_]u8{ 0x88, 0x02, 0x03, 0xe8 }; // Close with status 1000
 
     const result = try parseFrame(&data);
-    try testing.expectEqual(Opcode.close, result.frame.opcode);
-    try testing.expectEqual(@as(usize, 2), result.frame.payload.len);
+    const summary = .{
+        .opcode = @tagName(result.frame.opcode),
+        .payload_len = result.frame.payload.len,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.websocket.test.parseFrame close__struct_<^\d+$>
+        \\  .opcode: [:0]const u8
+        \\    "close"
+        \\  .payload_len: usize = 2
+    ).expectEqual(summary);
 }
 
 test "parseFrame reserved opcode" {
     var data = [_]u8{ 0x83, 0x00 }; // Reserved opcode 0x3
     try testing.expectError(error.ReservedOpcode, parseFrame(&data));
+}
+
+test "tryParseHandshake returns null for partial headers" {
+    const allocator = testing.allocator;
+    const partial = "GET /nvim HTTP/1.1\r\nHost: localhost\r\n";
+    const parsed = try tryParseHandshake(allocator, partial);
+    try testing.expect(parsed == null);
+}
+
+test "tryParseHandshake parses complete headers" {
+    const allocator = testing.allocator;
+    const request =
+        "GET /nvim HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "\r\n";
+    const parsed = (try tryParseHandshake(allocator, request)) orelse return error.TestExpectedEqual;
+    defer deinitHandshakeResult(allocator, &parsed.result);
+    try testing.expect(std.mem.eql(u8, parsed.result.path, "/nvim"));
+    try testing.expect(parsed.header_end > 0);
 }
 
 test "performHandshakeWithPath preserves trailing bytes" {
@@ -441,12 +549,26 @@ test "performHandshakeWithPath preserves trailing bytes" {
     var write_buf: [request.len + extra.len]u8 = undefined;
     @memcpy(write_buf[0..request.len], request);
     @memcpy(write_buf[request.len..], &extra);
-    _ = try std.posix.write(client, &write_buf);
+    try writeAll(client, &write_buf);
 
     const outcome = try performHandshakeWithPath(testing.allocator, server, auth);
     defer if (outcome.remainder) |bytes| testing.allocator.free(bytes);
 
-    try testing.expectEqual(ClientKind.nvim, outcome.client_kind);
-    try testing.expect(outcome.remainder != null);
-    try testing.expectEqualSlices(u8, &extra, outcome.remainder.?);
+    const remainder_hex: ?[]const u8 = if (outcome.remainder) |bytes|
+        try bytesToHexLower(testing.allocator, bytes)
+    else
+        null;
+    defer if (remainder_hex) |hex| testing.allocator.free(hex);
+
+    const summary = .{
+        .client_kind = @tagName(outcome.client_kind),
+        .remainder_hex = remainder_hex,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.websocket.test.performHandshakeWithPath preserves trailing bytes__struct_<^\d+$>
+        \\  .client_kind: [:0]const u8
+        \\    "nvim"
+        \\  .remainder_hex: ?[]const u8
+        \\    "8100"
+    ).expectEqual(summary);
 }

@@ -32,6 +32,39 @@ local function wait_for(condition, timeout_ms)
     return false
 end
 
+local function find_prompt_window(match_text)
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+        local config = vim.api.nvim_win_get_config(win)
+        if config.relative and config.relative ~= "" then
+            local buf = vim.api.nvim_win_get_buf(win)
+            local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+            local content = table.concat(lines, "\n")
+            if content:find(match_text, 1, true) then
+                return win, buf, content
+            end
+        end
+    end
+    return nil
+end
+
+local function wait_for_prompt(match_text, timeout_ms)
+    local win, buf, content
+    local ok = wait_for(function()
+        win, buf, content = find_prompt_window(match_text)
+        return win ~= nil
+    end, timeout_ms)
+    return ok, win, buf, content
+end
+
+local function close_prompt(win, buf)
+    if win and vim.api.nvim_win_is_valid(win) then
+        vim.api.nvim_win_close(win, true)
+    end
+    if buf and vim.api.nvim_buf_is_valid(buf) then
+        vim.api.nvim_buf_delete(buf, { force = true })
+    end
+end
+
 log("Starting comprehensive e2e test")
 log("Binary: " .. (vim.g.banjo_test_binary or "NOT FOUND"))
 
@@ -293,6 +326,59 @@ if content:find("Backend message") then
     pass("Message handling works end-to-end")
 else
     fail("Message handling failed", "got: " .. content:sub(1, 100))
+end
+
+-- Test 13b: Approval prompt rendering
+log("Test 13b: Approval prompt rendering...")
+bridge._handle_message({
+    method = "approval_request",
+    params = { id = "appr-1", tool_name = "Bash", risk_level = "high", arguments = "ls -la" }
+})
+local ok, win, buf, prompt = wait_for_prompt("APPROVAL REQUIRED", 2000)
+if ok and prompt and prompt:find("Bash", 1, true) then
+    pass("Approval prompt renders with tool name")
+else
+    fail("Approval prompt not shown")
+end
+close_prompt(win, buf)
+
+-- Test 13c: Permission prompt rendering
+log("Test 13c: Permission prompt rendering...")
+bridge._handle_message({
+    method = "permission_request",
+    params = { id = "perm-1", tool_name = "Read", tool_input = "README.md" }
+})
+ok, win, buf, prompt = wait_for_prompt("PERMISSION REQUEST", 2000)
+if ok and prompt and prompt:find("Read", 1, true) then
+    pass("Permission prompt renders with tool name")
+else
+    fail("Permission prompt not shown")
+end
+close_prompt(win, buf)
+
+-- Test 13d: error_msg notifications
+log("Test 13d: error_msg notifications...")
+local notify_calls = {}
+local orig_notify = vim.notify
+vim.notify = function(message, level, opts)
+    table.insert(notify_calls, { message = message, level = level, opts = opts })
+end
+bridge._handle_message({
+    method = "error_msg",
+    params = { message = "Auth required" }
+})
+vim.notify = orig_notify
+local found = false
+for _, entry in ipairs(notify_calls) do
+    if entry.message:find("Auth required", 1, true) and entry.level == vim.log.levels.ERROR then
+        found = true
+        break
+    end
+end
+if found then
+    pass("error_msg triggers error notification")
+else
+    fail("error_msg did not notify")
 end
 
 -- Test 14: Window focus handling

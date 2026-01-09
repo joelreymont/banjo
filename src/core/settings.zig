@@ -263,20 +263,33 @@ pub fn loadSettings(allocator: Allocator, cwd: []const u8) !Settings {
 
 // Tests
 const testing = std.testing;
+const ohsnap = @import("ohsnap");
 
 test "Settings init/deinit" {
     var settings = Settings.init(testing.allocator);
     defer settings.deinit();
 
-    try testing.expect(!settings.isAllowed("test"));
-    try testing.expect(!settings.isDenied("test"));
+    var out: std.io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try out.writer.print("allowed: {any}\ndenied: {any}\n", .{
+        settings.isAllowed("test"),
+        settings.isDenied("test"),
+    });
+    const snapshot = try out.toOwnedSlice();
+    defer testing.allocator.free(snapshot);
+    try (ohsnap{}).snap(@src(),
+        \\allowed: false
+        \\denied: false
+        \\
+    ).diff(snapshot, true);
 }
 
 // =============================================================================
 // Property Tests for Settings Permissions
 // =============================================================================
 
-const quickcheck = @import("../util/quickcheck.zig");
+const zcheck = @import("zcheck");
+const zcheck_seed_base: u64 = 0x4b19_7f6d_a803_2e11;
 
 /// Tool name options for property tests (avoids generating slices)
 const test_tools = [_][]const u8{ "Read", "Write", "Bash", "Edit", "Grep", "Glob", "WebFetch" };
@@ -286,7 +299,7 @@ fn getTestTool(idx: u3) []const u8 {
 }
 
 test "property: isAllowed returns true only for added tools" {
-    try quickcheck.check(struct {
+    try zcheck.check(struct {
         fn prop(args: struct { add_idx: u3, check_idx: u3 }) bool {
             var settings = Settings.init(testing.allocator);
             defer settings.deinit();
@@ -306,11 +319,11 @@ test "property: isAllowed returns true only for added tools" {
             const should_be_allowed = std.mem.eql(u8, add_tool, check_tool);
             return is_allowed == should_be_allowed;
         }
-    }.prop, .{});
+    }.prop, .{ .seed = zcheck_seed_base + 1 });
 }
 
 test "property: isDenied returns true only for added tools" {
-    try quickcheck.check(struct {
+    try zcheck.check(struct {
         fn prop(args: struct { add_idx: u3, check_idx: u3 }) bool {
             var settings = Settings.init(testing.allocator);
             defer settings.deinit();
@@ -330,11 +343,11 @@ test "property: isDenied returns true only for added tools" {
             const should_be_denied = std.mem.eql(u8, add_tool, check_tool);
             return is_denied == should_be_denied;
         }
-    }.prop, .{});
+    }.prop, .{ .seed = zcheck_seed_base + 2 });
 }
 
 test "property: allowed and denied are independent" {
-    try quickcheck.check(struct {
+    try zcheck.check(struct {
         fn prop(args: struct { allow_idx: u3, deny_idx: u3, check_idx: u3 }) bool {
             var settings = Settings.init(testing.allocator);
             defer settings.deinit();
@@ -366,11 +379,11 @@ test "property: allowed and denied are independent" {
 
             return is_allowed == expect_allowed and is_denied == expect_denied;
         }
-    }.prop, .{});
+    }.prop, .{ .seed = zcheck_seed_base + 3 });
 }
 
 test "property: empty settings allows/denies nothing" {
-    try quickcheck.check(struct {
+    try zcheck.check(struct {
         fn prop(args: struct { tool_idx: u3 }) bool {
             var settings = Settings.init(testing.allocator);
             defer settings.deinit();
@@ -378,11 +391,11 @@ test "property: empty settings allows/denies nothing" {
             const tool = getTestTool(args.tool_idx);
             return !settings.isAllowed(tool) and !settings.isDenied(tool);
         }
-    }.prop, .{});
+    }.prop, .{ .seed = zcheck_seed_base + 4 });
 }
 
 test "property: multiple tools can be allowed/denied" {
-    try quickcheck.check(struct {
+    try zcheck.check(struct {
         fn prop(args: struct { num_allowed: u2, num_denied: u2 }) bool {
             var settings = Settings.init(testing.allocator);
             defer settings.deinit();
@@ -411,7 +424,7 @@ test "property: multiple tools can be allowed/denied" {
             return settings.allowed_tools.count() <= args.num_allowed and
                 settings.denied_tools.count() <= args.num_denied;
         }
-    }.prop, .{});
+    }.prop, .{ .seed = zcheck_seed_base + 5 });
 }
 
 test "ensurePermissionHook with temp directory" {
@@ -437,19 +450,31 @@ test "ensurePermissionHook with temp directory" {
 
     // Test ensurePermissionHookInDir (new helper we'll add)
     const result = ensurePermissionHookInDir(testing.allocator, tmp_path);
-    try testing.expectEqual(HookConfigResult.configured, result);
 
     // Verify file was updated
     const updated_file = try tmp_dir.dir.openFile(".claude/settings.json", .{});
     defer updated_file.close();
     const content = try updated_file.readToEndAlloc(testing.allocator, 64 * 1024);
     defer testing.allocator.free(content);
-
-    // Check that our hook is in there
-    try testing.expect(std.mem.indexOf(u8, content, "banjo hook permission") != null);
-    try testing.expect(std.mem.indexOf(u8, content, "PreToolUse") != null);
-
-    // Running again should return already_configured
     const result2 = ensurePermissionHookInDir(testing.allocator, tmp_path);
-    try testing.expectEqual(HookConfigResult.already_configured, result2);
+    const has_hook = std.mem.indexOf(u8, content, "banjo hook permission") != null;
+    const has_pre = std.mem.indexOf(u8, content, "PreToolUse") != null;
+
+    var out: std.io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try out.writer.print("first: {s}\nsecond: {s}\nhas_hook: {any}\nhas_pre: {any}\n", .{
+        @tagName(result),
+        @tagName(result2),
+        has_hook,
+        has_pre,
+    });
+    const snapshot = try out.toOwnedSlice();
+    defer testing.allocator.free(snapshot);
+    try (ohsnap{}).snap(@src(),
+        \\first: configured
+        \\second: already_configured
+        \\has_hook: true
+        \\has_pre: true
+        \\
+    ).diff(snapshot, true);
 }

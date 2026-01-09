@@ -532,7 +532,7 @@ pub const Server = struct {
                                         if (context.before.len > 0) {
                                             try hover_content.writer.print("{s}\n", .{context.before});
                                         }
-                                        try hover_content.writer.print("→ {s}\n", .{context.current});
+                                        try hover_content.writer.print("-> {s}\n", .{context.current});
                                         if (context.after.len > 0) {
                                             try hover_content.writer.print("{s}\n", .{context.after});
                                         }
@@ -1736,65 +1736,141 @@ fn getLineContext(content: []const u8, line_num: u32, context_lines: u32) LineCo
 //
 
 const testing = std.testing;
+const ohsnap = @import("ohsnap");
 
 test "uriToPath strips file:// prefix" {
     const parsed = try lsp_uri.uriToPath(testing.allocator, "file:///home/user/test.zig") orelse return error.TestUnexpectedResult;
     defer parsed.deinit(testing.allocator);
-    try testing.expectEqualStrings("/home/user/test.zig", parsed.path);
+    const snapshot = .{ .path = parsed.path };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.server.test.uriToPath strips file:// prefix__struct_<^\d+$>
+        \\  .path: []const u8
+        \\    "/home/user/test.zig"
+    ).expectEqual(snapshot);
 }
 
 test "uriToPath returns null for non-file URIs" {
-    try testing.expect((try lsp_uri.uriToPath(testing.allocator, "http://example.com")) == null);
+    const snapshot = .{ .result = (try lsp_uri.uriToPath(testing.allocator, "http://example.com")) == null };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.server.test.uriToPath returns null for non-file URIs__struct_<^\d+$>
+        \\  .result: bool = true
+    ).expectEqual(snapshot);
 }
 
 test "hasTodoPattern scans full line" {
     const prefix = "a" ** 300;
     const line = prefix ++ " TODO: refactor this function";
-    try testing.expectEqualStrings("TODO:", hasTodoPattern(line).?);
+    const snapshot = .{ .match = hasTodoPattern(line) };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.server.test.hasTodoPattern scans full line__struct_<^\d+$>
+        \\  .match: ?[]const u8
+        \\    "TODO:"
+    ).expectEqual(snapshot);
 }
 
 test "getLineContent returns correct line" {
     const content = "line 0\nline 1\nline 2";
-    try testing.expectEqualStrings("line 0", getLineContent(content, 0).?);
-    try testing.expectEqualStrings("line 1", getLineContent(content, 1).?);
-    try testing.expectEqualStrings("line 2", getLineContent(content, 2).?);
-    try testing.expect(getLineContent(content, 3) == null);
+    const snapshot = .{
+        .line0 = getLineContent(content, 0),
+        .line1 = getLineContent(content, 1),
+        .line2 = getLineContent(content, 2),
+        .line3 = getLineContent(content, 3),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.server.test.getLineContent returns correct line__struct_<^\d+$>
+        \\  .line0: ?[]const u8
+        \\    "line 0"
+        \\  .line1: ?[]const u8
+        \\    "line 1"
+        \\  .line2: ?[]const u8
+        \\    "line 2"
+        \\  .line3: ?[]const u8
+        \\    null
+    ).expectEqual(snapshot);
 }
 
 test "isCommentLine detects comments" {
     const content = "code\n// comment\n# python\nmore code";
-    try testing.expect(!isCommentLine(content, 1)); // code
-    try testing.expect(isCommentLine(content, 2)); // // comment
-    try testing.expect(isCommentLine(content, 3)); // # python
-    try testing.expect(!isCommentLine(content, 4)); // more code
+    const snapshot = .{
+        .line1 = isCommentLine(content, 1),
+        .line2 = isCommentLine(content, 2),
+        .line3 = isCommentLine(content, 3),
+        .line4 = isCommentLine(content, 4),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.server.test.isCommentLine detects comments__struct_<^\d+$>
+        \\  .line1: bool = false
+        \\  .line2: bool = true
+        \\  .line3: bool = true
+        \\  .line4: bool = false
+    ).expectEqual(snapshot);
 }
 
 test "isCommentLine excludes banjo notes" {
     const content = "// @banjo[abc] note\n// regular comment";
-    try testing.expect(!isCommentLine(content, 1)); // already a note
-    try testing.expect(isCommentLine(content, 2)); // can be converted
+    const snapshot = .{
+        .line1 = isCommentLine(content, 1),
+        .line2 = isCommentLine(content, 2),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.server.test.isCommentLine excludes banjo notes__struct_<^\d+$>
+        \\  .line1: bool = false
+        \\  .line2: bool = true
+    ).expectEqual(snapshot);
 }
 
 test "findHoverTarget prioritizes note token over link" {
     const line = "// @banjo[note-1] See @[Note](note-2)";
     const note_target = findHoverTarget(line, 10).?;
-    try testing.expectEqualStrings("note-1", note_target.id);
-    try testing.expectEqual(HoverTargetKind.note, note_target.kind);
     const link_target = findHoverTarget(line, 30).?;
-    try testing.expectEqualStrings("note-2", link_target.id);
-    try testing.expectEqual(HoverTargetKind.link, link_target.kind);
+    const snapshot = .{
+        .note = .{ .id = note_target.id, .kind = @tagName(note_target.kind) },
+        .link = .{ .id = link_target.id, .kind = @tagName(link_target.kind) },
+    };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.server.test.findHoverTarget prioritizes note token over link__struct_<^\d+$>
+        \\  .note: lsp.server.test.findHoverTarget prioritizes note token over link__struct_<^\d+$>
+        \\    .id: []const u8
+        \\      "note-1"
+        \\    .kind: [:0]const u8
+        \\      "note"
+        \\  .link: lsp.server.test.findHoverTarget prioritizes note token over link__struct_<^\d+$>
+        \\    .id: []const u8
+        \\      "note-2"
+        \\    .kind: [:0]const u8
+        \\      "link"
+    ).expectEqual(snapshot);
 }
 
 test "findCommentInsertOffset finds insertion point after prefix and whitespace" {
-    try testing.expectEqual(@as(u32, 9), findCommentInsertOffset("    //   TODO").?);
-    try testing.expectEqual(@as(u32, 5), findCommentInsertOffset("<!-- note").?);
-    try testing.expectEqual(@as(u32, 8), findCommentInsertOffset("    //! Discriminator").?);
+    const snapshot = .{
+        .slashes = findCommentInsertOffset("    //   TODO"),
+        .html = findCommentInsertOffset("<!-- note"),
+        .doc = findCommentInsertOffset("    //! Discriminator"),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.server.test.findCommentInsertOffset finds insertion point after prefix and whitespace__struct_<^\d+$>
+        \\  .slashes: ?u32
+        \\    9
+        \\  .html: ?u32
+        \\    5
+        \\  .doc: ?u32
+        \\    8
+    ).expectEqual(snapshot);
 }
 
 test "shouldScheduleNoteIndexUpdate checks for banjo markers" {
-    try testing.expect(shouldScheduleNoteIndexUpdate(false, "// @banjo[id] note"));
-    try testing.expect(!shouldScheduleNoteIndexUpdate(false, "// regular comment"));
-    try testing.expect(shouldScheduleNoteIndexUpdate(true, "// regular comment"));
+    const snapshot = .{
+        .has_marker = shouldScheduleNoteIndexUpdate(false, "// @banjo[id] note"),
+        .skip_plain = shouldScheduleNoteIndexUpdate(false, "// regular comment"),
+        .force_update = shouldScheduleNoteIndexUpdate(true, "// regular comment"),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.server.test.shouldScheduleNoteIndexUpdate checks for banjo markers__struct_<^\d+$>
+        \\  .has_marker: bool = true
+        \\  .skip_plain: bool = false
+        \\  .force_update: bool = true
+    ).expectEqual(snapshot);
 }
 
 test "executeCreateNote inserts note marker after comment prefix" {
@@ -1834,12 +1910,33 @@ test "executeCreateNote inserts note marker after comment prefix" {
     defer parsed.deinit();
 
     const edits = parsed.value.params.edit.changes.map.get(uri) orelse return error.TestUnexpectedResult;
-    try testing.expect(edits.len > 0);
-    const new_text = edits[0].newText;
-    const banjo_pos = std.mem.indexOf(u8, new_text, "@banjo[") orelse return error.TestUnexpectedResult;
-    const todo_pos = std.mem.indexOf(u8, new_text, "TODO") orelse return error.TestUnexpectedResult;
-    try testing.expect(banjo_pos < todo_pos);
-    try testing.expect(std.mem.startsWith(u8, new_text, "    //   @banjo["));
+    const Snapshot = struct {
+        edits_len: usize,
+        new_text: ?[]const u8,
+        banjo_pos: ?usize,
+        todo_pos: ?usize,
+    };
+    const snapshot: Snapshot = if (edits.len > 0) .{
+        .edits_len = edits.len,
+        .new_text = edits[0].newText,
+        .banjo_pos = std.mem.indexOf(u8, edits[0].newText, "@banjo["),
+        .todo_pos = std.mem.indexOf(u8, edits[0].newText, "TODO"),
+    } else .{
+        .edits_len = edits.len,
+        .new_text = null,
+        .banjo_pos = null,
+        .todo_pos = null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.server.test.executeCreateNote inserts note marker after comment prefix.Snapshot
+        \\  .edits_len: usize = 1
+        \\  .new_text: ?[]const u8
+        \\    "    //   @banjo[<^[0-9a-f]+$>] TODO fix"
+        \\  .banjo_pos: ?usize
+        \\    9
+        \\  .todo_pos: ?usize
+        \\    30
+    ).expectEqual(snapshot);
 }
 
 test "executeCreateNote inserts on first line of comment block" {
@@ -1882,8 +1979,28 @@ test "executeCreateNote inserts on first line of comment block" {
     defer parsed.deinit();
 
     const edits = parsed.value.params.edit.changes.map.get(uri) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(u32, 0), edits[0].range.start.line);
-    try testing.expect(std.mem.startsWith(u8, edits[0].newText, "//! @banjo["));
+    const Snapshot = struct {
+        edits_len: usize,
+        start_line: ?u32,
+        new_text: ?[]const u8,
+    };
+    const snapshot: Snapshot = if (edits.len > 0) .{
+        .edits_len = edits.len,
+        .start_line = edits[0].range.start.line,
+        .new_text = edits[0].newText,
+    } else .{
+        .edits_len = edits.len,
+        .start_line = null,
+        .new_text = null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.server.test.executeCreateNote inserts on first line of comment block.Snapshot
+        \\  .edits_len: usize = 1
+        \\  .start_line: ?u32
+        \\    0
+        \\  .new_text: ?[]const u8
+        \\    "//! @banjo[<^[0-9a-f]+$>] Discriminator for decision tree"
+    ).expectEqual(snapshot);
 }
 
 test "executeCreateNote from last line inserts on first block line" {
@@ -1927,8 +2044,28 @@ test "executeCreateNote from last line inserts on first block line" {
     defer parsed.deinit();
 
     const edits = parsed.value.params.edit.changes.map.get(uri) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(u32, 0), edits[0].range.start.line);
-    try testing.expect(std.mem.startsWith(u8, edits[0].newText, "//! @banjo["));
+    const Snapshot = struct {
+        edits_len: usize,
+        start_line: ?u32,
+        new_text: ?[]const u8,
+    };
+    const snapshot: Snapshot = if (edits.len > 0) .{
+        .edits_len = edits.len,
+        .start_line = edits[0].range.start.line,
+        .new_text = edits[0].newText,
+    } else .{
+        .edits_len = edits.len,
+        .start_line = null,
+        .new_text = null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.server.test.executeCreateNote from last line inserts on first block line.Snapshot
+        \\  .edits_len: usize = 1
+        \\  .start_line: ?u32
+        \\    0
+        \\  .new_text: ?[]const u8
+        \\    "//! @banjo[<^[0-9a-f]+$>] Discriminator for decision tree"
+    ).expectEqual(snapshot);
 }
 
 test "completion adds note marker edit when linking from comment line" {
@@ -1970,12 +2107,43 @@ test "completion adds note marker edit when linking from comment line" {
     var response = try std.json.parseFromSlice(CompletionResponse, testing.allocator, json_body, .{ .ignore_unknown_fields = true });
     defer response.deinit();
 
-    try testing.expect(response.value.result.items.len > 0);
-    const edits = response.value.result.items[0].additionalTextEdits orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 1), edits.len);
-    try testing.expectEqual(@as(u32, 0), edits[0].range.start.line);
-    try testing.expectEqual(@as(u32, 3), edits[0].range.start.character);
-    try testing.expect(std.mem.startsWith(u8, edits[0].newText, "@banjo["));
+    const items = response.value.result.items;
+    const Snapshot = struct {
+        items_len: usize,
+        edits_len: ?usize,
+        start_line: ?u32,
+        start_character: ?u32,
+        new_text: ?[]const u8,
+    };
+    var snapshot: Snapshot = .{
+        .items_len = items.len,
+        .edits_len = null,
+        .start_line = null,
+        .start_character = null,
+        .new_text = null,
+    };
+    if (items.len > 0) {
+        if (items[0].additionalTextEdits) |edits| {
+            snapshot.edits_len = edits.len;
+            if (edits.len > 0) {
+                snapshot.start_line = edits[0].range.start.line;
+                snapshot.start_character = edits[0].range.start.character;
+                snapshot.new_text = edits[0].newText;
+            }
+        }
+    }
+    try (ohsnap{}).snap(@src(),
+        \\lsp.server.test.completion adds note marker edit when linking from comment line.Snapshot
+        \\  .items_len: usize = 1
+        \\  .edits_len: ?usize
+        \\    1
+        \\  .start_line: ?u32
+        \\    0
+        \\  .start_character: ?u32
+        \\    3
+        \\  .new_text: ?[]const u8
+        \\    "@banjo[<^[0-9a-f]+$>] "
+    ).expectEqual(snapshot);
 }
 
 test "completion does not add note marker edit on non-comment line" {
@@ -2015,8 +2183,16 @@ test "completion does not add note marker edit on non-comment line" {
     var response = try std.json.parseFromSlice(CompletionResponse, testing.allocator, json_body, .{ .ignore_unknown_fields = true });
     defer response.deinit();
 
-    try testing.expect(response.value.result.items.len > 0);
-    try testing.expect(response.value.result.items[0].additionalTextEdits == null);
+    const items = response.value.result.items;
+    const snapshot = .{
+        .items_len = items.len,
+        .first_has_additional = if (items.len > 0) items[0].additionalTextEdits != null else false,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.server.test.completion does not add note marker edit on non-comment line__struct_<^\d+$>
+        \\  .items_len: usize = 1
+        \\  .first_has_additional: bool = false
+    ).expectEqual(snapshot);
 }
 
 test "completion excludes self note" {
@@ -2063,11 +2239,23 @@ test "completion excludes self note" {
     var response = try std.json.parseFromSlice(CompletionResponse, testing.allocator, json_body, .{ .ignore_unknown_fields = true });
     defer response.deinit();
 
-    try testing.expect(response.value.result.items.len > 0);
+    var has_self = false;
     for (response.value.result.items) |item| {
         const insert_text = item.insertText orelse continue;
-        try testing.expect(mem.indexOf(u8, insert_text, "(note-a)") == null);
+        if (mem.indexOf(u8, insert_text, "(note-a)") != null) {
+            has_self = true;
+            break;
+        }
     }
+    const snapshot = .{
+        .items_len = response.value.result.items.len,
+        .has_self = has_self,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.server.test.completion excludes self note__struct_<^\d+$>
+        \\  .items_len: usize = 1
+        \\  .has_self: bool = false
+    ).expectEqual(snapshot);
 }
 
 test "note index updates are debounced" {
@@ -2082,7 +2270,7 @@ test "note index updates are debounced" {
     const initial = "// @banjo[a] First\n";
     try server.documents.put(try testing.allocator.dupe(u8, uri), try testing.allocator.dupe(u8, initial));
     try server.rebuildIndex();
-    try testing.expect(server.note_index.getNote("a") != null);
+    const initial_has_a = server.note_index.getNote("a") != null;
 
     const request_json =
         "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/didChange\",\"params\":" ++
@@ -2091,17 +2279,28 @@ test "note index updates are debounced" {
     defer parsed.deinit();
 
     try server.handleRequest(parsed.request);
-
-    try testing.expect(server.pending_note_index.count() == 1);
-    try testing.expect(server.note_index.getNote("b") == null);
+    const pending_count = server.pending_note_index.count();
+    const b_before = server.note_index.getNote("b") != null;
 
     var it = server.pending_note_index.iterator();
     const entry = it.next().?;
     entry.value_ptr.* = std.time.nanoTimestamp() - (DEBOUNCE_NS * 2);
     try server.flushPendingNoteIndex();
-
-    try testing.expect(server.note_index.getNote("a") == null);
-    try testing.expect(server.note_index.getNote("b") != null);
+    const snapshot = .{
+        .initial_has_a = initial_has_a,
+        .pending_count = pending_count,
+        .b_before = b_before,
+        .a_after = server.note_index.getNote("a") != null,
+        .b_after = server.note_index.getNote("b") != null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.server.test.note index updates are debounced__struct_<^\d+$>
+        \\  .initial_has_a: bool = true
+        \\  .pending_count: u32 = 1
+        \\  .b_before: bool = false
+        \\  .a_after: bool = false
+        \\  .b_after: bool = true
+    ).expectEqual(snapshot);
 }
 
 test "didChange without banjo markers skips note index update" {
@@ -2123,7 +2322,11 @@ test "didChange without banjo markers skips note index update" {
     defer parsed.deinit();
 
     try server.handleRequest(parsed.request);
-    try testing.expectEqual(@as(usize, 0), server.pending_note_index.count());
+    const snapshot = .{ .pending_count = server.pending_note_index.count() };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.server.test.didChange without banjo markers skips note index update__struct_<^\d+$>
+        \\  .pending_count: u32 = 0
+    ).expectEqual(snapshot);
 }
 
 test "Server initializes correctly" {
@@ -2134,8 +2337,16 @@ test "Server initializes correctly" {
     var server = Server.init(testing.allocator, input.reader().any(), output.writer().any());
     defer server.deinit();
 
-    try testing.expect(server.root_uri == null);
-    try testing.expect(!server.initialized);
+    const snapshot = .{
+        .root_uri = server.root_uri,
+        .initialized = server.initialized,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.server.test.Server initializes correctly__struct_<^\d+$>
+        \\  .root_uri: ?[]const u8
+        \\    null
+        \\  .initialized: bool = false
+    ).expectEqual(snapshot);
 }
 
 test "rebuildIndex scans project files for backlinks" {
@@ -2164,15 +2375,12 @@ test "rebuildIndex scans project files for backlinks" {
 
     try server.rebuildIndex();
 
-    const backlinks_opt = server.note_index.getBacklinks("note-b");
-    try testing.expect(backlinks_opt != null);
-
-    var found = false;
-    for (backlinks_opt.?) |id| {
-        if (std.mem.eql(u8, id, "note-a")) {
-            found = true;
-            break;
-        }
-    }
-    try testing.expect(found);
+    const backlinks = server.note_index.getBacklinks("note-b") orelse &.{};
+    const snapshot = .{ .backlinks = backlinks };
+    try (ohsnap{}).snap(@src(),
+        \\lsp.server.test.rebuildIndex scans project files for backlinks__struct_<^\d+$>
+        \\  .backlinks: []const []const u8
+        \\    [0]: []const u8
+        \\      "note-a"
+    ).expectEqual(snapshot);
 }

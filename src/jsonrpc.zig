@@ -595,8 +595,17 @@ test "parse request with string id" {
     ;
     var parsed = try parseRequest(testing.allocator, json);
     defer parsed.deinit();
-    try testing.expectEqualStrings("test", parsed.request.method);
-    try testing.expectEqualStrings("abc", parsed.request.id.?.string);
+    const summary = .{
+        .method = parsed.request.method,
+        .id = parsed.request.id.?.string,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\jsonrpc.test.parse request with string id__struct_<^\d+$>
+        \\  .method: []const u8
+        \\    "test"
+        \\  .id: []const u8
+        \\    "abc"
+    ).expectEqual(summary);
 }
 
 test "parse request with number id" {
@@ -605,8 +614,16 @@ test "parse request with number id" {
     ;
     var parsed = try parseRequest(testing.allocator, json);
     defer parsed.deinit();
-    try testing.expectEqualStrings("test", parsed.request.method);
-    try testing.expectEqual(@as(i64, 42), parsed.request.id.?.number);
+    const summary = .{
+        .method = parsed.request.method,
+        .id = parsed.request.id.?.number,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\jsonrpc.test.parse request with number id__struct_<^\d+$>
+        \\  .method: []const u8
+        \\    "test"
+        \\  .id: i64 = 42
+    ).expectEqual(summary);
 }
 
 test "parse notification (no id)" {
@@ -615,8 +632,16 @@ test "parse notification (no id)" {
     ;
     var parsed = try parseRequest(testing.allocator, json);
     defer parsed.deinit();
-    try testing.expectEqualStrings("notify", parsed.request.method);
-    try testing.expect(parsed.request.isNotification());
+    const summary = .{
+        .method = parsed.request.method,
+        .notification = parsed.request.isNotification(),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\jsonrpc.test.parse notification (no id)__struct_<^\d+$>
+        \\  .method: []const u8
+        \\    "notify"
+        \\  .notification: bool = true
+    ).expectEqual(summary);
 }
 
 test "Reader nextMessageWithTimeout returns timeout" {
@@ -636,21 +661,36 @@ test "serialize success response" {
     const response = Response.success(.{ .number = 1 }, .{ .bool = true });
     const json = try serializeResponse(testing.allocator, response);
     defer testing.allocator.free(json);
-    try testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"result\":true,\"id\":1}", json);
+    try (ohsnap{}).snap(@src(),
+        \\{"jsonrpc":"2.0","result":true,"id":1}
+    ).diff(json, true);
 }
 
 test "serialize error response" {
     const response = Response.err(.{ .number = 1 }, Error.MethodNotFound, "Method not found");
     const json = try serializeResponse(testing.allocator, response);
     defer testing.allocator.free(json);
-    try testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32601,\"message\":\"Method not found\"},\"id\":1}", json);
+    try (ohsnap{}).snap(@src(),
+        \\{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":1}
+    ).diff(json, true);
 }
 
 // Property tests
-const quickcheck = @import("util/quickcheck.zig");
+const zcheck = @import("zcheck");
+const zcheck_seed_base: u64 = 0x5d0a_c19e_0f23_4b7a;
+
+fn checkWithResult(prop: anytype, config: zcheck.Config, label: []const u8) !void {
+    if (zcheck.checkResult(prop, config)) |failure| {
+        std.debug.print(
+            "zcheck failure: {s}\nseed: {}\noriginal: {any}\nshrunk: {any}\n",
+            .{ label, failure.seed, failure.original, failure.shrunk },
+        );
+        return error.TestUnexpectedResult;
+    }
+}
 
 test "property: response with numeric id roundtrips through JSON" {
-    try quickcheck.check(struct {
+    try checkWithResult(struct {
         fn prop(args: struct { id: i64, result_bool: bool }) bool {
             const response = Response.success(
                 .{ .number = args.id },
@@ -678,11 +718,11 @@ test "property: response with numeric id roundtrips through JSON" {
 
             return true;
         }
-    }.prop, .{});
+    }.prop, .{ .seed = zcheck_seed_base + 1 }, "response numeric id roundtrip");
 }
 
 test "property: error response preserves error code" {
-    try quickcheck.check(struct {
+    try zcheck.check(struct {
         fn prop(args: struct { id: i64, code: i32 }) bool {
             const response = Response.err(.{ .number = args.id }, args.code, "test error");
 
@@ -698,15 +738,15 @@ test "property: error response preserves error code" {
 
             return code == args.code;
         }
-    }.prop, .{});
+    }.prop, .{ .seed = zcheck_seed_base + 2 });
 }
 
 test "property: request id types are preserved" {
-    try quickcheck.check(struct {
-        fn prop(args: struct { id: i64 }) bool {
+    try zcheck.check(struct {
+        fn prop(args: struct { id: i64, method: zcheck.String }) bool {
             // Test numeric ID roundtrip through request serialization
             const request = Request{
-                .method = "test",
+                .method = args.method.slice(),
                 .id = .{ .number = args.id },
             };
 
@@ -722,7 +762,30 @@ test "property: request id types are preserved" {
                 else => false,
             };
         }
-    }.prop, .{});
+    }.prop, .{ .seed = zcheck_seed_base + 3 });
+}
+
+test "property: request string id roundtrips" {
+    try zcheck.check(struct {
+        fn prop(args: struct { id: zcheck.Id, method: zcheck.String }) bool {
+            const request = Request{
+                .method = args.method.slice(),
+                .id = .{ .string = args.id.slice() },
+            };
+
+            const json = serializeRequest(testing.allocator, request) catch return false;
+            defer testing.allocator.free(json);
+
+            var parsed_req = parseRequest(testing.allocator, json) catch return false;
+            defer parsed_req.deinit();
+
+            const parsed_id = parsed_req.request.id orelse return false;
+            return switch (parsed_id) {
+                .string => |s| std.mem.eql(u8, s, args.id.slice()),
+                else => false,
+            };
+        }
+    }.prop, .{ .seed = zcheck_seed_base + 4 });
 }
 
 // =============================================================================

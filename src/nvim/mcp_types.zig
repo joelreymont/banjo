@@ -283,6 +283,7 @@ pub const Method = struct {
 
 // Tests
 const testing = std.testing;
+const ohsnap = @import("ohsnap");
 
 test "InitializeResult serialization" {
     const result = InitializeResult{};
@@ -297,9 +298,17 @@ test "InitializeResult serialization" {
 
     const parsed = try std.json.parseFromSlice(InitializeResult, testing.allocator, buf, .{});
     defer parsed.deinit();
-
-    try testing.expectEqualStrings(PROTOCOL_VERSION, parsed.value.protocolVersion);
-    try testing.expectEqualStrings(SERVER_NAME, parsed.value.serverInfo.name);
+    const summary = .{
+        .protocol_version = parsed.value.protocolVersion,
+        .server_name = parsed.value.serverInfo.name,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.mcp_types.test.InitializeResult serialization__struct_<^\d+$>
+        \\  .protocol_version: []const u8
+        \\    "2024-11-05"
+        \\  .server_name: []const u8
+        \\    "banjo-neovim"
+    ).expectEqual(summary);
 }
 
 test "ToolCallResult serialization" {
@@ -317,11 +326,16 @@ test "ToolCallResult serialization" {
     const buf = try out.toOwnedSlice();
     defer testing.allocator.free(buf);
 
-    try testing.expect(std.mem.indexOf(u8, buf, "\"content\"") != null);
-    try testing.expect(std.mem.indexOf(u8, buf, "\"text\"") != null);
+    try (ohsnap{}).snap(@src(),
+        \\{"content":[{"type":"text","text":"{\"success\":true}"}]}
+    ).diff(buf, true);
 }
 
 test "getToolDefinitions count" {
     const tools = getToolDefinitions();
-    try testing.expectEqual(@as(usize, 12), tools.len);
+    const summary = .{ .count = tools.len };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.mcp_types.test.getToolDefinitions count__struct_<^\d+$>
+        \\  .count: usize = 12
+    ).expectEqual(summary);
 }
