@@ -572,6 +572,13 @@ pub const CodexBridge = struct {
         self.reader_thread = try std.Thread.spawn(.{}, readerMain, .{self});
     }
 
+    pub fn isAlive(self: *CodexBridge) bool {
+        if (self.process == null) return false;
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+        return !self.reader_closed;
+    }
+
     pub fn stop(self: *CodexBridge) void {
         self.stop_requested.store(true, .release);
         if (self.process) |*proc| {

@@ -1,87 +1,32 @@
 const std = @import("std");
-const config = @import("config");
-const log = std.log.scoped(.debug_log);
+const banjo_log = @import("log.zig");
 
-/// Debug log file path - exported for use by other modules
-pub const path = "/tmp/banjo-nvim-debug.log";
+/// Legacy debug log path - kept for backwards compatibility
+pub const path = banjo_log.default_path;
 
-/// Write a debug message to the log file with stderr fallback.
-/// Opens the file, seeks to end, writes, and closes each call.
-/// This is thread-safe as each call uses its own file handle.
+/// Write a debug message. Delegates to the new logging system.
 pub fn write(comptime prefix: []const u8, comptime fmt: []const u8, args: anytype) void {
-    if (!config.nvim_debug) return;
-
-    var buf: [4096]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "[" ++ prefix ++ "] " ++ fmt ++ "\n", args) catch return;
-
-    const f = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch {
-        std.io.getStdErr().writer().writeAll(msg) catch |err| {
-            log.warn("Failed to write debug log to stderr: {}", .{err});
-        };
-        return;
-    };
-    defer f.close();
-
-    f.seekFromEnd(0) catch {
-        std.io.getStdErr().writer().writeAll(msg) catch |err| {
-            log.warn("Failed to write debug log to stderr: {}", .{err});
-        };
-        return;
-    };
-
-    _ = f.write(msg) catch {
-        std.io.getStdErr().writer().writeAll(msg) catch |err| {
-            log.warn("Failed to write debug log to stderr: {}", .{err});
-        };
-    };
-    f.sync() catch |err| {
-        log.warn("Failed to sync debug log file: {}", .{err});
-    };
+    const logger = banjo_log.scoped(prefix);
+    logger.debug(fmt, args);
 }
 
-/// Persistent debug logger for use in a single module.
-/// More efficient for high-frequency logging but requires init/deinit.
+/// Persistent debug logger - now just wraps the global logger.
 pub const PersistentLog = struct {
-    file: ?std.fs.File = null,
-
-    /// Initialize by creating the log file.
-    pub fn init(self: *PersistentLog) void {
-        if (config.nvim_debug and self.file == null) {
-            self.file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch null;
-        }
+    pub fn init(_: *PersistentLog) void {
+        banjo_log.init();
     }
 
-    /// Close the log file.
-    pub fn deinit(self: *PersistentLog) void {
-        if (self.file) |f| {
-            f.close();
-            self.file = null;
-        }
+    pub fn deinit(_: *PersistentLog) void {
+        // No-op: global logger handles cleanup
     }
 
-    /// Write a message with the given prefix.
-    pub fn write(self: *PersistentLog, comptime prefix: []const u8, comptime fmt: []const u8, args: anytype) void {
-        if (!config.nvim_debug) return;
-
-        var buf: [4096]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "[" ++ prefix ++ "] " ++ fmt ++ "\n", args) catch return;
-
-        if (self.file) |f| {
-            _ = f.write(msg) catch {
-                std.io.getStdErr().writer().writeAll(msg) catch |err| {
-                    log.warn("Failed to write debug log to stderr: {}", .{err});
-                };
-            };
-        } else {
-            std.io.getStdErr().writer().writeAll(msg) catch |err| {
-                log.warn("Failed to write debug log to stderr: {}", .{err});
-            };
-        }
+    pub fn write(_: *PersistentLog, comptime prefix: []const u8, comptime fmt: []const u8, args: anytype) void {
+        const logger = banjo_log.scoped(prefix);
+        logger.debug(fmt, args);
     }
 };
 
 test "debug_log write compiles" {
-    // Just verify the function compiles - don't actually write in tests
     if (false) {
         write("TEST", "hello {s}", .{"world"});
     }

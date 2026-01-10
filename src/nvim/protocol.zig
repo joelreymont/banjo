@@ -146,6 +146,12 @@ pub const ErrorMessage = struct {
     message: []const u8,
 };
 
+pub const DebugInfo = struct {
+    claude_bridge_alive: bool,
+    codex_bridge_alive: bool,
+    prompt_count: u32,
+};
+
 // JSON-RPC types (re-exported from mcp_types)
 const mcp_types = @import("mcp_types.zig");
 pub const JsonRpcRequest = mcp_types.JsonRpcRequest;

@@ -1,6 +1,7 @@
 -- Bridge between Neovim and Banjo backend via WebSocket
 local ws_client = require("banjo.websocket.client")
 local panel = require("banjo.panel")
+local ui_prompt = require("banjo.ui.prompt")
 
 local M = {}
 
@@ -214,13 +215,20 @@ function M._on_stdout(data, tabid)
 end
 
 -- Process stderr from binary (debug/error output)
+-- Only show ERROR and WARN level logs to avoid flooding notifications
 function M._on_stderr(data, tabid)
     local b = bridges[tabid]
     if not b then return end
     for _, line in ipairs(data) do
         if line ~= "" then
-            -- Show debug logs in nvim messages (use :messages to see)
-            vim.notify("Banjo: " .. line, vim.log.levels.INFO)
+            lua_debug("[bridge] stderr: " .. line)
+            -- Only notify for ERROR/WARN level (check for level prefix after timestamp)
+            if line:match("%[ERROR%]") then
+                vim.notify("Banjo: " .. line, vim.log.levels.ERROR)
+            elseif line:match("%[WARN%]") then
+                vim.notify("Banjo: " .. line, vim.log.levels.WARN)
+            end
+            -- DEBUG/INFO/TRACE go to /tmp/banjo-lua-debug.log only
         end
     end
 end
@@ -483,6 +491,10 @@ function M._handle_message(msg, tabid)
         if msg.params then
             M._show_permission_prompt(msg.params)
         end
+    elseif method == "debug_info" then
+        if msg.params then
+            b.debug_info = msg.params
+        end
     end
 
     -- Restore original tab
@@ -496,83 +508,23 @@ function M._show_approval_prompt(params)
     local b = get_bridge()
     local my_tabid = b.tabid
     local id = params.id or "unknown"
-    local tool_name = params.tool_name or "unknown"
-    local risk_level = params.risk_level or "medium"
-    local arguments = params.arguments
 
-    -- Build prompt message
-    local lines = {
-        "╭─────────────────────────────────────────╮",
-        "│         APPROVAL REQUIRED               │",
-        "├─────────────────────────────────────────┤",
-        string.format("│ Tool: %-33s │", tool_name),
-        string.format("│ Risk: %-33s │", risk_level),
-        "├─────────────────────────────────────────┤",
-    }
-
-    if arguments then
-        local arg_preview = arguments:sub(1, 60)
-        if #arguments > 60 then
-            arg_preview = arg_preview .. "..."
-        end
-        table.insert(lines, string.format("│ Args: %-33s │", arg_preview))
-        table.insert(lines, "├─────────────────────────────────────────┤")
-    end
-
-    table.insert(lines, "│  [y] Approve    [n] Decline             │")
-    table.insert(lines, "╰─────────────────────────────────────────╯")
-
-    -- Create floating window
-    local width = 45
-    local height = #lines
-    local row = math.floor((vim.o.lines - height) / 2)
-    local col = math.floor((vim.o.columns - width) / 2)
-
-    local buf = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-    vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
-
-    local win = vim.api.nvim_open_win(buf, true, {
-        relative = "editor",
-        width = width,
-        height = height,
-        row = row,
-        col = col,
-        style = "minimal",
-        border = "none",
+    ui_prompt.approval({
+        tool_name = params.tool_name or "unknown",
+        risk_level = params.risk_level or "medium",
+        arguments = params.arguments,
+        on_action = function(decision)
+            local my_b = bridges[my_tabid]
+            if my_b and my_b.client and ws_client.is_connected(my_b.client) then
+                local response = {
+                    jsonrpc = "2.0",
+                    method = "approval_response",
+                    params = { id = id, decision = decision },
+                }
+                ws_client.send(my_b.client, vim.json.encode(response))
+            end
+        end,
     })
-
-    -- Highlight based on risk
-    local hl = "Normal"
-    if risk_level == "high" then
-        hl = "DiagnosticError"
-    elseif risk_level == "medium" then
-        hl = "DiagnosticWarn"
-    end
-    vim.api.nvim_set_option_value("winhl", "Normal:" .. hl, { win = win })
-
-    -- Set up keymaps
-    local function close_and_respond(decision)
-        vim.api.nvim_win_close(win, true)
-        vim.api.nvim_buf_delete(buf, { force = true })
-        -- Use captured bridge instead of get_bridge()
-        local my_b = bridges[my_tabid]
-        if my_b and my_b.client and ws_client.is_connected(my_b.client) then
-            local response = {
-                jsonrpc = "2.0",
-                method = "approval_response",
-                params = { id = id, decision = decision },
-            }
-            ws_client.send(my_b.client, vim.json.encode(response))
-        end
-    end
-
-    vim.keymap.set("n", "y", function() close_and_respond("approve") end, { buffer = buf, nowait = true })
-    vim.keymap.set("n", "Y", function() close_and_respond("approve") end, { buffer = buf, nowait = true })
-    vim.keymap.set("n", "n", function() close_and_respond("decline") end, { buffer = buf, nowait = true })
-    vim.keymap.set("n", "N", function() close_and_respond("decline") end, { buffer = buf, nowait = true })
-    vim.keymap.set("n", "<Esc>", function() close_and_respond("decline") end, { buffer = buf, nowait = true })
-    vim.keymap.set("n", "q", function() close_and_respond("decline") end, { buffer = buf, nowait = true })
 end
 
 -- Permission prompt handling (Claude Code)
@@ -580,94 +532,22 @@ function M._show_permission_prompt(params)
     local b = get_bridge()
     local my_tabid = b.tabid
     local id = params.id or "unknown"
-    local tool_name = params.tool_name or "unknown"
-    local tool_input = params.tool_input
 
-    -- Determine risk level based on tool name
-    local risk_level = "medium"
-    local high_risk_tools = { Bash = true, Write = true, Edit = true, MultiEdit = true }
-    local low_risk_tools = { Read = true, Glob = true, Grep = true, LSP = true }
-    if high_risk_tools[tool_name] then
-        risk_level = "high"
-    elseif low_risk_tools[tool_name] then
-        risk_level = "low"
-    end
-
-    -- Build prompt message
-    local lines = {
-        "╭─────────────────────────────────────────╮",
-        "│         PERMISSION REQUEST              │",
-        "├─────────────────────────────────────────┤",
-        string.format("│ Tool: %-33s │", tool_name),
-        string.format("│ Risk: %-33s │", risk_level),
-        "├─────────────────────────────────────────┤",
-    }
-
-    if tool_input then
-        -- Show preview of tool input (first 60 chars)
-        local input_preview = tool_input:sub(1, 60)
-        if #tool_input > 60 then
-            input_preview = input_preview .. "..."
-        end
-        table.insert(lines, string.format("│ Input: %-32s │", input_preview))
-        table.insert(lines, "├─────────────────────────────────────────┤")
-    end
-
-    table.insert(lines, "│  [y] Allow  [a] Always  [n] Deny       │")
-    table.insert(lines, "╰─────────────────────────────────────────╯")
-
-    -- Create floating window
-    local width = 45
-    local height = #lines
-    local row = math.floor((vim.o.lines - height) / 2)
-    local col = math.floor((vim.o.columns - width) / 2)
-
-    local buf = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-    vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
-
-    local win = vim.api.nvim_open_win(buf, true, {
-        relative = "editor",
-        width = width,
-        height = height,
-        row = row,
-        col = col,
-        style = "minimal",
-        border = "none",
+    ui_prompt.permission({
+        tool_name = params.tool_name or "unknown",
+        tool_input = params.tool_input,
+        on_action = function(decision)
+            local my_b = bridges[my_tabid]
+            if my_b and my_b.client and ws_client.is_connected(my_b.client) then
+                local response = {
+                    jsonrpc = "2.0",
+                    method = "permission_response",
+                    params = { id = id, decision = decision },
+                }
+                ws_client.send(my_b.client, vim.json.encode(response))
+            end
+        end,
     })
-
-    -- Highlight based on risk
-    local hl = "Normal"
-    if risk_level == "high" then
-        hl = "DiagnosticError"
-    elseif risk_level == "medium" then
-        hl = "DiagnosticWarn"
-    end
-    vim.api.nvim_set_option_value("winhl", "Normal:" .. hl, { win = win })
-
-    -- Set up keymaps
-    local function close_and_respond(decision)
-        vim.api.nvim_win_close(win, true)
-        vim.api.nvim_buf_delete(buf, { force = true })
-        local my_b = bridges[my_tabid]
-        if my_b and my_b.client and ws_client.is_connected(my_b.client) then
-            local response = {
-                jsonrpc = "2.0",
-                method = "permission_response",
-                params = { id = id, decision = decision },
-            }
-            ws_client.send(my_b.client, vim.json.encode(response))
-        end
-    end
-
-    vim.keymap.set("n", "y", function() close_and_respond("allow") end, { buffer = buf, nowait = true })
-    vim.keymap.set("n", "Y", function() close_and_respond("allow") end, { buffer = buf, nowait = true })
-    vim.keymap.set("n", "a", function() close_and_respond("allow_always") end, { buffer = buf, nowait = true })
-    vim.keymap.set("n", "A", function() close_and_respond("allow_always") end, { buffer = buf, nowait = true })
-    vim.keymap.set("n", "n", function() close_and_respond("deny") end, { buffer = buf, nowait = true })
-    vim.keymap.set("n", "N", function() close_and_respond("deny") end, { buffer = buf, nowait = true })
-    vim.keymap.set("n", "<Esc>", function() close_and_respond("deny") end, { buffer = buf, nowait = true })
-    vim.keymap.set("n", "q", function() close_and_respond("deny") end, { buffer = buf, nowait = true })
 end
 
 function M.get_state()
@@ -675,6 +555,19 @@ function M.get_state()
     return vim.tbl_extend("force", b.state, {
         reconnect_attempt = b.reconnect.attempt,
     })
+end
+
+function M.get_debug_info()
+    local b = get_bridge()
+    b.debug_info = nil
+    M._send_notification("get_debug_info", {})
+    -- Wait for response (up to 1s)
+    local start = vim.loop.now()
+    while not b.debug_info and (vim.loop.now() - start) < 1000 do
+        vim.wait(50, function() return b.debug_info ~= nil end, 50)
+        vim.loop.run("nowait")
+    end
+    return b.debug_info
 end
 
 function M.set_engine(engine)
@@ -900,14 +793,6 @@ function M._send_tool_response(correlation_id, result, err)
     end
 
     ws_client.send(b.client, vim.json.encode(response))
-end
-
-local function lua_debug(msg)
-    local f = io.open("/tmp/banjo-lua-debug.log", "a")
-    if f then
-        f:write(os.date("%H:%M:%S ") .. msg .. "\n")
-        f:close()
-    end
 end
 
 function M._send_notification(method, params)

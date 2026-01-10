@@ -510,8 +510,16 @@ test "tryParseHandshake parses complete headers" {
         "\r\n";
     const parsed = (try tryParseHandshake(allocator, request)) orelse return error.TestExpectedEqual;
     defer deinitHandshakeResult(allocator, &parsed.result);
-    try testing.expect(std.mem.eql(u8, parsed.result.path, "/nvim"));
-    try testing.expect(parsed.header_end > 0);
+    const summary = .{
+        .path = parsed.result.path,
+        .has_header_end = parsed.header_end > 0,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.websocket.test.tryParseHandshake parses complete headers__struct_<^\d+$>
+        \\  .path: []const u8
+        \\    "/nvim"
+        \\  .has_header_end: bool = true
+    ).expectEqual(summary);
 }
 
 test "performHandshakeWithPath preserves trailing bytes" {

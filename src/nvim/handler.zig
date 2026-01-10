@@ -127,22 +127,26 @@ pub const Handler = struct {
     current_model: ?[]const u8 = null,
     session_active: bool = false,
 
+    // Persistent bridges (kept alive across prompts)
+    claude_bridge: ?claude_bridge.Bridge = null,
+    codex_bridge_inst: ?codex_bridge.CodexBridge = null,
+    bridge_cwd: ?[]const u8 = null,
+    prompt_count: u32 = 0,
+
     // Grouped state
     permission: PermissionState,
     approval: ApprovalState = .{},
     prompt: PromptState = .{},
     nudge: NudgeState = .{},
 
-    pub fn init(allocator: Allocator, stdin: std.io.AnyReader, stdout: std.io.AnyWriter) Handler {
-        const cwd_result = std.process.getCwdAlloc(allocator);
-        const cwd = cwd_result catch "/";
-        const owns_cwd = if (cwd_result) |_| true else |_| false;
+    pub fn init(allocator: Allocator, stdin: std.io.AnyReader, stdout: std.io.AnyWriter) !Handler {
+        const cwd = try std.process.getCwdAlloc(allocator);
         return Handler{
             .allocator = allocator,
             .stdin = stdin,
             .stdout = stdout,
             .cwd = cwd,
-            .owns_cwd = owns_cwd,
+            .owns_cwd = true,
             .permission = PermissionState.init(allocator),
         };
     }
@@ -156,6 +160,11 @@ pub const Handler = struct {
         if (self.poll_thread) |thread| {
             thread.join();
         }
+
+        // Clean up persistent bridges
+        if (self.claude_bridge) |*b| b.deinit();
+        if (self.codex_bridge_inst) |*b| b.deinit();
+        if (self.bridge_cwd) |c| self.allocator.free(c);
 
         if (self.mcp_server) |mcp| {
             mcp.deinit();
@@ -241,8 +250,9 @@ pub const Handler = struct {
         }
 
         if (self.mcp_server) |mcp| {
-            // Set up nvim message callback
+            // Set up nvim callbacks
             mcp.nvim_message_callback = nvimMessageCallback;
+            mcp.nvim_connect_callback = nvimConnectCallback;
             mcp.nvim_callback_ctx = @ptrCast(self);
 
             mcp.start() catch |err| {
@@ -299,18 +309,16 @@ pub const Handler = struct {
             if (prompt.cwd) |c| self.allocator.free(c);
         }
 
-        // Emit session_start if not already in a session
-        if (!self.session_active) {
-            debugLog("processQueuedPrompt: starting new session", .{});
-            self.session_active = true;
-            self.sendNotification("session_start", protocol.SessionEvent{}) catch |err| {
-                log.warn("Failed to send session_start: {}", .{err});
+        // Emit session_start for every new prompt (resets timer on Lua side)
+        debugLog("processQueuedPrompt: emitting session_start", .{});
+        self.session_active = true;
+        self.sendNotification("session_start", protocol.SessionEvent{}) catch |err| {
+            log.warn("Failed to send session_start: {}", .{err});
+        };
+        if (self.mcp_server) |mcp| {
+            mcp.sendNvimNotification("session_start", protocol.SessionEvent{}) catch |err| {
+                log.warn("Failed to send MCP session_start: {}", .{err});
             };
-            if (self.mcp_server) |mcp| {
-                mcp.sendNvimNotification("session_start", protocol.SessionEvent{}) catch |err| {
-                    log.warn("Failed to send MCP session_start: {}", .{err});
-                };
-            }
         }
 
         self.cancelled.store(false, .release);
@@ -605,6 +613,12 @@ pub const Handler = struct {
         };
     }
 
+    fn nvimConnectCallback(ctx: *anyopaque) void {
+        const self: *Handler = @ptrCast(@alignCast(ctx));
+        debugLog("nvimConnectCallback: sending initial state", .{});
+        self.sendStateNotification();
+    }
+
     fn nvimMessageCallback(ctx: *anyopaque, method: []const u8, params: ?std.json.Value) void {
         const self: *Handler = @ptrCast(@alignCast(ctx));
         debugLog("nvimMessageCallback: method={s}", .{method});
@@ -617,6 +631,7 @@ pub const Handler = struct {
             .{ "set_model", .set_model },
             .{ "set_permission_mode", .set_permission_mode },
             .{ "get_state", .get_state },
+            .{ "get_debug_info", .get_debug_info },
             .{ "approval_response", .approval_response },
             .{ "permission_response", .permission_response },
             .{ "shutdown", .shutdown },
@@ -637,6 +652,7 @@ pub const Handler = struct {
             .set_model => self.handleNvimSetModel(params),
             .set_permission_mode => self.handleNvimSetPermissionMode(params),
             .get_state => self.handleNvimGetState(),
+            .get_debug_info => self.handleNvimGetDebugInfo(),
             .approval_response => self.handleNvimApprovalResponse(params),
             .permission_response => self.handleNvimPermissionResponse(params),
             .shutdown => self.handleNvimShutdown(),
@@ -653,6 +669,7 @@ pub const Handler = struct {
         set_model,
         set_permission_mode,
         get_state,
+        get_debug_info,
         approval_response,
         permission_response,
         shutdown,
@@ -742,12 +759,7 @@ pub const Handler = struct {
         const parsed = self.parseParams(protocol.SetEngineRequest, params) orelse return;
         defer parsed.deinit();
 
-        const engine_map = std.StaticStringMap(Engine).initComptime(.{
-            .{ "claude", .claude },
-            .{ "codex", .codex },
-        });
-
-        if (engine_map.get(parsed.value.engine)) |engine| {
+        if (core_types.engine_map.get(parsed.value.engine)) |engine| {
             self.current_engine = engine;
             self.sendNotification("status", protocol.StatusUpdate{
                 .text = if (engine == .claude) "Engine: Claude" else "Engine: Codex",
@@ -768,13 +780,7 @@ pub const Handler = struct {
         defer parsed.deinit();
 
         // Validate model name
-        const valid_models = std.StaticStringMap(void).initComptime(.{
-            .{ "sonnet", {} },
-            .{ "opus", {} },
-            .{ "haiku", {} },
-        });
-
-        if (valid_models.has(parsed.value.model)) {
+        if (core_types.model_id_set.has(parsed.value.model)) {
             // Free old model if owned
             if (self.current_model) |old| {
                 self.allocator.free(old);
@@ -898,6 +904,19 @@ pub const Handler = struct {
         };
     }
 
+    fn handleNvimGetDebugInfo(self: *Handler) void {
+        const claude_alive = if (self.claude_bridge) |*b| b.isAlive() else false;
+        const codex_alive = if (self.codex_bridge_inst) |*b| b.isAlive() else false;
+
+        self.sendNotification("debug_info", protocol.DebugInfo{
+            .claude_bridge_alive = claude_alive,
+            .codex_bridge_alive = codex_alive,
+            .prompt_count = self.prompt_count,
+        }) catch |err| {
+            log.err("Failed to send debug_info notification: {}", .{err});
+        };
+    }
+
     fn handleNvimShutdown(self: *Handler) void {
         log.info("Shutdown requested", .{});
         self.should_exit.store(true, .release);
@@ -941,8 +960,61 @@ pub const Handler = struct {
         }
     }
 
+    fn ensureClaudeBridge(self: *Handler, cwd: []const u8) !*claude_bridge.Bridge {
+        // Check if cwd changed - need to restart bridge
+        const cwd_changed = if (self.bridge_cwd) |bc| !std.mem.eql(u8, bc, cwd) else true;
+        if (cwd_changed) {
+            if (self.claude_bridge) |*b| b.deinit();
+            self.claude_bridge = null;
+            if (self.bridge_cwd) |bc| self.allocator.free(bc);
+            self.bridge_cwd = try self.allocator.dupe(u8, cwd);
+        }
+
+        if (self.claude_bridge == null) {
+            self.claude_bridge = claude_bridge.Bridge.init(self.allocator, cwd);
+        }
+
+        if (!self.claude_bridge.?.isAlive()) {
+            debugLog("ensureClaudeBridge: starting bridge", .{});
+            try self.claude_bridge.?.start(.{
+                .permission_mode = self.permission.mode.toCliArg(),
+                .model = self.current_model,
+                .permission_socket_path = self.permission.socket_path,
+                .resume_session_id = self.claude_session_id,
+            });
+        }
+
+        return &self.claude_bridge.?;
+    }
+
+    fn ensureCodexBridge(self: *Handler, cwd: []const u8) !*codex_bridge.CodexBridge {
+        // Check if cwd changed - need to restart bridge
+        const cwd_changed = if (self.bridge_cwd) |bc| !std.mem.eql(u8, bc, cwd) else true;
+        if (cwd_changed) {
+            if (self.codex_bridge_inst) |*b| b.deinit();
+            self.codex_bridge_inst = null;
+            if (self.bridge_cwd) |bc| self.allocator.free(bc);
+            self.bridge_cwd = try self.allocator.dupe(u8, cwd);
+        }
+
+        if (self.codex_bridge_inst == null) {
+            self.codex_bridge_inst = codex_bridge.CodexBridge.init(self.allocator, cwd);
+        }
+
+        if (!self.codex_bridge_inst.?.isAlive()) {
+            debugLog("ensureCodexBridge: starting bridge", .{});
+            try self.codex_bridge_inst.?.start(.{
+                .approval_policy = self.permission.mode.toCodexApprovalPolicy(),
+                .resume_session_id = self.codex_session_id,
+            });
+        }
+
+        return &self.codex_bridge_inst.?;
+    }
+
     fn processPrompt(self: *Handler, prompt_req: protocol.PromptRequest) !void {
-        debugLog("processPrompt: entry, engine={s}", .{@tagName(self.current_engine)});
+        self.prompt_count += 1;
+        debugLog("processPrompt: entry, engine={s}, count={d}", .{ @tagName(self.current_engine), self.prompt_count });
         const engine = self.current_engine;
 
         debugLog("processPrompt: sending stream_start notification", .{});
@@ -970,43 +1042,39 @@ pub const Handler = struct {
 
         switch (engine) {
             .claude => {
-                debugLog("processPrompt: initializing claude bridge", .{});
-                var bridge = claude_bridge.Bridge.init(self.allocator, prompt_ctx.cwd);
-                defer bridge.deinit();
-
-                debugLog("processPrompt: starting claude bridge", .{});
-                bridge.start(.{
-                    .permission_mode = self.permission.mode.toCliArg(),
-                    .model = self.current_model,
-                    .permission_socket_path = self.permission.socket_path,
-                }) catch |err| {
-                    debugLog("processPrompt: bridge.start failed!", .{});
+                const bridge = self.ensureClaudeBridge(prompt_ctx.cwd) catch |err| {
+                    debugLog("processPrompt: ensureClaudeBridge failed!", .{});
                     log.err("Failed to start Claude bridge: {}", .{err});
                     try self.sendError("Failed to start Claude");
                     return;
                 };
-                debugLog("processPrompt: bridge started, sending prompt", .{});
+                debugLog("processPrompt: bridge ready, sending prompt", .{});
 
                 bridge.sendPrompt(prompt_req.text) catch |err| {
-                    debugLog("processPrompt: sendPrompt failed!", .{});
-                    log.err("Failed to send prompt: {}", .{err});
-                    try self.sendError("Failed to send prompt");
-                    return;
+                    debugLog("processPrompt: sendPrompt failed ({}), restarting", .{err});
+                    bridge.stop();
+                    _ = self.ensureClaudeBridge(prompt_ctx.cwd) catch |restart_err| {
+                        log.err("Failed to restart Claude bridge: {}", .{restart_err});
+                        try self.sendError("Failed to send prompt");
+                        return;
+                    };
+                    if (self.claude_bridge) |*restarted| {
+                        restarted.sendPrompt(prompt_req.text) catch |retry_err| {
+                            log.err("Retry sendPrompt failed: {}", .{retry_err});
+                            try self.sendError("Failed to send prompt");
+                            return;
+                        };
+                    }
                 };
                 debugLog("processPrompt: prompt sent, processing messages", .{});
 
-                _ = engine_mod.processClaudeMessages(&prompt_ctx, &bridge) catch |err| {
+                _ = engine_mod.processClaudeMessages(&prompt_ctx, &self.claude_bridge.?) catch |err| {
                     debugLog("processPrompt: processClaudeMessages error!", .{});
                     log.err("Claude processing error: {}", .{err});
                 };
             },
             .codex => {
-                var bridge = codex_bridge.CodexBridge.init(self.allocator, prompt_ctx.cwd);
-                defer bridge.deinit();
-
-                bridge.start(.{
-                    .approval_policy = self.permission.mode.toCodexApprovalPolicy(),
-                }) catch |err| {
+                const bridge = self.ensureCodexBridge(prompt_ctx.cwd) catch |err| {
                     log.err("Failed to start Codex bridge: {}", .{err});
                     try self.sendError("Failed to start Codex");
                     return;
@@ -1016,12 +1084,23 @@ pub const Handler = struct {
                     .{ .type = "text", .text = prompt_req.text },
                 };
                 bridge.sendPrompt(&inputs) catch |err| {
-                    log.err("Failed to send prompt: {}", .{err});
-                    try self.sendError("Failed to send prompt");
-                    return;
+                    debugLog("processPrompt: sendPrompt failed ({}), restarting", .{err});
+                    bridge.stop();
+                    _ = self.ensureCodexBridge(prompt_ctx.cwd) catch |restart_err| {
+                        log.err("Failed to restart Codex bridge: {}", .{restart_err});
+                        try self.sendError("Failed to send prompt");
+                        return;
+                    };
+                    if (self.codex_bridge_inst) |*restarted| {
+                        restarted.sendPrompt(&inputs) catch |retry_err| {
+                            log.err("Retry sendPrompt failed: {}", .{retry_err});
+                            try self.sendError("Failed to send prompt");
+                            return;
+                        };
+                    }
                 };
 
-                _ = engine_mod.processCodexMessages(&prompt_ctx, &bridge) catch |err| {
+                _ = engine_mod.processCodexMessages(&prompt_ctx, &self.codex_bridge_inst.?) catch |err| {
                     log.err("Codex processing error: {}", .{err});
                 };
             },
@@ -1137,31 +1216,11 @@ pub const Handler = struct {
         defer if (input_owned) |owned| cb_ctx.handler.allocator.free(owned);
         if (input) |inp| {
             if (inp != .null) {
-                const input_buf_size: usize = 512;
-                var stack_buf: [input_buf_size]u8 = undefined;
-                var fbs = std.io.fixedBufferStream(&stack_buf);
-                var jw: std.json.Stringify = .{ .writer = fbs.writer() };
-                if (jw.write(inp)) |_| {
-                    input_str = fbs.getWritten();
-                } else |err| switch (err) {
-                    error.NoSpaceLeft => {
-                        var out: std.io.Writer.Allocating = .init(cb_ctx.handler.allocator);
-                        defer out.deinit();
-                        var jw_alloc: std.json.Stringify = .{ .writer = &out.writer };
-                        if (jw_alloc.write(inp)) |_| {
-                            input_owned = out.toOwnedSlice() catch |slice_err| {
-                                log.warn("Failed to allocate tool input: {}", .{slice_err});
-                                null;
-                            };
-                            input_str = input_owned;
-                        } else |write_err| {
-                            log.warn("Failed to stringify tool input: {}", .{write_err});
-                        }
-                    },
-                    else => {
-                        log.warn("Failed to stringify tool input: {}", .{err});
-                    },
-                }
+                input_owned = std.json.Stringify.valueAlloc(cb_ctx.handler.allocator, inp, .{}) catch |err| {
+                    log.warn("Failed to stringify tool input: {}", .{err});
+                    return;
+                };
+                input_str = input_owned;
             }
         }
 
@@ -1201,7 +1260,21 @@ pub const Handler = struct {
 
     fn cbOnSessionId(ctx: *anyopaque, engine: Engine, session_id: []const u8) void {
         const cb_ctx = CallbackContext.from(ctx);
-        cb_ctx.handler.sendNotification("session_id", protocol.SessionIdUpdate{
+        const handler = cb_ctx.handler;
+
+        // Store session_id for future prompts (--resume)
+        switch (engine) {
+            .claude => {
+                if (handler.claude_session_id) |old| handler.allocator.free(old);
+                handler.claude_session_id = handler.allocator.dupe(u8, session_id) catch null;
+            },
+            .codex => {
+                if (handler.codex_session_id) |old| handler.allocator.free(old);
+                handler.codex_session_id = handler.allocator.dupe(u8, session_id) catch null;
+            },
+        }
+
+        handler.sendNotification("session_id", protocol.SessionIdUpdate{
             .engine = engine,
             .session_id = session_id,
         }) catch |err| {
@@ -1279,20 +1352,12 @@ pub const Handler = struct {
         // Convert params to arguments string
         var args_str: ?[]const u8 = null;
         if (params) |p| {
-            var out: std.io.Writer.Allocating = .init(handler.allocator);
-            defer out.deinit();
-            var jw: std.json.Stringify = .{
-                .writer = &out.writer,
-                .options = .{ .emit_null_optional_fields = false },
-            };
-            if (jw.write(p)) |_| {
-                args_str = out.toOwnedSlice() catch |err| {
-                    log.warn("Failed to allocate approval params: {}", .{err});
-                    null;
-                };
-            } else |err| {
+            args_str = std.json.Stringify.valueAlloc(handler.allocator, p, .{
+                .emit_null_optional_fields = false,
+            }) catch |err| {
                 log.warn("Failed to stringify approval params: {}", .{err});
-            }
+                return null;
+            };
         }
         defer if (args_str) |a| handler.allocator.free(a);
 
@@ -1368,7 +1433,7 @@ test "handler init/deinit" {
     var stdin = std.io.fixedBufferStream(&stdin_buf);
     var stdout = std.io.fixedBufferStream(&stdout_buf);
 
-    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    var handler = try Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
     defer handler.deinit();
 
     const summary = .{
@@ -1390,7 +1455,7 @@ test "handler nudge toggle" {
     var stdin = std.io.fixedBufferStream(&stdin_buf);
     var stdout = std.io.fixedBufferStream(&stdout_buf);
 
-    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    var handler = try Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
     defer handler.deinit();
 
     const initial = handler.nudge.enabled;
@@ -1423,7 +1488,7 @@ test "handler cancel" {
     var stdin = std.io.fixedBufferStream(&stdin_buf);
     var stdout = std.io.fixedBufferStream(&stdout_buf);
 
-    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    var handler = try Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
     defer handler.deinit();
 
     const before = handler.cancelled.load(.acquire);
@@ -1447,7 +1512,7 @@ test "cancelled flag is atomic - concurrent reads" {
     var stdin = std.io.fixedBufferStream(&stdin_buf);
     var stdout = std.io.fixedBufferStream(&stdout_buf);
 
-    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    var handler = try Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
     defer handler.deinit();
 
     // Spawn multiple reader threads
@@ -1498,7 +1563,7 @@ test "cancelled flag is atomic - writer thread sets, reader sees it" {
     var stdin = std.io.fixedBufferStream(&stdin_buf);
     var stdout = std.io.fixedBufferStream(&stdout_buf);
 
-    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    var handler = try Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
     defer handler.deinit();
 
     var seen_true = std.atomic.Value(bool).init(false);
@@ -1540,7 +1605,7 @@ test "should_exit flag stops poll thread" {
     var stdin = std.io.fixedBufferStream(&stdin_buf);
     var stdout = std.io.fixedBufferStream(&stdout_buf);
 
-    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    var handler = try Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
 
     // Simulate what run() does - spawn poll thread
     var thread_exited = std.atomic.Value(bool).init(false);
@@ -1581,7 +1646,7 @@ test "prompt queueing - main thread sees queued prompt" {
     var stdin = std.io.fixedBufferStream(&stdin_buf);
     var stdout = std.io.fixedBufferStream(&stdout_buf);
 
-    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    var handler = try Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
 
     // Simulate what handleNvimPrompt does - queue a prompt
     const text = try allocator.dupe(u8, "test prompt");
@@ -1618,7 +1683,7 @@ test "cancel flag visible across threads during simulated processing" {
     var stdin = std.io.fixedBufferStream(&stdin_buf);
     var stdout = std.io.fixedBufferStream(&stdout_buf);
 
-    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    var handler = try Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
 
     var processing_saw_cancel = std.atomic.Value(bool).init(false);
     var processing_started = std.atomic.Value(bool).init(false);
@@ -1669,7 +1734,7 @@ test "prompt queue with condition variable wakeup" {
     var stdin = std.io.fixedBufferStream(&stdin_buf);
     var stdout = std.io.fixedBufferStream(&stdout_buf);
 
-    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    var handler = try Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
 
     var waiter_got_prompt = std.atomic.Value(bool).init(false);
 
@@ -1790,7 +1855,7 @@ test "generateSessionId format" {
     var stdin = std.io.fixedBufferStream(&stdin_buf);
     var stdout = std.io.fixedBufferStream(&stdout_buf);
 
-    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    var handler = try Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
     defer handler.deinit();
 
     const session_id = try handler.generateSessionId();
@@ -1824,7 +1889,7 @@ test "generateSessionId uniqueness" {
     var stdin = std.io.fixedBufferStream(&stdin_buf);
     var stdout = std.io.fixedBufferStream(&stdout_buf);
 
-    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    var handler = try Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
     defer handler.deinit();
 
     const id1 = try handler.generateSessionId();
@@ -1847,7 +1912,7 @@ test "permission socket create and close" {
     var stdin = std.io.fixedBufferStream(&stdin_buf);
     var stdout = std.io.fixedBufferStream(&stdout_buf);
 
-    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    var handler = try Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
 
     // Create socket
     try handler.createPermissionSocket();
@@ -1899,7 +1964,7 @@ test "checkPermissionAutoApprove safe tools" {
     var stdin = std.io.fixedBufferStream(&stdin_buf);
     var stdout = std.io.fixedBufferStream(&stdout_buf);
 
-    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    var handler = try Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
     defer handler.deinit();
 
     const summary = .{
@@ -1944,7 +2009,7 @@ test "checkPermissionAutoApprove auto_approve mode" {
     var stdin = std.io.fixedBufferStream(&stdin_buf);
     var stdout = std.io.fixedBufferStream(&stdout_buf);
 
-    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    var handler = try Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
     defer handler.deinit();
 
     // Set auto_approve mode (bypassPermissions)
@@ -1974,7 +2039,7 @@ test "checkPermissionAutoApprove accept_edits mode" {
     var stdin = std.io.fixedBufferStream(&stdin_buf);
     var stdout = std.io.fixedBufferStream(&stdout_buf);
 
-    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    var handler = try Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
     defer handler.deinit();
 
     // Set accept_edits mode
@@ -2031,7 +2096,7 @@ test "cbCheckAuthRequired returns auth_required for marker" {
     var stdin = std.io.fixedBufferStream(&stdin_buf);
     var stdout = std.io.fixedBufferStream(&stdout_buf);
 
-    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    var handler = try Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
     defer handler.deinit();
 
     var cb_ctx = Handler.CallbackContext{ .handler = &handler };
@@ -2057,7 +2122,7 @@ test "checkPermissionAutoApprove always_allowed_tools" {
     var stdin = std.io.fixedBufferStream(&stdin_buf);
     var stdout = std.io.fixedBufferStream(&stdout_buf);
 
-    var handler = Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    var handler = try Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
     defer handler.deinit();
 
     const before = handler.checkPermissionAutoApprove("Bash");
@@ -2075,6 +2140,80 @@ test "checkPermissionAutoApprove always_allowed_tools" {
         \\    null
         \\  .after: ?[]const u8
         \\    "allow"
+    ).expectEqual(summary);
+}
+
+test "ensureClaudeBridge reuses bridge for same cwd" {
+    const allocator = std.testing.allocator;
+
+    var stdin_buf: [0]u8 = undefined;
+    var stdout_buf: [1024]u8 = undefined;
+    var stdin = std.io.fixedBufferStream(&stdin_buf);
+    var stdout = std.io.fixedBufferStream(&stdout_buf);
+
+    var handler = try Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    defer handler.deinit();
+
+    // First call creates bridge (won't start process since Claude not available in tests)
+    _ = handler.ensureClaudeBridge("/tmp/test1") catch {};
+    const first_bridge_ptr = if (handler.claude_bridge) |*b| @intFromPtr(b) else 0;
+    const first_cwd_correct = if (handler.bridge_cwd) |c| std.mem.eql(u8, c, "/tmp/test1") else false;
+
+    // Second call with same cwd should reuse
+    _ = handler.ensureClaudeBridge("/tmp/test1") catch {};
+    const second_bridge_ptr = if (handler.claude_bridge) |*b| @intFromPtr(b) else 0;
+
+    // Third call with different cwd should create new bridge
+    _ = handler.ensureClaudeBridge("/tmp/test2") catch {};
+    const third_cwd_correct = if (handler.bridge_cwd) |c| std.mem.eql(u8, c, "/tmp/test2") else false;
+
+    const summary = .{
+        .same_bridge_reused = first_bridge_ptr == second_bridge_ptr and first_bridge_ptr != 0,
+        .first_cwd_correct = first_cwd_correct,
+        .cwd_updated_on_change = third_cwd_correct,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.ensureClaudeBridge reuses bridge for same cwd__struct_<^\d+$>
+        \\  .same_bridge_reused: bool = true
+        \\  .first_cwd_correct: bool = true
+        \\  .cwd_updated_on_change: bool = true
+    ).expectEqual(summary);
+}
+
+test "ensureCodexBridge reuses bridge for same cwd" {
+    const allocator = std.testing.allocator;
+
+    var stdin_buf: [0]u8 = undefined;
+    var stdout_buf: [1024]u8 = undefined;
+    var stdin = std.io.fixedBufferStream(&stdin_buf);
+    var stdout = std.io.fixedBufferStream(&stdout_buf);
+
+    var handler = try Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
+    defer handler.deinit();
+
+    // First call creates bridge
+    _ = handler.ensureCodexBridge("/tmp/test1") catch {};
+    const first_bridge_ptr = if (handler.codex_bridge_inst) |*b| @intFromPtr(b) else 0;
+    const first_cwd_correct = if (handler.bridge_cwd) |c| std.mem.eql(u8, c, "/tmp/test1") else false;
+
+    // Second call with same cwd should reuse
+    _ = handler.ensureCodexBridge("/tmp/test1") catch {};
+    const second_bridge_ptr = if (handler.codex_bridge_inst) |*b| @intFromPtr(b) else 0;
+
+    // Third call with different cwd should create new bridge
+    _ = handler.ensureCodexBridge("/tmp/test2") catch {};
+    const third_cwd_correct = if (handler.bridge_cwd) |c| std.mem.eql(u8, c, "/tmp/test2") else false;
+
+    const summary = .{
+        .same_bridge_reused = first_bridge_ptr == second_bridge_ptr and first_bridge_ptr != 0,
+        .first_cwd_correct = first_cwd_correct,
+        .cwd_updated_on_change = third_cwd_correct,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.handler.test.ensureCodexBridge reuses bridge for same cwd__struct_<^\d+$>
+        \\  .same_bridge_reused: bool = true
+        \\  .first_cwd_correct: bool = true
+        \\  .cwd_updated_on_change: bool = true
     ).expectEqual(summary);
 }
 

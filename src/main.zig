@@ -7,6 +7,25 @@ const config = @import("config");
 
 const log = std.log.scoped(.banjo);
 
+// Override std.log to write to file instead of stderr
+pub const std_options: std.Options = .{
+    .logFn = fileLogFn,
+};
+
+var log_file: ?std.fs.File = null;
+
+fn fileLogFn(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.enum_literal),
+    comptime fmt: []const u8,
+    args: anytype,
+) void {
+    const file = log_file orelse return;
+    const scope_prefix = if (scope == .default) "" else "(" ++ @tagName(scope) ++ ") ";
+    const prefix = "[" ++ comptime level.asText() ++ "] " ++ scope_prefix;
+    file.deprecatedWriter().print(prefix ++ fmt ++ "\n", args) catch {};
+}
+
 /// Run mode
 const Mode = enum {
     agent, // ACP agent mode (default)
@@ -136,15 +155,13 @@ fn parseArgs(allocator: std.mem.Allocator) !CliOptions {
 }
 
 fn printHookHelp() void {
-    const stderr = std.fs.File.stderr().deprecatedWriter();
-    stderr.writeAll("Usage: banjo hook <permission>\n") catch |err| {
+    std.fs.File.stderr().writeAll("Usage: banjo hook <permission>\n") catch |err| {
         log.warn("Failed to write hook help: {}", .{err});
     };
 }
 
 fn printHelp() void {
-    const stderr = std.fs.File.stderr().deprecatedWriter();
-    stderr.writeAll(
+    std.fs.File.stderr().writeAll(
         \\Banjo - A Second Brain for your code
         \\
         \\Usage: banjo [MODE] [OPTIONS]
@@ -223,7 +240,7 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
 
     hookDebugLog("Hook invoked, socket={s}", .{socket_path});
 
-    const stdout = std.fs.File.stdout().deprecatedWriter();
+    const stdout = std.fs.File.stdout();
 
     hookDebugLog("Read {d} bytes from stdin", .{input.len});
 
@@ -285,12 +302,22 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
         .tool_input = hook_input.tool_input,
         .tool_use_id = hook_input.tool_use_id,
         .session_id = hook_input.session_id,
-    }) catch return;
-    out.writer.writeAll("\n") catch return;
-    const request = out.toOwnedSlice() catch return;
+    }) catch |err| {
+        hookDebugLog("Failed to serialize request: {}", .{err});
+        return;
+    };
+    out.writer.writeAll("\n") catch |err| {
+        hookDebugLog("Failed to write newline: {}", .{err});
+        return;
+    };
+    const request = out.toOwnedSlice() catch |err| {
+        hookDebugLog("Failed to allocate request: {}", .{err});
+        return;
+    };
     defer allocator.free(request);
 
     _ = std.posix.write(sock, request) catch |err| {
+        hookDebugLog("Failed to write to socket: {}", .{err});
         log.warn("Failed to write to socket: {}", .{err});
         return;
     };
@@ -298,17 +325,22 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
     // Read response
     var response_buf: [1024]u8 = undefined;
     const n = std.posix.read(sock, &response_buf) catch |err| {
+        hookDebugLog("Failed to read from socket: {}", .{err});
         log.warn("Failed to read from socket: {}", .{err});
         return;
     };
-    if (n == 0) return;
+    if (n == 0) {
+        hookDebugLog("Empty response from socket", .{});
+        return;
+    }
 
     const response = std.mem.trimRight(u8, response_buf[0..n], "\n\r");
 
     // Parse response
     var resp_parsed = std.json.parseFromSlice(HookSocketResponse, allocator, response, .{
         .ignore_unknown_fields = true,
-    }) catch {
+    }) catch |err| {
+        hookDebugLog("Failed to parse response: {}", .{err});
         return;
     };
     defer resp_parsed.deinit();
@@ -344,26 +376,47 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
                     };
                     hook_jw.write(HookOutput{
                         .hookSpecificOutput = .{ .updatedInput = .{ .answers = answers } },
-                    }) catch return;
-                    const hook_json = hook_out.toOwnedSlice() catch return;
+                    }) catch |err| {
+                        hookDebugLog("Failed to write hook output: {}", .{err});
+                        return;
+                    };
+                    const hook_json = hook_out.toOwnedSlice() catch |err| {
+                        hookDebugLog("Failed to allocate hook output: {}", .{err});
+                        return;
+                    };
                     defer allocator.free(hook_json);
-                    stdout.writeAll(hook_json) catch return;
+                    stdout.writeAll(hook_json) catch |err| {
+                        hookDebugLog("Failed to write to stdout: {}", .{err});
+                        return;
+                    };
                 } else {
                     stdout.writeAll(
                         \\{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}
-                    ) catch return;
+                    ) catch |err| {
+                        hookDebugLog("Failed to write allow to stdout: {}", .{err});
+                        return;
+                    };
                 }
             },
             .deny => {
                 // Include reason if provided
                 if (resp.reason) |reason| {
                     var buf: [512]u8 = undefined;
-                    const output = std.fmt.bufPrint(&buf, "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"{s}\"}}}}", .{reason}) catch return;
-                    stdout.writeAll(output) catch return;
+                    const output = std.fmt.bufPrint(&buf, "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"{s}\"}}}}", .{reason}) catch |err| {
+                        hookDebugLog("Failed to format deny output: {}", .{err});
+                        return;
+                    };
+                    stdout.writeAll(output) catch |err| {
+                        hookDebugLog("Failed to write deny to stdout: {}", .{err});
+                        return;
+                    };
                 } else {
                     stdout.writeAll(
                         \\{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Permission denied by Banjo"}}
-                    ) catch return;
+                    ) catch |err| {
+                        hookDebugLog("Failed to write default deny to stdout: {}", .{err});
+                        return;
+                    };
                 }
             },
         }
@@ -374,6 +427,12 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
 }
 
 pub fn main() !void {
+    // Initialize file-based logging (writes to /tmp/banjo.log by default)
+    const log_path = std.posix.getenv("BANJO_LOG_FILE") orelse "/tmp/banjo.log";
+    log_file = std.fs.cwd().createFile(log_path, .{ .truncate = false }) catch null;
+    if (log_file) |f| f.seekFromEnd(0) catch {};
+    defer if (log_file) |f| f.close();
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -425,7 +484,7 @@ pub fn main() !void {
         },
         .nvim => {
             log.info("Banjo Neovim v{s} ({s}) starting", .{ config.version, config.git_hash });
-            var handler = NvimHandler.init(allocator, stdin, stdout);
+            var handler = try NvimHandler.init(allocator, stdin, stdout);
             defer handler.deinit();
             try handler.run();
         },
@@ -452,6 +511,7 @@ test {
     _ = @import("core/settings.zig");
     _ = @import("core/types.zig");
     _ = @import("tools/proxy.zig");
+    _ = @import("util/log.zig");
 
     // Notes (comment-based)
     _ = @import("notes/comments.zig");

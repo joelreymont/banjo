@@ -49,6 +49,9 @@ pub const McpServer = struct {
     nvim_message_callback: ?*const fn (ctx: *anyopaque, method: []const u8, params: ?std.json.Value) void = null,
     nvim_callback_ctx: ?*anyopaque = null,
 
+    // Callback for nvim connection (send initial state)
+    nvim_connect_callback: ?*const fn (ctx: *anyopaque) void = null,
+
     // Type declarations (must come after fields)
     const OwnedSelection = struct {
         text: []const u8, // owned
@@ -159,32 +162,22 @@ pub const McpServer = struct {
         log.info("MCP server listening on port {d}", .{self.port});
     }
 
-    pub fn stop(self: *McpServer) void {
-        // Send close frame to MCP client if connected
-        if (self.mcp_client_socket) |sock| {
-            const close_frame = websocket.encodeFrame(self.allocator, .close, "") catch null;
-            if (close_frame) |frame| {
-                _ = posix.write(sock, frame) catch |err| {
-                    log.debug("Failed to send close frame to MCP client: {}", .{err});
-                };
-                self.allocator.free(frame);
-            }
-            posix.close(sock);
-            self.mcp_client_socket = null;
+    fn closeSocket(self: *McpServer, socket_ptr: *?posix.socket_t, name: []const u8) void {
+        const sock = socket_ptr.* orelse return;
+        const close_frame = websocket.encodeFrame(self.allocator, .close, "") catch null;
+        if (close_frame) |frame| {
+            _ = posix.write(sock, frame) catch |err| {
+                log.debug("Failed to send close frame to {s} client: {}", .{ name, err });
+            };
+            self.allocator.free(frame);
         }
+        posix.close(sock);
+        socket_ptr.* = null;
+    }
 
-        // Send close frame to nvim client if connected
-        if (self.nvim_client_socket) |sock| {
-            const close_frame = websocket.encodeFrame(self.allocator, .close, "") catch null;
-            if (close_frame) |frame| {
-                _ = posix.write(sock, frame) catch |err| {
-                    log.debug("Failed to send close frame to nvim client: {}", .{err});
-                };
-                self.allocator.free(frame);
-            }
-            posix.close(sock);
-            self.nvim_client_socket = null;
-        }
+    pub fn stop(self: *McpServer) void {
+        self.closeSocket(&self.mcp_client_socket, "MCP");
+        self.closeSocket(&self.nvim_client_socket, "nvim");
 
         // Delete lock file
         if (self.lock_file) |*lock| {
@@ -313,7 +306,8 @@ pub const McpServer = struct {
     fn closePendingHandshake(self: *McpServer, fd: posix.socket_t) void {
         if (self.pending_handshakes.fetchRemove(fd)) |entry| {
             posix.close(entry.key);
-            entry.value.deinit(self.allocator);
+            var handshake = entry.value;
+            handshake.deinit(self.allocator);
         } else {
             posix.close(fd);
         }
@@ -327,7 +321,8 @@ pub const McpServer = struct {
 
     fn setBlocking(fd: posix.socket_t) !void {
         var flags = try posix.fcntl(fd, posix.F.GETFL, 0);
-        flags &= ~(1 << @bitOffsetOf(posix.O, "NONBLOCK"));
+        const nonblock_bit: @TypeOf(flags) = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
+        flags &= ~nonblock_bit;
         _ = try posix.fcntl(fd, posix.F.SETFL, flags);
     }
 
@@ -373,6 +368,13 @@ pub const McpServer = struct {
                 }
                 log.info("Neovim connected", .{});
                 debugLog("nvim_client_socket set to fd={d}", .{client});
+
+                // Notify handler to send initial state
+                if (self.nvim_connect_callback) |cb| {
+                    if (self.nvim_callback_ctx) |ctx| {
+                        cb(ctx);
+                    }
+                }
             },
         }
     }
@@ -450,7 +452,10 @@ pub const McpServer = struct {
         var iter = self.pending_handshakes.iterator();
         while (iter.next()) |entry| {
             if (entry.value_ptr.deadline_ms <= now_ms) {
-                to_remove.append(self.allocator, entry.key_ptr.*) catch {};
+                to_remove.append(self.allocator, entry.key_ptr.*) catch |err| {
+                    log.warn("Failed to track expired handshake for removal: {}", .{err});
+                    continue;
+                };
             }
         }
 
@@ -971,5 +976,34 @@ test "McpServer port binding" {
         \\  .port1: u16 = <^\d+$>
         \\  .port2: u16 = <^\d+$>
         \\  .different: bool = true
+    ).expectEqual(summary);
+}
+
+test "setNonBlocking and setBlocking toggle O_NONBLOCK" {
+    const sock = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer posix.close(sock);
+
+    const initial_flags = try posix.fcntl(sock, posix.F.GETFL, 0);
+    const nonblock_bit: @TypeOf(initial_flags) = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
+    const initial_nonblock = (initial_flags & nonblock_bit) != 0;
+
+    try McpServer.setNonBlocking(sock);
+    const after_nonblock_flags = try posix.fcntl(sock, posix.F.GETFL, 0);
+    const after_nonblock = (after_nonblock_flags & nonblock_bit) != 0;
+
+    try McpServer.setBlocking(sock);
+    const after_blocking_flags = try posix.fcntl(sock, posix.F.GETFL, 0);
+    const after_blocking = (after_blocking_flags & nonblock_bit) != 0;
+
+    const summary = .{
+        .initial_nonblock = initial_nonblock,
+        .after_nonblock = after_nonblock,
+        .after_blocking = after_blocking,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\nvim.mcp_server.test.setNonBlocking and setBlocking toggle O_NONBLOCK__struct_<^\d+$>
+        \\  .initial_nonblock: bool = false
+        \\  .after_nonblock: bool = true
+        \\  .after_blocking: bool = false
     ).expectEqual(summary);
 }

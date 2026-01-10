@@ -36,6 +36,12 @@ pub const engine_map = std.StaticStringMap(Engine).initComptime(.{
     .{ "codex", .codex },
 });
 
+pub const model_id_set = std.StaticStringMap(void).initComptime(.{
+    .{ "sonnet", {} },
+    .{ "opus", {} },
+    .{ "haiku", {} },
+});
+
 pub fn routeFromEnv() Route {
     const val = std.posix.getenv("BANJO_ROUTE") orelse return .claude;
     return route_map.get(val) orelse .claude;
