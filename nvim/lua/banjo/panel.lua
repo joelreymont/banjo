@@ -335,6 +335,11 @@ local function set_input_keymaps(buf, state)
         end
     end, { buffer = buf, noremap = true })
 
+    -- 'q' to close panel (same as output buffer)
+    vim.keymap.set("n", "q", function()
+        M.close()
+    end, { buffer = buf, noremap = true })
+
     -- Up/Down for history navigation
     vim.keymap.set({ "n", "i" }, "<Up>", function()
         local history = require("banjo.history")
@@ -1260,8 +1265,12 @@ end
 function M._start_session_timer()
     local state = get_state()
     local my_tabid = vim.api.nvim_get_current_tabpage()
+
+    -- Stop existing timer if any (restart behavior)
     if state.session_timer then
-        return
+        state.session_timer:stop()
+        state.session_timer:close()
+        state.session_timer = nil
     end
 
     state.session_timer = vim.loop.new_timer()
