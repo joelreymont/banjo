@@ -1,7 +1,11 @@
 -- Permission and approval prompts using nui.nvim
 local M = {}
 
-local Popup = require("nui.popup")
+local Popup
+local has_nui, nui_popup = pcall(require, "nui.popup")
+if has_nui then
+    Popup = nui_popup
+end
 
 -- Format tool input for display (extract meaningful fields, not raw JSON)
 local function format_tool_input(name, input_json)
@@ -96,6 +100,27 @@ end
 
 -- Create a permission/approval prompt
 function M.show(opts)
+    if not Popup then
+        -- Fallback: use vim.ui.select when nui.nvim not available
+        local actions = opts.actions or {}
+        local choices = {}
+        local action_map = {}
+        for _, action in ipairs(actions) do
+            table.insert(choices, string.format("[%s] %s", action.key, action.label))
+            action_map[#choices] = action.value
+        end
+        vim.ui.select(choices, {
+            prompt = (opts.title or "Prompt") .. ": " .. (opts.tool_name or ""),
+        }, function(_, idx)
+            if idx and opts.on_action then
+                opts.on_action(action_map[idx] or "deny")
+            elseif opts.on_action then
+                opts.on_action("deny")
+            end
+        end)
+        return
+    end
+
     opts = opts or {}
     local title = opts.title or "Prompt"
     local tool_name = opts.tool_name or "unknown"
