@@ -16,6 +16,15 @@ end
 -- Per-tab bridge b.state (indexed by tabpage handle)
 local bridges = {}
 
+-- Notify user when a background tab needs attention
+local function notify_background(tabid, message, level)
+    local current_tab = vim.api.nvim_get_current_tabpage()
+    if current_tab ~= tabid then
+        local tabnr = vim.api.nvim_tabpage_get_number(tabid)
+        vim.notify(string.format("[Tab %d] %s", tabnr, message), level or vim.log.levels.INFO)
+    end
+end
+
 -- Per-tab bridge b.state accessor
 local function get_bridge()
     local tabid = vim.api.nvim_get_current_tabpage()
@@ -441,6 +450,7 @@ function M._handle_message(msg, tabid)
         panel.append(text, is_thought)
     elseif method == "stream_end" then
         panel.end_stream()
+        notify_background(tabid, "Banjo: Task complete", vim.log.levels.INFO)
     elseif method == "tool_call" then
         local id = msg.params and msg.params.id
         local name = msg.params and msg.params.name or "?"
@@ -456,6 +466,7 @@ function M._handle_message(msg, tabid)
     elseif method == "error_msg" then
         local message = msg.params and msg.params.message or "Unknown error"
         vim.notify("Banjo: " .. message, vim.log.levels.ERROR)
+        notify_background(tabid, "Banjo: Error - " .. message, vim.log.levels.ERROR)
     elseif method == "status" then
         local text = msg.params and msg.params.text or ""
         vim.notify("Banjo: " .. text, vim.log.levels.INFO)
@@ -485,10 +496,13 @@ function M._handle_message(msg, tabid)
         panel._stop_session_timer()
     elseif method == "approval_request" then
         if msg.params then
+            notify_background(tabid, "Banjo: Approval needed", vim.log.levels.WARN)
             M._show_approval_prompt(msg.params)
         end
     elseif method == "permission_request" then
         if msg.params then
+            local tool = msg.params.tool_name or "tool"
+            notify_background(tabid, "Banjo: Permission needed for " .. tool, vim.log.levels.WARN)
             M._show_permission_prompt(msg.params)
         end
     elseif method == "debug_info" then
