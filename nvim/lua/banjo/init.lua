@@ -194,7 +194,10 @@ end
 
 -- Open a project in a new tab with its own cwd and bridge
 function M.open_project(path)
-    path = vim.fn.expand(path)
+    -- Expand ~ and resolve to absolute path
+    path = vim.fn.fnamemodify(vim.fn.expand(path), ":p")
+    -- Remove trailing slash for consistency
+    path = path:gsub("/$", "")
     if vim.fn.isdirectory(path) ~= 1 then
         vim.notify("Banjo: Not a directory: " .. path, vim.log.levels.ERROR)
         return
@@ -206,17 +209,29 @@ function M.open_project(path)
     -- Set tab-local cwd
     vim.cmd("tcd " .. vim.fn.fnameescape(path))
 
-    -- Open file explorer if available
-    local has_neotree = pcall(require, "neo-tree")
-    if has_neotree then
-        vim.cmd("Neotree reveal")
-    else
-        vim.cmd("Explore")
-    end
+    vim.schedule(function()
+        -- Start banjo for this tab (new bridge, new session)
+        M.start()
 
-    -- Start banjo for this tab (new bridge, new session)
-    M.start()
-    panel.open()
+        -- Open banjo panel first (on the right)
+        panel.open()
+
+        -- Then open snacks explorer (on the left) - focus stays on main window
+        vim.schedule(function()
+            local has_snacks, snacks = pcall(require, "snacks")
+            if has_snacks then
+                if snacks.explorer then
+                    snacks.explorer()
+                end
+            else
+                if vim.fn.exists(":Neotree") == 2 then
+                    vim.cmd("Neotree show")
+                elseif vim.fn.exists(":NvimTreeOpen") == 2 then
+                    vim.cmd("NvimTreeOpen")
+                end
+            end
+        end)
+    end)
 end
 
 -- Resolve <leader> in prefix to human-readable key name
@@ -238,7 +253,7 @@ end
 
 -- Show help in styled floating window
 function M.help()
-    local prefix = resolve_prefix(config.keymap_prefix or "<leader>b")
+    local prefix = resolve_prefix(config.keymap_prefix)
 
     local bindings = {
         { "b", "Toggle panel" },
@@ -308,7 +323,7 @@ end
 
 -- Setup keymaps
 function M.setup_keymaps()
-    local prefix = config.keymap_prefix or "<leader>b"
+    local prefix = config.keymap_prefix
 
     local mappings = {
         { "b", function() panel.toggle() end, "Toggle panel" },
