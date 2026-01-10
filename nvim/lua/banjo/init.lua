@@ -11,6 +11,7 @@ local default_config = {
     keymap_prefix = "<leader>a",  -- "a" for agent, avoids conflict with buffer keymaps
     keymaps = true,
     scope = true, -- Enable tab-scoped buffers via scope.nvim
+    bufferline = true, -- Configure bufferline for multi-project tabs
 }
 
 local config = {}
@@ -60,6 +61,37 @@ function M.setup(opts)
         local has_scope, scope = pcall(require, "scope")
         if has_scope then
             scope.setup({})
+        end
+    end
+
+    -- Configure bufferline for multi-project tabs
+    if config.bufferline then
+        local has_bufferline, bufferline = pcall(require, "bufferline")
+        if has_bufferline then
+            bufferline.setup({
+                options = {
+                    mode = "tabs",
+                    separator_style = "slant",
+                    show_buffer_close_icons = false,
+                    show_close_icon = false,
+                    always_show_bufferline = true,
+                    indicator = { style = "underline" },
+                    name_formatter = function(buf)
+                        local tabpages = vim.api.nvim_list_tabpages()
+                        local pos = 0
+                        for i, handle in ipairs(tabpages) do
+                            if handle == buf.tabnr then
+                                pos = i
+                                break
+                            end
+                        end
+                        local cwd = vim.fn.getcwd(-1, pos)
+                        local dir = vim.fn.fnamemodify(cwd, ":t")
+                        if dir == "" then dir = buf.name end
+                        return string.format("%d:%s", pos, dir)
+                    end,
+                },
+            })
         end
     end
 
