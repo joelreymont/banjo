@@ -53,6 +53,10 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run banjo ACP agent");
     run_step.dependOn(&run_cmd.step);
 
+    // Check step (compile without install - safe for cross-compile testing)
+    const check_step = b.step("check", "Check compilation (no install)");
+    check_step.dependOn(&exe.step);
+
     // Unit tests
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
