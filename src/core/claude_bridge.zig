@@ -705,7 +705,26 @@ pub const Bridge = struct {
         defer self.allocator.free(data);
 
         log.debug("Sending to CLI stdin: {s}", .{data});
-        try stdin.writeAll(data);
+        stdin.writeAll(data) catch |err| {
+            if (err == error.BrokenPipe) {
+                // Process died - try to get exit status
+                if (self.process) |*child| {
+                    const term = child.wait() catch |wait_err| blk: {
+                        log.err("Claude CLI died (BrokenPipe), wait failed: {}", .{wait_err});
+                        break :blk std.process.Child.Term{ .Unknown = 0 };
+                    };
+                    switch (term) {
+                        .Exited => |code| log.err("Claude CLI exited with code {d}", .{code}),
+                        .Signal => |sig| log.err("Claude CLI killed by signal {d}", .{sig}),
+                        .Stopped => |sig| log.err("Claude CLI stopped by signal {d}", .{sig}),
+                        .Unknown => |val| log.err("Claude CLI terminated (unknown: {d})", .{val}),
+                    }
+                    self.process = null;
+                    self.stdout_reader = null;
+                }
+            }
+            return err;
+        };
     }
 
     /// Read next message from CLI stdout (reader thread only).
