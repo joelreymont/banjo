@@ -75,15 +75,28 @@ fn getLockFilePath(allocator: Allocator, port: u16) ![]const u8 {
 }
 
 fn getPid() i32 {
-    // std.os.linux.getpid() returns pid_t which is i32 on most systems
-    // On macOS/Darwin, use std.c.getpid()
-    return @intCast(std.c.getpid());
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .linux) {
+        return @intCast(std.os.linux.getpid());
+    }
+    // macOS/Darwin - use self-referential /proc alternative
+    // For lock file purposes, we just need a unique identifier
+    return @intCast(@as(u32, @truncate(std.Thread.getCurrentId())));
 }
 
 fn isPidAlive(pid: i32) bool {
-    // kill(pid, 0) returns 0 if process exists, -1 otherwise
-    const result = std.c.kill(pid, 0);
-    return result == 0;
+    // Use /proc on Linux, or just assume alive if we can't check
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .linux) {
+        var buf: [32]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "/proc/{d}", .{pid}) catch return true;
+        var dir = std.fs.openDirAbsolute(path, .{}) catch return false;
+        dir.close();
+        return true;
+    }
+    // On macOS/other: assume process is alive if lock file exists
+    // The worst case is we fail to start, which is safe
+    return true;
 }
 
 fn readExistingLockFile(allocator: Allocator, path: []const u8) !LockFileData {
