@@ -78,14 +78,15 @@ function M.setup(opts)
                     indicator = { style = "underline" },
                     name_formatter = function(buf)
                         local tabpages = vim.api.nvim_list_tabpages()
-                        local pos = 0
+                        local pos = 1
                         for i, handle in ipairs(tabpages) do
                             if handle == buf.tabnr then
                                 pos = i
                                 break
                             end
                         end
-                        local cwd = vim.fn.getcwd(-1, pos)
+                        local ok, cwd = pcall(vim.fn.getcwd, -1, pos)
+                        if not ok then cwd = "" end
                         local dir = vim.fn.fnamemodify(cwd, ":t")
                         if dir == "" then dir = buf.name end
                         return string.format("%d:%s", pos, dir)
