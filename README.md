@@ -32,6 +32,7 @@ Banjo Duet is a Second Brain for your code — run [Claude Code](https://docs.an
 - Tool call display with folding
 - File path navigation (jump to `file:line` references)
 - Input history and session management
+- Multi-project workspaces (`:BanjoProject`) with tab-scoped buffers
 
 ## Dots Integration
 

@@ -87,6 +87,7 @@ When in the input buffer:
 | `:BanjoNudge` | Toggle auto-continue |
 | `:BanjoClear` | Clear the panel |
 | `:BanjoHelp` | Show keybindings |
+| `:BanjoProject <path>` | Open project in new tab |
 
 ### Slash Commands
 
@@ -103,6 +104,7 @@ Type these in the input buffer:
 | `/agent <name>` | Set agent (claude, codex) |
 | `/sessions` | List saved sessions |
 | `/load <id>` | Load a session |
+| `/project <path>` | Open project in new tab |
 
 ## Features
 
@@ -133,6 +135,23 @@ Input history is preserved across sessions:
 Conversations can be saved and restored:
 - Sessions saved to `~/.local/share/nvim/banjo/sessions/`
 - Use `/sessions` to list, `/load <id>` to restore
+
+### Multi-Project Workspaces
+
+Work on multiple projects in a single Neovim instance:
+
+```vim
+:BanjoProject ~/Work/other-project
+```
+
+Each tab gets:
+- **Tab-local cwd** — file operations scoped to project root
+- **Separate Claude session** — independent conversation per project
+- **Scoped buffers** — `:bnext`/`:bprev` only cycle buffers in current tab
+
+Requires [scope.nvim](https://github.com/tiagovla/scope.nvim) (auto-configured by Banjo).
+
+Switch between project tabs with `gt`/`gT` or tab numbers.
 
 ## Dots Integration
 
@@ -166,6 +185,9 @@ Use `/nudge` or `<leader>an` to toggle.
     width = 80,           -- Panel width in columns
     position = "right",   -- "right" or "left"
   },
+
+  -- Enable scope.nvim for tab-scoped buffers (default: true)
+  scope = true,
 }
 ```
 
