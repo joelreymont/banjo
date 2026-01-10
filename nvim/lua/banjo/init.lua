@@ -10,6 +10,7 @@ local default_config = {
     panel = {},
     keymap_prefix = "<leader>a",  -- "a" for agent, avoids conflict with buffer keymaps
     keymaps = true,
+    scope = true, -- Enable tab-scoped buffers via scope.nvim
 }
 
 local config = {}
@@ -54,6 +55,14 @@ function M.setup(opts)
         return
     end
 
+    -- Setup scope.nvim for tab-scoped buffers (if available)
+    if config.scope then
+        local has_scope, scope = pcall(require, "scope")
+        if has_scope then
+            scope.setup({})
+        end
+    end
+
     -- Setup panel
     panel.setup(config.panel)
 
@@ -94,6 +103,10 @@ function M.setup(opts)
     vim.api.nvim_create_user_command("BanjoHelp", function()
         M.help()
     end, { desc = "Show Banjo keybindings" })
+
+    vim.api.nvim_create_user_command("BanjoProject", function(args)
+        M.open_project(args.args)
+    end, { nargs = 1, complete = "dir", desc = "Open project in new tab" })
 
     -- Setup keymaps
     if config.keymaps then
@@ -177,6 +190,33 @@ end
 
 function M.get_mcp_port()
     return bridge.get_mcp_port()
+end
+
+-- Open a project in a new tab with its own cwd and bridge
+function M.open_project(path)
+    path = vim.fn.expand(path)
+    if vim.fn.isdirectory(path) ~= 1 then
+        vim.notify("Banjo: Not a directory: " .. path, vim.log.levels.ERROR)
+        return
+    end
+
+    -- Create new tab
+    vim.cmd("tabnew")
+
+    -- Set tab-local cwd
+    vim.cmd("tcd " .. vim.fn.fnameescape(path))
+
+    -- Open file explorer if available
+    local has_neotree = pcall(require, "neo-tree")
+    if has_neotree then
+        vim.cmd("Neotree reveal")
+    else
+        vim.cmd("Explore")
+    end
+
+    -- Start banjo for this tab (new bridge, new session)
+    M.start()
+    panel.open()
 end
 
 -- Resolve <leader> in prefix to human-readable key name

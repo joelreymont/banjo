@@ -21,6 +21,7 @@ local function cmd_help(args, context)
         "  /agent <name> - Switch agent (claude, codex)",
         "  /sessions - List saved sessions",
         "  /load <id> - Restore a saved session",
+        "  /project <path> - Open project in new tab",
         "",
         "Keybinds:",
         "  <CR> - Submit input",
@@ -218,6 +219,20 @@ local function cmd_load(args, context)
     panel.append_status(string.format("Loaded session: %s", args))
 end
 
+local function cmd_project(args, context)
+    local panel = context.panel
+
+    if not args or args == "" then
+        if panel then
+            panel.append_status("Usage: /project <path>")
+        end
+        return
+    end
+
+    local banjo = require("banjo")
+    banjo.open_project(args)
+end
+
 -- Parse input text into command and arguments
 -- Returns: {cmd = string, args = string} or nil if not a command
 function M.parse(text)
@@ -261,6 +276,7 @@ M.register("mode", cmd_mode)
 M.register("agent", cmd_agent)
 M.register("sessions", cmd_sessions)
 M.register("load", cmd_load)
+M.register("project", cmd_project)
 
 -- Dispatch a command
 -- Returns: true if handled locally, false if should forward to backend
