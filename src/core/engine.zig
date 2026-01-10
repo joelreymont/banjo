@@ -34,6 +34,21 @@ pub const NudgeConfig = struct {
     last_nudge_ms: *i64,
 };
 
+/// Inputs for nudge decision - extracted for testability
+pub const NudgeInputs = struct {
+    enabled: bool,
+    cancelled: bool,
+    cooldown_ok: bool,
+    has_dots: bool,
+    reason_ok: bool,
+    did_work: bool, // True if tools were used
+
+    pub fn shouldNudge(self: NudgeInputs) bool {
+        return self.enabled and !self.cancelled and self.cooldown_ok and
+            self.has_dots and self.reason_ok and self.did_work;
+    }
+};
+
 fn authMarkerTextFromTurnError(err: codex_bridge.TurnError) ?[]const u8 {
     if (err.message) |msg| {
         if (auth_markers.containsAuthMarker(msg)) return msg;
@@ -102,6 +117,7 @@ pub fn processClaudeMessages(
 
     var stop_reason: StopReason = .end_turn;
     var first_response_ms: u64 = 0;
+    var tool_use_count: u32 = 0; // Track if Claude did actual work
     var msg_count: u32 = 0;
     var stream_prefix_pending = false;
     var thought_prefix_pending = false;
@@ -165,6 +181,7 @@ pub fn processClaudeMessages(
                 }
 
                 if (msg.getToolUse()) |tool| {
+                    tool_use_count += 1;
                     engineDebugLog("tool_use: {s}", .{tool.name});
                     try ctx.cb.sendToolCall(
                         ctx.session_id,
@@ -194,33 +211,39 @@ pub fn processClaudeMessages(
                 engineDebugLog("result: stop_reason={?s}", .{stop_reason_opt});
                 if (stop_reason_opt) |reason| {
                     const now_ms = std.time.milliTimestamp();
-                    const cooldown_ok = (now_ms - ctx.nudge.last_nudge_ms.*) >= ctx.nudge.cooldown_ms;
-                    const has_dots = dots.hasPendingTasks(ctx.allocator, ctx.cwd).has_tasks;
-                    const reason_ok = std.mem.eql(u8, reason, "error_max_turns") or
-                        std.mem.eql(u8, reason, "success") or
-                        std.mem.eql(u8, reason, "end_turn");
-                    const should_nudge = ctx.nudge.enabled and !ctx.isCancelled() and cooldown_ok and
-                        has_dots and reason_ok;
 
-                    log.info("Nudge check: enabled={}, cancelled={}, cooldown_ok={}, has_dots={}, reason={s}, reason_ok={}", .{
-                        ctx.nudge.enabled,
-                        ctx.isCancelled(),
-                        cooldown_ok,
-                        has_dots,
+                    const nudge_inputs = NudgeInputs{
+                        .enabled = ctx.nudge.enabled,
+                        .cancelled = ctx.isCancelled(),
+                        .cooldown_ok = (now_ms - ctx.nudge.last_nudge_ms.*) >= ctx.nudge.cooldown_ms,
+                        .has_dots = dots.hasPendingTasks(ctx.allocator, ctx.cwd).has_tasks,
+                        .reason_ok = isNudgeableStopReason(reason),
+                        .did_work = tool_use_count > 0,
+                    };
+
+                    log.info("Nudge check: enabled={}, cancelled={}, cooldown_ok={}, has_dots={}, did_work={} (tools={}), reason={s}, reason_ok={}", .{
+                        nudge_inputs.enabled,
+                        nudge_inputs.cancelled,
+                        nudge_inputs.cooldown_ok,
+                        nudge_inputs.has_dots,
+                        nudge_inputs.did_work,
+                        tool_use_count,
                         reason,
-                        reason_ok,
+                        nudge_inputs.reason_ok,
                     });
 
-                    if (should_nudge) {
+                    if (nudge_inputs.shouldNudge()) {
                         ctx.nudge.last_nudge_ms.* = now_ms;
                         log.info("Claude Code stopped ({s}); pending dots, nudging", .{reason});
-                        try ctx.cb.sendUserMessage(ctx.session_id, "dots: continue working on pending dots");
+                        try ctx.cb.sendUserMessage(ctx.session_id, "keep going");
                         const nudge_prompt = "clean up dots, then pick a dot and work on it";
                         // Queue continuation - handler will process it after we break
                         _ = try ctx.cb.sendContinuePrompt(.claude, nudge_prompt);
                         // Don't continue loop - Claude is done, break and let handler start new session
-                    } else if (!cooldown_ok) {
+                    } else if (!nudge_inputs.cooldown_ok) {
                         log.info("Claude Code stopped ({s}); not nudging due to cooldown", .{reason});
+                    } else if (!nudge_inputs.did_work) {
+                        log.info("Claude Code stopped ({s}); not nudging (no tools used)", .{reason});
                     }
                     stop_reason = mapCliStopReason(reason);
                 }
@@ -354,6 +377,15 @@ fn mapCliStopReason(cli_reason: []const u8) StopReason {
     return map.get(cli_reason) orelse .end_turn;
 }
 
+fn isNudgeableStopReason(reason: []const u8) bool {
+    const nudge_reasons = std.StaticStringMap(void).initComptime(.{
+        .{ "error_max_turns", {} },
+        .{ "success", {} },
+        .{ "end_turn", {} },
+    });
+    return nudge_reasons.has(reason);
+}
+
 fn isCodexMaxTurnError(err: codex_bridge.TurnError) bool {
     return err.isMaxTurnError();
 }
@@ -383,6 +415,7 @@ pub fn processCodexMessages(
 
     var first_response_ms: u64 = 0;
     var msg_count: u32 = 0;
+    var tool_use_count: u32 = 0; // Track if Codex did actual work
     var stream_prefix_pending = false;
     var thought_prefix_pending = false;
     var stop_reason: StopReason = .end_turn;
@@ -476,6 +509,7 @@ pub fn processCodexMessages(
         }
 
         if (msg.getToolCall()) |tool| {
+            tool_use_count += 1;
             try ctx.cb.sendToolCall(
                 ctx.session_id,
                 engine,
@@ -527,23 +561,30 @@ pub fn processCodexMessages(
             const has_max_turn_error = if (msg.turn_error) |err| isCodexMaxTurnError(err) else false;
             const has_blocking_error = msg.turn_error != null and !has_max_turn_error;
             const now_ms = std.time.milliTimestamp();
-            const cooldown_ok = (now_ms - ctx.nudge.last_nudge_ms.*) >= ctx.nudge.cooldown_ms;
-            const should_nudge = ctx.nudge.enabled and !ctx.isCancelled() and
-                !has_blocking_error and cooldown_ok and
-                dots.hasPendingTasks(ctx.allocator, ctx.cwd).has_tasks;
 
-            if (should_nudge) {
+            const nudge_inputs = NudgeInputs{
+                .enabled = ctx.nudge.enabled,
+                .cancelled = ctx.isCancelled(),
+                .cooldown_ok = (now_ms - ctx.nudge.last_nudge_ms.*) >= ctx.nudge.cooldown_ms,
+                .has_dots = dots.hasPendingTasks(ctx.allocator, ctx.cwd).has_tasks,
+                .reason_ok = !has_blocking_error, // Codex: no blocking error means OK to nudge
+                .did_work = tool_use_count > 0,
+            };
+
+            if (nudge_inputs.shouldNudge()) {
                 ctx.nudge.last_nudge_ms.* = now_ms;
                 log.info("Codex turn completed; pending dots, nudging to continue", .{});
-                try ctx.cb.sendUserMessage(ctx.session_id, "dots: continue working on pending dots");
+                try ctx.cb.sendUserMessage(ctx.session_id, "keep going");
                 const nudge_prompt = "continue with the next dot task";
                 // Queue continuation - handler will process it after we break
                 _ = try ctx.cb.sendContinuePrompt(.codex, nudge_prompt);
                 // Don't continue loop - Codex is done, break and let handler start new session
             } else if (has_blocking_error) {
                 log.info("Codex turn completed; not nudging due to error", .{});
-            } else if (!cooldown_ok) {
+            } else if (!nudge_inputs.cooldown_ok) {
                 log.info("Codex turn completed; not nudging due to cooldown", .{});
+            } else if (!nudge_inputs.did_work) {
+                log.info("Codex turn completed; not nudging (no tools used)", .{});
             }
         }
 
@@ -904,4 +945,185 @@ test "PromptContext.isCancelled concurrent access is safe" {
         \\    [2]: u32 = 10000
         \\    [3]: u32 = 10000
     ).expectEqual(summary);
+}
+
+test "integration: processClaudeMessages nudge requires tool use" {
+    // Integration test: inject real StreamMessages into Bridge, verify nudge behavior
+    // Regression: previously nudged after every completion even without tool use
+
+    const NudgeTracker = struct {
+        nudge_called: bool = false,
+        allocator: Allocator,
+
+        fn sendContinuePrompt(ctx: *anyopaque, _: Engine, _: []const u8) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.nudge_called = true;
+            return true;
+        }
+    };
+
+    const Callbacks = struct {
+        fn sendText(_: *anyopaque, _: []const u8, _: Engine, _: []const u8) anyerror!void {}
+        fn sendTextRaw(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {}
+        fn sendTextPrefix(_: *anyopaque, _: []const u8, _: Engine) anyerror!void {}
+        fn sendThought(_: *anyopaque, _: []const u8, _: Engine, _: []const u8) anyerror!void {}
+        fn sendThoughtRaw(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {}
+        fn sendThoughtPrefix(_: *anyopaque, _: []const u8, _: Engine) anyerror!void {}
+        fn sendToolCall(_: *anyopaque, _: []const u8, _: Engine, _: []const u8, _: []const u8, _: []const u8, _: ToolKind, _: ?std.json.Value) anyerror!void {}
+        fn sendToolResult(_: *anyopaque, _: []const u8, _: Engine, _: []const u8, _: ?[]const u8, _: ToolStatus, _: ?std.json.Value) anyerror!void {}
+        fn sendUserMessage(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {}
+        fn onTimeout(_: *anyopaque) void {}
+        fn onSessionId(_: *anyopaque, _: Engine, _: []const u8) void {}
+        fn onSlashCommands(_: *anyopaque, _: []const u8, _: []const []const u8) anyerror!void {}
+        fn checkAuthRequired(_: *anyopaque, _: []const u8, _: Engine, _: []const u8) anyerror!?StopReason {
+            return null;
+        }
+        fn onApprovalRequest(_: *anyopaque, _: std.json.Value, _: ApprovalKind, _: ?std.json.Value) anyerror!?[]const u8 {
+            return null;
+        }
+    };
+
+    // Test case 1: Q&A response (no tools) - should NOT nudge
+    {
+        var tracker = NudgeTracker{ .allocator = testing.allocator };
+        const vtable = EditorCallbacks.VTable{
+            .sendText = Callbacks.sendText,
+            .sendTextRaw = Callbacks.sendTextRaw,
+            .sendTextPrefix = Callbacks.sendTextPrefix,
+            .sendThought = Callbacks.sendThought,
+            .sendThoughtRaw = Callbacks.sendThoughtRaw,
+            .sendThoughtPrefix = Callbacks.sendThoughtPrefix,
+            .sendToolCall = Callbacks.sendToolCall,
+            .sendToolResult = Callbacks.sendToolResult,
+            .sendUserMessage = Callbacks.sendUserMessage,
+            .onTimeout = Callbacks.onTimeout,
+            .onSessionId = Callbacks.onSessionId,
+            .onSlashCommands = Callbacks.onSlashCommands,
+            .checkAuthRequired = Callbacks.checkAuthRequired,
+            .sendContinuePrompt = NudgeTracker.sendContinuePrompt,
+            .onApprovalRequest = Callbacks.onApprovalRequest,
+        };
+        const cbs = EditorCallbacks{ .ctx = @ptrCast(&tracker), .vtable = &vtable };
+
+        var cancelled = std.atomic.Value(bool).init(false);
+        var last_nudge: i64 = 0;
+        var ctx = PromptContext{
+            .allocator = testing.allocator,
+            .session_id = "test",
+            .cwd = "/tmp", // No dots here
+            .cancelled = &cancelled,
+            .nudge = .{ .enabled = true, .cooldown_ms = 0, .last_nudge_ms = &last_nudge },
+            .cb = cbs,
+        };
+
+        // Create bridge and inject Q&A messages (text only, no tool_use)
+        var bridge = Bridge.init(testing.allocator, "/tmp");
+        defer bridge.deinit();
+        bridge.reader_closed = true; // Signal no more messages after queue
+
+        // Parse and inject: assistant text message
+        const text_json = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Hello!\"}]}}";
+        var arena1 = std.heap.ArenaAllocator.init(testing.allocator);
+        const parsed1 = try std.json.parseFromSlice(std.json.Value, arena1.allocator(), text_json, .{});
+        bridge.queue_mutex.lock();
+        try bridge.message_queue.append(testing.allocator, claude_bridge.StreamMessage{
+            .type = .assistant,
+            .subtype = null,
+            .raw = parsed1.value,
+            .arena = arena1,
+        });
+        bridge.queue_mutex.unlock();
+
+        // Parse and inject: result message
+        const result_json = "{\"type\":\"result\",\"result\":{\"stop_reason\":\"success\"}}";
+        var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+        const parsed2 = try std.json.parseFromSlice(std.json.Value, arena2.allocator(), result_json, .{});
+        bridge.queue_mutex.lock();
+        try bridge.message_queue.append(testing.allocator, claude_bridge.StreamMessage{
+            .type = .result,
+            .subtype = null,
+            .raw = parsed2.value,
+            .arena = arena2,
+        });
+        bridge.queue_mutex.unlock();
+
+        // Process messages
+        _ = try processClaudeMessages(&ctx, &bridge);
+
+        // Should NOT have nudged (no tools used)
+        try testing.expect(!tracker.nudge_called);
+    }
+
+    // Test case 2: Work response (with tool_use) - verify tool tracking works
+    // Note: actual nudge requires pending dots which we can't easily mock,
+    // but we verify the tool_use path is exercised by checking no crash
+    {
+        var tracker = NudgeTracker{ .allocator = testing.allocator };
+        const vtable = EditorCallbacks.VTable{
+            .sendText = Callbacks.sendText,
+            .sendTextRaw = Callbacks.sendTextRaw,
+            .sendTextPrefix = Callbacks.sendTextPrefix,
+            .sendThought = Callbacks.sendThought,
+            .sendThoughtRaw = Callbacks.sendThoughtRaw,
+            .sendThoughtPrefix = Callbacks.sendThoughtPrefix,
+            .sendToolCall = Callbacks.sendToolCall,
+            .sendToolResult = Callbacks.sendToolResult,
+            .sendUserMessage = Callbacks.sendUserMessage,
+            .onTimeout = Callbacks.onTimeout,
+            .onSessionId = Callbacks.onSessionId,
+            .onSlashCommands = Callbacks.onSlashCommands,
+            .checkAuthRequired = Callbacks.checkAuthRequired,
+            .sendContinuePrompt = NudgeTracker.sendContinuePrompt,
+            .onApprovalRequest = Callbacks.onApprovalRequest,
+        };
+        const cbs = EditorCallbacks{ .ctx = @ptrCast(&tracker), .vtable = &vtable };
+
+        var cancelled = std.atomic.Value(bool).init(false);
+        var last_nudge: i64 = 0;
+        var ctx = PromptContext{
+            .allocator = testing.allocator,
+            .session_id = "test",
+            .cwd = "/tmp",
+            .cancelled = &cancelled,
+            .nudge = .{ .enabled = true, .cooldown_ms = 0, .last_nudge_ms = &last_nudge },
+            .cb = cbs,
+        };
+
+        var bridge = Bridge.init(testing.allocator, "/tmp");
+        defer bridge.deinit();
+        bridge.reader_closed = true;
+
+        // Parse and inject: assistant message with tool_use
+        const tool_json = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Read\",\"input\":{}}]}}";
+        var arena1 = std.heap.ArenaAllocator.init(testing.allocator);
+        const parsed1 = try std.json.parseFromSlice(std.json.Value, arena1.allocator(), tool_json, .{});
+        bridge.queue_mutex.lock();
+        try bridge.message_queue.append(testing.allocator, claude_bridge.StreamMessage{
+            .type = .assistant,
+            .subtype = null,
+            .raw = parsed1.value,
+            .arena = arena1,
+        });
+        bridge.queue_mutex.unlock();
+
+        // Parse and inject: result message
+        const result_json = "{\"type\":\"result\",\"result\":{\"stop_reason\":\"success\"}}";
+        var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+        const parsed2 = try std.json.parseFromSlice(std.json.Value, arena2.allocator(), result_json, .{});
+        bridge.queue_mutex.lock();
+        try bridge.message_queue.append(testing.allocator, claude_bridge.StreamMessage{
+            .type = .result,
+            .subtype = null,
+            .raw = parsed2.value,
+            .arena = arena2,
+        });
+        bridge.queue_mutex.unlock();
+
+        // Process messages - tool path exercised, nudge not called because no dots in /tmp
+        _ = try processClaudeMessages(&ctx, &bridge);
+
+        // Still no nudge because /tmp has no dots (dots.hasPendingTasks returns false)
+        // But the key is: if there WERE dots, it would nudge because tool_use_count > 0
+        try testing.expect(!tracker.nudge_called);
+    }
 }

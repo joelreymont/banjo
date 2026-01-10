@@ -355,3 +355,61 @@ try std.json.Stringify.encodeJsonString(my_string, .{}, &out.writer);
 **WRONG**: `value.jsonStringify(array_list.writer())` - ArrayList.Writer is NOT a Stringify!
 
 **RIGHT**: Create a `std.json.Stringify` and pass it to `jsonStringify`.
+
+## stdin/stdout for CLI Programs
+
+For reading/writing stdin/stdout in CLI programs, use `deprecatedReader()`/`deprecatedWriter()`:
+
+```zig
+// For type-erased readers/writers (std.io.AnyReader/AnyWriter)
+const stdin = std.fs.File.stdin().deprecatedReader().any();
+const stdout = std.fs.File.stdout().deprecatedWriter().any();
+
+// For direct file operations (no buffering needed)
+const stderr = std.fs.File.stderr();
+stderr.writeAll("error message\n") catch {};
+```
+
+**Note**: The `deprecated` prefix indicates Zig plans to change this API in future versions. The new `File.reader(buffer)` and `File.writer(buffer)` require explicit buffer management. For simple CLI I/O, `deprecatedReader()`/`deprecatedWriter()` is the correct approach in 0.15.
+
+```zig
+// For buffered file reading (new API)
+var buf: [4096]u8 = undefined;
+var file_reader = file.reader(&buf);
+const reader = &file_reader.interface;
+
+// For simple stdin reading without buffering
+const stdin = std.fs.File.stdin();
+const input = try stdin.readToEndAlloc(allocator, max_size);
+```
+
+## StaticStringMap for String Dispatch
+
+Use `std.StaticStringMap` for compile-time string-to-value mapping:
+
+```zig
+const Action = enum { allow, deny, ask };
+const action_map = std.StaticStringMap(Action).initComptime(.{
+    .{ "allow", .allow },
+    .{ "deny", .deny },
+    .{ "ask", .ask },
+});
+
+// Usage
+if (action_map.get(input_string)) |action| {
+    switch (action) {
+        .allow => handleAllow(),
+        .deny => handleDeny(),
+        .ask => handleAsk(),
+    }
+}
+
+// For existence checks (void value)
+const valid_names = std.StaticStringMap(void).initComptime(.{
+    .{ "foo", {} },
+    .{ "bar", {} },
+});
+if (valid_names.has(name)) { ... }
+```
+
+**Rule**: Any 2+ literal string comparisons with `mem.eql` should use `StaticStringMap` instead.

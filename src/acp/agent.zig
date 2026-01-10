@@ -61,18 +61,6 @@ fn isAuthRequiredContent(content: []const u8) bool {
     return auth_markers.containsAuthMarker(content);
 }
 
-/// Map CLI result subtypes to ACP stop reasons
-fn mapCliStopReason(cli_reason: []const u8) protocol.StopReason {
-    const map = std.StaticStringMap(protocol.StopReason).initComptime(.{
-        .{ "success", .end_turn },
-        .{ "cancelled", .cancelled },
-        .{ "max_tokens", .max_tokens },
-        .{ "error_max_turns", .max_turn_requests },
-        .{ "error_max_budget_usd", .max_turn_requests },
-    });
-    return map.get(cli_reason) orelse .end_turn;
-}
-
 fn replaceFirst(allocator: Allocator, input: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
     const pos = std.mem.indexOf(u8, input, needle) orelse {
         return allocator.dupe(u8, input);
@@ -155,11 +143,7 @@ const allow_session_option_ids = std.StaticStringMap(void).initComptime(.{
     .{ "allow_always", {} },
 });
 
-const model_id_set = std.StaticStringMap(void).initComptime(.{
-    .{ "sonnet", {} },
-    .{ "opus", {} },
-    .{ "haiku", {} },
-});
+const model_id_set = types.model_id_set;
 
 const mime_language_map = std.StaticStringMap([]const u8).initComptime(.{
     .{ "application/json", "json" },
@@ -1684,7 +1668,7 @@ pub const Agent = struct {
         if (session.bridge == null) {
             session.bridge = Bridge.init(self.allocator, session.cwd);
         }
-        if (session.bridge.?.process == null) {
+        if (!session.bridge.?.isAlive()) {
             try self.startClaudeBridge(session, session_id);
         }
         return &session.bridge.?;
@@ -1733,7 +1717,7 @@ pub const Agent = struct {
         if (session.codex_bridge == null) {
             session.codex_bridge = CodexBridge.init(self.allocator, session.cwd);
         }
-        if (session.codex_bridge.?.process == null) {
+        if (!session.codex_bridge.?.isAlive()) {
             try self.startCodexBridge(session, session_id);
         }
         session.codex_bridge.?.approval_policy = codexApprovalPolicy(session.permission_mode);
@@ -1770,7 +1754,7 @@ pub const Agent = struct {
     /// Trigger a nudge continuation - starts Claude/Codex with the nudge prompt
     fn triggerNudge(self: *Agent, request: jsonrpc.Request, session: *Session, session_id: []const u8) !void {
         _ = request;
-        const nudge_prompt = "clean up dots, then pick a dot and work on it";
+        const nudge_prompt = "work on the next dot";
         switch (session.config.route) {
             .claude, .duet => _ = try self.runClaudePrompt(session, session_id, nudge_prompt),
             .codex => {
@@ -3666,19 +3650,29 @@ pub const Agent = struct {
         try self.writer.writeTypedResponse(request.id, protocol.PromptResponse{ .stopReason = .end_turn });
     }
 
+    const NudgeArg = enum { on, off };
+    const nudge_arg_map = std.StaticStringMap(NudgeArg).initComptime(.{
+        .{ "on", .on },
+        .{ "off", .off },
+    });
+
     fn handleNudgeCommand(self: *Agent, request: jsonrpc.Request, session: *Session, session_id: []const u8, args: ?[]const u8) !void {
         var should_trigger = false;
         const msg = if (args) |a| blk: {
             const trimmed = std.mem.trim(u8, a, " \t");
-            if (std.mem.eql(u8, trimmed, "on")) {
-                session.nudge_enabled = true;
-                should_trigger = true;
-                break :blk "Auto-nudge enabled. Will continue working on dots when agent stops.";
-            } else if (std.mem.eql(u8, trimmed, "off")) {
-                session.nudge_enabled = false;
-                break :blk "Auto-nudge disabled. Agent will stop when done.";
-            } else {
+            const arg = nudge_arg_map.get(trimmed) orelse {
                 break :blk if (session.nudge_enabled) "Usage: /nudge [on|off]\nCurrent: on" else "Usage: /nudge [on|off]\nCurrent: off";
+            };
+            switch (arg) {
+                .on => {
+                    session.nudge_enabled = true;
+                    should_trigger = true;
+                    break :blk "Auto-nudge enabled. Will continue working on dots when agent stops.";
+                },
+                .off => {
+                    session.nudge_enabled = false;
+                    break :blk "Auto-nudge disabled. Agent will stop when done.";
+                },
             }
         } else if (session.nudge_enabled) "Auto-nudge is ON. Use `/nudge off` to disable." else "Auto-nudge is OFF. Use `/nudge on` to enable.";
 
@@ -3695,7 +3689,7 @@ pub const Agent = struct {
         if (should_trigger and dots.hasPendingTasks(self.allocator, session.cwd).has_tasks) {
             session.last_nudge_ms = std.time.milliTimestamp();
             log.info("Nudge enabled with pending dots, triggering continuation", .{});
-            try self.sendUserMessage(session_id, "dots: continue working on pending dots");
+            try self.sendUserMessage(session_id, "keep going");
             _ = try self.triggerNudge(request, session, session_id);
         } else {
             try self.writer.writeTypedResponse(request.id, protocol.PromptResponse{ .stopReason = .end_turn });

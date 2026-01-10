@@ -677,6 +677,14 @@ pub const Bridge = struct {
         log.info("Stopped Claude Code", .{});
     }
 
+    /// Check if the bridge process is alive and ready for prompts
+    pub fn isAlive(self: *Bridge) bool {
+        if (self.process == null) return false;
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+        return !self.reader_closed;
+    }
+
     /// Send a prompt to the CLI
     pub fn sendPrompt(self: *Bridge, prompt: []const u8) !void {
         const proc = self.process orelse return error.NotStarted;
