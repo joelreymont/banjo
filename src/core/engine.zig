@@ -53,11 +53,12 @@ fn authMarkerTextFromTurnError(err: codex_bridge.TurnError) ?[]const u8 {
     if (err.message) |msg| {
         if (auth_markers.containsAuthMarker(msg)) return msg;
     }
-    if (err.code) |code| {
-        if (auth_markers.containsAuthMarker(code)) return code;
+    if (err.additional_details) |details| {
+        if (auth_markers.containsAuthMarker(details)) return details;
     }
-    if (err.type) |err_type| {
-        if (auth_markers.containsAuthMarker(err_type)) return err_type;
+    // Check for unauthorized error info
+    if (err.codex_error_info) |info| {
+        if (info == .unauthorized) return "unauthorized";
     }
     return null;
 }

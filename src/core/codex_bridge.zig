@@ -11,10 +11,57 @@ const auth_markers = @import("auth_markers.zig");
 
 const max_json_line_bytes: usize = 4 * 1024 * 1024;
 
+// Codex error info tags (matches codex_error_info field in TurnError)
+pub const CodexErrorInfo = enum {
+    context_window_exceeded,
+    usage_limit_exceeded,
+    http_connection_failed,
+    response_stream_connection_failed,
+    internal_server_error,
+    unauthorized,
+    bad_request,
+    thread_rollback_failed,
+    sandbox_error,
+    response_stream_disconnected,
+    response_too_many_failed_attempts,
+    other,
+    unknown,
+
+    const tag_map = std.StaticStringMap(CodexErrorInfo).initComptime(.{
+        .{ "contextWindowExceeded", .context_window_exceeded },
+        .{ "usageLimitExceeded", .usage_limit_exceeded },
+        .{ "httpConnectionFailed", .http_connection_failed },
+        .{ "responseStreamConnectionFailed", .response_stream_connection_failed },
+        .{ "internalServerError", .internal_server_error },
+        .{ "unauthorized", .unauthorized },
+        .{ "badRequest", .bad_request },
+        .{ "threadRollbackFailed", .thread_rollback_failed },
+        .{ "sandboxError", .sandbox_error },
+        .{ "responseStreamDisconnected", .response_stream_disconnected },
+        .{ "responseTooManyFailedAttempts", .response_too_many_failed_attempts },
+        .{ "other", .other },
+    });
+
+    pub fn fromString(s: []const u8) CodexErrorInfo {
+        return tag_map.get(s) orelse .unknown;
+    }
+
+    pub fn userMessage(self: CodexErrorInfo) ?[]const u8 {
+        return switch (self) {
+            .context_window_exceeded => "Context window exceeded. Try /compact to reduce history.",
+            .usage_limit_exceeded => "API usage limit exceeded.",
+            .unauthorized => "Authentication failed. Check API key.",
+            .sandbox_error => "Sandbox execution error.",
+            .response_stream_disconnected => "Connection lost. Retrying...",
+            else => null,
+        };
+    }
+};
+
 pub const TurnError = struct {
-    code: ?[]const u8 = null,
     message: ?[]const u8 = null,
-    type: ?[]const u8 = null,
+    codex_error_info: ?CodexErrorInfo = null,
+    additional_details: ?[]const u8 = null,
 
     const max_turn_markers = [_][]const u8{
         "max_turn",
@@ -31,9 +78,42 @@ pub const TurnError = struct {
     }
 
     pub fn isMaxTurnError(self: TurnError) bool {
-        return containsMaxTurnMarker(self.code) or
-            containsMaxTurnMarker(self.type) or
-            containsMaxTurnMarker(self.message);
+        return containsMaxTurnMarker(self.message) or
+            containsMaxTurnMarker(self.additional_details);
+    }
+
+    pub fn isContextWindowExceeded(self: TurnError) bool {
+        return self.codex_error_info == .context_window_exceeded;
+    }
+
+    // Custom JSON parser to handle codexErrorInfo tagged enum
+    pub fn jsonParseFromValue(
+        allocator: Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) std.json.ParseFromValueError!TurnError {
+        _ = allocator;
+        _ = options;
+        if (source != .object) return .{};
+        const obj = source.object;
+
+        var result = TurnError{};
+        if (obj.get("message")) |v| {
+            if (v == .string) result.message = v.string;
+        }
+        if (obj.get("additionalDetails")) |v| {
+            if (v == .string) result.additional_details = v.string;
+        }
+        // codexErrorInfo is a tagged enum: {"contextWindowExceeded": {}} or similar
+        if (obj.get("codexErrorInfo")) |v| {
+            if (v == .object) {
+                var it = v.object.iterator();
+                if (it.next()) |entry| {
+                    result.codex_error_info = CodexErrorInfo.fromString(entry.key_ptr.*);
+                }
+            }
+        }
+        return result;
     }
 };
 
