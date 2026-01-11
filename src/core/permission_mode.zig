@@ -39,11 +39,12 @@ pub const PermissionMode = enum {
         };
     }
 
-    /// Returns the Codex approvalPolicy value, or null for default (interactive).
+    /// Returns the Codex approvalPolicy value, or null for default (on-request).
     pub fn toCodexApprovalPolicy(self: PermissionMode) ?[]const u8 {
         return switch (self) {
-            .default, .acceptEdits, .plan => null,
-            .bypassPermissions, .dontAsk => "never",
+            .default, .plan => null, // on-request (interactive)
+            .acceptEdits => "auto-edit", // auto-approve edits only
+            .bypassPermissions, .dontAsk => "full-auto", // auto-approve everything
         };
     }
 };
