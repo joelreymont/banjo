@@ -796,7 +796,7 @@ pub const CodexBridge = struct {
             .model = model,
             .cwd = self.cwd,
             .approvalPolicy = self.approval_policy,
-            .sandbox = "workspace-write",
+            .sandbox = null, // Use Codex defaults
             .experimentalRawEvents = false,
         };
         try self.sendRequest(request_id, "thread/start", params);
