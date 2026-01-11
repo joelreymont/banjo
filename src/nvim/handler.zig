@@ -727,6 +727,14 @@ pub const Handler = struct {
 
         self.cancelled.store(true, .release);
 
+        // Interrupt the running Claude/Codex process
+        if (self.claude_bridge) |bridge| {
+            bridge.interrupt();
+        }
+        if (self.codex_bridge_inst) |*bridge| {
+            bridge.interrupt();
+        }
+
         // Clear pending prompt to prevent queued work from starting after cancel
         self.prompt.mutex.lock();
         if (self.prompt.pending) |p| {

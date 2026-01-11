@@ -9,19 +9,28 @@ vim.opt.rtp:prepend(plugin_root)
 local tests_dir = plugin_root .. "/tests"
 package.path = tests_dir .. "/?.lua;" .. package.path
 
--- Find plenary (required for test framework)
-local plenary_paths = {
-    vim.fn.expand("~/.local/share/nvim/site/pack/*/start/plenary.nvim"),
-    vim.fn.expand("~/.local/share/nvim/lazy/plenary.nvim"),
-    vim.fn.expand("~/.config/nvim/pack/*/start/plenary.nvim"),
+-- Find dependencies (plenary for test framework, nui.nvim for UI)
+local dep_patterns = {
+    plenary = {
+        vim.fn.expand("~/.local/share/nvim/site/pack/*/start/plenary.nvim"),
+        vim.fn.expand("~/.local/share/nvim/lazy/plenary.nvim"),
+        vim.fn.expand("~/.config/nvim/pack/*/start/plenary.nvim"),
+    },
+    nui = {
+        vim.fn.expand("~/.local/share/nvim/site/pack/*/start/nui.nvim"),
+        vim.fn.expand("~/.local/share/nvim/lazy/nui.nvim"),
+        vim.fn.expand("~/.config/nvim/pack/*/start/nui.nvim"),
+    },
 }
 
-for _, pattern in ipairs(plenary_paths) do
-    local matches = vim.fn.glob(pattern, false, true)
-    for _, path in ipairs(matches) do
-        if vim.fn.isdirectory(path) == 1 then
-            vim.opt.rtp:prepend(path)
-            break
+for _, patterns in pairs(dep_patterns) do
+    for _, pattern in ipairs(patterns) do
+        local matches = vim.fn.glob(pattern, false, true)
+        for _, path in ipairs(matches) do
+            if vim.fn.isdirectory(path) == 1 then
+                vim.opt.rtp:prepend(path)
+                break
+            end
         end
     end
 end

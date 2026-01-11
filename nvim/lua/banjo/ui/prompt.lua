@@ -101,24 +101,7 @@ end
 -- Create a permission/approval prompt
 function M.show(opts)
     if not Popup then
-        -- Fallback: use vim.ui.select when nui.nvim not available
-        local actions = opts.actions or {}
-        local choices = {}
-        local action_map = {}
-        for _, action in ipairs(actions) do
-            table.insert(choices, string.format("[%s] %s", action.key, action.label))
-            action_map[#choices] = action.value
-        end
-        vim.ui.select(choices, {
-            prompt = (opts.title or "Prompt") .. ": " .. (opts.tool_name or ""),
-        }, function(_, idx)
-            if idx and opts.on_action then
-                opts.on_action(action_map[idx] or "deny")
-            elseif opts.on_action then
-                opts.on_action("deny")
-            end
-        end)
-        return
+        error("banjo.nvim requires nui.nvim for prompts. Install: https://github.com/MunifTanjim/nui.nvim")
     end
 
     opts = opts or {}

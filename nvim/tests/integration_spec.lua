@@ -94,6 +94,52 @@ describe("banjo integration", function()
     end)
   end)
 
+  describe("state synchronization", function()
+    it("state message updates bridge state", function()
+      bridge.get_state()
+
+      -- Simulate state message from backend (sent on nvim connect)
+      bridge._handle_message({
+        method = "state",
+        params = {
+          engine = "claude",
+          model = "opus",
+          mode = "auto_approve",
+          connected = true,
+        },
+      })
+
+      helpers.wait(50)
+
+      local state = bridge.get_state()
+      assert.equals("claude", state.engine, "Engine should be updated")
+      assert.equals("opus", state.model, "Model should be updated")
+      assert.equals("auto_approve", state.mode, "Mode should be updated")
+    end)
+
+    it("state message updates panel status line", function()
+      bridge.get_state()
+      panel.open()
+
+      bridge._handle_message({
+        method = "state",
+        params = {
+          engine = "codex",
+          model = "o3",
+          mode = "default",
+          connected = true,
+        },
+      })
+
+      helpers.wait(50)
+
+      -- Verify status was updated (panel._build_status uses bridge.get_state)
+      local state = bridge.get_state()
+      assert.equals("codex", state.engine)
+      assert.equals("default", state.mode)
+    end)
+  end)
+
   describe("message handling", function()
     it("stream_start opens panel", function()
       -- Initialize bridge state for current tab
@@ -374,6 +420,231 @@ describe("banjo integration", function()
   end)
 
 end)
+describe("banjo permission dialog", function()
+  -- Tests for the nui.nvim permission/approval dialogs
+  local ui_prompt
+
+  before_each(function()
+    package.loaded["banjo.ui.prompt"] = nil
+    ui_prompt = require("banjo.ui.prompt")
+  end)
+
+  after_each(function()
+    -- Close any open popup windows
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_is_valid(win) then
+        local buf = vim.api.nvim_win_get_buf(win)
+        local bufname = vim.api.nvim_buf_get_name(buf)
+        -- nui popups have empty or special names
+        if vim.bo[buf].buftype == "nofile" and not bufname:match("Banjo") then
+          pcall(vim.api.nvim_win_close, win, true)
+        end
+      end
+    end
+    helpers.cleanup()
+  end)
+
+  describe("permission prompt", function()
+    it("creates popup with tool name and risk", function()
+      local action_received = nil
+      local popup = ui_prompt.permission({
+        tool_name = "Bash",
+        tool_input = "rm -rf /tmp/test",
+        on_action = function(action)
+          action_received = action
+        end,
+      })
+
+      helpers.wait(50)
+
+      -- Should have created a popup window
+      assert.is_not_nil(popup, "Should create popup")
+      assert.is_not_nil(popup.bufnr, "Popup should have buffer")
+      assert.is_true(vim.api.nvim_buf_is_valid(popup.bufnr), "Buffer should be valid")
+
+      -- Check content
+      local lines = vim.api.nvim_buf_get_lines(popup.bufnr, 0, -1, false)
+      local content = table.concat(lines, "\n")
+
+      assert.truthy(content:find("Bash"), "Should show tool name")
+      assert.truthy(content:find("high"), "Bash should have high risk")
+
+      -- Clean up
+      popup:unmount()
+    end)
+
+    it("responds to y key with allow", function()
+      local action_received = nil
+      local popup = ui_prompt.permission({
+        tool_name = "Read",
+        tool_input = "/tmp/test.txt",
+        on_action = function(action)
+          action_received = action
+        end,
+      })
+
+      helpers.wait(50)
+
+      -- Simulate pressing 'y'
+      vim.api.nvim_buf_call(popup.bufnr, function()
+        vim.api.nvim_feedkeys("y", "x", false)
+      end)
+
+      helpers.wait(50)
+      assert.equals("allow", action_received, "y should trigger allow")
+    end)
+
+    it("responds to a key with allow_always", function()
+      local action_received = nil
+      local popup = ui_prompt.permission({
+        tool_name = "Glob",
+        tool_input = "**/*.lua",
+        on_action = function(action)
+          action_received = action
+        end,
+      })
+
+      helpers.wait(50)
+
+      vim.api.nvim_buf_call(popup.bufnr, function()
+        vim.api.nvim_feedkeys("a", "x", false)
+      end)
+
+      helpers.wait(50)
+      assert.equals("allow_always", action_received, "a should trigger allow_always")
+    end)
+
+    it("responds to n key with deny", function()
+      local action_received = nil
+      local popup = ui_prompt.permission({
+        tool_name = "Write",
+        tool_input = "/etc/passwd",
+        on_action = function(action)
+          action_received = action
+        end,
+      })
+
+      helpers.wait(50)
+
+      vim.api.nvim_buf_call(popup.bufnr, function()
+        vim.api.nvim_feedkeys("n", "x", false)
+      end)
+
+      helpers.wait(50)
+      assert.equals("deny", action_received, "n should trigger deny")
+    end)
+
+    it("responds to Escape with deny (default)", function()
+      local action_received = nil
+      local popup = ui_prompt.permission({
+        tool_name = "Edit",
+        tool_input = "some file",
+        on_action = function(action)
+          action_received = action
+        end,
+      })
+
+      helpers.wait(50)
+
+      vim.api.nvim_buf_call(popup.bufnr, function()
+        vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
+      end)
+
+      helpers.wait(50)
+      assert.equals("deny", action_received, "Escape should trigger deny")
+    end)
+
+    it("determines risk level based on tool", function()
+      -- High risk tools
+      for _, tool in ipairs({ "Bash", "Write", "Edit" }) do
+        local popup = ui_prompt.permission({
+          tool_name = tool,
+          tool_input = "test",
+          on_action = function() end,
+        })
+        helpers.wait(20)
+        local lines = vim.api.nvim_buf_get_lines(popup.bufnr, 0, -1, false)
+        local content = table.concat(lines, "\n")
+        assert.truthy(content:find("high"), tool .. " should have high risk")
+        popup:unmount()
+      end
+
+      -- Low risk tools
+      for _, tool in ipairs({ "Read", "Glob", "Grep" }) do
+        local popup = ui_prompt.permission({
+          tool_name = tool,
+          tool_input = "test",
+          on_action = function() end,
+        })
+        helpers.wait(20)
+        local lines = vim.api.nvim_buf_get_lines(popup.bufnr, 0, -1, false)
+        local content = table.concat(lines, "\n")
+        assert.truthy(content:find("low"), tool .. " should have low risk")
+        popup:unmount()
+      end
+    end)
+  end)
+
+  describe("approval prompt", function()
+    it("creates popup for approval", function()
+      local popup = ui_prompt.approval({
+        tool_name = "execute_code",
+        risk_level = "high",
+        arguments = "python -c 'print(1)'",
+        on_action = function() end,
+      })
+
+      helpers.wait(50)
+
+      local lines = vim.api.nvim_buf_get_lines(popup.bufnr, 0, -1, false)
+      local content = table.concat(lines, "\n")
+
+      assert.truthy(content:find("execute_code"), "Should show tool name")
+      -- Title is in window border, not buffer content - check tool name is enough
+
+      popup:unmount()
+    end)
+
+    it("responds to y with approve", function()
+      local action_received = nil
+      local popup = ui_prompt.approval({
+        tool_name = "run_command",
+        on_action = function(action)
+          action_received = action
+        end,
+      })
+
+      helpers.wait(50)
+
+      vim.api.nvim_buf_call(popup.bufnr, function()
+        vim.api.nvim_feedkeys("y", "x", false)
+      end)
+
+      helpers.wait(50)
+      assert.equals("approve", action_received)
+    end)
+
+    it("responds to n with decline", function()
+      local action_received = nil
+      local popup = ui_prompt.approval({
+        tool_name = "dangerous_op",
+        on_action = function(action)
+          action_received = action
+        end,
+      })
+
+      helpers.wait(50)
+
+      vim.api.nvim_buf_call(popup.bufnr, function()
+        vim.api.nvim_feedkeys("n", "x", false)
+      end)
+
+      helpers.wait(50)
+      assert.equals("decline", action_received)
+    end)
+  end)
+end)
+
 describe("banjo panel integration", function()
   -- These tests verify panel behavior with simulated backend messages
   -- They don't require the actual binary

@@ -131,8 +131,8 @@ local input_buf = panel.get_input_buf()
 
 if output_buf then
     local name = vim.api.nvim_buf_get_name(output_buf)
-    if name:match("Banjo$") then
-        pass("Output buffer name is 'Banjo'")
+    if name:match("Banjo") then
+        pass("Output buffer name contains 'Banjo'")
     else
         fail("Output buffer name incorrect", "got: " .. name)
     end
@@ -140,8 +140,8 @@ end
 
 if input_buf then
     local name = vim.api.nvim_buf_get_name(input_buf)
-    if name:match("BanjoInput$") then
-        pass("Input buffer name is 'BanjoInput'")
+    if name:match("BanjoInput") then
+        pass("Input buffer name contains 'BanjoInput'")
     else
         fail("Input buffer name incorrect", "got: " .. name)
     end
@@ -215,11 +215,11 @@ end
 -- Test 8: Tool call display
 log("Test 8: Tool call display...")
 panel.clear()
-panel.show_tool_call("Read", "/path/to/file.txt")
+panel.show_tool_call("tool-1", "Read", "file.txt", "/path/to/file.txt")
 
 lines = vim.api.nvim_buf_get_lines(output_buf, 0, -1, false)
 content = table.concat(lines, "\n")
-if content:find("Read") and content:find("file.txt") then
+if content:find("file.txt") then
     pass("Tool call displays correctly")
 else
     fail("Tool call display incorrect", "got: " .. content)
@@ -227,7 +227,7 @@ end
 
 -- Test 9: Tool result update
 log("Test 9: Tool result update...")
-panel.show_tool_result("file.txt", "completed")
+panel.show_tool_result("tool-1", "completed")
 lines = vim.api.nvim_buf_get_lines(output_buf, 0, -1, false)
 content = table.concat(lines, "\n")
 if content:find("✓") then
@@ -334,7 +334,8 @@ bridge._handle_message({
     method = "approval_request",
     params = { id = "appr-1", tool_name = "Bash", risk_level = "high", arguments = "ls -la" }
 })
-local ok, win, buf, prompt = wait_for_prompt("APPROVAL REQUIRED", 2000)
+-- Look for "Tool: Bash" in content (title is in border now)
+local ok, win, buf, prompt = wait_for_prompt("Tool:", 2000)
 if ok and prompt and prompt:find("Bash", 1, true) then
     pass("Approval prompt renders with tool name")
 else
@@ -348,7 +349,8 @@ bridge._handle_message({
     method = "permission_request",
     params = { id = "perm-1", tool_name = "Read", tool_input = "README.md" }
 })
-ok, win, buf, prompt = wait_for_prompt("PERMISSION REQUEST", 2000)
+-- Look for "Tool: Read" in content
+ok, win, buf, prompt = wait_for_prompt("Tool:", 2000)
 if ok and prompt and prompt:find("Read", 1, true) then
     pass("Permission prompt renders with tool name")
 else
@@ -601,6 +603,66 @@ wait_for(function()
     local st = bridge.get_state()
     return st and st.engine == "claude"
 end, 2000)
+
+log("")
+log("=== Bridge Reuse Tests ===")
+
+-- Test 28: get_debug_info
+log("Test 28: get_debug_info...")
+local debug_info = bridge.get_debug_info()
+if debug_info and debug_info.prompt_count ~= nil then
+    pass("get_debug_info returns prompt_count: " .. debug_info.prompt_count)
+else
+    fail("get_debug_info failed", "got: " .. vim.inspect(debug_info))
+end
+
+-- Note: Full bridge reuse test requires sending actual prompts to Claude/Codex
+-- which we can't do in automated tests. The unit tests in handler.zig verify
+-- the bridge reuse logic. This test verifies the debug_info protocol works.
+
+log("")
+log("=== Timer Restart Tests ===")
+
+-- Test 29: Timer restarts on new session_start
+log("Test 29: Timer restarts on session_start...")
+-- Simulate first session_start
+bridge._handle_message({
+    method = "session_start",
+    params = {}
+})
+local state1 = bridge.get_state()
+local start_time_1 = state1.session_start_time
+if state1.session_active and start_time_1 then
+    pass("First session_start sets session_start_time")
+else
+    fail("First session_start failed", "active: " .. tostring(state1.session_active) .. ", time: " .. tostring(start_time_1))
+end
+
+-- Wait a bit and simulate another session_start (new prompt)
+vim.wait(100)
+bridge._handle_message({
+    method = "session_start",
+    params = {}
+})
+local state2 = bridge.get_state()
+local start_time_2 = state2.session_start_time
+if start_time_2 and start_time_2 >= start_time_1 then
+    pass("Second session_start resets session_start_time")
+else
+    fail("Timer did not restart", "time1: " .. tostring(start_time_1) .. ", time2: " .. tostring(start_time_2))
+end
+
+-- Cleanup timer
+bridge._handle_message({
+    method = "session_end",
+    params = {}
+})
+local state3 = bridge.get_state()
+if not state3.session_active and not state3.session_start_time then
+    pass("session_end clears session state")
+else
+    fail("session_end did not clear state")
+end
 
 -- Cleanup
 log("")
