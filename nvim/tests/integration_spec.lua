@@ -605,7 +605,7 @@ describe("banjo permission dialog", function()
       popup:unmount()
     end)
 
-    it("responds to y with approve", function()
+    it("responds to y with accept", function()
       local action_received = nil
       local popup = ui_prompt.approval({
         tool_name = "run_command",
@@ -621,10 +621,10 @@ describe("banjo permission dialog", function()
       end)
 
       helpers.wait(50)
-      assert.equals("approve", action_received)
+      assert.equals("accept", action_received)
     end)
 
-    it("responds to n with decline", function()
+    it("responds to d with decline", function()
       local action_received = nil
       local popup = ui_prompt.approval({
         tool_name = "dangerous_op",
@@ -636,11 +636,49 @@ describe("banjo permission dialog", function()
       helpers.wait(50)
 
       vim.api.nvim_buf_call(popup.bufnr, function()
-        vim.api.nvim_feedkeys("n", "x", false)
+        vim.api.nvim_feedkeys("d", "x", false)
       end)
 
       helpers.wait(50)
       assert.equals("decline", action_received)
+    end)
+
+    it("responds to a with acceptForSession", function()
+      local action_received = nil
+      local popup = ui_prompt.approval({
+        tool_name = "run_command",
+        on_action = function(action)
+          action_received = action
+        end,
+      })
+
+      helpers.wait(50)
+
+      vim.api.nvim_buf_call(popup.bufnr, function()
+        vim.api.nvim_feedkeys("a", "x", false)
+      end)
+
+      helpers.wait(50)
+      assert.equals("acceptForSession", action_received)
+    end)
+
+    it("responds to c with cancel", function()
+      local action_received = nil
+      local popup = ui_prompt.approval({
+        tool_name = "dangerous_op",
+        on_action = function(action)
+          action_received = action
+        end,
+      })
+
+      helpers.wait(50)
+
+      vim.api.nvim_buf_call(popup.bufnr, function()
+        vim.api.nvim_feedkeys("c", "x", false)
+      end)
+
+      helpers.wait(50)
+      assert.equals("cancel", action_received)
     end)
   end)
 end)
