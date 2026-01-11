@@ -239,12 +239,14 @@ test "isPidAlive self" {
 }
 
 test "isPidAlive invalid" {
-    // PID 0 is the kernel scheduler, not a user process
-    // PID 1 is init/systemd which should exist
-    // Use a very high unlikely PID
+    // On Linux, we check /proc which can detect dead PIDs
+    // On macOS, isPidAlive always returns true (can't check without /proc)
+    const builtin = @import("builtin");
+    const expected = builtin.os.tag != .linux;
     const summary = .{ .alive = isPidAlive(99999999) };
     try (ohsnap{}).snap(@src(),
         \\nvim.lockfile.test.isPidAlive invalid__struct_<^\d+$>
-        \\  .alive: bool = false
+        \\  .alive: bool = <^(true|false)$>
     ).expectEqual(summary);
+    try std.testing.expectEqual(expected, summary.alive);
 }
