@@ -579,16 +579,32 @@ pub const CodexBridge = struct {
         return !self.reader_closed;
     }
 
-    /// Interrupt the current request (SIGINT to Codex CLI)
-    pub fn interrupt(self: *const CodexBridge) void {
-        if (self.process) |proc| {
-            const pid = proc.id;
-            log.info("Sending SIGINT to Codex CLI (pid={})", .{pid});
-            std.posix.kill(pid, std.posix.SIG.INT) catch |err| {
-                log.warn("Failed to send SIGINT to Codex: {}", .{err});
-            };
-        }
+    /// Interrupt the current turn via JSON-RPC turn/interrupt
+    pub fn interrupt(self: *CodexBridge) void {
+        const thread_id = self.thread_id orelse {
+            log.warn("Cannot interrupt: no thread_id", .{});
+            return;
+        };
+        const turn_id = self.current_turn_id orelse {
+            log.warn("Cannot interrupt: no turn_id", .{});
+            return;
+        };
+        const request_id = self.nextRequestId();
+        const params = TurnInterruptParams{
+            .threadId = thread_id,
+            .turnId = turn_id,
+        };
+        log.info("Sending turn/interrupt for turn {s}", .{turn_id});
+        self.sendRequest(request_id, "turn/interrupt", params) catch |err| {
+            log.warn("Failed to send turn/interrupt: {}", .{err});
+        };
+        // Response handled by readerMain; turn_completed with status=interrupted will follow
     }
+
+    const TurnInterruptParams = struct {
+        threadId: []const u8,
+        turnId: []const u8,
+    };
 
     pub fn stop(self: *CodexBridge) void {
         self.stop_requested.store(true, .release);
