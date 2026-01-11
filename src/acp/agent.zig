@@ -4473,21 +4473,21 @@ test "replaceFirst returns copy when needle not found" {
 test "TurnError.isMaxTurnError detects max turn errors" {
     const TurnError = codex_cli.TurnError;
     const summary = .{
-        .code_max_turns = (TurnError{ .code = "max_turns" }).isMaxTurnError(),
-        .code_max_turn_requests = (TurnError{ .code = "max_turn_requests" }).isMaxTurnError(),
+        .message_max_turns = (TurnError{ .message = "max_turns" }).isMaxTurnError(),
         .message_max_turn_requests = (TurnError{ .message = "max_turn_requests" }).isMaxTurnError(),
-        .type_error_max_turns = (TurnError{ .type = "error_max_turns" }).isMaxTurnError(),
-        .code_budget = (TurnError{ .code = "budget" }).isMaxTurnError(),
-        .code_budget_exceeded = (TurnError{ .code = "budget_exceeded" }).isMaxTurnError(),
+        .details_max_turn_requests = (TurnError{ .additional_details = "max_turn_requests" }).isMaxTurnError(),
+        .details_error_max_turns = (TurnError{ .additional_details = "error_max_turns" }).isMaxTurnError(),
+        .message_budget = (TurnError{ .message = "budget" }).isMaxTurnError(),
+        .message_budget_exceeded = (TurnError{ .message = "budget_exceeded" }).isMaxTurnError(),
     };
     try (ohsnap{}).snap(@src(),
         \\acp.agent.test.TurnError.isMaxTurnError detects max turn errors__struct_<^\d+$>
-        \\  .code_max_turns: bool = true
-        \\  .code_max_turn_requests: bool = true
+        \\  .message_max_turns: bool = true
         \\  .message_max_turn_requests: bool = true
-        \\  .type_error_max_turns: bool = true
-        \\  .code_budget: bool = false
-        \\  .code_budget_exceeded: bool = false
+        \\  .details_max_turn_requests: bool = true
+        \\  .details_error_max_turns: bool = true
+        \\  .message_budget: bool = false
+        \\  .message_budget_exceeded: bool = false
     ).expectEqual(summary);
 }
 
