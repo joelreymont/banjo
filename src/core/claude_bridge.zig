@@ -650,6 +650,17 @@ pub const Bridge = struct {
         permission_socket_path: ?[]const u8 = null, // Unix socket for permission hook
     };
 
+    /// Interrupt the current request (SIGINT to Claude CLI)
+    pub fn interrupt(self: *const Bridge) void {
+        if (self.process) |proc| {
+            const pid = proc.id;
+            log.info("Sending SIGINT to Claude CLI (pid={})", .{pid});
+            std.posix.kill(pid, std.posix.SIG.INT) catch |err| {
+                log.warn("Failed to send SIGINT to Claude: {}", .{err});
+            };
+        }
+    }
+
     /// Stop the CLI process
     pub fn stop(self: *Bridge) void {
         self.stop_requested.store(true, .release);

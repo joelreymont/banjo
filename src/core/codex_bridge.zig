@@ -579,6 +579,17 @@ pub const CodexBridge = struct {
         return !self.reader_closed;
     }
 
+    /// Interrupt the current request (SIGINT to Codex CLI)
+    pub fn interrupt(self: *const CodexBridge) void {
+        if (self.process) |proc| {
+            const pid = proc.id;
+            log.info("Sending SIGINT to Codex CLI (pid={})", .{pid});
+            std.posix.kill(pid, std.posix.SIG.INT) catch |err| {
+                log.warn("Failed to send SIGINT to Codex: {}", .{err});
+            };
+        }
+    }
+
     pub fn stop(self: *CodexBridge) void {
         self.stop_requested.store(true, .release);
         if (self.process) |*proc| {

@@ -589,8 +589,7 @@ local function create_panel()
     setup_input_keymaps()
     setup_output_keymaps()
 
-    -- Return focus to previous window
-    vim.cmd("wincmd p")
+    -- Focus back on the main editing window (not panel)
     vim.cmd("wincmd p")
 end
 
