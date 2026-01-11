@@ -103,7 +103,7 @@ fn resolveDefaultRoute(availability: EngineAvailability) Route {
 }
 
 fn codexApprovalPolicy(mode: protocol.PermissionMode) []const u8 {
-    return mode.toCodexApprovalPolicy() orelse "on-request";
+    return mode.toCodexApprovalPolicy();
 }
 
 const falsey_env_values = std.StaticStringMap(void).initComptime(.{

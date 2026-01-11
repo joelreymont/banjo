@@ -39,12 +39,14 @@ pub const PermissionMode = enum {
         };
     }
 
-    /// Returns the Codex approvalPolicy value, or null for default (on-request).
-    pub fn toCodexApprovalPolicy(self: PermissionMode) ?[]const u8 {
+    /// Returns the Codex approvalPolicy value.
+    /// Valid values: untrusted, on-failure, on-request, never
+    /// See /tmp/codex/codex-rs/protocol/src/protocol.rs:257
+    pub fn toCodexApprovalPolicy(self: PermissionMode) []const u8 {
         return switch (self) {
-            .default, .plan => null, // on-request (interactive)
-            .acceptEdits => "auto-edit", // auto-approve edits only
-            .bypassPermissions, .dontAsk => "full-auto", // auto-approve everything
+            .default, .plan => "on-request", // interactive approval
+            .acceptEdits => "untrusted", // auto-approve safe read-only commands
+            .bypassPermissions, .dontAsk => "never", // never ask (auto-approve all)
         };
     }
 };
@@ -64,7 +66,7 @@ test "PermissionMode mappings snapshot" {
     for (modes) |mode| {
         const cli_flag = mode.toCliFlag() orelse "null";
         const cli_arg = mode.toCliArg() orelse "null";
-        const policy = mode.toCodexApprovalPolicy() orelse "null";
+        const policy = mode.toCodexApprovalPolicy();
         try out.writer.print(
             "mode: {s}\nlabel: {s}\ncli_flag: {s}\ncli_arg: {s}\ncodex_policy: {s}\n\n",
             .{ @tagName(mode), mode.toString(), cli_flag, cli_arg, policy },
@@ -79,13 +81,13 @@ test "PermissionMode mappings snapshot" {
         \\label: Default
         \\cli_flag: null
         \\cli_arg: null
-        \\codex_policy: null
+        \\codex_policy: on-request
         \\
         \\mode: acceptEdits
         \\label: Accept Edits
         \\cli_flag: --allowedTools
         \\cli_arg: acceptEdits
-        \\codex_policy: null
+        \\codex_policy: untrusted
         \\
         \\mode: bypassPermissions
         \\label: Auto-approve
@@ -103,7 +105,7 @@ test "PermissionMode mappings snapshot" {
         \\label: Plan Only
         \\cli_flag: --plan
         \\cli_arg: plan
-        \\codex_policy: null
+        \\codex_policy: on-request
         \\
         \\
     ).diff(snapshot, true);
