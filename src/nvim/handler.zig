@@ -840,11 +840,14 @@ pub const Handler = struct {
         self.sendStateNotification();
     }
 
-    // Valid approval decisions - use string literals to avoid allocation
+    // Map nvim decisions to Codex camelCase decisions
     const approval_decisions = std.StaticStringMap([]const u8).initComptime(.{
-        .{ "allow", "allow" },
+        .{ "allow", "accept" },
+        .{ "accept", "accept" },
         .{ "decline", "decline" },
-        .{ "allow_always", "allow_always" },
+        .{ "cancel", "cancel" },
+        .{ "allow_always", "acceptForSession" },
+        .{ "acceptForSession", "acceptForSession" },
     });
 
     fn handleNvimApprovalResponse(self: *Handler, params: ?std.json.Value) void {
