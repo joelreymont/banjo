@@ -219,7 +219,7 @@ function M.show(opts)
     return popup
 end
 
--- Approval prompt (Codex style: approve/decline)
+-- Approval prompt (Codex style: accept/decline/cancel)
 function M.approval(opts)
     -- Format arguments for display (not raw JSON)
     local formatted = format_tool_input(opts.tool_name, opts.arguments)
@@ -230,8 +230,10 @@ function M.approval(opts)
         risk_level = opts.risk_level or "high",
         content = formatted,
         actions = {
-            { key = "y", label = "Approve", name = "approve" },
-            { key = "n", label = "Decline", name = "decline" },
+            { key = "y", label = "Accept", name = "accept" },
+            { key = "a", label = "Always", name = "acceptForSession" },
+            { key = "d", label = "Decline", name = "decline" },
+            { key = "c", label = "Cancel", name = "cancel" },
         },
         default_action = "decline",
         on_action = opts.on_action,
