@@ -140,6 +140,7 @@ pub const CodexMessage = struct {
         agent_message_delta,
         reasoning_delta,
         approval_request,
+        stream_error,
         unknown,
     };
 
@@ -357,6 +358,13 @@ const ItemEventParams = struct {
     threadId: ?[]const u8 = null,
     turnId: ?[]const u8 = null,
     item: ItemData,
+};
+
+const ErrorNotificationParams = struct {
+    @"error": TurnError = .{},
+    will_retry: bool = false,
+    threadId: ?[]const u8 = null,
+    turnId: ?[]const u8 = null,
 };
 
 const ReasoningLineEntry = struct {
@@ -1305,6 +1313,23 @@ pub const CodexBridge = struct {
                     .arena = arena.*,
                 };
             },
+            .stream_error => {
+                const parsed = parseNotificationParams(arena, ErrorNotificationParams, params) orelse {
+                    log.warn("Codex error notification parse failed", .{});
+                    return null;
+                };
+                if (!self.matchesCurrentTurn(parsed.turnId)) return null;
+                // If will_retry is true, this is transient - don't propagate as error
+                if (parsed.will_retry) {
+                    log.info("Codex transient error (will retry): {?s}", .{parsed.@"error".message});
+                    return null;
+                }
+                return CodexMessage{
+                    .event_type = .stream_error,
+                    .turn_error = parsed.@"error",
+                    .arena = arena.*,
+                };
+            },
             .unknown => return null,
         }
     }
@@ -1421,6 +1446,7 @@ fn notificationKind(method: []const u8) NotificationKind {
         .{ "item/agentMessage/completed", .item_completed },
         .{ "item/reasoning/completed", .item_completed },
         .{ "item/commandExecution/completed", .item_completed },
+        .{ "error", .stream_error },
     });
     return map.get(method) orelse .unknown;
 }
@@ -1490,6 +1516,7 @@ const NotificationKind = enum {
     reasoning_text_delta,
     item_started,
     item_completed,
+    stream_error,
     unknown,
 };
 
