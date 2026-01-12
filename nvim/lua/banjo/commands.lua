@@ -13,12 +13,14 @@ local function cmd_help(args, context)
     local help_text = {
         "Available commands:",
         "  /help - Show this help",
+        "  /version - Show banjo version",
         "  /clear - Clear output buffer",
         "  /new - Start new session",
         "  /cancel - Cancel current request",
-        "  /model <name> - Set model (claude: opus/sonnet/haiku, codex: o3/o4-mini/gpt-4.1)",
+        "  /model <name> - Set model (use /model to see available)",
         "  /mode <name> - Set permission mode (default, accept_edits, auto_approve, plan_only)",
-        "  /agent <name> - Switch agent (claude, codex)",
+        "  /claude - Switch to Claude",
+        "  /codex - Switch to Codex",
         "  /sessions - List saved sessions",
         "  /load <id> - Restore a saved session",
         "  /project <path> - Open project in new tab",
@@ -79,17 +81,28 @@ local function cmd_cancel(args, context)
     end
 end
 
--- Valid models per engine
-local claude_models = { opus = true, sonnet = true, haiku = true }
-local codex_models = { o3 = true, ["o4-mini"] = true, ["gpt-4.1"] = true }
+-- Build valid model set from backend state
+local function get_model_set(bridge)
+    local state = bridge and bridge.get_state and bridge.get_state() or {}
+    local models = state.models or {}
+    local set = {}
+    for _, m in ipairs(models) do
+        set[m.id] = true
+    end
+    return set, models
+end
 
 local function cmd_model(args, context)
     local bridge = context.bridge
     local panel = context.panel
 
-    local engine = bridge and bridge.get_state and bridge.get_state().engine or "claude"
-    local valid_models = engine == "codex" and codex_models or claude_models
-    local model_list = engine == "codex" and "o3, o4-mini, gpt-4.1" or "opus, sonnet, haiku"
+    local valid_set, models = get_model_set(bridge)
+    local ids = {}
+    for _, m in ipairs(models) do
+        table.insert(ids, m.id)
+    end
+    local model_list = table.concat(ids, ", ")
+    if model_list == "" then model_list = "(none available)" end
 
     if not args or args == "" then
         if panel then
@@ -99,7 +112,7 @@ local function cmd_model(args, context)
     end
 
     local model = args:lower()
-    if not valid_models[model] then
+    if not valid_set[model] then
         if panel then
             panel.append_status("Invalid model. Use: " .. model_list)
         end
@@ -151,29 +164,14 @@ local function cmd_mode(args, context)
     end
 end
 
-local function cmd_agent(args, context)
+local function set_agent(name, context)
     local bridge = context.bridge
     local panel = context.panel
 
-    if not args or args == "" then
-        if panel then
-            panel.append_status("Usage: /agent <claude|codex>")
-        end
-        return
-    end
-
-    local agent = args:lower()
-    if agent ~= "claude" and agent ~= "codex" then
-        if panel then
-            panel.append_status("Invalid agent. Use: claude or codex")
-        end
-        return
-    end
-
     if bridge and bridge.set_engine then
-        bridge.set_engine(agent)
+        bridge.set_engine(name)
         if panel then
-            panel.append_status("Agent: " .. agent)
+            panel.append_status("Agent: " .. name)
             panel._update_status()
         end
     else
@@ -241,6 +239,19 @@ local function cmd_project(args, context)
     banjo.open_project(args)
 end
 
+local function cmd_version(args, context)
+    local panel = context.panel
+    local bridge = context.bridge
+    if not panel then return end
+
+    local version = bridge and bridge.get_state and bridge.get_state().version
+    if version and version ~= "" then
+        panel.append_status("Banjo " .. version)
+    else
+        panel.append_status("Banjo version unknown (not connected)")
+    end
+end
+
 -- Parse input text into command and arguments
 -- Returns: {cmd = string, args = string} or nil if not a command
 function M.parse(text)
@@ -274,6 +285,15 @@ function M.register(name, handler)
     registry[name] = handler
 end
 
+-- Agent switching commands (matches Zed extension)
+local function cmd_claude(args, context)
+    set_agent("claude", context)
+end
+
+local function cmd_codex(args, context)
+    set_agent("codex", context)
+end
+
 -- Register built-in commands
 M.register("help", cmd_help)
 M.register("clear", cmd_clear)
@@ -281,10 +301,12 @@ M.register("new", cmd_new)
 M.register("cancel", cmd_cancel)
 M.register("model", cmd_model)
 M.register("mode", cmd_mode)
-M.register("agent", cmd_agent)
+M.register("claude", cmd_claude)
+M.register("codex", cmd_codex)
 M.register("sessions", cmd_sessions)
 M.register("load", cmd_load)
 M.register("project", cmd_project)
+M.register("version", cmd_version)
 
 -- Dispatch a command
 -- Returns: true if handled locally, false if should forward to backend

@@ -269,15 +269,30 @@ describe("banjo commands", function()
     end)
 
     describe("/model", function()
+      -- Helper to create mock bridge with models in state
+      local function mock_bridge_with_models(set_model_fn)
+        return {
+          set_model = set_model_fn or function() end,
+          get_state = function()
+            return {
+              engine = "claude",
+              models = {
+                { id = "opus", name = "Claude Opus", desc = "Most capable" },
+                { id = "sonnet", name = "Claude Sonnet", desc = "Balanced" },
+                { id = "haiku", name = "Claude Haiku", desc = "Fastest" },
+              },
+            }
+          end,
+        }
+      end
+
       it("sets model when valid", function()
         local set_model_arg = nil
         local status_lines = {}
 
-        local mock_bridge = {
-          set_model = function(model)
-            set_model_arg = model
-          end
-        }
+        local mock_bridge = mock_bridge_with_models(function(model)
+          set_model_arg = model
+        end)
 
         local mock_panel = {
           append_status = function(line)
@@ -297,13 +312,14 @@ describe("banjo commands", function()
       it("validates model names", function()
         local status_lines = {}
 
+        local mock_bridge = mock_bridge_with_models()
         local mock_panel = {
           append_status = function(line)
             table.insert(status_lines, line)
           end
         }
 
-        commands.dispatch("model", "invalid", { panel = mock_panel })
+        commands.dispatch("model", "invalid", { bridge = mock_bridge, panel = mock_panel })
 
         local status = table.concat(status_lines, "\n")
         assert.truthy(status:find("Invalid model"), "Should reject invalid model")
@@ -312,13 +328,14 @@ describe("banjo commands", function()
       it("shows usage when no arguments", function()
         local status_lines = {}
 
+        local mock_bridge = mock_bridge_with_models()
         local mock_panel = {
           append_status = function(line)
             table.insert(status_lines, line)
           end
         }
 
-        commands.dispatch("model", "", { panel = mock_panel })
+        commands.dispatch("model", "", { bridge = mock_bridge, panel = mock_panel })
 
         local status = table.concat(status_lines, "\n")
         assert.truthy(status:find("Usage"), "Should show usage message")
@@ -327,11 +344,9 @@ describe("banjo commands", function()
       it("accepts all valid models", function()
         local models_set = {}
 
-        local mock_bridge = {
-          set_model = function(model)
-            table.insert(models_set, model)
-          end
-        }
+        local mock_bridge = mock_bridge_with_models(function(model)
+          table.insert(models_set, model)
+        end)
 
         local mock_panel = {
           append_status = function() end,
@@ -347,8 +362,20 @@ describe("banjo commands", function()
         assert.equals(3, #models_set, "Should accept all three models")
       end)
 
-      it("shows not connected message when no bridge", function()
+      it("shows not connected message when no bridge with set_model", function()
         local status_lines = {}
+
+        -- Bridge that provides models but no set_model function
+        local mock_bridge = {
+          get_state = function()
+            return {
+              engine = "claude",
+              models = {
+                { id = "opus", name = "Claude Opus", desc = "Most capable" },
+              },
+            }
+          end,
+        }
 
         local mock_panel = {
           append_status = function(line)
@@ -356,7 +383,7 @@ describe("banjo commands", function()
           end
         }
 
-        commands.dispatch("model", "opus", { panel = mock_panel })
+        commands.dispatch("model", "opus", { bridge = mock_bridge, panel = mock_panel })
 
         local status = table.concat(status_lines, "\n")
         assert.truthy(status:find("Not connected"), "Should show not connected message")
@@ -444,8 +471,8 @@ describe("banjo commands", function()
       end)
     end)
 
-    describe("/agent", function()
-      it("sets agent when valid", function()
+    describe("/claude", function()
+      it("switches to claude agent", function()
         local set_engine_arg = nil
         local status_lines = {}
 
@@ -462,49 +489,12 @@ describe("banjo commands", function()
           _update_status = function() end
         }
 
-        commands.dispatch("agent", "codex", { bridge = mock_bridge, panel = mock_panel })
+        commands.dispatch("claude", "", { bridge = mock_bridge, panel = mock_panel })
 
-        assert.equals("codex", set_engine_arg, "Should set agent")
-
-        local status = table.concat(status_lines, "\n")
-        assert.truthy(status:find("Agent: codex"), "Should show agent confirmation")
-      end)
-
-      it("validates agent names", function()
-        local status_lines = {}
-
-        local mock_panel = {
-          append_status = function(line)
-            table.insert(status_lines, line)
-          end
-        }
-
-        commands.dispatch("agent", "invalid", { panel = mock_panel })
+        assert.equals("claude", set_engine_arg, "Should set agent to claude")
 
         local status = table.concat(status_lines, "\n")
-        assert.truthy(status:find("Invalid agent"), "Should reject invalid agent")
-      end)
-
-      it("accepts all valid agents", function()
-        local agents_set = {}
-
-        local mock_bridge = {
-          set_engine = function(agent)
-            table.insert(agents_set, agent)
-          end
-        }
-
-        local mock_panel = {
-          append_status = function() end,
-          _update_status = function() end
-        }
-
-        local context = { bridge = mock_bridge, panel = mock_panel }
-
-        commands.dispatch("agent", "claude", context)
-        commands.dispatch("agent", "codex", context)
-
-        assert.equals(2, #agents_set, "Should accept both agents")
+        assert.truthy(status:find("Agent: claude"), "Should show agent confirmation")
       end)
 
       it("shows not connected message when no bridge", function()
@@ -516,7 +506,49 @@ describe("banjo commands", function()
           end
         }
 
-        commands.dispatch("agent", "claude", { panel = mock_panel })
+        commands.dispatch("claude", "", { panel = mock_panel })
+
+        local status = table.concat(status_lines, "\n")
+        assert.truthy(status:find("Not connected"), "Should show not connected message")
+      end)
+    end)
+
+    describe("/codex", function()
+      it("switches to codex agent", function()
+        local set_engine_arg = nil
+        local status_lines = {}
+
+        local mock_bridge = {
+          set_engine = function(agent)
+            set_engine_arg = agent
+          end
+        }
+
+        local mock_panel = {
+          append_status = function(line)
+            table.insert(status_lines, line)
+          end,
+          _update_status = function() end
+        }
+
+        commands.dispatch("codex", "", { bridge = mock_bridge, panel = mock_panel })
+
+        assert.equals("codex", set_engine_arg, "Should set agent to codex")
+
+        local status = table.concat(status_lines, "\n")
+        assert.truthy(status:find("Agent: codex"), "Should show agent confirmation")
+      end)
+
+      it("shows not connected message when no bridge", function()
+        local status_lines = {}
+
+        local mock_panel = {
+          append_status = function(line)
+            table.insert(status_lines, line)
+          end
+        }
+
+        commands.dispatch("codex", "", { panel = mock_panel })
 
         local status = table.concat(status_lines, "\n")
         assert.truthy(status:find("Not connected"), "Should show not connected message")

@@ -40,7 +40,17 @@ pub const model_id_set = std.StaticStringMap(void).initComptime(.{
     .{ "sonnet", {} },
     .{ "opus", {} },
     .{ "haiku", {} },
+    .{ "gpt-5.2-codex", {} },
+    .{ "gpt-5.1-codex-max", {} },
+    .{ "gpt-5.1-codex-mini", {} },
+    .{ "gpt-5.2", {} },
 });
+
+pub const ModelInfo = struct {
+    id: []const u8,
+    name: []const u8,
+    desc: []const u8,
+};
 
 pub fn routeFromEnv() Route {
     const val = std.posix.getenv("BANJO_ROUTE") orelse return .claude;

@@ -175,21 +175,21 @@ local command_args = {
         { word = "auto_approve", abbr = "Approve all" },
         { word = "plan_only", abbr = "Plan only" },
     },
-    model_claude = {
-        { word = "opus", abbr = "Opus (most capable)" },
-        { word = "sonnet", abbr = "Sonnet (balanced)" },
-        { word = "haiku", abbr = "Haiku (fastest)" },
-    },
-    model_codex = {
-        { word = "o3", abbr = "o3 (most capable)" },
-        { word = "o4-mini", abbr = "o4-mini (fast)" },
-        { word = "gpt-4.1", abbr = "GPT-4.1" },
-    },
-    agent = {
-        { word = "claude", abbr = "Claude (Anthropic)" },
-        { word = "codex", abbr = "Codex (OpenAI)" },
-    },
 }
+
+-- Build model completions from backend state
+local function get_model_completions()
+    local state = get_state()
+    local models = state.bridge and state.bridge.get_state and state.bridge.get_state().models or {}
+    local result = {}
+    for _, m in ipairs(models) do
+        table.insert(result, {
+            word = m.id,
+            abbr = m.name .. (m.desc and (" (" .. m.desc .. ")") or ""),
+        })
+    end
+    return result
+end
 
 -- Slash command completion function
 local function banjo_complete(findstart, base)
@@ -225,10 +225,7 @@ local function banjo_complete(findstart, base)
         if cmd_match then
             local args
             if cmd_match == "model" then
-                -- Pick model list based on current engine
-                local state = get_state()
-                local engine = state.bridge and state.bridge.get_state and state.bridge.get_state().engine or "claude"
-                args = engine == "codex" and command_args.model_codex or command_args.model_claude
+                args = get_model_completions()
             else
                 args = command_args[cmd_match]
             end
