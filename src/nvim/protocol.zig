@@ -2,6 +2,7 @@ const std = @import("std");
 const types = @import("../core/types.zig");
 const permission_mode = @import("../core/permission_mode.zig");
 const Engine = types.Engine;
+const ModelInfo = types.ModelInfo;
 
 // Permission modes for Claude Code
 pub const PermissionMode = permission_mode.PermissionMode;
@@ -94,6 +95,8 @@ pub const StateResponse = struct {
     mode: []const u8,
     session_id: ?[]const u8 = null,
     connected: bool,
+    models: []const ModelInfo = &.{},
+    version: []const u8 = "",
 };
 
 pub const ApprovalRequest = struct {
