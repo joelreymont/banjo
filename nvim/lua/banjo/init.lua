@@ -12,6 +12,7 @@ local default_config = {
     keymaps = true,
     scope = true, -- Enable tab-scoped buffers via scope.nvim
     bufferline = true, -- Configure bufferline for multi-project tabs
+    tab_keymaps = true, -- Set up <leader>1-9 for tab switching
 }
 
 local config = {}
@@ -93,6 +94,16 @@ function M.setup(opts)
                     end,
                 },
             })
+
+        end
+    end
+
+    -- Set up <leader>1-9 to switch tabs
+    if config.tab_keymaps then
+        for i = 1, 9 do
+            vim.keymap.set("n", "<leader>" .. i, function()
+                vim.cmd("tabn " .. i)
+            end, { desc = "Go to tab " .. i })
         end
     end
 
