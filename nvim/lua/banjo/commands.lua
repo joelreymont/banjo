@@ -16,7 +16,7 @@ local function cmd_help(args, context)
         "  /clear - Clear output buffer",
         "  /new - Start new session",
         "  /cancel - Cancel current request",
-        "  /model <name> - Set model (opus, sonnet, haiku)",
+        "  /model <name> - Set model (claude: opus/sonnet/haiku, codex: o3/o4-mini/gpt-4.1)",
         "  /mode <name> - Set permission mode (default, accept_edits, auto_approve, plan_only)",
         "  /agent <name> - Switch agent (claude, codex)",
         "  /sessions - List saved sessions",
@@ -79,21 +79,29 @@ local function cmd_cancel(args, context)
     end
 end
 
+-- Valid models per engine
+local claude_models = { opus = true, sonnet = true, haiku = true }
+local codex_models = { o3 = true, ["o4-mini"] = true, ["gpt-4.1"] = true }
+
 local function cmd_model(args, context)
     local bridge = context.bridge
     local panel = context.panel
 
+    local engine = bridge and bridge.get_state and bridge.get_state().engine or "claude"
+    local valid_models = engine == "codex" and codex_models or claude_models
+    local model_list = engine == "codex" and "o3, o4-mini, gpt-4.1" or "opus, sonnet, haiku"
+
     if not args or args == "" then
         if panel then
-            panel.append_status("Usage: /model <opus|sonnet|haiku>")
+            panel.append_status("Usage: /model <" .. model_list .. ">")
         end
         return
     end
 
     local model = args:lower()
-    if model ~= "opus" and model ~= "sonnet" and model ~= "haiku" then
+    if not valid_models[model] then
         if panel then
-            panel.append_status("Invalid model. Use: opus, sonnet, or haiku")
+            panel.append_status("Invalid model. Use: " .. model_list)
         end
         return
     end
