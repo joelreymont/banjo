@@ -728,7 +728,7 @@ pub const Handler = struct {
         self.cancelled.store(true, .release);
 
         // Interrupt the running Claude/Codex process
-        if (self.claude_bridge) |bridge| {
+        if (self.claude_bridge) |*bridge| {
             bridge.interrupt();
         }
         if (self.codex_bridge_inst) |*bridge| {
@@ -904,12 +904,18 @@ pub const Handler = struct {
             .codex => self.codex_session_id,
         };
 
+        const models: []const core_types.ModelInfo = switch (self.current_engine) {
+            .claude => &claude_bridge.models,
+            .codex => &codex_bridge.models,
+        };
+
         self.sendNotification("state", protocol.StateResponse{
             .engine = engine_str,
             .model = self.current_model,
             .mode = self.permission.mode.toString(),
             .session_id = session_id,
             .connected = self.mcp_server != null,
+            .models = models,
         }) catch |err| {
             log.err("Failed to send state notification: {}", .{err});
         };
@@ -991,7 +997,7 @@ pub const Handler = struct {
                 .permission_mode = self.permission.mode.toCliArg(),
                 .model = self.current_model,
                 .permission_socket_path = self.permission.socket_path,
-                .resume_session_id = self.claude_session_id,
+                .continue_last = true, // Always continue last session
             });
         }
 
@@ -1016,7 +1022,7 @@ pub const Handler = struct {
             debugLog("ensureCodexBridge: starting bridge", .{});
             try self.codex_bridge_inst.?.start(.{
                 .approval_policy = self.permission.mode.toCodexApprovalPolicy(),
-                .resume_session_id = self.codex_session_id,
+                .resume_last = self.codex_session_id == null, // Resume last if no explicit session
             });
         }
 

@@ -8,8 +8,17 @@ const executable = @import("executable.zig");
 const io_utils = @import("io_utils.zig");
 const test_utils = @import("test_utils.zig");
 const auth_markers = @import("auth_markers.zig");
+const core_types = @import("types.zig");
 
 const max_json_line_bytes: usize = 4 * 1024 * 1024;
+
+// Models supported by Codex CLI
+pub const models = [_]core_types.ModelInfo{
+    .{ .id = "gpt-5.2-codex", .name = "gpt-5.2-codex", .desc = "Latest agentic coding model" },
+    .{ .id = "gpt-5.1-codex-max", .name = "gpt-5.1-codex-max", .desc = "Deep and fast reasoning" },
+    .{ .id = "gpt-5.1-codex-mini", .name = "gpt-5.1-codex-mini", .desc = "Cheaper, faster" },
+    .{ .id = "gpt-5.2", .name = "gpt-5.2", .desc = "Latest frontier model" },
+};
 
 // Codex error info tags (matches codex_error_info field in TurnError)
 pub const CodexErrorInfo = enum {
@@ -284,6 +293,19 @@ const ThreadStartParams = struct {
 
 const ThreadResumeParams = struct {
     threadId: []const u8,
+};
+
+const ThreadListParams = struct {
+    limit: u32 = 20, // Fetch enough to find matching cwd
+};
+
+const ThreadSummary = struct {
+    id: []const u8,
+    cwd: []const u8,
+};
+
+const ThreadListResponse = struct {
+    data: []const ThreadSummary,
 };
 
 const ThreadRef = struct {
@@ -587,7 +609,7 @@ pub const CodexBridge = struct {
     }
 
     pub const StartOptions = struct {
-        resume_session_id: ?[]const u8 = null,
+        resume_last: bool = false,
         model: ?[]const u8 = null,
         approval_policy: ?[]const u8 = null,
     };
@@ -655,15 +677,17 @@ pub const CodexBridge = struct {
         self.approval_policy = opts.approval_policy;
         try self.initialize();
 
-        if (opts.resume_session_id) |sid| {
-            self.resumeThread(sid, opts.model) catch |err| {
-                log.warn("Failed to resume Codex thread ({s}): {}", .{ sid, err });
-                try self.startThread(opts.model);
+        if (opts.resume_last) {
+            if (self.getMostRecentThread()) |tid| {
+                self.resumeThread(tid, opts.model) catch |err| {
+                    log.warn("Failed to resume Codex thread ({s}): {}", .{ tid, err });
+                    try self.startThread(opts.model);
+                    return;
+                };
                 return;
-            };
-        } else {
-            try self.startThread(opts.model);
+            }
         }
+        try self.startThread(opts.model);
     }
 
     fn startReaderThread(self: *CodexBridge) !void {
@@ -949,6 +973,38 @@ pub const CodexBridge = struct {
             return error.InvalidResponse;
         };
         try self.setThreadId(resumed_id);
+    }
+
+    fn getMostRecentThread(self: *CodexBridge) ?[]const u8 {
+        const request_id = self.nextRequestId();
+        self.sendRequest(request_id, "thread/list", ThreadListParams{}) catch return null;
+        var response = self.waitForResponse(request_id) catch return null;
+        defer response.arena.deinit();
+
+        const parsed = std.json.parseFromValue(
+            ThreadListResponse,
+            response.arena.allocator(),
+            response.value,
+            .{ .ignore_unknown_fields = true },
+        ) catch return null;
+
+        // Resolve cwd to absolute path for comparison
+        var abs_cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const abs_cwd = std.fs.cwd().realpath(self.cwd, &abs_cwd_buf) catch self.cwd;
+
+        // Find most recent thread matching our cwd
+        for (parsed.value.data) |thread| {
+            // Normalize thread.cwd by stripping trailing /. if present
+            var thread_cwd = thread.cwd;
+            if (std.mem.endsWith(u8, thread_cwd, "/.")) {
+                thread_cwd = thread_cwd[0 .. thread_cwd.len - 2];
+            }
+            if (std.mem.eql(u8, thread_cwd, abs_cwd)) {
+                log.info("Found recent thread for cwd: {s}", .{thread.id});
+                return thread.id;
+            }
+        }
+        return null;
     }
 
     fn setThreadId(self: *CodexBridge, thread_id: []const u8) !void {
@@ -1873,7 +1929,7 @@ fn collectCodexSnapshot(allocator: Allocator, prompt: []const u8) ![]u8 {
     var bridge = CodexBridge.init(allocator, ".");
     defer bridge.deinit();
 
-    try bridge.start(.{ .resume_session_id = null, .model = null, .approval_policy = "never" });
+    try bridge.start(.{ .approval_policy = "never" });
     defer bridge.stop();
 
     const inputs = [_]UserInput{.{ .type = "text", .text = prompt }};
@@ -1970,7 +2026,7 @@ test "Codex app-server supports multi-turn prompts in one process" {
     var bridge = CodexBridge.init(testing.allocator, ".");
     defer bridge.deinit();
 
-    try bridge.start(.{ .resume_session_id = null, .model = null, .approval_policy = "never" });
+    try bridge.start(.{ .approval_policy = "never" });
     defer bridge.stop();
 
     const first_inputs = [_]UserInput{.{ .type = "text", .text = "say hello in one word" }};
@@ -2018,7 +2074,7 @@ test "Codex interrupt stops turn and returns interrupted status" {
     var bridge = CodexBridge.init(testing.allocator, ".");
     defer bridge.deinit();
 
-    try bridge.start(.{ .resume_session_id = null, .model = null, .approval_policy = "never" });
+    try bridge.start(.{ .approval_policy = "never" });
     defer bridge.stop();
 
     // Start a prompt that will take a while to complete
@@ -2123,4 +2179,53 @@ test "Codex bridge restarts after process exit" {
 
     bridge.stop();
     try testing.expect(got_response);
+}
+
+test "Codex resume_last resumes most recent thread for cwd" {
+    // Tests that resume_last uses thread/list API to find and resume
+    // the most recent thread matching the current working directory,
+    // preserving conversation context.
+    if (!config.live_cli_tests) return error.SkipZigTest;
+    if (!CodexBridge.isAvailable()) return error.SkipZigTest;
+
+    var bridge = CodexBridge.init(testing.allocator, ".");
+    defer bridge.deinit();
+
+    // First session - establish context with unique secret
+    try bridge.start(.{ .approval_policy = "never" });
+    const inputs1 = [_]UserInput{.{ .type = "text", .text = "Remember this secret word: MANGO7X. Just say OK." }};
+    try bridge.sendPrompt(inputs1[0..]);
+
+    const deadline1 = std.time.milliTimestamp() + 30000;
+    while (std.time.milliTimestamp() < deadline1) {
+        var msg = bridge.readMessageWithTimeout(deadline1) catch break orelse break;
+        defer msg.deinit();
+        if (msg.event_type == .turn_completed) break;
+    }
+    bridge.stop();
+
+    // Second session with resume_last - should find and resume the thread
+    try bridge.start(.{ .approval_policy = "never", .resume_last = true });
+
+    // Ask about the secret - should remember from previous context
+    const inputs2 = [_]UserInput{.{ .type = "text", .text = "What was the secret word I told you? Reply with just that word." }};
+    try bridge.sendPrompt(inputs2[0..]);
+
+    var remembered = false;
+    const deadline2 = std.time.milliTimestamp() + 30000;
+    while (std.time.milliTimestamp() < deadline2) {
+        var msg = bridge.readMessageWithTimeout(deadline2) catch break orelse break;
+        defer msg.deinit();
+        if (msg.event_type == .agent_message_delta) {
+            if (msg.text) |text| {
+                if (std.mem.indexOf(u8, text, "MANGO7X") != null) {
+                    remembered = true;
+                }
+            }
+        }
+        if (msg.event_type == .turn_completed) break;
+    }
+
+    bridge.stop();
+    try testing.expect(remembered);
 }

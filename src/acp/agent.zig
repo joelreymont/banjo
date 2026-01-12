@@ -1726,7 +1726,7 @@ pub const Agent = struct {
 
     fn buildCodexStartOptions(session: *Session) CodexBridge.StartOptions {
         return .{
-            .resume_session_id = if (session.force_new_codex) null else session.codex_session_id,
+            .resume_last = !session.force_new_codex and session.codex_session_id == null,
             .model = null,
             .approval_policy = codexApprovalPolicy(session.permission_mode),
         };
@@ -4120,11 +4120,24 @@ pub const Agent = struct {
         .{ .id = "plan", .name = "Plan only", .description = "Plan without executing tools" },
     };
 
-    const available_models = [_]protocol.SessionModel{
+    const claude_models = [_]protocol.SessionModel{
         .{ .id = "sonnet", .name = "Claude Sonnet", .description = "Fast, balanced" },
         .{ .id = "opus", .name = "Claude Opus", .description = "Most capable" },
         .{ .id = "haiku", .name = "Claude Haiku", .description = "Fastest" },
     };
+
+    const codex_models = [_]protocol.SessionModel{
+        .{ .id = "o3", .name = "o3", .description = "Most capable" },
+        .{ .id = "o4-mini", .name = "o4-mini", .description = "Fast" },
+        .{ .id = "gpt-4.1", .name = "GPT-4.1", .description = "Balanced" },
+    };
+
+    fn getModelsForEngine(engine: Engine) []const protocol.SessionModel {
+        return switch (engine) {
+            .claude => claude_models[0..],
+            .codex => codex_models[0..],
+        };
+    }
 
     const auto_resume_config_options = [_]protocol.SessionConfigSelectOption{
         .{ .value = "true", .name = "On" },
@@ -6099,28 +6112,20 @@ test "buildCodexStartOptions honors force_new" {
     };
     defer session.deinit(testing.allocator);
 
-    session.codex_session_id = try testing.allocator.dupe(u8, "thread-id");
+    // force_new_codex = true should disable resume_last
     session.force_new_codex = true;
-
     const forced = Agent.buildCodexStartOptions(&session);
-    const forced_summary = .{ .resume_session_id = forced.resume_session_id };
+    try testing.expect(!forced.resume_last);
 
+    // force_new_codex = false and no session_id should enable resume_last
     session.force_new_codex = false;
     const resume_opts = Agent.buildCodexStartOptions(&session);
-    const resume_summary = .{ .resume_session_id = resume_opts.resume_session_id };
-    const summary = .{
-        .forced = forced_summary,
-        .resume_opts = resume_summary,
-    };
-    try (ohsnap{}).snap(@src(),
-        \\acp.agent.test.buildCodexStartOptions honors force_new__struct_<^\d+$>
-        \\  .forced: acp.agent.test.buildCodexStartOptions honors force_new__struct_<^\d+$>
-        \\    .resume_session_id: ?[]const u8
-        \\      null
-        \\  .resume_opts: acp.agent.test.buildCodexStartOptions honors force_new__struct_<^\d+$>
-        \\    .resume_session_id: ?[]const u8
-        \\      "thread-id"
-    ).expectEqual(summary);
+    try testing.expect(resume_opts.resume_last);
+
+    // With explicit session_id, resume_last should be false
+    session.codex_session_id = try testing.allocator.dupe(u8, "thread-id");
+    const with_id = Agent.buildCodexStartOptions(&session);
+    try testing.expect(!with_id.resume_last);
 }
 
 test "codex auto approval respects permission mode" {
