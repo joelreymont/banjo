@@ -363,9 +363,8 @@ function M._on_exit(code, tabid)
     -- Save session before clearing state
     if b.state.session_id and b.state.session_active then
         local sessions = require("banjo.sessions")
-        local history = require("banjo.history")
         sessions.save(b.state.session_id, {
-            history = history.get_all(),
+            history = panel.get_history_entries(),
             input_text = panel.get_input_text(),
             timestamp = os.time(),
         })
@@ -872,32 +871,42 @@ M._connect_websocket = M._connect_websocket
 M._on_stdout = M._on_stdout
 M._on_exit = M._on_exit
 
--- Global TabClosed autocmd (registered once at module load)
-vim.api.nvim_create_autocmd("TabClosed", {
-    callback = function(ev)
-        local tabid = tonumber(ev.match)
-        if not tabid or not bridges[tabid] then
-            return
-        end
-        -- Stop backend for this tab
-        local old_b = bridges[tabid]
-        if old_b.reconnect.timer then
-            pcall(old_b.reconnect.timer.stop, old_b.reconnect.timer)
-            pcall(old_b.reconnect.timer.close, old_b.reconnect.timer)
-        end
-        if old_b.client then
-            pcall(ws_client.close, old_b.client)
-        end
-        if old_b.job_id then
-            pcall(vim.fn.jobstop, old_b.job_id)
-        end
-        if old_b.autocmd_group then
-            pcall(vim.api.nvim_del_augroup_by_id, old_b.autocmd_group)
-        end
-        bridges[tabid] = nil
+-- Cleanup a single bridge by tabid
+local function cleanup_bridge(tabid)
+    local old_b = bridges[tabid]
+    if not old_b then return end
 
-        -- Cleanup panel state for this tab
-        pcall(panel.cleanup_tab, tabid)
+    if old_b.reconnect.timer then
+        pcall(old_b.reconnect.timer.stop, old_b.reconnect.timer)
+        pcall(old_b.reconnect.timer.close, old_b.reconnect.timer)
+    end
+    if old_b.client then
+        pcall(ws_client.close, old_b.client)
+    end
+    if old_b.job_id then
+        pcall(vim.fn.jobstop, old_b.job_id)
+    end
+    if old_b.autocmd_group then
+        pcall(vim.api.nvim_del_augroup_by_id, old_b.autocmd_group)
+    end
+    bridges[tabid] = nil
+    pcall(panel.cleanup_tab, tabid)
+end
+
+-- Global TabClosed autocmd (registered once at module load)
+-- Note: ev.match is tab NUMBER (display position), NOT tabpage handle.
+-- We must iterate and cleanup any bridges whose handles are no longer valid.
+vim.api.nvim_create_autocmd("TabClosed", {
+    callback = function()
+        local valid_tabs = {}
+        for _, handle in ipairs(vim.api.nvim_list_tabpages()) do
+            valid_tabs[handle] = true
+        end
+        for tabid, _ in pairs(bridges) do
+            if not valid_tabs[tabid] then
+                cleanup_bridge(tabid)
+            end
+        end
     end,
 })
 

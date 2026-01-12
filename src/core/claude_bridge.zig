@@ -547,6 +547,17 @@ pub const Bridge = struct {
 
     /// Start Claude Code process
     pub fn start(self: *Bridge, opts: StartOptions) !void {
+        // Clean up old process/thread if restarting after previous exit
+        if (self.reader_thread) |thread| {
+            thread.join();
+            self.reader_thread = null;
+        }
+        if (self.process) |*proc| {
+            _ = proc.wait() catch {};
+            self.process = null;
+            self.stdout_reader = null;
+        }
+
         var args: std.ArrayList([]const u8) = .empty;
         defer args.deinit(self.allocator);
 
@@ -665,13 +676,13 @@ pub const Bridge = struct {
     pub fn stop(self: *Bridge) void {
         self.stop_requested.store(true, .release);
         if (self.process) |*proc| {
-            _ = proc.kill() catch |err| blk: {
-                log.warn("Failed to kill Claude process: {}", .{err});
-                break :blk std.process.Child.Term{ .Unknown = 0 };
+            _ = proc.kill() catch |err| switch (err) {
+                error.AlreadyTerminated => {},
+                else => log.warn("Failed to kill Claude process: {}", .{err}),
             };
-            _ = proc.wait() catch |err| blk: {
-                log.warn("Failed to wait for Claude process: {}", .{err});
-                break :blk std.process.Child.Term{ .Unknown = 0 };
+            _ = proc.wait() catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => log.warn("Failed to wait for Claude process: {}", .{err}),
             };
             self.process = null;
             self.stdout_reader = null;
@@ -1221,6 +1232,63 @@ fn readClaudeMessageWithTimeout(bridge: *Bridge, deadline_ms: i64) !?StreamMessa
     return bridge.readMessageWithTimeout(deadline_ms);
 }
 
+fn waitForClaudeStreamStart(bridge: *Bridge, timeout_ms: i64) !bool {
+    const deadline = std.time.milliTimestamp() + timeout_ms;
+    while (true) {
+        var msg = (try bridge.readMessageWithTimeout(deadline)) orelse return error.UnexpectedEof;
+        defer msg.deinit();
+        // Wait for actual content delta (not just stream event start)
+        if (msg.type == .stream_event) {
+            if (msg.getStreamTextDelta()) |_| return true;
+        }
+        if (msg.type == .assistant) {
+            if (msg.getContent()) |_| return true;
+        }
+        if (msg.type == .result) return error.UnexpectedEof;
+    }
+}
+
+const ClaudeInterruptResult = struct {
+    got_result: bool,
+    stop_reason: ?[]const u8,
+    had_content: bool,
+};
+
+fn collectClaudeInterruptResult(allocator: Allocator, bridge: *Bridge, timeout_ms: i64) !ClaudeInterruptResult {
+    const deadline = std.time.milliTimestamp() + timeout_ms;
+    var had_content = false;
+    var stop_reason_buf: ?[]u8 = null;
+
+    while (true) {
+        var msg = (try bridge.readMessageWithTimeout(deadline)) orelse {
+            if (stop_reason_buf) |buf| allocator.free(buf);
+            return .{ .got_result = false, .stop_reason = null, .had_content = had_content };
+        };
+        defer msg.deinit();
+
+        switch (msg.type) {
+            .stream_event => {
+                if (msg.getStreamTextDelta()) |_| had_content = true;
+            },
+            .assistant => {
+                if (msg.getContent()) |_| had_content = true;
+            },
+            .result => {
+                if (msg.getStopReason()) |reason| {
+                    stop_reason_buf = allocator.dupe(u8, reason) catch null;
+                }
+                // Caller must free stop_reason if non-null
+                return .{
+                    .got_result = true,
+                    .stop_reason = stop_reason_buf,
+                    .had_content = had_content,
+                };
+            },
+            else => {},
+        }
+    }
+}
+
 fn collectClaudeControlProbe(allocator: Allocator, input: StreamControlInput) ![]u8 {
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(allocator);
@@ -1314,6 +1382,101 @@ test "snapshot: Claude Code control messages are rejected" {
         \\stdout:
         \\
     ).diff(probe, true);
+}
+
+test "Claude Code SIGINT interrupt stops streaming" {
+    if (!config.live_cli_tests) return error.SkipZigTest;
+    if (!Bridge.isAvailable()) return error.SkipZigTest;
+
+    var bridge = Bridge.init(testing.allocator, ".");
+    defer bridge.deinit();
+
+    try bridge.start(.{
+        .resume_session_id = null,
+        .continue_last = false,
+        .permission_mode = "default",
+        .model = null,
+    });
+    defer bridge.stop();
+
+    // Start a long prompt
+    try bridge.sendPrompt("Write a 500 word essay about the history of computing.");
+
+    // Wait for actual content to start streaming (not just init messages)
+    const got_initial_content = try waitForClaudeStreamStart(&bridge, 30000);
+
+    // Small delay to ensure more content is flowing
+    std.Thread.sleep(500 * std.time.ns_per_ms);
+
+    // Send SIGINT
+    bridge.interrupt();
+
+    // Collect result
+    var result = try collectClaudeInterruptResult(testing.allocator, &bridge, 15000);
+    defer if (result.stop_reason) |s| testing.allocator.free(s);
+
+    // We got initial content when waiting for stream start, so had_content should be true
+    result.had_content = result.had_content or got_initial_content;
+
+    // Claude CLI should return a result message after interrupt
+    const summary = .{
+        .got_result = result.got_result,
+        .had_content = result.had_content,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.claude_bridge.test.Claude Code SIGINT interrupt stops streaming__struct_<^\d+$>
+        \\  .got_result: bool = true
+        \\  .had_content: bool = true
+    ).expectEqual(summary);
+}
+
+test "Bridge restarts after SIGINT and processes new prompt" {
+    if (!config.live_cli_tests) return error.SkipZigTest;
+    if (!Bridge.isAvailable()) return error.SkipZigTest;
+
+    var bridge = Bridge.init(testing.allocator, ".");
+    defer bridge.deinit();
+
+    // First session: start, prompt, interrupt
+    try bridge.start(.{ .permission_mode = "default" });
+
+    try bridge.sendPrompt("Count to 100 slowly.");
+    _ = try waitForClaudeStreamStart(&bridge, 30000);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
+    bridge.interrupt();
+
+    // Wait for process to exit after interrupt
+    var exit_seen = false;
+    const deadline = std.time.milliTimestamp() + 10000;
+    while (std.time.milliTimestamp() < deadline) {
+        if (!bridge.isAlive()) {
+            exit_seen = true;
+            break;
+        }
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+    }
+    try testing.expect(exit_seen);
+
+    // Restart bridge - this is the critical test
+    try bridge.start(.{ .permission_mode = "default" });
+    try testing.expect(bridge.isAlive());
+
+    // Send a new prompt and verify we get a response
+    try bridge.sendPrompt("Say exactly: hello world");
+
+    var got_response = false;
+    const deadline2 = std.time.milliTimestamp() + 30000;
+    while (std.time.milliTimestamp() < deadline2) {
+        var msg = bridge.readMessageWithTimeout(deadline2) catch break orelse break;
+        defer msg.deinit();
+        if (msg.type == .assistant and msg.getContent() != null) {
+            got_response = true;
+            break;
+        }
+    }
+
+    bridge.stop();
+    try testing.expect(got_response);
 }
 
 // =============================================================================

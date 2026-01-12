@@ -599,6 +599,17 @@ pub const CodexBridge = struct {
     }
 
     pub fn start(self: *CodexBridge, opts: StartOptions) !void {
+        // Clean up old process/thread if restarting after previous exit
+        if (self.reader_thread) |thread| {
+            thread.join();
+            self.reader_thread = null;
+        }
+        if (self.process) |*proc| {
+            _ = proc.wait() catch {};
+            self.process = null;
+            self.stdout_file = null;
+        }
+
         var args: std.ArrayList([]const u8) = .empty;
         defer args.deinit(self.allocator);
 
@@ -697,13 +708,13 @@ pub const CodexBridge = struct {
     pub fn stop(self: *CodexBridge) void {
         self.stop_requested.store(true, .release);
         if (self.process) |*proc| {
-            _ = proc.kill() catch |err| blk: {
-                log.warn("Failed to kill Codex process: {}", .{err});
-                break :blk std.process.Child.Term{ .Unknown = 0 };
+            _ = proc.kill() catch |err| switch (err) {
+                error.AlreadyTerminated => {},
+                else => log.warn("Failed to kill Codex process: {}", .{err}),
             };
-            _ = proc.wait() catch |err| blk: {
-                log.warn("Failed to wait for Codex process: {}", .{err});
-                break :blk std.process.Child.Term{ .Unknown = 0 };
+            _ = proc.wait() catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => log.warn("Failed to wait for Codex process: {}", .{err}),
             };
             self.process = null;
             self.stdout_file = null;
@@ -1969,4 +1980,147 @@ test "Codex app-server supports multi-turn prompts in one process" {
     const second_inputs = [_]UserInput{.{ .type = "text", .text = "say goodbye in one word" }};
     try bridge.sendPrompt(second_inputs[0..]);
     try waitForTurnCompleted(&bridge, 20000);
+}
+
+fn waitForTurnStarted(bridge: *CodexBridge, timeout_ms: i64) !void {
+    const deadline = std.time.milliTimestamp() + timeout_ms;
+    while (true) {
+        var msg = (try bridge.readMessageWithTimeout(deadline)) orelse return error.UnexpectedEof;
+        defer msg.deinit();
+        if (msg.event_type == .turn_started) return;
+        if (msg.isTurnCompleted()) return error.UnexpectedEof;
+    }
+}
+
+const InterruptResult = struct {
+    got_turn_completed: bool,
+    status_is_interrupted: bool,
+};
+
+fn collectInterruptResult(bridge: *CodexBridge, timeout_ms: i64) !InterruptResult {
+    const deadline = std.time.milliTimestamp() + timeout_ms;
+    while (true) {
+        var msg = (try bridge.readMessageWithTimeout(deadline)) orelse {
+            return .{ .got_turn_completed = false, .status_is_interrupted = false };
+        };
+        defer msg.deinit();
+        if (msg.isTurnCompleted()) {
+            const is_interrupted = if (msg.turn_status) |s| std.mem.eql(u8, s, "interrupted") else false;
+            return .{ .got_turn_completed = true, .status_is_interrupted = is_interrupted };
+        }
+    }
+}
+
+test "Codex interrupt stops turn and returns interrupted status" {
+    if (!config.live_cli_tests) return error.SkipZigTest;
+    if (!CodexBridge.isAvailable()) return error.SkipZigTest;
+
+    var bridge = CodexBridge.init(testing.allocator, ".");
+    defer bridge.deinit();
+
+    try bridge.start(.{ .resume_session_id = null, .model = null, .approval_policy = "never" });
+    defer bridge.stop();
+
+    // Start a prompt that will take a while to complete
+    const inputs = [_]UserInput{.{ .type = "text", .text = "Write a 500 word essay about the history of computing." }};
+    try bridge.sendPrompt(inputs[0..]);
+
+    // Wait for turn to actually start
+    try waitForTurnStarted(&bridge, 10000);
+
+    // Small delay to ensure streaming has begun
+    std.Thread.sleep(200 * std.time.ns_per_ms);
+
+    // Send interrupt
+    bridge.interrupt();
+
+    // Collect result - should get turn_completed with interrupted status
+    const result = try collectInterruptResult(&bridge, 10000);
+
+    try (ohsnap{}).snap(@src(),
+        \\core.codex_bridge.InterruptResult
+        \\  .got_turn_completed: bool = true
+        \\  .status_is_interrupted: bool = true
+    ).expectEqual(result);
+}
+
+test "Codex bridge handles interrupt then processes new prompt" {
+    if (!config.live_cli_tests) return error.SkipZigTest;
+    if (!CodexBridge.isAvailable()) return error.SkipZigTest;
+
+    var bridge = CodexBridge.init(testing.allocator, ".");
+    defer bridge.deinit();
+
+    try bridge.start(.{ .approval_policy = "never" });
+    defer bridge.stop();
+
+    // First turn: start, interrupt
+    const inputs = [_]UserInput{.{ .type = "text", .text = "Count to 100 slowly." }};
+    try bridge.sendPrompt(inputs[0..]);
+    try waitForTurnStarted(&bridge, 10000);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
+    bridge.interrupt();
+
+    // Wait for turn_completed with interrupted status
+    const result = try collectInterruptResult(&bridge, 10000);
+    try testing.expect(result.got_turn_completed);
+    try testing.expect(result.status_is_interrupted);
+
+    // Bridge should still be alive (Codex doesn't exit on interrupt)
+    try testing.expect(bridge.isAlive());
+
+    // Send a new prompt and verify we get a response
+    const inputs2 = [_]UserInput{.{ .type = "text", .text = "Say exactly: hello world" }};
+    try bridge.sendPrompt(inputs2[0..]);
+
+    var got_response = false;
+    const deadline2 = std.time.milliTimestamp() + 30000;
+    while (std.time.milliTimestamp() < deadline2) {
+        var msg = bridge.readMessageWithTimeout(deadline2) catch break orelse break;
+        defer msg.deinit();
+        if (msg.event_type == .agent_message_delta and msg.text != null) {
+            got_response = true;
+            break;
+        }
+    }
+
+    try testing.expect(got_response);
+}
+
+test "Codex bridge restarts after process exit" {
+    if (!config.live_cli_tests) return error.SkipZigTest;
+    if (!CodexBridge.isAvailable()) return error.SkipZigTest;
+
+    var bridge = CodexBridge.init(testing.allocator, ".");
+    defer bridge.deinit();
+
+    // First session
+    try bridge.start(.{ .approval_policy = "never" });
+    try testing.expect(bridge.isAlive());
+
+    // Force stop (simulates crash/exit)
+    bridge.stop();
+    try testing.expect(!bridge.isAlive());
+
+    // Restart - this is the critical test
+    try bridge.start(.{ .approval_policy = "never" });
+    try testing.expect(bridge.isAlive());
+
+    // Verify it works
+    const inputs = [_]UserInput{.{ .type = "text", .text = "Say exactly: hello world" }};
+    try bridge.sendPrompt(inputs[0..]);
+
+    var got_response = false;
+    const deadline = std.time.milliTimestamp() + 30000;
+    while (std.time.milliTimestamp() < deadline) {
+        var msg = bridge.readMessageWithTimeout(deadline) catch break orelse break;
+        defer msg.deinit();
+        if (msg.event_type == .agent_message_delta and msg.text != null) {
+            got_response = true;
+            break;
+        }
+    }
+
+    bridge.stop();
+    try testing.expect(got_response);
 }

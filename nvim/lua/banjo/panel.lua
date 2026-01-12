@@ -54,8 +54,7 @@ local function get_state()
             code_buffer = nil,
             code_start_line = nil,
             code_lang = nil,
-            history_offset = 0,
-            history_temp_input = "",
+            history = nil,
             last_manual_scroll_time = 0,
             session_timer = nil,
             bridge = nil,
@@ -66,15 +65,24 @@ end
 
 function M.setup(opts)
     config = vim.tbl_deep_extend("force", config, opts or {})
-
-    -- Load history from disk
-    local history = require("banjo.history")
-    history.load()
 end
 
 function M.set_bridge(b)
     local state = get_state()
     state.bridge = b
+end
+
+-- Get or create history for this tab (uses bridge cwd)
+local function get_history()
+    local state = get_state()
+    if not state.history then
+        local History = require("banjo.history")
+        local cwd = (state.bridge and state.bridge.reconnect and state.bridge.reconnect.cwd)
+            or vim.fn.getcwd()
+        state.history = History.new(cwd)
+        state.history:load()
+    end
+    return state.history
 end
 
 -- Output buffer
@@ -83,6 +91,16 @@ local function create_output_buffer()
     local state = get_state()
     if state.output_buf and vim.api.nvim_buf_is_valid(state.output_buf) then
         return state.output_buf
+    end
+
+    -- Clean up stale buffer with same name if it exists
+    local tabid = vim.api.nvim_get_current_tabpage()
+    local bufname = string.format("Banjo-%d", tabid)
+    local existing = vim.fn.bufnr(bufname)
+    if existing ~= -1 and not vim.api.nvim_buf_is_valid(existing) then
+        pcall(vim.cmd, "bwipeout! " .. existing)
+    elseif existing ~= -1 and existing ~= state.output_buf then
+        pcall(vim.cmd, "bwipeout! " .. existing)
     end
 
     state.output_buf = vim.api.nvim_create_buf(false, true)
@@ -108,9 +126,7 @@ local function create_output_buffer()
     vim.b[state.output_buf].cmp_enabled = false
     vim.b[state.output_buf].blink_cmp_enabled = false
 
-    -- Use per-tab buffer name to support multiple tabs
-    local tabid = vim.api.nvim_get_current_tabpage()
-    vim.api.nvim_buf_set_name(state.output_buf, string.format("Banjo-%d", tabid))
+    vim.api.nvim_buf_set_name(state.output_buf, bufname)
 
     return state.output_buf
 end
@@ -123,15 +139,23 @@ local function create_input_buffer()
         return state.input_buf
     end
 
+    -- Clean up stale buffer with same name if it exists
+    local tabid = vim.api.nvim_get_current_tabpage()
+    local bufname = string.format("BanjoInput-%d", tabid)
+    local existing = vim.fn.bufnr(bufname)
+    if existing ~= -1 and not vim.api.nvim_buf_is_valid(existing) then
+        pcall(vim.cmd, "bwipeout! " .. existing)
+    elseif existing ~= -1 and existing ~= state.input_buf then
+        pcall(vim.cmd, "bwipeout! " .. existing)
+    end
+
     state.input_buf = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_set_option_value("buftype", "nofile", { buf = state.input_buf })
     vim.api.nvim_set_option_value("bufhidden", "hide", { buf = state.input_buf })
     vim.api.nvim_set_option_value("swapfile", false, { buf = state.input_buf })
     vim.api.nvim_set_option_value("filetype", "banjo_input", { buf = state.input_buf })
 
-    -- Use per-tab buffer name to support multiple tabs
-    local tabid = vim.api.nvim_get_current_tabpage()
-    vim.api.nvim_buf_set_name(state.input_buf, string.format("BanjoInput-%d", tabid))
+    vim.api.nvim_buf_set_name(state.input_buf, bufname)
 
     -- Set initial prompt indicator
     vim.api.nvim_buf_set_lines(state.input_buf, 0, -1, false, { "" })
@@ -342,17 +366,17 @@ local function set_input_keymaps(buf, state)
 
     -- Up/Down for history navigation
     vim.keymap.set({ "n", "i" }, "<Up>", function()
-        local history = require("banjo.history")
+        local history = get_history()
 
         -- First Up press: save current input
-        if state.history_offset == 0 then
-            state.history_temp_input = M.get_input_text()
+        if history.offset == 0 then
+            history.temp_input = M.get_input_text()
         end
 
         -- Navigate back in history
-        if state.history_offset < history.size() then
-            state.history_offset = state.history_offset + 1
-            local entry = history.get(state.history_offset - 1)
+        if history.offset < history:size() then
+            history.offset = history.offset + 1
+            local entry = history:get(history.offset - 1)
             if entry then
                 M.set_input_text(entry)
             end
@@ -360,20 +384,20 @@ local function set_input_keymaps(buf, state)
     end, { buffer = buf, noremap = true })
 
     vim.keymap.set({ "n", "i" }, "<Down>", function()
-        local history = require("banjo.history")
+        local history = get_history()
 
-        if state.history_offset == 0 then
+        if history.offset == 0 then
             return
         end
 
         -- Navigate forward in history
-        state.history_offset = state.history_offset - 1
+        history.offset = history.offset - 1
 
-        if state.history_offset == 0 then
+        if history.offset == 0 then
             -- Restore temp input
-            M.set_input_text(state.history_temp_input)
+            M.set_input_text(history.temp_input)
         else
-            local entry = history.get(state.history_offset - 1)
+            local entry = history:get(history.offset - 1)
             if entry then
                 M.set_input_text(entry)
             end
@@ -659,8 +683,17 @@ function M.submit_input()
     lua_debug("submit_input called")
     local state = get_state()
     if not state.input_buf or not vim.api.nvim_buf_is_valid(state.input_buf) then
-        lua_debug("  no valid input_buf")
-        return
+        lua_debug("  no valid input_buf, recreating")
+        -- Buffer was invalidated (e.g., by :bwipe), recreate panel
+        state.input_buf = nil
+        state.output_buf = nil
+        state.input_win = nil
+        state.output_win = nil
+        create_panel()
+        if not state.input_buf or not vim.api.nvim_buf_is_valid(state.input_buf) then
+            vim.notify("Banjo: Failed to recover panel. Try :BanjoToggle", vim.log.levels.ERROR)
+            return
+        end
     end
 
     local lines = vim.api.nvim_buf_get_lines(state.input_buf, 0, -1, false)
@@ -681,10 +714,10 @@ function M.submit_input()
     end
 
     -- Add to history and reset navigation
-    local history = require("banjo.history")
-    history.add(text)
-    state.history_offset = 0
-    state.history_temp_input = ""
+    local history = get_history()
+    history:add(text)
+    history.offset = 0
+    history.temp_input = ""
 
     -- Clear input
     vim.api.nvim_buf_set_lines(state.input_buf, 0, -1, false, { "" })
@@ -1544,5 +1577,11 @@ end
 
 -- Expose for testing
 M._get_state = get_state
+
+-- Get history entries for session saving
+function M.get_history_entries()
+    local history = get_history()
+    return history:get_all()
+end
 
 return M
