@@ -7,9 +7,17 @@ const log = std.log.scoped(.cli_bridge);
 const executable = @import("executable.zig");
 const io_utils = @import("io_utils.zig");
 const test_utils = @import("test_utils.zig");
+const core_types = @import("types.zig");
 
 const max_json_line_bytes: usize = 4 * 1024 * 1024;
 const debug_log = @import("../util/debug_log.zig");
+
+// Models supported by Claude Code CLI
+pub const models = [_]core_types.ModelInfo{
+    .{ .id = "sonnet", .name = "Claude Sonnet", .desc = "Fast, balanced" },
+    .{ .id = "opus", .name = "Claude Opus", .desc = "Most capable" },
+    .{ .id = "haiku", .name = "Claude Haiku", .desc = "Fastest" },
+};
 
 fn bridgeDebugLog(comptime fmt: []const u8, args: anytype) void {
     debug_log.write("BRIDGE", fmt, args);
@@ -515,6 +523,7 @@ pub const Bridge = struct {
     reader_thread: ?std.Thread = null,
     reader_closed: bool = false,
     stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    interrupted: bool = false,
 
     pub fn init(allocator: Allocator, cwd: []const u8) Bridge {
         return .{
@@ -636,6 +645,7 @@ pub const Bridge = struct {
         self.queue_mutex.lock();
         self.reader_closed = false;
         self.queue_mutex.unlock();
+        self.interrupted = false;
         self.stop_requested.store(false, .release);
         self.clearQueue();
         bridgeDebugLog("start: starting reader thread", .{});
@@ -662,7 +672,8 @@ pub const Bridge = struct {
     };
 
     /// Interrupt the current request (SIGINT to Claude CLI)
-    pub fn interrupt(self: *const Bridge) void {
+    pub fn interrupt(self: *Bridge) void {
+        self.interrupted = true;
         if (self.process) |proc| {
             const pid = proc.id;
             log.info("Sending SIGINT to Claude CLI (pid={})", .{pid});
@@ -702,6 +713,7 @@ pub const Bridge = struct {
     /// Check if the bridge process is alive and ready for prompts
     pub fn isAlive(self: *Bridge) bool {
         if (self.process == null) return false;
+        if (self.interrupted) return false;
         self.queue_mutex.lock();
         defer self.queue_mutex.unlock();
         return !self.reader_closed;
@@ -1477,6 +1489,65 @@ test "Bridge restarts after SIGINT and processes new prompt" {
 
     bridge.stop();
     try testing.expect(got_response);
+}
+
+test "interrupt and continue preserves session context" {
+    // Regression: Before fix, isAlive() could return true during race window
+    // after interrupt but before process fully exited, causing sendPrompt to fail.
+    // Also verifies session continuity via --continue.
+    if (!config.live_cli_tests) return error.SkipZigTest;
+    if (!Bridge.isAvailable()) return error.SkipZigTest;
+
+    var bridge = Bridge.init(testing.allocator, ".");
+    defer bridge.deinit();
+
+    // Start session and establish context
+    try bridge.start(.{ .permission_mode = "default" });
+    try bridge.sendPrompt("Remember the secret word: BANANA. Acknowledge with OK.");
+
+    // Wait for acknowledgment
+    const deadline1 = std.time.milliTimestamp() + 30000;
+    while (std.time.milliTimestamp() < deadline1) {
+        var msg = bridge.readMessageWithTimeout(deadline1) catch break orelse break;
+        defer msg.deinit();
+        if (msg.type == .result) break;
+    }
+
+    // Interrupt then IMMEDIATELY restart with --continue
+    bridge.interrupt();
+    try testing.expect(!bridge.isAlive());
+    try bridge.start(.{
+        .permission_mode = "default",
+        .continue_last = true,
+    });
+    try testing.expect(bridge.isAlive());
+
+    // Ask about the secret - should remember from previous context
+    try bridge.sendPrompt("What was the secret word I told you? Reply with just the word.");
+    var remembered = false;
+    const deadline2 = std.time.milliTimestamp() + 30000;
+    while (std.time.milliTimestamp() < deadline2) {
+        var msg = bridge.readMessageWithTimeout(deadline2) catch break orelse break;
+        defer msg.deinit();
+        if (msg.type == .stream_event) {
+            if (msg.getStreamTextDelta()) |text| {
+                if (std.mem.indexOf(u8, text, "BANANA") != null) {
+                    remembered = true;
+                }
+            }
+        }
+        if (msg.type == .assistant) {
+            if (msg.getContent()) |content| {
+                if (std.mem.indexOf(u8, content, "BANANA") != null) {
+                    remembered = true;
+                }
+            }
+        }
+        if (msg.type == .result) break;
+    }
+
+    bridge.stop();
+    try testing.expect(remembered);
 }
 
 // =============================================================================
