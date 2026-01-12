@@ -89,6 +89,14 @@ pub fn scoped(comptime scope: []const u8) type {
     };
 }
 
+var cached_pid: ?posix.pid_t = null;
+
+fn getPid() posix.pid_t {
+    if (cached_pid) |pid| return pid;
+    cached_pid = std.c.getpid();
+    return cached_pid.?;
+}
+
 fn log(level: Level, comptime scope: []const u8, comptime fmt: []const u8, args: anytype) void {
     if (@intFromEnum(level) > @intFromEnum(global_level)) return;
 
@@ -107,8 +115,8 @@ fn log(level: Level, comptime scope: []const u8, comptime fmt: []const u8, args:
         day_secs.getSecondsIntoMinute(),
     }) catch return;
 
-    // Level and scope
-    w.print("[{s}] [{s}] ", .{ level.asText(), scope }) catch return;
+    // Level, scope, and PID
+    w.print("[{s}] [{s}] [pid={d}] ", .{ level.asText(), scope, getPid() }) catch return;
 
     // Message
     w.print(fmt, args) catch return;
