@@ -296,6 +296,11 @@ function M._connect_websocket(port, tabid)
                     my_b.preserved.input_text = nil
                 end
 
+                -- Restore permission mode if previously set
+                if my_b.preserved.permission_mode then
+                    M._send_notification("set_permission_mode", { mode = my_b.preserved.permission_mode })
+                end
+
                 -- Restore original tab
                 if need_switch and vim.api.nvim_tabpage_is_valid(current_tab) then
                     vim.api.nvim_set_current_tabpage(current_tab)
@@ -476,6 +481,8 @@ function M._handle_message(msg, tabid)
             b.state.mode = msg.params.mode or b.state.mode
             b.state.session_id = msg.params.session_id
             b.state.connected = msg.params.connected or false
+            b.state.models = msg.params.models or {}
+            b.state.version = msg.params.version
             panel._update_status()
         end
     elseif method == "session_id" then
@@ -595,6 +602,7 @@ end
 
 function M.set_permission_mode(mode)
     local b = get_bridge()
+    b.preserved.permission_mode = mode
     M._send_notification("set_permission_mode", { mode = mode })
 end
 

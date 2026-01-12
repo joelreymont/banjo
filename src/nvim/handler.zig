@@ -916,6 +916,7 @@ pub const Handler = struct {
             .session_id = session_id,
             .connected = self.mcp_server != null,
             .models = models,
+            .version = config.version ++ " (" ++ config.git_hash ++ ")",
         }) catch |err| {
             log.err("Failed to send state notification: {}", .{err});
         };
@@ -978,17 +979,13 @@ pub const Handler = struct {
     }
 
     fn ensureClaudeBridge(self: *Handler, cwd: []const u8) !*claude_bridge.Bridge {
-        // Check if cwd changed - need to restart bridge
-        const cwd_changed = if (self.bridge_cwd) |bc| !std.mem.eql(u8, bc, cwd) else true;
-        if (cwd_changed) {
-            if (self.claude_bridge) |*b| b.deinit();
-            self.claude_bridge = null;
-            if (self.bridge_cwd) |bc| self.allocator.free(bc);
+        // Only set cwd if we don't have one yet
+        if (self.bridge_cwd == null) {
             self.bridge_cwd = try self.allocator.dupe(u8, cwd);
         }
 
         if (self.claude_bridge == null) {
-            self.claude_bridge = claude_bridge.Bridge.init(self.allocator, cwd);
+            self.claude_bridge = claude_bridge.Bridge.init(self.allocator, self.bridge_cwd.?);
         }
 
         if (!self.claude_bridge.?.isAlive()) {
@@ -2160,7 +2157,7 @@ test "checkPermissionAutoApprove always_allowed_tools" {
     ).expectEqual(summary);
 }
 
-test "ensureClaudeBridge reuses bridge for same cwd" {
+test "ensureClaudeBridge reuses bridge regardless of cwd" {
     const allocator = std.testing.allocator;
 
     var stdin_buf: [0]u8 = undefined;
@@ -2180,20 +2177,23 @@ test "ensureClaudeBridge reuses bridge for same cwd" {
     _ = handler.ensureClaudeBridge("/tmp/test1") catch {};
     const second_bridge_ptr = if (handler.claude_bridge) |*b| @intFromPtr(b) else 0;
 
-    // Third call with different cwd should create new bridge
+    // Third call with different cwd should still reuse (cwd locked to first)
     _ = handler.ensureClaudeBridge("/tmp/test2") catch {};
-    const third_cwd_correct = if (handler.bridge_cwd) |c| std.mem.eql(u8, c, "/tmp/test2") else false;
+    const third_bridge_ptr = if (handler.claude_bridge) |*b| @intFromPtr(b) else 0;
+    const cwd_unchanged = if (handler.bridge_cwd) |c| std.mem.eql(u8, c, "/tmp/test1") else false;
 
     const summary = .{
         .same_bridge_reused = first_bridge_ptr == second_bridge_ptr and first_bridge_ptr != 0,
+        .bridge_reused_on_cwd_change = second_bridge_ptr == third_bridge_ptr,
         .first_cwd_correct = first_cwd_correct,
-        .cwd_updated_on_change = third_cwd_correct,
+        .cwd_unchanged = cwd_unchanged,
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.ensureClaudeBridge reuses bridge for same cwd__struct_<^\d+$>
+        \\nvim.handler.test.ensureClaudeBridge reuses bridge regardless of cwd__struct_<^\d+$>
         \\  .same_bridge_reused: bool = true
+        \\  .bridge_reused_on_cwd_change: bool = true
         \\  .first_cwd_correct: bool = true
-        \\  .cwd_updated_on_change: bool = true
+        \\  .cwd_unchanged: bool = true
     ).expectEqual(summary);
 }
 

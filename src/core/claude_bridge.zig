@@ -556,15 +556,20 @@ pub const Bridge = struct {
 
     /// Start Claude Code process
     pub fn start(self: *Bridge, opts: StartOptions) !void {
-        // Clean up old process/thread if restarting after previous exit
-        if (self.reader_thread) |thread| {
-            thread.join();
-            self.reader_thread = null;
-        }
-        if (self.process) |*proc| {
-            _ = proc.wait() catch {};
-            self.process = null;
-            self.stdout_reader = null;
+        // Clean up old process/thread if restarting
+        if (self.process != null or self.reader_thread != null) {
+            self.stop_requested.store(true, .release);
+            if (self.process) |*proc| {
+                // Kill first so reader thread sees EOF
+                _ = proc.kill() catch {};
+                _ = proc.wait() catch {};
+                self.process = null;
+                self.stdout_reader = null;
+            }
+            if (self.reader_thread) |thread| {
+                thread.join();
+                self.reader_thread = null;
+            }
         }
 
         var args: std.ArrayList([]const u8) = .empty;
@@ -607,7 +612,7 @@ pub const Bridge = struct {
         child.cwd = self.cwd;
         child.stdin_behavior = .Pipe;
         child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Inherit;
+        child.stderr_behavior = .Pipe; // Capture stderr for debugging
 
         // Set permission socket environment variable if provided
         var env: ?std.process.EnvMap = null;
@@ -672,15 +677,35 @@ pub const Bridge = struct {
     };
 
     /// Interrupt the current request (SIGINT to Claude CLI)
+    /// Claude exits on SIGINT - next prompt will restart with --continue.
     pub fn interrupt(self: *Bridge) void {
         self.interrupted = true;
-        if (self.process) |proc| {
+        self.stop_requested.store(true, .release);
+        if (self.process) |*proc| {
             const pid = proc.id;
             log.info("Sending SIGINT to Claude CLI (pid={})", .{pid});
             std.posix.kill(pid, std.posix.SIG.INT) catch |err| {
                 log.warn("Failed to send SIGINT to Claude: {}", .{err});
             };
+            // Wait for process to exit
+            _ = proc.wait() catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => log.warn("Failed to wait for Claude process: {}", .{err}),
+            };
+            self.process = null;
+            self.stdout_reader = null;
         }
+        // Join reader thread
+        if (self.reader_thread) |thread| {
+            thread.join();
+            self.reader_thread = null;
+        }
+        self.queue_mutex.lock();
+        self.reader_closed = true;
+        self.queue_mutex.unlock();
+        self.queue_cond.broadcast();
+        self.clearQueue();
+        log.info("Interrupt complete, bridge cleaned up", .{});
     }
 
     /// Stop the CLI process
@@ -741,8 +766,16 @@ pub const Bridge = struct {
         log.debug("Sending to CLI stdin: {s}", .{data});
         stdin.writeAll(data) catch |err| {
             if (err == error.BrokenPipe) {
-                // Process died - try to get exit status
+                // Process died - try to get exit status and stderr
                 if (self.process) |*child| {
+                    // Read stderr if available
+                    if (child.stderr) |stderr| {
+                        var stderr_buf: [4096]u8 = undefined;
+                        const stderr_len = stderr.read(&stderr_buf) catch 0;
+                        if (stderr_len > 0) {
+                            log.err("Claude CLI stderr: {s}", .{stderr_buf[0..stderr_len]});
+                        }
+                    }
                     const term = child.wait() catch |wait_err| blk: {
                         log.err("Claude CLI died (BrokenPipe), wait failed: {}", .{wait_err});
                         break :blk std.process.Child.Term{ .Unknown = 0 };
@@ -775,7 +808,7 @@ pub const Bridge = struct {
 
         _ = reader.streamDelimiterLimit(&line_writer.writer, '\n', .limited(max_json_line_bytes)) catch |e| switch (e) {
             error.ReadFailed => {
-                log.debug("CLI read failed", .{});
+                bridgeDebugLog("readMessageRaw: streamDelimiter ReadFailed", .{});
                 return null;
             },
             error.WriteFailed => return error.OutOfMemory,
@@ -788,7 +821,7 @@ pub const Bridge = struct {
             }
         } else |err| switch (err) {
             error.ReadFailed => {
-                log.debug("CLI read failed", .{});
+                bridgeDebugLog("readMessageRaw: peekGreedy ReadFailed", .{});
                 return null;
             },
             error.EndOfStream => {},
@@ -797,7 +830,7 @@ pub const Bridge = struct {
         const line = line_writer.written();
 
         if (line.len == 0) {
-            log.debug("CLI returned empty line", .{});
+            bridgeDebugLog("readMessageRaw: empty line (len=0)", .{});
             return null;
         }
 
@@ -1397,6 +1430,7 @@ test "snapshot: Claude Code control messages are rejected" {
 }
 
 test "Claude Code SIGINT interrupt stops streaming" {
+    // Verifies: SIGINT kills Claude process, streaming was happening before interrupt
     if (!config.live_cli_tests) return error.SkipZigTest;
     if (!Bridge.isAvailable()) return error.SkipZigTest;
 
@@ -1409,37 +1443,25 @@ test "Claude Code SIGINT interrupt stops streaming" {
         .permission_mode = "default",
         .model = null,
     });
-    defer bridge.stop();
 
     // Start a long prompt
     try bridge.sendPrompt("Write a 500 word essay about the history of computing.");
 
     // Wait for actual content to start streaming (not just init messages)
-    const got_initial_content = try waitForClaudeStreamStart(&bridge, 30000);
+    const got_content = try waitForClaudeStreamStart(&bridge, 30000);
+    try testing.expect(got_content);
 
-    // Small delay to ensure more content is flowing
+    // Small delay to ensure content is flowing
     std.Thread.sleep(500 * std.time.ns_per_ms);
 
-    // Send SIGINT
+    // Verify alive before interrupt
+    try testing.expect(bridge.isAlive());
+
+    // Send SIGINT - this kills Claude (no result message sent)
     bridge.interrupt();
 
-    // Collect result
-    var result = try collectClaudeInterruptResult(testing.allocator, &bridge, 15000);
-    defer if (result.stop_reason) |s| testing.allocator.free(s);
-
-    // We got initial content when waiting for stream start, so had_content should be true
-    result.had_content = result.had_content or got_initial_content;
-
-    // Claude CLI should return a result message after interrupt
-    const summary = .{
-        .got_result = result.got_result,
-        .had_content = result.had_content,
-    };
-    try (ohsnap{}).snap(@src(),
-        \\core.claude_bridge.test.Claude Code SIGINT interrupt stops streaming__struct_<^\d+$>
-        \\  .got_result: bool = true
-        \\  .had_content: bool = true
-    ).expectEqual(summary);
+    // Verify process exited
+    try testing.expect(!bridge.isAlive());
 }
 
 test "Bridge restarts after SIGINT and processes new prompt" {
