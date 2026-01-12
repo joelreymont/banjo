@@ -175,10 +175,15 @@ local command_args = {
         { word = "auto_approve", abbr = "Approve all" },
         { word = "plan_only", abbr = "Plan only" },
     },
-    model = {
+    model_claude = {
         { word = "opus", abbr = "Opus (most capable)" },
         { word = "sonnet", abbr = "Sonnet (balanced)" },
         { word = "haiku", abbr = "Haiku (fastest)" },
+    },
+    model_codex = {
+        { word = "o3", abbr = "o3 (most capable)" },
+        { word = "o4-mini", abbr = "o4-mini (fast)" },
+        { word = "gpt-4.1", abbr = "GPT-4.1" },
     },
     agent = {
         { word = "claude", abbr = "Claude (Anthropic)" },
@@ -194,7 +199,7 @@ local function banjo_complete(findstart, base)
     if findstart == 1 then
         -- Check if we're completing an argument (after command + space)
         local cmd_match = line:match("^/(%w+)%s+")
-        if cmd_match and command_args[cmd_match] then
+        if cmd_match and (cmd_match == "model" or command_args[cmd_match]) then
             -- Find start of argument
             local space_pos = line:find("%s+[^%s]*$")
             if space_pos then
@@ -217,19 +222,29 @@ local function banjo_complete(findstart, base)
 
         -- Check if completing command arguments
         local cmd_match = line:match("^/(%w+)%s+")
-        if cmd_match and command_args[cmd_match] then
-            local matches = {}
-            local args = command_args[cmd_match]
-
-            for _, arg in ipairs(args) do
-                if base == "" or vim.startswith(arg.word, base) then
-                    table.insert(matches, {
-                        word = arg.word,
-                        abbr = arg.abbr,
-                    })
-                end
+        if cmd_match then
+            local args
+            if cmd_match == "model" then
+                -- Pick model list based on current engine
+                local state = get_state()
+                local engine = state.bridge and state.bridge.get_state and state.bridge.get_state().engine or "claude"
+                args = engine == "codex" and command_args.model_codex or command_args.model_claude
+            else
+                args = command_args[cmd_match]
             end
-            return matches
+
+            if args then
+                local matches = {}
+                for _, arg in ipairs(args) do
+                    if base == "" or vim.startswith(arg.word, base) then
+                        table.insert(matches, {
+                            word = arg.word,
+                            abbr = arg.abbr,
+                        })
+                    end
+                end
+                return matches
+            end
         end
 
         -- Return command matches
