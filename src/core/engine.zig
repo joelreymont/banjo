@@ -235,11 +235,12 @@ pub fn processClaudeMessages(
 
                     if (nudge_inputs.shouldNudge()) {
                         ctx.nudge.last_nudge_ms.* = now_ms;
-                        log.info("Claude Code stopped ({s}); pending dots, nudging", .{reason});
-                        try ctx.cb.sendUserMessage(ctx.session_id, "keep going");
-                        const nudge_prompt = "clean up dots, then pick a dot and work on it";
-                        // Queue continuation - handler will process it after we break
-                        _ = try ctx.cb.sendContinuePrompt(.claude, nudge_prompt);
+                        log.info("Claude Code stopped ({s}); pending dots, clearing and triggering", .{reason});
+                        // Clear context, then trigger dot skill
+                        const clear_cmd = dots.clearCmd(.claude);
+                        const trigger_cmd = dots.trigger(.claude);
+                        _ = try ctx.cb.sendContinuePrompt(.claude, clear_cmd);
+                        _ = try ctx.cb.sendContinuePrompt(.claude, trigger_cmd);
                         // Don't continue loop - Claude is done, break and let handler start new session
                     } else if (!nudge_inputs.cooldown_ok) {
                         log.info("Claude Code stopped ({s}); not nudging due to cooldown", .{reason});
@@ -574,11 +575,12 @@ pub fn processCodexMessages(
 
             if (nudge_inputs.shouldNudge()) {
                 ctx.nudge.last_nudge_ms.* = now_ms;
-                log.info("Codex turn completed; pending dots, nudging to continue", .{});
-                try ctx.cb.sendUserMessage(ctx.session_id, "keep going");
-                const nudge_prompt = "continue with the next dot task";
-                // Queue continuation - handler will process it after we break
-                _ = try ctx.cb.sendContinuePrompt(.codex, nudge_prompt);
+                log.info("Codex turn completed; pending dots, clearing and triggering", .{});
+                // Clear context, then trigger dot skill
+                const clear_cmd = dots.clearCmd(.codex);
+                const trigger_cmd = dots.trigger(.codex);
+                _ = try ctx.cb.sendContinuePrompt(.codex, clear_cmd);
+                _ = try ctx.cb.sendContinuePrompt(.codex, trigger_cmd);
                 // Don't continue loop - Codex is done, break and let handler start new session
             } else if (has_blocking_error) {
                 log.info("Codex turn completed; not nudging due to error", .{});
