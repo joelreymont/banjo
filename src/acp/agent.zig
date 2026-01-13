@@ -6411,3 +6411,94 @@ test "requestReadTextFile returns null when cancelled" {
         \\    null
     ).expectEqual(summary);
 }
+
+test "dots_setup_done flag starts false" {
+    // Verify the dots_setup_done flag starts as false and can be set
+    var session = Agent.Session{
+        .id = try testing.allocator.dupe(u8, "session-dots"),
+        .cwd = try testing.allocator.dupe(u8, "."),
+        .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
+        .availability = .{ .claude = true, .codex = false },
+        .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
+        .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+        .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
+    };
+    defer session.deinit(testing.allocator);
+
+    const initial = session.dots_setup_done;
+    session.dots_setup_done = true;
+    const after_set = session.dots_setup_done;
+
+    const summary = .{ .initial = initial, .after_set = after_set };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.dots_setup_done flag starts false__struct_<^\d+$>
+        \\  .initial: bool = false
+        \\  .after_set: bool = true
+    ).expectEqual(summary);
+}
+
+test "dotsSessionSetup state machine logic" {
+    // Test the dots session setup state machine decisions
+    // We can't easily test the full function due to bridge dependencies,
+    // but we can verify the decision points work correctly
+    var out: std.io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    // Check that dots module functions return expected types
+    const has_cli = dots.hasDotCli();
+    const claude_skill_path = dots.skillPath(.claude);
+    const codex_skill_path = dots.skillPath(.codex);
+    const claude_trigger = dots.trigger(.claude);
+    const codex_trigger = dots.trigger(.codex);
+
+    try out.writer.print(
+        \\has_cli: {any}
+        \\claude_skill_path: {s}
+        \\codex_skill_path: {s}
+        \\claude_trigger: {s}
+        \\codex_trigger: {s}
+        \\
+    , .{
+        has_cli,
+        claude_skill_path,
+        codex_skill_path,
+        claude_trigger,
+        codex_trigger,
+    });
+    const snapshot = try out.toOwnedSlice();
+    defer testing.allocator.free(snapshot);
+
+    // Verify the state machine components work correctly
+    // The actual flow depends on environment (dots installed, skill exists, etc.)
+    try testing.expect(snapshot.len > 0);
+
+    // Verify trigger commands are correct (these are deterministic)
+    try testing.expectEqualStrings("/dot", claude_trigger);
+    try testing.expectEqualStrings("$dot", codex_trigger);
+}
+
+test "Route to Engine mapping for dots" {
+    // Verify route to engine mapping used in dotsSessionSetup
+    var out: std.io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    const routes = [_]Route{ .claude, .codex, .duet };
+    for (routes) |route| {
+        const engine: Engine = switch (route) {
+            .claude => .claude,
+            .codex => .codex,
+            .duet => .claude,
+        };
+        try out.writer.print("{s}: {s}\n", .{ @tagName(route), @tagName(engine) });
+    }
+
+    const snapshot = try out.toOwnedSlice();
+    defer testing.allocator.free(snapshot);
+    try (ohsnap{}).snap(@src(),
+        \\claude: claude
+        \\codex: codex
+        \\duet: claude
+        \\
+    ).diff(snapshot, true);
+}

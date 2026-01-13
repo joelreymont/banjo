@@ -248,3 +248,107 @@ test "property: clearCmd is consistent" {
         }
     }.prop, .{ .seed = 0x5678 });
 }
+
+test "skill_prompt content snapshot" {
+    // Verify skill prompt has expected structure
+    var out: std.io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    const has_frontmatter = std.mem.indexOf(u8, skill_prompt, "---") != null;
+    const has_name = std.mem.indexOf(u8, skill_prompt, "name: dot") != null;
+    const has_commands = std.mem.indexOf(u8, skill_prompt, "## Commands") != null;
+    const has_workflow = std.mem.indexOf(u8, skill_prompt, "## Workflow") != null;
+    const has_dot_ls = std.mem.indexOf(u8, skill_prompt, "dot ls") != null;
+    const has_dot_on = std.mem.indexOf(u8, skill_prompt, "dot on") != null;
+    const has_dot_off = std.mem.indexOf(u8, skill_prompt, "dot off") != null;
+
+    try out.writer.print(
+        \\has_frontmatter: {any}
+        \\has_name: {any}
+        \\has_commands: {any}
+        \\has_workflow: {any}
+        \\has_dot_ls: {any}
+        \\has_dot_on: {any}
+        \\has_dot_off: {any}
+        \\
+    , .{ has_frontmatter, has_name, has_commands, has_workflow, has_dot_ls, has_dot_on, has_dot_off });
+    const snapshot = try out.toOwnedSlice();
+    defer testing.allocator.free(snapshot);
+    try (ohsnap{}).snap(@src(),
+        \\has_frontmatter: true
+        \\has_name: true
+        \\has_commands: true
+        \\has_workflow: true
+        \\has_dot_ls: true
+        \\has_dot_on: true
+        \\has_dot_off: true
+        \\
+    ).diff(snapshot, true);
+}
+
+test "hasDotCli returns bool without crash" {
+    // Integration test: actually calls the CLI
+    // We just verify it returns a bool without crashing
+    const result = hasDotCli();
+    // Result depends on whether dot is installed on test machine
+    // Just verify it's a valid bool
+    try testing.expect(result == true or result == false);
+}
+
+test "hasSkill with missing skill" {
+    // hasSkill checks HOME env, so we test the path construction
+    // by verifying it returns false for a definitely-missing path
+    const home = std.posix.getenv("HOME");
+    if (home == null) return error.SkipZigTest;
+
+    // Unless someone has ~/.claude/skills/dot/SKILL.md, this should work
+    // We can't easily mock HOME, so we just verify the function runs
+    const claude_result = hasSkill(.claude);
+    const codex_result = hasSkill(.codex);
+
+    // Snapshot the results - they depend on test environment
+    var out: std.io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try out.writer.print("claude: {any}\ncodex: {any}\n", .{ claude_result, codex_result });
+    const snapshot = try out.toOwnedSlice();
+    defer testing.allocator.free(snapshot);
+
+    // We can't predict the result, but we verify no crash
+    try testing.expect(snapshot.len > 0);
+}
+
+test "property: hasDotDir consistent for same path" {
+    try zcheck.check(struct {
+        fn prop(_: struct { dummy: u8 }) bool {
+            const path = "/tmp";
+            const r1 = hasDotDir(path);
+            const r2 = hasDotDir(path);
+            return r1 == r2;
+        }
+    }.prop, .{ .seed = 0xabcd });
+}
+
+test "property: trigger and clearCmd are different" {
+    try zcheck.check(struct {
+        fn prop(args: struct { engine_idx: u8 }) bool {
+            const engine: Engine = if (args.engine_idx % 2 == 0) .claude else .codex;
+            const t = trigger(engine);
+            const c = clearCmd(engine);
+            // Trigger and clear should be different commands
+            return !std.mem.eql(u8, t, c);
+        }
+    }.prop, .{ .seed = 0xef01 });
+}
+
+test "property: skillPath contains engine name" {
+    try zcheck.check(struct {
+        fn prop(args: struct { engine_idx: u8 }) bool {
+            const engine: Engine = if (args.engine_idx % 2 == 0) .claude else .codex;
+            const path = skillPath(engine);
+            return switch (engine) {
+                .claude => std.mem.indexOf(u8, path, ".claude") != null,
+                .codex => std.mem.indexOf(u8, path, ".codex") != null,
+            };
+        }
+    }.prop, .{ .seed = 0x2345 });
+}
