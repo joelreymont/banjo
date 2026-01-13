@@ -321,6 +321,15 @@ Deep code review for performance, DRY compliance, and anti-patterns.
 3. Present report to user
 ```
 
+### Invocation
+
+Skills can be invoked two ways:
+
+1. **Explicit**: Use `/skill-name` slash command or mention "use the skill-name skill"
+2. **Implicit**: Claude auto-applies when task matches skill description
+
+**Known issue**: Claude doesn't always invoke skills automatically. You may need to explicitly say "use your skill" or mention the skill name.
+
 ### Skill vs Agent
 
 | Aspect | Skill | Agent |

@@ -332,6 +332,7 @@ pub const Agent = struct {
         processing_queue: bool = false,
         prompt_queue: std.ArrayListUnmanaged(QueuedPrompt) = .empty,
         last_nudge_ms: i64 = 0,
+        dots_setup_done: bool = false,
 
         const QueuedPrompt = struct {
             request_id: jsonrpc.Request.Id,
@@ -1114,6 +1115,12 @@ pub const Agent = struct {
             stop_reason = try self.runDuetPrompt(session, session_id, text, route, codex_text, prompt_parts.codex_inputs);
         }
 
+        // Dots session setup - runs once after first prompt
+        if (!session.dots_setup_done) {
+            session.dots_setup_done = true;
+            self.dotsSessionSetup(session, session_id, route);
+        }
+
         try self.writer.writeTypedResponse(request.id, protocol.PromptResponse{ .stopReason = stop_reason });
         response_sent = true;
     }
@@ -1168,6 +1175,59 @@ pub const Agent = struct {
                     log.warn("Failed to write error response: {}", .{write_err});
                 };
             };
+        }
+    }
+
+    /// Dots session setup - checks and sends setup prompts if needed
+    fn dotsSessionSetup(self: *Agent, session: *Session, session_id: []const u8, route: Route) void {
+        // Skip if dot CLI not available
+        if (!dots.hasDotCli()) {
+            log.debug("Dots: CLI not available, skipping setup", .{});
+            return;
+        }
+
+        // Determine which engine to use
+        const engine: Engine = switch (route) {
+            .claude => .claude,
+            .codex => .codex,
+            .duet => .claude, // Default to Claude for duet mode
+        };
+
+        // Check if skill exists
+        if (!dots.hasSkill(engine)) {
+            log.info("Dots: skill missing, sending creation prompt", .{});
+            const prompt = std.fmt.allocPrint(self.allocator, "{s}", .{dots.skill_prompt}) catch return;
+            defer self.allocator.free(prompt);
+            self.sendDotsPrompt(session, session_id, engine, prompt);
+            return;
+        }
+
+        // Check if .dots directory exists
+        if (!dots.hasDotDir(session.cwd)) {
+            log.info("Dots: .dots missing, sending init prompt", .{});
+            self.sendDotsPrompt(session, session_id, engine, "Run `dot init` to set up task tracking.");
+            return;
+        }
+
+        // All good - send trigger
+        log.info("Dots: sending trigger", .{});
+        const trigger_cmd = dots.trigger(engine);
+        self.sendDotsPrompt(session, session_id, engine, trigger_cmd);
+    }
+
+    fn sendDotsPrompt(self: *Agent, session: *Session, session_id: []const u8, engine: Engine, prompt: []const u8) void {
+        switch (engine) {
+            .claude => {
+                _ = self.sendClaudePromptWithRestart(session, session_id, prompt) catch |err| {
+                    log.warn("Failed to send dots prompt to Claude: {}", .{err});
+                };
+            },
+            .codex => {
+                const inputs = [_]CodexUserInput{.{ .type = "text", .text = prompt }};
+                _ = self.sendCodexPromptWithRestart(session, session_id, inputs[0..]) catch |err| {
+                    log.warn("Failed to send dots prompt to Codex: {}", .{err});
+                };
+            },
         }
     }
 

@@ -28,6 +28,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     main_mod.addOptions("config", options);
+    main_mod.addAnonymousImport("dot-skill", .{ .root_source_file = b.path("assets/dot-skill.md") });
     if (b.lazyDependency("zcheck", .{
         .target = target,
         .optimize = optimize,
@@ -65,6 +66,7 @@ pub fn build(b: *std.Build) void {
         .sanitize_c = sanitize,
     });
     test_mod.addOptions("config", options);
+    test_mod.addAnonymousImport("dot-skill", .{ .root_source_file = b.path("assets/dot-skill.md") });
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
@@ -103,6 +105,7 @@ pub fn build(b: *std.Build) void {
         .sanitize_c = sanitize,
     });
     live_test_mod.addOptions("config", live_options);
+    live_test_mod.addAnonymousImport("dot-skill", .{ .root_source_file = b.path("assets/dot-skill.md") });
 
     const live_tests = b.addTest(.{
         .root_module = live_test_mod,
