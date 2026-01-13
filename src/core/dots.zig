@@ -146,6 +146,149 @@ pub fn outputHasPendingTasks(allocator: Allocator, output: []const u8) !bool {
     return parsed.value.len > 0;
 }
 
+/// Result of cleanup operation
+pub const CleanupResult = struct {
+    cleaned: bool,
+    error_msg: ?[]const u8 = null,
+};
+
+/// Clean up dots hooks from Claude Code settings.
+/// Returns true if any hooks were removed, false otherwise.
+pub fn cleanupClaudeHooks(allocator: Allocator) CleanupResult {
+    const home = std.posix.getenv("HOME") orelse return .{ .cleaned = false, .error_msg = "HOME not set" };
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const settings_path = std.fmt.bufPrint(&path_buf, "{s}/.claude/settings.json", .{home}) catch {
+        return .{ .cleaned = false, .error_msg = "path too long" };
+    };
+
+    // Read settings file
+    const file = std.fs.cwd().openFile(settings_path, .{}) catch |err| {
+        log.debug("Could not open Claude settings: {}", .{err});
+        return .{ .cleaned = false, .error_msg = "settings file not found" };
+    };
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
+        log.warn("Could not read Claude settings: {}", .{err});
+        return .{ .cleaned = false, .error_msg = "failed to read settings" };
+    };
+    defer allocator.free(content);
+
+    // Parse JSON
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch |err| {
+        log.warn("Could not parse Claude settings: {}", .{err});
+        return .{ .cleaned = false, .error_msg = "invalid JSON" };
+    };
+    defer parsed.deinit();
+
+    // Check for hooks object
+    const hooks = parsed.value.object.getPtr("hooks") orelse {
+        return .{ .cleaned = false }; // No hooks, nothing to clean
+    };
+    if (hooks.* != .object) return .{ .cleaned = false };
+
+    var modified = false;
+
+    // Clean SessionStart hooks
+    if (hooks.object.getPtr("SessionStart")) |session_start| {
+        if (filterDotsHooks(allocator, session_start)) {
+            modified = true;
+        }
+    }
+
+    // Clean PostToolUse hooks
+    if (hooks.object.getPtr("PostToolUse")) |post_tool| {
+        if (filterDotsHooks(allocator, post_tool)) {
+            modified = true;
+        }
+    }
+
+    if (!modified) return .{ .cleaned = false };
+
+    // Write back
+    var out_writer: std.io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    std.json.Stringify.value(parsed.value, .{ .whitespace = .indent_2 }, &out_writer.writer) catch |err| {
+        log.warn("Could not serialize settings: {}", .{err});
+        return .{ .cleaned = false, .error_msg = "failed to serialize" };
+    };
+    const out_buf = out_writer.toOwnedSlice() catch |err| {
+        log.warn("Could not finalize settings buffer: {}", .{err});
+        return .{ .cleaned = false, .error_msg = "failed to serialize" };
+    };
+    defer allocator.free(out_buf);
+
+    const out_file = std.fs.cwd().createFile(settings_path, .{}) catch |err| {
+        log.warn("Could not write Claude settings: {}", .{err});
+        return .{ .cleaned = false, .error_msg = "failed to write settings" };
+    };
+    defer out_file.close();
+
+    out_file.writeAll(out_buf) catch |err| {
+        log.warn("Could not write Claude settings: {}", .{err});
+        return .{ .cleaned = false, .error_msg = "write failed" };
+    };
+
+    log.info("Cleaned up dots hooks from Claude settings", .{});
+    return .{ .cleaned = true };
+}
+
+/// Filter out hooks containing "dot hook" from a hooks array.
+/// Returns true if any were removed.
+fn filterDotsHooks(allocator: Allocator, hooks_value: *std.json.Value) bool {
+    if (hooks_value.* != .array) return false;
+
+    var removed = false;
+    var i: usize = 0;
+    while (i < hooks_value.array.items.len) {
+        const item = hooks_value.array.items[i];
+        if (isDotHook(item)) {
+            _ = hooks_value.array.orderedRemove(i);
+            removed = true;
+        } else {
+            i += 1;
+        }
+    }
+
+    // If array is now empty, we could remove the key, but leaving empty array is fine
+    _ = allocator; // unused for now
+    return removed;
+}
+
+/// Check if a hook entry contains "dot hook" command
+fn isDotHook(value: std.json.Value) bool {
+    if (value != .object) return false;
+
+    // Check direct hooks array
+    if (value.object.get("hooks")) |hooks| {
+        if (hooks == .array) {
+            for (hooks.array.items) |hook| {
+                if (hook == .object) {
+                    if (hook.object.get("command")) |cmd| {
+                        if (cmd == .string) {
+                            if (std.mem.indexOf(u8, cmd.string, "dot hook") != null) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Check command directly (for simpler hook format)
+    if (value.object.get("command")) |cmd| {
+        if (cmd == .string) {
+            if (std.mem.indexOf(u8, cmd.string, "dot hook") != null) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 const testing = std.testing;
 const ohsnap = @import("ohsnap");
 
@@ -351,4 +494,256 @@ test "property: skillPath contains engine name" {
             };
         }
     }.prop, .{ .seed = 0x2345 });
+}
+
+const config = @import("config");
+
+test "live: hasDotCli detects installed CLI" {
+    if (!config.live_cli_tests) return error.SkipZigTest;
+
+    // This test verifies hasDotCli works with the real system
+    const result = hasDotCli();
+
+    var out: std.io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try out.writer.print("dot_cli_available: {any}\n", .{result});
+    const snapshot = try out.toOwnedSlice();
+    defer testing.allocator.free(snapshot);
+
+    // On a system with dot installed, this should be true
+    // We snapshot the actual result to track regressions
+    try (ohsnap{}).snap(@src(),
+        \\dot_cli_available: true
+        \\
+    ).diff(snapshot, true);
+}
+
+test "live: hasSkill checks real filesystem" {
+    if (!config.live_cli_tests) return error.SkipZigTest;
+
+    const claude_has = hasSkill(.claude);
+    const codex_has = hasSkill(.codex);
+
+    var out: std.io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try out.writer.print("claude_skill: {any}\ncodex_skill: {any}\n", .{ claude_has, codex_has });
+    const snapshot = try out.toOwnedSlice();
+    defer testing.allocator.free(snapshot);
+
+    // Snapshot actual state - may vary by environment
+    // Just verify it runs without error
+    try testing.expect(snapshot.len > 0);
+}
+
+test "live: hasDotDir checks real cwd" {
+    if (!config.live_cli_tests) return error.SkipZigTest;
+
+    // Check the actual banjo repo directory
+    const has_dots = hasDotDir(".");
+
+    var out: std.io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try out.writer.print("cwd_has_dots: {any}\n", .{has_dots});
+    const snapshot = try out.toOwnedSlice();
+    defer testing.allocator.free(snapshot);
+
+    // Banjo repo should have .dots directory
+    try (ohsnap{}).snap(@src(),
+        \\cwd_has_dots: true
+        \\
+    ).diff(snapshot, true);
+}
+
+test "live: hasPendingTasks with real dot CLI" {
+    if (!config.live_cli_tests) return error.SkipZigTest;
+    if (!hasDotCli()) return error.SkipZigTest;
+
+    // Run against the actual cwd
+    const result = hasPendingTasks(testing.allocator, ".");
+
+    var out: std.io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    // We can't predict if there are pending tasks, but we can verify no error
+    try out.writer.print("has_error: {any}\n", .{result.error_msg != null});
+    const snapshot = try out.toOwnedSlice();
+    defer testing.allocator.free(snapshot);
+
+    try (ohsnap{}).snap(@src(),
+        \\has_error: false
+        \\
+    ).diff(snapshot, true);
+}
+
+test "isDotHook detects dot hook commands" {
+    // Test nested hooks format (SessionStart style)
+    const nested_hook = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\{"hooks": [{"type": "command", "command": "dot hook session"}]}
+    , .{});
+    defer nested_hook.deinit();
+    try testing.expect(isDotHook(nested_hook.value));
+
+    // Test direct command format
+    const direct_hook = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\{"type": "command", "command": "dot hook sync"}
+    , .{});
+    defer direct_hook.deinit();
+    try testing.expect(isDotHook(direct_hook.value));
+
+    // Test non-dot hook
+    const other_hook = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\{"hooks": [{"type": "command", "command": "echo hello"}]}
+    , .{});
+    defer other_hook.deinit();
+    try testing.expect(!isDotHook(other_hook.value));
+
+    // Test empty object
+    const empty = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{}", .{});
+    defer empty.deinit();
+    try testing.expect(!isDotHook(empty.value));
+}
+
+test "filterDotsHooks removes dot hooks from array" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\[
+        \\  {"hooks": [{"type": "command", "command": "echo agents"}]},
+        \\  {"hooks": [{"type": "command", "command": "dot hook session"}]},
+        \\  {"hooks": [{"type": "command", "command": "echo other"}]}
+        \\]
+    , .{});
+    defer parsed.deinit();
+
+    const removed = filterDotsHooks(testing.allocator, &parsed.value);
+    try testing.expect(removed);
+    try testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+}
+
+test "filterDotsHooks returns false when no dot hooks" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\[
+        \\  {"hooks": [{"type": "command", "command": "echo agents"}]},
+        \\  {"hooks": [{"type": "command", "command": "echo other"}]}
+        \\]
+    , .{});
+    defer parsed.deinit();
+
+    const removed = filterDotsHooks(testing.allocator, &parsed.value);
+    try testing.expect(!removed);
+    try testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+}
+
+test "cleanupClaudeHooks with temp settings file" {
+    // Create a temp directory to simulate HOME
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Create .claude directory
+    try tmp.dir.makeDir(".claude");
+
+    // Write a settings file with dot hooks
+    const settings_content =
+        \\{
+        \\  "model": "opus",
+        \\  "hooks": {
+        \\    "SessionStart": [
+        \\      {"hooks": [{"type": "command", "command": "echo agents"}]},
+        \\      {"hooks": [{"type": "command", "command": "dot hook session"}]}
+        \\    ],
+        \\    "PostToolUse": [
+        \\      {"matcher": "TodoWrite", "hooks": [{"type": "command", "command": "dot hook sync"}]}
+        \\    ]
+        \\  }
+        \\}
+    ;
+
+    var claude_dir = try tmp.dir.openDir(".claude", .{});
+    defer claude_dir.close();
+    const settings_file = try claude_dir.createFile("settings.json", .{});
+    defer settings_file.close();
+    try settings_file.writeAll(settings_content);
+
+    // Get the temp path and set HOME
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try tmp.dir.realpath(".", &path_buf);
+
+    const test_env = @import("../util/test_env.zig");
+    var guard = try test_env.EnvVarGuard.set(testing.allocator, "HOME", tmp_path);
+    defer guard.deinit();
+
+    // Run cleanup
+    const result = cleanupClaudeHooks(testing.allocator);
+
+    var out: std.io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try out.writer.print("cleaned: {any}\nerror: {?s}\n", .{ result.cleaned, result.error_msg });
+    const snapshot = try out.toOwnedSlice();
+    defer testing.allocator.free(snapshot);
+
+    try (ohsnap{}).snap(@src(),
+        \\cleaned: true
+        \\error: null
+        \\
+    ).diff(snapshot, true);
+
+    // Verify the file was modified correctly
+    const modified = try claude_dir.openFile("settings.json", .{});
+    defer modified.close();
+    const new_content = try modified.readToEndAlloc(testing.allocator, 1024 * 1024);
+    defer testing.allocator.free(new_content);
+
+    // Should not contain "dot hook"
+    try testing.expect(std.mem.indexOf(u8, new_content, "dot hook") == null);
+    // Should still contain echo agents
+    try testing.expect(std.mem.indexOf(u8, new_content, "echo agents") != null);
+}
+
+test "cleanupClaudeHooks returns false when no hooks to clean" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir(".claude");
+
+    const settings_content =
+        \\{
+        \\  "model": "opus",
+        \\  "hooks": {
+        \\    "SessionStart": [
+        \\      {"hooks": [{"type": "command", "command": "echo agents"}]}
+        \\    ]
+        \\  }
+        \\}
+    ;
+
+    var claude_dir = try tmp.dir.openDir(".claude", .{});
+    defer claude_dir.close();
+    const settings_file = try claude_dir.createFile("settings.json", .{});
+    defer settings_file.close();
+    try settings_file.writeAll(settings_content);
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try tmp.dir.realpath(".", &path_buf);
+
+    const test_env = @import("../util/test_env.zig");
+    var guard = try test_env.EnvVarGuard.set(testing.allocator, "HOME", tmp_path);
+    defer guard.deinit();
+
+    const result = cleanupClaudeHooks(testing.allocator);
+    try testing.expect(!result.cleaned);
+    try testing.expect(result.error_msg == null);
+}
+
+test "cleanupClaudeHooks handles missing settings file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try tmp.dir.realpath(".", &path_buf);
+
+    const test_env = @import("../util/test_env.zig");
+    var guard = try test_env.EnvVarGuard.set(testing.allocator, "HOME", tmp_path);
+    defer guard.deinit();
+
+    const result = cleanupClaudeHooks(testing.allocator);
+    try testing.expect(!result.cleaned);
+    try testing.expect(result.error_msg != null);
 }

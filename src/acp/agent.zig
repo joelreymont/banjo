@@ -1180,6 +1180,12 @@ pub const Agent = struct {
 
     /// Dots session setup - checks and sends setup prompts if needed
     fn dotsSessionSetup(self: *Agent, session: *Session, session_id: []const u8, route: Route) void {
+        // Clean up dots hooks from Claude settings (banjo now handles this)
+        const cleanup_result = dots.cleanupClaudeHooks(self.allocator);
+        if (cleanup_result.cleaned) {
+            log.info("Dots: cleaned up dots hooks from Claude settings", .{});
+        }
+
         // Skip if dot CLI not available
         if (!dots.hasDotCli()) {
             log.debug("Dots: CLI not available, skipping setup", .{});
@@ -1218,11 +1224,13 @@ pub const Agent = struct {
     fn sendDotsPrompt(self: *Agent, session: *Session, session_id: []const u8, engine: Engine, prompt: []const u8) void {
         switch (engine) {
             .claude => {
+                if (!session.availability.claude) return;
                 _ = self.sendClaudePromptWithRestart(session, session_id, prompt) catch |err| {
                     log.warn("Failed to send dots prompt to Claude: {}", .{err});
                 };
             },
             .codex => {
+                if (!session.availability.codex) return;
                 const inputs = [_]CodexUserInput{.{ .type = "text", .text = prompt }};
                 _ = self.sendCodexPromptWithRestart(session, session_id, inputs[0..]) catch |err| {
                     log.warn("Failed to send dots prompt to Codex: {}", .{err});
@@ -6501,4 +6509,130 @@ test "Route to Engine mapping for dots" {
         \\duet: claude
         \\
     ).diff(snapshot, true);
+}
+
+test "live: dots session setup with Claude" {
+    if (!config.live_cli_tests) return error.SkipZigTest;
+    if (!Bridge.isAvailable()) return error.SkipZigTest;
+    if (!dots.hasDotCli()) return error.SkipZigTest;
+
+    // This test verifies the dots session setup flow works end-to-end
+    var guard_session = try EnvVarGuard.set(testing.allocator, "BANJO_TEST_SESSION_ID", "session-dots-live");
+    defer guard_session.deinit();
+
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
+    defer agent.deinit();
+
+    // Create session using JSON Value directly
+    var session_params = std.json.Value{ .object = std.json.ObjectMap.init(testing.allocator) };
+    defer session_params.object.deinit();
+    try session_params.object.put("cwd", .{ .string = "." });
+
+    const new_session_req = jsonrpc.Request{
+        .method = "session/new",
+        .id = .{ .number = 1 },
+        .params = session_params,
+    };
+    try agent.handleRequest(new_session_req);
+
+    // Verify session was created
+    const session = agent.sessions.get("session-dots-live");
+    try testing.expect(session != null);
+
+    // Verify dots_setup_done starts false
+    try testing.expect(!session.?.dots_setup_done);
+
+    // Build prompt params
+    var prompt_arr = std.json.Value{ .array = std.json.Array.init(testing.allocator) };
+    defer prompt_arr.array.deinit();
+    var text_obj = std.json.Value{ .object = std.json.ObjectMap.init(testing.allocator) };
+    defer text_obj.object.deinit();
+    try text_obj.object.put("type", .{ .string = "text" });
+    try text_obj.object.put("text", .{ .string = "Reply with DOTS_TEST_OK" });
+    try prompt_arr.array.append(text_obj);
+
+    var prompt_params = std.json.Value{ .object = std.json.ObjectMap.init(testing.allocator) };
+    defer prompt_params.object.deinit();
+    try prompt_params.object.put("sessionId", .{ .string = "session-dots-live" });
+    try prompt_params.object.put("prompt", prompt_arr);
+
+    const prompt_req = jsonrpc.Request{
+        .method = "session/prompt",
+        .id = .{ .number = 2 },
+        .params = prompt_params,
+    };
+    try agent.handleRequest(prompt_req);
+
+    // After prompt, dots_setup_done should be true
+    try testing.expect(session.?.dots_setup_done);
+
+    // Verify output contains some response
+    const output = tw.getOutput();
+    try testing.expect(output.len > 0);
+}
+
+test "sendDotsPrompt handles missing bridge gracefully" {
+    // Test that sendDotsPrompt doesn't crash when bridge is null
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
+    defer agent.deinit();
+
+    // Create a session without a bridge
+    var session = Agent.Session{
+        .id = try testing.allocator.dupe(u8, "session-no-bridge"),
+        .cwd = try testing.allocator.dupe(u8, "."),
+        .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
+        .availability = .{ .claude = false, .codex = false }, // No engines available
+        .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
+        .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+        .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
+        .bridge = null, // No bridge
+        .codex_bridge = null, // No codex bridge
+    };
+    defer session.deinit(testing.allocator);
+
+    // This should not crash - errors are caught and logged
+    agent.sendDotsPrompt(&session, session.id, .claude, "/dot");
+    agent.sendDotsPrompt(&session, session.id, .codex, "$dot");
+
+    // Verify no crash - test passes if we get here
+    try testing.expect(true);
+}
+
+test "dotsSessionSetup skips when no dot CLI" {
+    var tw = try TestWriter.init(testing.allocator);
+    defer tw.deinit();
+
+    var agent = Agent.init(testing.allocator, tw.writer.stream, null);
+    defer agent.deinit();
+
+    // Mock environment without dot CLI by setting PATH to empty
+    var guard_path = try EnvVarGuard.set(testing.allocator, "PATH", "");
+    defer guard_path.deinit();
+
+    var session = Agent.Session{
+        .id = try testing.allocator.dupe(u8, "session-no-dot"),
+        .cwd = try testing.allocator.dupe(u8, "."),
+        .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
+        .availability = .{ .claude = true, .codex = false },
+        .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
+        .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
+        .always_allowed_tools = std.StringHashMap(void).init(testing.allocator),
+        .quiet_tool_ids = std.StringHashMap(void).init(testing.allocator),
+    };
+    defer session.deinit(testing.allocator);
+
+    // This should skip (no crash, no prompts sent)
+    agent.dotsSessionSetup(&session, session.id, .claude);
+
+    // Verify no output was sent (dots was skipped)
+    const output = tw.getOutput();
+    // Output should be empty or minimal since dots was skipped
+    try testing.expect(output.len == 0 or std.mem.indexOf(u8, output, "/dot") == null);
 }
