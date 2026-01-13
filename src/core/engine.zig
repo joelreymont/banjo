@@ -1130,3 +1130,155 @@ test "integration: processClaudeMessages nudge requires tool use" {
         try testing.expect(!tracker.nudge_called);
     }
 }
+
+test "NudgeInputs shouldNudge logic" {
+    // Test all combinations of NudgeInputs to verify shouldNudge behavior
+    var out: std.io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    // All true - should nudge
+    const all_true = NudgeInputs{
+        .enabled = true,
+        .cancelled = false,
+        .cooldown_ok = true,
+        .has_dots = true,
+        .reason_ok = true,
+        .did_work = true,
+    };
+
+    // Disabled - should not nudge
+    const disabled = NudgeInputs{
+        .enabled = false,
+        .cancelled = false,
+        .cooldown_ok = true,
+        .has_dots = true,
+        .reason_ok = true,
+        .did_work = true,
+    };
+
+    // Cancelled - should not nudge
+    const cancelled = NudgeInputs{
+        .enabled = true,
+        .cancelled = true,
+        .cooldown_ok = true,
+        .has_dots = true,
+        .reason_ok = true,
+        .did_work = true,
+    };
+
+    // No dots - should not nudge
+    const no_dots = NudgeInputs{
+        .enabled = true,
+        .cancelled = false,
+        .cooldown_ok = true,
+        .has_dots = false,
+        .reason_ok = true,
+        .did_work = true,
+    };
+
+    // No work done - should not nudge
+    const no_work = NudgeInputs{
+        .enabled = true,
+        .cancelled = false,
+        .cooldown_ok = true,
+        .has_dots = true,
+        .reason_ok = true,
+        .did_work = false,
+    };
+
+    // Cooldown not ok - should not nudge
+    const cooldown = NudgeInputs{
+        .enabled = true,
+        .cancelled = false,
+        .cooldown_ok = false,
+        .has_dots = true,
+        .reason_ok = true,
+        .did_work = true,
+    };
+
+    try out.writer.print(
+        \\all_true: {any}
+        \\disabled: {any}
+        \\cancelled: {any}
+        \\no_dots: {any}
+        \\no_work: {any}
+        \\cooldown: {any}
+        \\
+    , .{
+        all_true.shouldNudge(),
+        disabled.shouldNudge(),
+        cancelled.shouldNudge(),
+        no_dots.shouldNudge(),
+        no_work.shouldNudge(),
+        cooldown.shouldNudge(),
+    });
+    const snapshot = try out.toOwnedSlice();
+    defer testing.allocator.free(snapshot);
+    try (ohsnap{}).snap(@src(),
+        \\all_true: true
+        \\disabled: false
+        \\cancelled: false
+        \\no_dots: false
+        \\no_work: false
+        \\cooldown: false
+        \\
+    ).diff(snapshot, true);
+}
+
+test "dots trigger and clear commands snapshot" {
+    // Verify the trigger and clear commands used in nudge
+    var out: std.io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    try out.writer.print(
+        \\claude_trigger: {s}
+        \\claude_clear: {s}
+        \\codex_trigger: {s}
+        \\codex_clear: {s}
+        \\
+    , .{
+        dots.trigger(.claude),
+        dots.clearCmd(.claude),
+        dots.trigger(.codex),
+        dots.clearCmd(.codex),
+    });
+    const snapshot = try out.toOwnedSlice();
+    defer testing.allocator.free(snapshot);
+    try (ohsnap{}).snap(@src(),
+        \\claude_trigger: /dot
+        \\claude_clear: /clear
+        \\codex_trigger: $dot
+        \\codex_clear: /new
+        \\
+    ).diff(snapshot, true);
+}
+
+test "isNudgeableStopReason categorizes stop reasons" {
+    var out: std.io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    try out.writer.print(
+        \\success: {any}
+        \\end_turn: {any}
+        \\error_max_turns: {any}
+        \\cancelled: {any}
+        \\unknown: {any}
+        \\
+    , .{
+        isNudgeableStopReason("success"),
+        isNudgeableStopReason("end_turn"),
+        isNudgeableStopReason("error_max_turns"),
+        isNudgeableStopReason("cancelled"),
+        isNudgeableStopReason("unknown"),
+    });
+    const snapshot = try out.toOwnedSlice();
+    defer testing.allocator.free(snapshot);
+    try (ohsnap{}).snap(@src(),
+        \\success: true
+        \\end_turn: true
+        \\error_max_turns: true
+        \\cancelled: false
+        \\unknown: false
+        \\
+    ).diff(snapshot, true);
+}
