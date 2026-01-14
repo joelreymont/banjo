@@ -20,6 +20,7 @@ const callbacks_mod = @import("../core/callbacks.zig");
 const EditorCallbacks = callbacks_mod.EditorCallbacks;
 const CallbackToolKind = callbacks_mod.ToolKind;
 const CallbackToolStatus = callbacks_mod.ToolStatus;
+const comments = @import("../notes/comments.zig");
 const notes_commands = @import("../notes/commands.zig");
 const permission_socket = @import("../core/permission_socket.zig");
 const constants = @import("../core/constants.zig");
@@ -3990,9 +3991,44 @@ pub const Agent = struct {
         };
     }
 
+    const ResPath = struct {
+        uri_info: FileUri,
+        real_path: []const u8,
+
+        fn deinit(self: *const ResPath, allocator: Allocator) void {
+            self.uri_info.deinit(allocator);
+            allocator.free(self.real_path);
+        }
+    };
+
+    fn resolveResourcePath(self: *Agent, session: *Session, resource: ResourceData) !ResPath {
+        const uri_info = try parseFileUri(self.allocator, resource.uri) orelse return error.InvalidUri;
+        errdefer uri_info.deinit(self.allocator);
+
+        const real_path = std.fs.cwd().realpathAlloc(self.allocator, uri_info.path) catch return error.InvalidPath;
+        errdefer self.allocator.free(real_path);
+
+        const real_cwd = std.fs.cwd().realpathAlloc(self.allocator, session.cwd) catch blk: {
+            const duped = self.allocator.dupe(u8, session.cwd) catch return error.InvalidPath;
+            break :blk duped;
+        };
+        defer self.allocator.free(real_cwd);
+
+        const in_project = std.mem.startsWith(u8, real_path, real_cwd) and
+            (real_path.len == real_cwd.len or real_path[real_cwd.len] == '/');
+        if (!in_project) {
+            log.warn("Path traversal attempt: {s} not in {s}", .{ real_path, real_cwd });
+            return error.PathOutsideProject;
+        }
+
+        return .{
+            .uri_info = uri_info,
+            .real_path = real_path,
+        };
+    }
+
     /// Handle /explain command: get summary from Claude and insert as note comment
     fn handleExplainCommand(self: *Agent, request: jsonrpc.Request, session: *Session, session_id: []const u8, resource: ResourceData) !void {
-        const comments = @import("../notes/comments.zig");
 
         // Initialize plan
         var plan_entries = [_]protocol.SessionUpdate.PlanEntry{
@@ -4002,35 +4038,16 @@ pub const Agent = struct {
         };
         try self.sendPlan(session_id, &plan_entries);
 
-        // Parse URI
-        const uri_info = parseFileUri(self.allocator, resource.uri) catch |err| switch (err) {
+        const res = self.resolveResourcePath(session, resource) catch |err| switch (err) {
             error.InvalidUri, error.InvalidLine => return self.sendErrorAndEnd(request, session_id, "Invalid file URI"),
+            error.InvalidPath => return self.sendErrorAndEnd(request, session_id, "Invalid file path"),
+            error.PathOutsideProject => return self.sendErrorAndEnd(request, session_id, "File must be within project directory"),
             else => return err,
-        } orelse {
-            return self.sendErrorAndEnd(request, session_id, "Invalid file URI");
         };
-        defer uri_info.deinit(self.allocator);
+        defer res.deinit(self.allocator);
 
-        // Security: validate path is within project directory (resolve symlinks)
-        const real_path = std.fs.cwd().realpathAlloc(self.allocator, uri_info.path) catch {
-            return self.sendErrorAndEnd(request, session_id, "Invalid file path");
-        };
-        defer self.allocator.free(real_path);
-
-        const real_cwd = std.fs.cwd().realpathAlloc(self.allocator, session.cwd) catch blk: {
-            const duped = self.allocator.dupe(u8, session.cwd) catch {
-                return self.sendErrorAndEnd(request, session_id, "Invalid project path");
-            };
-            break :blk duped;
-        };
-        defer self.allocator.free(real_cwd);
-
-        const in_project = std.mem.startsWith(u8, real_path, real_cwd) and
-            (real_path.len == real_cwd.len or real_path[real_cwd.len] == '/');
-        if (!in_project) {
-            log.warn("Path traversal attempt: {s} not in {s}", .{ real_path, real_cwd });
-            return self.sendErrorAndEnd(request, session_id, "File must be within project directory");
-        }
+        const uri_info = res.uri_info;
+        const real_path = res.real_path;
 
         // Get code content from resource
         const code = resource.text;
