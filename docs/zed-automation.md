@@ -89,6 +89,8 @@ Zed auto-discovers LSP servers. For the optional Banjo LSP:
 ### Global config (`~/.config/zed/settings.json`)
 Same structure, applies to all projects.
 
+Banjo's `/setup` only writes project-level `.zed/settings.json`. It never modifies global Zed settings.
+
 ## Accessibility API Limitations
 
 Zed uses GPUI (Rust), not AppKit/Electron. Accessibility support is limited:
