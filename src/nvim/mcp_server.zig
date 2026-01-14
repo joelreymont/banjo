@@ -508,7 +508,7 @@ pub const McpServer = struct {
 
         // Try to parse complete frames
         while (self.mcp_read_buffer.len() >= 2) {
-            const buf = self.mcp_read_buffer.slice();
+            const buf = self.mcp_read_buffer.sliceMut();
             const result = websocket.parseFrame(buf) catch |err| switch (err) {
                 error.NeedMoreData => break,
                 error.ReservedOpcode => {
@@ -570,7 +570,7 @@ pub const McpServer = struct {
 
         // Try to parse complete frames
         while (self.nvim_read_buffer.len() >= 2) {
-            const buf = self.nvim_read_buffer.slice();
+            const buf = self.nvim_read_buffer.sliceMut();
             const result = websocket.parseFrame(buf) catch |err| switch (err) {
                 error.NeedMoreData => break,
                 error.ReservedOpcode => {

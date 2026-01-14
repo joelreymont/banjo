@@ -27,6 +27,13 @@ pub const ByteQueue = struct {
         return self.buf.items[self.pos..];
     }
 
+    pub fn sliceMut(self: *ByteQueue) []u8 {
+        if (self.pos >= self.buf.items.len) {
+            return self.buf.items[self.buf.items.len..];
+        }
+        return self.buf.items[self.pos..];
+    }
+
     pub fn append(self: *ByteQueue, allocator: Allocator, data: []const u8) !void {
         if (data.len == 0) return;
         if (self.pos > 0) {
@@ -70,6 +77,9 @@ test "ByteQueue append and consume preserve order" {
     try q.append(testing.allocator, "hello");
     try testing.expectEqual(@as(usize, 5), q.len());
     try testing.expect(std.mem.eql(u8, q.slice(), "hello"));
+    const mut = q.sliceMut();
+    mut[0] = 'H';
+    try testing.expect(std.mem.eql(u8, q.slice(), "Hello"));
 
     q.consume(2);
     try testing.expectEqual(@as(usize, 3), q.len());
