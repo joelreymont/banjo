@@ -5,7 +5,18 @@ on:
     tags: ['v*']
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check extension release metadata
+        run: scripts/check-extension-release.sh
+
   build:
+    needs: verify
     strategy:
       matrix:
         include:
