@@ -248,7 +248,7 @@ end
 ---@param fin boolean|nil Final fragment flag (default: true)
 ---@return string frame_data The encoded frame data
 function M.create_text_frame(text, fin)
-  return M.create_frame(M.OPCODE.TEXT, text, fin, false)
+  return M.create_frame(M.OPCODE.TEXT, text, fin, true)
 end
 
 ---Create a binary frame
@@ -256,7 +256,7 @@ end
 ---@param fin boolean|nil Final fragment flag (default: true)
 ---@return string frame_data The encoded frame data
 function M.create_binary_frame(data, fin)
-  return M.create_frame(M.OPCODE.BINARY, data, fin, false)
+  return M.create_frame(M.OPCODE.BINARY, data, fin, true)
 end
 
 ---Create a close frame
@@ -268,7 +268,7 @@ function M.create_close_frame(code, reason)
   reason = reason or ""
 
   local payload = utils.uint16_to_bytes(code) .. reason
-  return M.create_frame(M.OPCODE.CLOSE, payload, true, false)
+  return M.create_frame(M.OPCODE.CLOSE, payload, true, true)
 end
 
 ---Create a ping frame
@@ -276,7 +276,7 @@ end
 ---@return string frame_data The encoded frame data
 function M.create_ping_frame(data)
   data = data or ""
-  return M.create_frame(M.OPCODE.PING, data, true, false)
+  return M.create_frame(M.OPCODE.PING, data, true, true)
 end
 
 ---Create a pong frame
@@ -284,7 +284,7 @@ end
 ---@return string frame_data The encoded frame data
 function M.create_pong_frame(data)
   data = data or ""
-  return M.create_frame(M.OPCODE.PONG, data, true, false)
+  return M.create_frame(M.OPCODE.PONG, data, true, true)
 end
 
 ---Check if an opcode is a control frame

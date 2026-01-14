@@ -153,16 +153,11 @@ pub fn parseFrame(data: []u8) !ParseResult {
     if (payload_len > MAX_FRAME_SIZE) return error.FrameTooLarge;
 
     // Masking key (RFC 6455: clients MUST mask frames to server)
+    if (!masked) return error.UnmaskedFrame;
     var mask: [4]u8 = undefined;
-    if (masked) {
-        if (data.len < offset + 4) return error.NeedMoreData;
-        @memcpy(&mask, data[offset..][0..4]);
-        offset += 4;
-    } else {
-        // Per RFC 6455, unmasked client frames are a protocol error
-        // For compatibility with local development clients, log a warning instead of failing
-        log.warn("Received unmasked WebSocket frame (RFC 6455 violation)", .{});
-    }
+    if (data.len < offset + 4) return error.NeedMoreData;
+    @memcpy(&mask, data[offset..][0..4]);
+    offset += 4;
 
     // Payload
     const payload_len_usize: usize = @intCast(payload_len);
@@ -362,6 +357,30 @@ fn writeAll(fd: std.posix.socket_t, buf: []const u8) !void {
 const testing = std.testing;
 const ohsnap = @import("ohsnap");
 
+fn makeMaskedFrame(allocator: Allocator, opcode: u8, payload: []const u8, mask: [4]u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.append(allocator, 0x80 | opcode);
+    if (payload.len < 126) {
+        try buf.append(allocator, 0x80 | @as(u8, @intCast(payload.len)));
+    } else if (payload.len < 65536) {
+        try buf.append(allocator, 0x80 | 126);
+        const len_bytes = std.mem.toBytes(std.mem.nativeToBig(u16, @intCast(payload.len)));
+        try buf.appendSlice(allocator, &len_bytes);
+    } else {
+        try buf.append(allocator, 0x80 | 127);
+        const len_bytes = std.mem.toBytes(std.mem.nativeToBig(u64, @intCast(payload.len)));
+        try buf.appendSlice(allocator, &len_bytes);
+    }
+    try buf.appendSlice(allocator, &mask);
+    for (payload, 0..) |b, i| {
+        try buf.append(allocator, b ^ mask[i % 4]);
+    }
+
+    return buf.toOwnedSlice(allocator);
+}
+
 test "encodeFrame small payload" {
     const allocator = testing.allocator;
     const frame = try encodeFrame(allocator, .text, "hello");
@@ -405,22 +424,7 @@ test "parseFrame small unmasked" {
     // Manually construct unmasked frame (server-to-client style)
     var data = [_]u8{ 0x81, 0x05 } ++ "hello".*;
 
-    const result = try parseFrame(&data);
-    const summary = .{
-        .fin = result.frame.fin,
-        .opcode = @tagName(result.frame.opcode),
-        .payload = result.frame.payload,
-        .consumed = result.consumed,
-    };
-    try (ohsnap{}).snap(@src(),
-        \\nvim.websocket.test.parseFrame small unmasked__struct_<^\d+$>
-        \\  .fin: bool = true
-        \\  .opcode: [:0]const u8
-        \\    "text"
-        \\  .payload: []const u8
-        \\    "hello"
-        \\  .consumed: usize = 7
-    ).expectEqual(summary);
+    try testing.expectError(error.UnmaskedFrame, parseFrame(&data));
 }
 
 test "parseFrame masked" {
@@ -460,9 +464,12 @@ test "parseFrame incomplete" {
 }
 
 test "parseFrame ping" {
-    var data = [_]u8{ 0x89, 0x00 }; // FIN + ping, no payload
+    const allocator = testing.allocator;
+    const mask = [4]u8{ 0x12, 0x34, 0x56, 0x78 };
+    const data = try makeMaskedFrame(allocator, @intFromEnum(Opcode.ping), "", mask);
+    defer allocator.free(data);
 
-    const result = try parseFrame(&data);
+    const result = try parseFrame(data);
     const summary = .{
         .opcode = @tagName(result.frame.opcode),
         .payload_len = result.frame.payload.len,
@@ -476,9 +483,13 @@ test "parseFrame ping" {
 }
 
 test "parseFrame close" {
-    var data = [_]u8{ 0x88, 0x02, 0x03, 0xe8 }; // Close with status 1000
+    const allocator = testing.allocator;
+    const mask = [4]u8{ 0x01, 0x02, 0x03, 0x04 };
+    const payload = [_]u8{ 0x03, 0xe8 };
+    const data = try makeMaskedFrame(allocator, @intFromEnum(Opcode.close), &payload, mask);
+    defer allocator.free(data);
 
-    const result = try parseFrame(&data);
+    const result = try parseFrame(data);
     const summary = .{
         .opcode = @tagName(result.frame.opcode),
         .payload_len = result.frame.payload.len,
@@ -492,8 +503,11 @@ test "parseFrame close" {
 }
 
 test "parseFrame reserved opcode" {
-    var data = [_]u8{ 0x83, 0x00 }; // Reserved opcode 0x3
-    try testing.expectError(error.ReservedOpcode, parseFrame(&data));
+    const allocator = testing.allocator;
+    const mask = [4]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+    const data = try makeMaskedFrame(allocator, 0x3, "", mask);
+    defer allocator.free(data);
+    try testing.expectError(error.ReservedOpcode, parseFrame(data));
 }
 
 test "tryParseHandshake returns null for partial headers" {
