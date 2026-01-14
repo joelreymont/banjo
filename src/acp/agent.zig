@@ -4224,7 +4224,7 @@ pub const Agent = struct {
         .{ .name = "explain", .description = "Summarize selected code as a note comment" },
         .{ .name = "setup", .description = "Configure Zed for banjo LSP integration" },
         .{ .name = "notes", .description = "List all notes in the project" },
-        .{ .name = "note", .description = "Note management commands" },
+        .{ .name = "note", .description = "Note creation help (code actions)" },
         .{ .name = "version", .description = "Show banjo version" },
         .{ .name = "new", .description = "Start fresh Claude Code and Codex sessions" },
         .{ .name = "nudge", .description = "Toggle auto-continue when dots are pending (on/off)" },
@@ -4540,7 +4540,7 @@ const expected_commands_json =
     "[{\"name\":\"explain\",\"description\":\"Summarize selected code as a note comment\"}," ++
     "{\"name\":\"setup\",\"description\":\"Configure Zed for banjo LSP integration\"}," ++
     "{\"name\":\"notes\",\"description\":\"List all notes in the project\"}," ++
-    "{\"name\":\"note\",\"description\":\"Note management commands\"}," ++
+    "{\"name\":\"note\",\"description\":\"Note creation help (code actions)\"}," ++
     "{\"name\":\"version\",\"description\":\"Show banjo version\"}," ++
     "{\"name\":\"new\",\"description\":\"Start fresh Claude Code and Codex sessions\"}," ++
     "{\"name\":\"nudge\",\"description\":\"Toggle auto-continue when dots are pending (on/off)\"}," ++

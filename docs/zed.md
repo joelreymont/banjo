@@ -13,7 +13,7 @@ Banjo Duet runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) an
 
 - **Auto-continue with Dots** — when Claude pauses at turn limits, Banjo checks for pending [Dots](https://github.com/joelreymont/dots) tasks and automatically continues
 - **Auto-resume sessions** — automatically continues your last conversation
-- **Code notes** — attach notes to code as comments with `/explain`
+- **Code notes** — attach notes to code as comments via LSP code actions or `/explain`
 - **Auto-setup** — Banjo writes `.zed/settings.json` on first run for LSP diagnostics
 - **Duet routing** — `/claude`, `/codex`, `/duet` switch the active routing mode
 
@@ -33,22 +33,22 @@ Banjo Duet runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) an
 
 ## Notes
 
-Banjo lets you attach notes to code as `@banjo[id]` comments. Notes appear as LSP diagnostics once Banjo writes `.zed/settings.json` and you reload the workspace.
+Banjo lets you attach notes to code as `@banjo[id]` comments. Notes are created via LSP code actions after Banjo writes `.zed/settings.json` and you reload the workspace.
 
 ### Quick Start
 
 1. Start a Banjo session — it writes `.zed/settings.json` automatically
 2. Reload workspace (`Cmd+Shift+P` → "workspace: reload") to enable LSP notes
-3. Write a comment, press `Cmd+.`, select "Create Banjo Note"
+3. Place cursor on a comment or code line, press `Cmd+.`, select "Create Banjo Note"
 4. Or select code, press `Cmd+>`, type `/explain` to have Claude summarize it
 
 ### Creating Notes
 
-**From a comment** — Position cursor on any comment line, press `Cmd+.`:
+**From a comment (LSP)** — Position cursor on any comment line, press `Cmd+.`:
 - "Create Banjo Note" — converts the comment to a tracked note
 - "Convert TODO to Banjo Note" — shown for TODO/FIXME/HACK comments
 
-**From code** — Position cursor on a code line, press `Cmd+.`:
+**From code (LSP)** — Position cursor on a code line, press `Cmd+.`:
 - "Add Banjo Note" — inserts a note comment above the line
 
 **With `/explain`** — Have Claude explain code and insert as a note:

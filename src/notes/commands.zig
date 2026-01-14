@@ -85,8 +85,7 @@ fn makeResult(allocator: Allocator, success: bool, message: []const u8) !Command
 }
 
 /// Parse and execute a /note or /notes command
-/// Note: With comment-based notes, most operations are done via LSP code actions.
-/// Agent panel commands are for listing and searching only.
+/// Note creation happens via LSP code actions after /setup.
 pub fn executeCommand(allocator: Allocator, project_root: []const u8, command: []const u8) !CommandResult {
     // Extract command name (first word)
     const trimmed = mem.trimLeft(u8, command, " ");
@@ -109,20 +108,12 @@ fn handleNotes(allocator: Allocator, project_root: []const u8, _: []const u8) !C
     return listNotes(allocator, project_root);
 }
 
-const note_subcommands = std.StaticStringMap([]const u8).initComptime(.{
-    .{ "create", "To create a note:\n1. Write a comment in your code: // TODO: fix this\n2. Place cursor on that line\n3. Press Cmd+. and select 'Create Banjo Note'\n\nThe comment will be converted to: // @banjo[id] TODO: fix this" },
-});
+const note_help =
+    "To create a note:\n1. Run /setup and reload workspace to enable Banjo LSP\n2. Place cursor on a comment or code line\n3. Press Cmd+. -> Create Banjo Note";
+const no_notes_help = "No notes found.\n\n" ++ note_help;
 
-fn handleNote(allocator: Allocator, _: []const u8, args: []const u8) !CommandResult {
-    const subcmd = if (mem.indexOf(u8, args, " ")) |idx| args[0..idx] else args;
-    if (note_subcommands.get(subcmd)) |msg| {
-        return makeResult(allocator, true, msg);
-    }
-    return makeResult(
-        allocator,
-        false,
-        "Usage: /notes - list notes\n/note create - create a note (use code action instead)",
-    );
+fn handleNote(allocator: Allocator, _: []const u8, _: []const u8) !CommandResult {
+    return makeResult(allocator, true, note_help);
 }
 
 /// List all notes in project grouped by file
@@ -146,11 +137,7 @@ fn listNotes(allocator: Allocator, project_root: []const u8) !CommandResult {
     try scanProjectForNotes(allocator, project_root, &notes_by_file, 0);
 
     if (notes_by_file.count() == 0) {
-        return makeResult(
-            allocator,
-            true,
-            "No notes found.\n\nTo create a note:\n1. Write a comment: // TODO: something\n2. Press Cmd+. and select 'Create Banjo Note'",
-        );
+        return makeResult(allocator, true, no_notes_help);
     }
 
     // Build output grouped by file
@@ -602,6 +589,26 @@ test "parseZedUrl returns null for invalid format" {
         \\  .not_url: bool = true
         \\  .missing_line: bool = true
         \\  .wrong_scheme: bool = true
+    ).expectEqual(summary);
+}
+
+test "note command shows LSP instructions" {
+    const allocator = testing.allocator;
+    var result = try executeCommand(allocator, "/tmp", "/note create");
+    defer result.deinit(allocator);
+
+    const summary = .{
+        .success = result.success,
+        .message = result.message,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\notes.commands.test.note command shows LSP instructions__struct_<^\d+$>
+        \\  .success: bool = true
+        \\  .message: []const u8
+        \\    "To create a note:
+        \\1. Run /setup and reload workspace to enable Banjo LSP
+        \\2. Place cursor on a comment or code line
+        \\3. Press Cmd+. -> Create Banjo Note"
     ).expectEqual(summary);
 }
 
