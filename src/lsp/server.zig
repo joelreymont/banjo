@@ -2278,6 +2278,46 @@ test "Server initializes correctly" {
     ).expectEqual(snapshot);
 }
 
+test "perf: addNotesFromContent budget" {
+    const alloc = testing.allocator;
+    const total_lines: usize = 4000;
+    const note_every: usize = 40;
+    const budget_ns: u64 = 300 * std.time.ns_per_ms;
+
+    var input = std.io.fixedBufferStream("");
+    var output_buf: [1024]u8 = undefined;
+    var output = std.io.fixedBufferStream(&output_buf);
+
+    var server = Server.init(alloc, input.reader().any(), output.writer().any());
+    defer server.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    var note_count: usize = 0;
+    var i: usize = 0;
+    while (i < total_lines) : (i += 1) {
+        if (i % note_every == 0) {
+            var line_buf: [72]u8 = undefined;
+            const line = try std.fmt.bufPrint(&line_buf, "// @banjo[note-{d}] perf\n", .{note_count});
+            note_count += 1;
+            try buf.appendSlice(alloc, line);
+        } else {
+            try buf.appendSlice(alloc, "const y = 2;\n");
+        }
+    }
+
+    const content = try buf.toOwnedSlice(alloc);
+    defer alloc.free(content);
+
+    var timer = try std.time.Timer.start();
+    try server.addNotesFromContent("/tmp/test.zig", content);
+    const elapsed = timer.read();
+
+    try testing.expectEqual(@as(usize, note_count), server.note_index.notes.count());
+    try testing.expect(elapsed <= budget_ns);
+}
+
 test "rebuildIndex scans project files for backlinks" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
