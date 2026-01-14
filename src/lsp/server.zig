@@ -4,6 +4,7 @@ const Allocator = mem.Allocator;
 const protocol = @import("protocol.zig");
 const diagnostics = @import("diagnostics.zig");
 const comments = @import("../notes/comments.zig");
+const comment_edit = @import("../notes/comment_edit.zig");
 const jsonrpc = @import("../jsonrpc.zig");
 const summary = @import("summary.zig");
 const lsp_uri = @import("uri.zig");
@@ -45,47 +46,14 @@ const skip_dirs = std.StaticStringMap(void).initComptime(.{
     .{ "__pycache__", {} },
 });
 
-const LineIndex = struct {
-    starts: std.ArrayListUnmanaged(usize) = .empty,
-
-    pub fn init(allocator: Allocator, content: []const u8) !LineIndex {
-        var starts: std.ArrayListUnmanaged(usize) = .empty;
-        if (content.len == 0) return .{ .starts = starts };
-        try starts.append(allocator, 0);
-        for (content, 0..) |c, i| {
-            if (c == '\n' and i + 1 < content.len) {
-                try starts.append(allocator, i + 1);
-            }
-        }
-        return .{ .starts = starts };
-    }
-
-    pub fn deinit(self: *LineIndex, allocator: Allocator) void {
-        self.starts.deinit(allocator);
-    }
-
-    pub fn lineSlice(self: *const LineIndex, content: []const u8, line: u32) ?[]const u8 {
-        const idx = std.math.cast(usize, line) orelse return null;
-        if (idx >= self.starts.items.len) return null;
-        const start = self.starts.items[idx];
-        const end = if (idx + 1 < self.starts.items.len)
-            self.starts.items[idx + 1] - 1
-        else if (content.len > 0 and content[content.len - 1] == '\n')
-            content.len - 1
-        else
-            content.len;
-        return content[start..end];
-    }
-};
-
 const Document = struct {
     content: []const u8,
-    line_index: LineIndex,
+    line_index: comment_edit.LineIndex,
 
     pub fn init(allocator: Allocator, text: []const u8) !Document {
         const content = try allocator.dupe(u8, text);
         errdefer allocator.free(content);
-        const line_index = try LineIndex.init(allocator, content);
+        const line_index = try comment_edit.LineIndex.init(allocator, content);
         return .{ .content = content, .line_index = line_index };
     }
 
@@ -561,7 +529,7 @@ pub const Server = struct {
             return;
         };
 
-        const line_content = getLineContent(&doc.line_index, doc.content, line) orelse {
+        const line_content = comment_edit.getLineContent(&doc.line_index, doc.content, line) orelse {
             try self.transport.writeTypedResponse(request.id, null);
             return;
         };
@@ -644,7 +612,7 @@ pub const Server = struct {
             return;
         };
 
-        const line_content = getLineContent(&doc.line_index, doc.content, line) orelse {
+        const line_content = comment_edit.getLineContent(&doc.line_index, doc.content, line) orelse {
             try self.transport.writeTypedResponse(request.id, @as(?protocol.Location, null));
             return;
         };
@@ -690,7 +658,7 @@ pub const Server = struct {
             return;
         };
 
-        const line_content = getLineContent(&doc.line_index, doc.content, line) orelse {
+        const line_content = comment_edit.getLineContent(&doc.line_index, doc.content, line) orelse {
             try self.transport.writeTypedResponse(request.id, &[_]protocol.Location{});
             return;
         };
@@ -751,7 +719,7 @@ pub const Server = struct {
         };
 
         // Check if we're after [[
-        const line_content = getLineContent(&doc.line_index, doc.content, line) orelse {
+        const line_content = comment_edit.getLineContent(&doc.line_index, doc.content, line) orelse {
             try self.transport.writeTypedResponse(request.id, protocol.CompletionList{ .items = &.{} });
             return;
         };
@@ -795,14 +763,14 @@ pub const Server = struct {
             }
         }
 
-        const should_insert_note = isCommentLine(&doc.line_index, doc.content, line);
+        const should_insert_note = comment_edit.isCommentLine(&doc.line_index, doc.content, line);
         if (should_insert_note) {
-            const block_start = findCommentBlockStart(&doc.line_index, doc.content, line);
-            const block_end = findCommentBlockEnd(&doc.line_index, doc.content, line);
-            if (commentBlockHasNote(&doc.line_index, doc.content, block_start, block_end)) {
+            const block_start = comment_edit.findCommentBlockStart(&doc.line_index, doc.content, line);
+            const block_end = comment_edit.findCommentBlockEnd(&doc.line_index, doc.content, line);
+            if (comment_edit.commentBlockHasNote(&doc.line_index, doc.content, block_start, block_end)) {
                 var scan_line = block_start;
                 while (scan_line <= block_end) : (scan_line += 1) {
-                    if (getLineContent(&doc.line_index, doc.content, scan_line)) |block_line| {
+                    if (comment_edit.getLineContent(&doc.line_index, doc.content, scan_line)) |block_line| {
                         if (mem.indexOf(u8, block_line, "@banjo[") != null) {
                             if (try comments.parseNoteLine(self.allocator, block_line, scan_line + 1)) |note| {
                                 self_note = note;
@@ -812,8 +780,8 @@ pub const Server = struct {
                     }
                 }
             } else {
-                if (getLineContent(&doc.line_index, doc.content, block_start)) |block_line| {
-                    if (findCommentInsertOffset(block_line)) |insert_char| {
+                if (comment_edit.getLineContent(&doc.line_index, doc.content, block_start)) |block_line| {
+                    if (comment_edit.findCommentInsertOffset(block_line)) |insert_char| {
                         const note_id = comments.generateNoteId();
                         const insert_text = try std.fmt.allocPrint(self.allocator, "@banjo[{s}] ", .{&note_id});
                         try allocated_strings.append(self.allocator, insert_text);
@@ -1047,21 +1015,21 @@ pub const Server = struct {
             edit_allocs.deinit(self.allocator);
         }
 
-        const line_text = getLineContent(&doc.line_index, doc.content, line) orelse "";
-        const is_comment = isCommentLine(&doc.line_index, doc.content, line);
-        const block_start = if (is_comment) findCommentBlockStart(&doc.line_index, doc.content, line) else line;
-        const block_end = if (is_comment) findCommentBlockEnd(&doc.line_index, doc.content, line) else line;
-        const block_line_text = if (is_comment) getLineContent(&doc.line_index, doc.content, block_start) orelse "" else line_text;
+        const line_text = comment_edit.getLineContent(&doc.line_index, doc.content, line) orelse "";
+        const is_comment = comment_edit.isCommentLine(&doc.line_index, doc.content, line);
+        const block_start = if (is_comment) comment_edit.findCommentBlockStart(&doc.line_index, doc.content, line) else line;
+        const block_end = if (is_comment) comment_edit.findCommentBlockEnd(&doc.line_index, doc.content, line) else line;
+        const block_line_text = if (is_comment) comment_edit.getLineContent(&doc.line_index, doc.content, block_start) orelse "" else line_text;
 
         // Skip create action if the comment block already contains a note marker.
-        if (commentBlockHasNote(&doc.line_index, doc.content, block_start, block_end)) {
+        if (comment_edit.commentBlockHasNote(&doc.line_index, doc.content, block_start, block_end)) {
             try self.transport.writeTypedResponse(request.id, &[_]protocol.CodeAction{});
             return;
         }
 
         if (is_comment) {
             // Comment line: insert @banjo[id] after comment prefix and whitespace
-            const insert_char = findCommentInsertOffset(block_line_text) orelse {
+            const insert_char = comment_edit.findCommentInsertOffset(block_line_text) orelse {
                 try self.transport.writeTypedResponse(request.id, &[_]protocol.CodeAction{});
                 return;
             };
@@ -1097,7 +1065,7 @@ pub const Server = struct {
             // Code line: insert note comment above
             const prefix = comments.getCommentPrefix(file_path);
             const note_id = comments.generateNoteId();
-            const indent = getIndent(line_text);
+            const indent = comment_edit.getIndent(line_text);
 
             const new_line = try std.fmt.allocPrint(
                 self.allocator,
@@ -1187,13 +1155,13 @@ pub const Server = struct {
         const note_id = comments.generateNoteId();
 
         if (is_comment) {
-            const target_line = findCommentBlockStart(&doc.line_index, doc.content, line - 1);
-            const target_end = findCommentBlockEnd(&doc.line_index, doc.content, line - 1);
-            if (commentBlockHasNote(&doc.line_index, doc.content, target_line, target_end)) return;
+            const target_line = comment_edit.findCommentBlockStart(&doc.line_index, doc.content, line - 1);
+            const target_end = comment_edit.findCommentBlockEnd(&doc.line_index, doc.content, line - 1);
+            if (comment_edit.commentBlockHasNote(&doc.line_index, doc.content, target_line, target_end)) return;
 
-            const line_content = getLineContent(&doc.line_index, doc.content, target_line) orelse return;
+            const line_content = comment_edit.getLineContent(&doc.line_index, doc.content, target_line) orelse return;
             // Comment line: insert @banjo[id] after comment prefix and whitespace
-            const insert_char = findCommentInsertOffset(line_content) orelse return;
+            const insert_char = comment_edit.findCommentInsertOffset(line_content) orelse return;
             const insert_text = try std.fmt.allocPrint(self.allocator, "@banjo[{s}] ", .{&note_id});
             defer self.allocator.free(insert_text);
             const new_line = try std.fmt.allocPrint(
@@ -1205,9 +1173,9 @@ pub const Server = struct {
             try self.applyLineEdit(uri, target_line, new_line);
         } else {
             // Code line: insert note comment above
-            const line_content = getLineContent(&doc.line_index, doc.content, line - 1) orelse return;
+            const line_content = comment_edit.getLineContent(&doc.line_index, doc.content, line - 1) orelse return;
             const prefix = comments.getCommentPrefix(file_path);
-            const indent = getIndent(line_content);
+            const indent = comment_edit.getIndent(line_content);
             const new_line = try std.fmt.allocPrint(
                 self.allocator,
                 "{s}{s} @banjo[{s}] NOTE:\n",
@@ -1479,74 +1447,11 @@ pub const Server = struct {
     fn findNoteAtLine(self: *Server, doc: *const Document, line: u32) !?comments.ParsedNote {
         return try comments.parseNoteLine(
             self.allocator,
-            getLineContent(&doc.line_index, doc.content, line - 1) orelse return null,
+            comment_edit.getLineContent(&doc.line_index, doc.content, line - 1) orelse return null,
             line,
         );
     }
 };
-
-// line is 0-based (LSP positions).
-fn getLineContent(line_index: *const LineIndex, content: []const u8, line: u32) ?[]const u8 {
-    return line_index.lineSlice(content, line);
-}
-
-fn getIndent(line: []const u8) []const u8 {
-    for (line, 0..) |c, i| {
-        if (c != ' ' and c != '\t') {
-            return line[0..i];
-        }
-    }
-    return line; // All whitespace
-}
-
-const CommentPrefixKind = enum {
-    slash,
-    hash,
-    dash,
-    semi,
-    html,
-};
-
-const CommentPrefix = struct {
-    kind: CommentPrefixKind,
-    len: usize,
-};
-
-const comment_prefixes = [_]struct {
-    prefix: []const u8,
-    kind: CommentPrefixKind,
-}{
-    .{ .prefix = "<!--", .kind = .html },
-    .{ .prefix = "//", .kind = .slash },
-    .{ .prefix = "--", .kind = .dash },
-    .{ .prefix = "#", .kind = .hash },
-    .{ .prefix = ";", .kind = .semi },
-};
-
-fn getCommentPrefix(trimmed: []const u8) ?CommentPrefix {
-    for (comment_prefixes) |entry| {
-        if (mem.startsWith(u8, trimmed, entry.prefix)) {
-            return .{ .kind = entry.kind, .len = entry.prefix.len };
-        }
-    }
-    return null;
-}
-
-fn isCommentLine(line_index: *const LineIndex, content: []const u8, line: u32) bool {
-    const line_content = getLineContent(line_index, content, line) orelse return false;
-    const trimmed = mem.trimLeft(u8, line_content, " \t");
-    if (getCommentPrefix(trimmed) != null) {
-        // Make sure it's not already a banjo note
-        return mem.indexOf(u8, trimmed, "@banjo[") == null;
-    }
-    return false;
-}
-
-fn isCommentBlockLine(line_index: *const LineIndex, content: []const u8, line: u32) bool {
-    const line_content = getLineContent(line_index, content, line) orelse return false;
-    const trimmed = mem.trimLeft(u8, line_content, " \t");
-    return getCommentPrefix(trimmed) != null;
-}
 
 /// Find note ID at cursor position. Handles:
 /// - @banjo[id] - returns id
@@ -1656,69 +1561,6 @@ fn hasBanjoMarker(content: []const u8) bool {
 
 fn shouldScheduleNoteIndexUpdate(old_has_notes: bool, new_content: []const u8) bool {
     return old_has_notes or hasBanjoMarker(new_content);
-}
-
-fn findCommentInsertOffset(line_content: []const u8) ?u32 {
-    const trimmed = mem.trimLeft(u8, line_content, " \t");
-    if (trimmed.len == 0) return null;
-
-    const leading_spaces = line_content.len - trimmed.len;
-    const prefix = getCommentPrefix(trimmed) orelse return null;
-
-    var pos = prefix.len;
-    switch (prefix.kind) {
-        .slash => {
-            while (pos < trimmed.len and (trimmed[pos] == '/' or trimmed[pos] == '!')) {
-                pos += 1;
-            }
-        },
-        .dash => {
-            while (pos < trimmed.len and trimmed[pos] == '-') {
-                pos += 1;
-            }
-        },
-        .hash => {
-            while (pos < trimmed.len and trimmed[pos] == '#') {
-                pos += 1;
-            }
-        },
-        .semi, .html => {},
-    }
-    while (pos < trimmed.len and (trimmed[pos] == ' ' or trimmed[pos] == '\t')) {
-        pos += 1;
-    }
-
-    return castU32(leading_spaces + pos);
-}
-
-fn findCommentBlockStart(line_index: *const LineIndex, content: []const u8, line: u32) u32 {
-    var current = line;
-    while (current > 0) {
-        const prev = current - 1;
-        if (!isCommentBlockLine(line_index, content, prev)) break;
-        current = prev;
-    }
-    return current;
-}
-
-fn findCommentBlockEnd(line_index: *const LineIndex, content: []const u8, line: u32) u32 {
-    var current = line;
-    while (true) {
-        const next = current + 1;
-        if (getLineContent(line_index, content, next) == null) break;
-        if (!isCommentBlockLine(line_index, content, next)) break;
-        current = next;
-    }
-    return current;
-}
-
-fn commentBlockHasNote(line_index: *const LineIndex, content: []const u8, start_line: u32, end_line: u32) bool {
-    var line = start_line;
-    while (line <= end_line) : (line += 1) {
-        const line_content = getLineContent(line_index, content, line) orelse continue;
-        if (mem.indexOf(u8, line_content, "@banjo[") != null) return true;
-    }
-    return false;
 }
 
 fn appendNoteCompletion(
@@ -1843,22 +1685,22 @@ test "hasTodoPattern scans full line" {
     ).expectEqual(snapshot);
 }
 
-test "getLineContent returns correct line" {
+test "comment_edit.getLineContent returns correct line" {
     const content = "line 0\nline 1\nline 2";
-    var index = try LineIndex.init(testing.allocator, content);
+    var index = try comment_edit.LineIndex.init(testing.allocator, content);
     defer index.deinit(testing.allocator);
     const empty = "";
-    var empty_index = try LineIndex.init(testing.allocator, empty);
+    var empty_index = try comment_edit.LineIndex.init(testing.allocator, empty);
     defer empty_index.deinit(testing.allocator);
     const snapshot = .{
-        .line0 = getLineContent(&index, content, 0),
-        .line1 = getLineContent(&index, content, 1),
-        .line2 = getLineContent(&index, content, 2),
-        .line3 = getLineContent(&index, content, 3),
-        .empty = getLineContent(&empty_index, empty, 0),
+        .line0 = comment_edit.getLineContent(&index, content, 0),
+        .line1 = comment_edit.getLineContent(&index, content, 1),
+        .line2 = comment_edit.getLineContent(&index, content, 2),
+        .line3 = comment_edit.getLineContent(&index, content, 3),
+        .empty = comment_edit.getLineContent(&empty_index, empty, 0),
     };
     try (ohsnap{}).snap(@src(),
-        \\lsp.server.test.getLineContent returns correct line__struct_<^\d+$>
+        \\lsp.server.test.comment_edit.getLineContent returns correct line__struct_<^\d+$>
         \\  .line0: ?[]const u8
         \\    "line 0"
         \\  .line1: ?[]const u8
@@ -1872,18 +1714,18 @@ test "getLineContent returns correct line" {
     ).expectEqual(snapshot);
 }
 
-test "isCommentLine detects comments" {
+test "comment_edit.isCommentLine detects comments" {
     const content = "code\n// comment\n# python\nmore code";
-    var index = try LineIndex.init(testing.allocator, content);
+    var index = try comment_edit.LineIndex.init(testing.allocator, content);
     defer index.deinit(testing.allocator);
     const snapshot = .{
-        .line0 = isCommentLine(&index, content, 0),
-        .line1 = isCommentLine(&index, content, 1),
-        .line2 = isCommentLine(&index, content, 2),
-        .line3 = isCommentLine(&index, content, 3),
+        .line0 = comment_edit.isCommentLine(&index, content, 0),
+        .line1 = comment_edit.isCommentLine(&index, content, 1),
+        .line2 = comment_edit.isCommentLine(&index, content, 2),
+        .line3 = comment_edit.isCommentLine(&index, content, 3),
     };
     try (ohsnap{}).snap(@src(),
-        \\lsp.server.test.isCommentLine detects comments__struct_<^\d+$>
+        \\lsp.server.test.comment_edit.isCommentLine detects comments__struct_<^\d+$>
         \\  .line0: bool = false
         \\  .line1: bool = true
         \\  .line2: bool = true
@@ -1891,16 +1733,16 @@ test "isCommentLine detects comments" {
     ).expectEqual(snapshot);
 }
 
-test "isCommentLine excludes banjo notes" {
+test "comment_edit.isCommentLine excludes banjo notes" {
     const content = "// @banjo[abc] note\n// regular comment";
-    var index = try LineIndex.init(testing.allocator, content);
+    var index = try comment_edit.LineIndex.init(testing.allocator, content);
     defer index.deinit(testing.allocator);
     const snapshot = .{
-        .line0 = isCommentLine(&index, content, 0),
-        .line1 = isCommentLine(&index, content, 1),
+        .line0 = comment_edit.isCommentLine(&index, content, 0),
+        .line1 = comment_edit.isCommentLine(&index, content, 1),
     };
     try (ohsnap{}).snap(@src(),
-        \\lsp.server.test.isCommentLine excludes banjo notes__struct_<^\d+$>
+        \\lsp.server.test.comment_edit.isCommentLine excludes banjo notes__struct_<^\d+$>
         \\  .line0: bool = false
         \\  .line1: bool = true
     ).expectEqual(snapshot);
@@ -1929,14 +1771,14 @@ test "findHoverTarget prioritizes note token over link" {
     ).expectEqual(snapshot);
 }
 
-test "findCommentInsertOffset finds insertion point after prefix and whitespace" {
+test "comment_edit.findCommentInsertOffset finds insertion point after prefix and whitespace" {
     const snapshot = .{
-        .slashes = findCommentInsertOffset("    //   TODO"),
-        .html = findCommentInsertOffset("<!-- note"),
-        .doc = findCommentInsertOffset("    //! Discriminator"),
+        .slashes = comment_edit.findCommentInsertOffset("    //   TODO"),
+        .html = comment_edit.findCommentInsertOffset("<!-- note"),
+        .doc = comment_edit.findCommentInsertOffset("    //! Discriminator"),
     };
     try (ohsnap{}).snap(@src(),
-        \\lsp.server.test.findCommentInsertOffset finds insertion point after prefix and whitespace__struct_<^\d+$>
+        \\lsp.server.test.comment_edit.findCommentInsertOffset finds insertion point after prefix and whitespace__struct_<^\d+$>
         \\  .slashes: ?u32
         \\    9
         \\  .html: ?u32
