@@ -13,8 +13,8 @@ Agent output supports markdown links that navigate to files in the **active proj
 ### Examples
 
 ```markdown
-[@main.zig (1:1)](file:///Users/joel/Work/banjo/src/main.zig#L1:1)
-[@parser.zig (42:50)](file:///Users/joel/Work/project/src/parser.zig#L42:50)
+[@main.zig (1:1)](file:///path/to/project/src/main.zig#L1:1)
+[@parser.zig (42:50)](file:///path/to/project/src/parser.zig#L42:50)
 ```
 
 ### Limitations
@@ -48,11 +48,13 @@ Users can add context via @mentions:
 ## Slash Commands
 
 Banjo commands:
-- `/setup lsp` - enable LSP server for current project (auto-configures Zed)
+- `/setup lsp` - re-run setup for banjo-notes LSP (`.zed/settings.json`)
 - `/explain` - summarize selected code and insert as note comment
 - `/notes` - list all notes in project
 
 Claude Code commands (`/version`, `/model`, `/compact`, `/review`, `/clear`) forwarded to Claude Code.
+
+Note: Banjo auto-writes `.zed/settings.json` on first session; reload workspace once to activate the LSP.
 
 ## Note Creation Workflow
 
@@ -210,7 +212,8 @@ LSP Server (banjo --lsp)
 
 Agent (banjo --agent)
   ├─ /explain command for Claude-generated summaries
-  ├─ /setup lsp for per-project configuration
+  ├─ Auto-setup writes `.zed/settings.json` on first session
+  ├─ /setup lsp to re-run configuration
   └─ Forwards other commands to Claude Code
 ```
 
@@ -221,7 +224,7 @@ Notes appear as info-level diagnostics. `F8` jumps between notes, `Cmd+.` shows 
 Banjo LSP runs alongside language-specific servers (rust-analyzer, zls). Configure in Zed settings:
 ```json
 "languages": {
-  "Zig": { "language_servers": ["zls", "banjo"] }
+  "Zig": { "language_servers": ["zls", "banjo-notes"] }
 }
 ```
 Diagnostics merge by server ID - both servers' markers displayed together.

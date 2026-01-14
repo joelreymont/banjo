@@ -380,7 +380,10 @@ pub const Transport = struct {
 
             // Parse Content-Length header
             if (mem.startsWith(u8, header, "Content-Length: ")) {
-                content_length = std.fmt.parseInt(usize, header[16..], 10) catch return error.InvalidHeader;
+                content_length = std.fmt.parseInt(usize, header[16..], 10) catch |err| switch (err) {
+                    error.InvalidCharacter, error.Overflow => return error.InvalidHeader,
+                    else => return err,
+                };
             }
         }
 

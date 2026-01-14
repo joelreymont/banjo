@@ -240,19 +240,137 @@ fn scanProjectForNotes(allocator: Allocator, dir_path: []const u8, notes_by_file
 }
 
 /// Find banjo binary path
-fn findBanjoBinary(allocator: Allocator) ![]const u8 {
-    const home = std.posix.getenv("HOME") orelse return error.NoHome;
+const banjo_bin_names = [_][]const u8{ "banjo", "banjo.exe" };
 
-    // Check dev build first
-    const dev_path = try std.fs.path.join(allocator, &.{ home, "Work/banjo/zig-out/bin/banjo" });
-    if (fs.accessAbsolute(dev_path, .{})) |_| {
-        return dev_path;
-    } else |_| {
-        allocator.free(dev_path);
+fn isBanjoBin(name: []const u8) bool {
+    for (banjo_bin_names) |bin| {
+        if (mem.eql(u8, name, bin)) return true;
     }
+    return false;
+}
+
+fn resolveBinPath(allocator: Allocator, path: []const u8) ![]const u8 {
+    const abs = if (std.fs.path.isAbsolute(path))
+        try allocator.dupe(u8, path)
+    else
+        try fs.cwd().realpathAlloc(allocator, path);
+    errdefer allocator.free(abs);
+
+    const st = try fs.cwd().statFile(abs);
+    if (st.kind != .file) return error.NotAFile;
+    return abs;
+}
+
+fn tryBinPath(allocator: Allocator, label: []const u8, path: []const u8) ?[]const u8 {
+    return resolveBinPath(allocator, path) catch |err| {
+        log.debug("{s} banjo path unavailable: {s}: {}", .{ label, path, err });
+        return null;
+    };
+}
+
+fn findBanjoInPath(allocator: Allocator) !?[]const u8 {
+    const path_env = std.process.getEnvVarOwned(allocator, "PATH") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(path_env);
+
+    var it = mem.splitScalar(u8, path_env, std.fs.path.delimiter);
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        for (banjo_bin_names) |bin| {
+            const full = try std.fs.path.join(allocator, &.{ dir, bin });
+            const resolved = resolveBinPath(allocator, full) catch {
+                allocator.free(full);
+                continue;
+            };
+            allocator.free(full);
+            return resolved;
+        }
+    }
+    return null;
+}
+
+fn findBanjoBinary(allocator: Allocator, project_root: []const u8) ![]const u8 {
+    if (std.posix.getenv("BANJO_BIN")) |env| {
+        return resolveBinPath(allocator, env) catch |err| {
+            log.err("BANJO_BIN invalid: {s}: {}", .{ env, err });
+            return err;
+        };
+    }
+
+    const self_path = std.fs.selfExePathAlloc(allocator) catch |err| blk: {
+        log.warn("Failed to resolve self path: {}", .{err});
+        break :blk null;
+    };
+    if (self_path) |path| {
+        const base = std.fs.path.basename(path);
+        if (isBanjoBin(base)) {
+            if (fs.cwd().statFile(path)) |st| {
+                if (st.kind == .file) return path;
+                log.warn("Self path is not a file: {s}", .{path});
+            } else |err| {
+                log.warn("Self path invalid: {s}: {}", .{ path, err });
+            }
+        } else {
+            log.debug("Self path is not banjo: {s}", .{path});
+        }
+        allocator.free(path);
+    }
+
+    const dev_path = try std.fs.path.join(allocator, &.{ project_root, "zig-out", "bin", "banjo" });
+    defer allocator.free(dev_path);
+    if (tryBinPath(allocator, "dev", dev_path)) |path| return path;
+
+    if (try findBanjoInPath(allocator)) |path| return path;
 
     return error.NotFound;
 }
+
+const ZedLspBinary = struct {
+    path: []const u8,
+    arguments: []const []const u8,
+};
+
+const ZedLspEntry = struct {
+    binary: ZedLspBinary,
+};
+
+const ZedLspConfig = struct {
+    @"banjo-notes": ZedLspEntry,
+};
+
+const ZedLanguageEntry = struct {
+    name: []const u8,
+    primary_lsp: []const u8,
+};
+
+const ZedSettings = struct {
+    lsp: ZedLspConfig,
+    languages: []const ZedLanguageEntry,
+
+    pub fn jsonStringify(self: ZedSettings, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("lsp");
+        try jw.write(self.lsp);
+        try jw.objectField("languages");
+        try jw.beginObject();
+        for (self.languages) |entry| {
+            try jw.objectField(entry.name);
+            try jw.beginObject();
+            try jw.objectField("language_servers");
+            try jw.beginArray();
+            if (entry.primary_lsp.len > 0) {
+                try jw.write(entry.primary_lsp);
+            }
+            try jw.write("banjo-notes");
+            try jw.endArray();
+            try jw.endObject();
+        }
+        try jw.endObject();
+        try jw.endObject();
+    }
+};
 
 /// Scan project for languages and create .zed/settings.json with banjo-notes as secondary LSP
 fn setupLsp(allocator: Allocator, project_root: []const u8) !CommandResult {
@@ -267,42 +385,41 @@ fn setupLsp(allocator: Allocator, project_root: []const u8) !CommandResult {
     }
 
     // Find banjo binary
-    const banjo_path = findBanjoBinary(allocator) catch {
+    const banjo_path = findBanjoBinary(allocator, project_root) catch {
         return makeResult(allocator, false, "Could not find banjo binary");
     };
     defer allocator.free(banjo_path);
 
-    // Build .zed/settings.json with binary path (WASM extension not working for dev)
-    var json: std.ArrayListUnmanaged(u8) = .empty;
-    defer json.deinit(allocator);
-    const writer = json.writer(allocator);
+    var entries: std.ArrayListUnmanaged(ZedLanguageEntry) = .empty;
+    defer entries.deinit(allocator);
 
-    try writer.print(
-        \\{{
-        \\  "lsp": {{
-        \\    "banjo-notes": {{
-        \\      "binary": {{ "path": "{s}", "arguments": ["--lsp"] }}
-        \\    }}
-        \\  }},
-        \\  "languages": {{
-        \\
-    , .{banjo_path});
-
-    var first = true;
     var iter = detected.iterator();
     while (iter.next()) |entry| {
-        if (!first) try writer.writeAll(",\n");
-        first = false;
-
         const info = entry.value_ptr.*;
-        if (info.primary_lsp.len > 0) {
-            try writer.print("    \"{s}\": {{ \"language_servers\": [\"{s}\", \"banjo-notes\"] }}", .{ info.zed_name, info.primary_lsp });
-        } else {
-            try writer.print("    \"{s}\": {{ \"language_servers\": [\"banjo-notes\"] }}", .{info.zed_name});
-        }
+        try entries.append(allocator, .{
+            .name = info.zed_name,
+            .primary_lsp = info.primary_lsp,
+        });
     }
 
-    try writer.writeAll("\n  }\n}\n"); // close languages and root
+    std.sort.block(ZedLanguageEntry, entries.items, {}, struct {
+        fn lessThan(_: void, lhs: ZedLanguageEntry, rhs: ZedLanguageEntry) bool {
+            return mem.lessThan(u8, lhs.name, rhs.name);
+        }
+    }.lessThan);
+
+    const settings = ZedSettings{
+        .lsp = .{ .@"banjo-notes" = .{
+            .binary = .{ .path = banjo_path, .arguments = &.{ "--lsp" } },
+        } },
+        .languages = entries.items,
+    };
+    const settings_json = try std.json.Stringify.valueAlloc(
+        allocator,
+        settings,
+        .{ .whitespace = .indent_2 },
+    );
+    defer allocator.free(settings_json);
 
     // Create .zed directory if needed
     const zed_dir_path = try std.fs.path.join(allocator, &.{ project_root, ".zed" });
@@ -322,7 +439,10 @@ fn setupLsp(allocator: Allocator, project_root: []const u8) !CommandResult {
     };
     defer file.close();
 
-    file.writeAll(json.items) catch {
+    file.writeAll(settings_json) catch {
+        return makeResult(allocator, false, "Failed to write .zed/settings.json");
+    };
+    file.writeAll("\n") catch {
         return makeResult(allocator, false, "Failed to write .zed/settings.json");
     };
 
@@ -331,9 +451,8 @@ fn setupLsp(allocator: Allocator, project_root: []const u8) !CommandResult {
     const msg_writer = msg.writer(allocator);
     try msg_writer.writeAll("Created .zed/settings.json with banjo-notes enabled for:\n");
 
-    iter = detected.iterator();
-    while (iter.next()) |entry| {
-        try msg_writer.print("  - {s}\n", .{entry.value_ptr.zed_name});
+    for (entries.items) |entry| {
+        try msg_writer.print("  - {s}\n", .{entry.name});
     }
     try msg_writer.writeAll("\nReload Zed to activate the LSP.");
 
@@ -370,7 +489,7 @@ fn scanForLanguages(allocator: Allocator, dir_path: []const u8, detected: *std.S
 
 /// Parse Zed URL format: [@filename (line:col)](file:///absolute/path#Lline:col)
 /// Returns: file_path, line_number, or null if not a valid Zed URL
-pub fn parseZedUrl(allocator: Allocator, url: []const u8) ?struct {
+pub fn parseZedUrl(allocator: Allocator, url: []const u8) !?struct {
     file_path: []const u8,
     line: u32,
     owned: bool,
@@ -387,7 +506,7 @@ pub fn parseZedUrl(allocator: Allocator, url: []const u8) ?struct {
     // Find #L which marks the line number
     const hash_idx = mem.indexOf(u8, url[path_start..], "#L") orelse return null;
     const uri_slice = url[file_start..];
-    const parsed_path = (lsp_uri.uriToPath(allocator, uri_slice) catch return null) orelse return null;
+    const parsed_path = try lsp_uri.uriToPath(allocator, uri_slice) orelse return error.InvalidUri;
     errdefer if (parsed_path.owned) allocator.free(parsed_path.path);
     const file_path = parsed_path.path;
 
@@ -400,7 +519,11 @@ pub fn parseZedUrl(allocator: Allocator, url: []const u8) ?struct {
 
     if (line_end == line_start) return null;
 
-    const line = std.fmt.parseInt(u32, url[line_start..line_end], 10) catch return null;
+    const line = std.fmt.parseInt(u32, url[line_start..line_end], 10) catch |err| switch (err) {
+        error.InvalidCharacter, error.Overflow => return error.InvalidLine,
+        else => return err,
+    };
+    if (line == 0) return error.InvalidLine;
 
     return .{ .file_path = file_path, .line = line, .owned = parsed_path.owned };
 }
@@ -414,7 +537,7 @@ const ohsnap = @import("ohsnap");
 
 test "parseZedUrl extracts file path and line" {
     const url = "[@main.zig (42:1)](file:///Users/joel/project/src/main.zig#L42:1)";
-    var result = parseZedUrl(testing.allocator, url);
+    var result = try parseZedUrl(testing.allocator, url);
     defer if (result) |*item| item.deinit(testing.allocator);
     const Summary = struct {
         found: bool,
@@ -442,7 +565,7 @@ test "parseZedUrl extracts file path and line" {
 
 test "parseZedUrl handles line without column" {
     const url = "file:///path/to/file.zig#L100";
-    var result = parseZedUrl(testing.allocator, url);
+    var result = try parseZedUrl(testing.allocator, url);
     defer if (result) |*item| item.deinit(testing.allocator);
     const Summary = struct {
         found: bool,
@@ -470,9 +593,9 @@ test "parseZedUrl handles line without column" {
 
 test "parseZedUrl returns null for invalid format" {
     const summary = .{
-        .not_url = parseZedUrl(testing.allocator, "not a url") == null,
-        .missing_line = parseZedUrl(testing.allocator, "file:///path/no-line") == null,
-        .wrong_scheme = parseZedUrl(testing.allocator, "https://example.com#L1") == null,
+        .not_url = (try parseZedUrl(testing.allocator, "not a url")) == null,
+        .missing_line = (try parseZedUrl(testing.allocator, "file:///path/no-line")) == null,
+        .wrong_scheme = (try parseZedUrl(testing.allocator, "https://example.com#L1")) == null,
     };
     try (ohsnap{}).snap(@src(),
         \\notes.commands.test.parseZedUrl returns null for invalid format__struct_<^\d+$>
@@ -492,6 +615,8 @@ test "setup creates .zed/settings.json with detected languages" {
     // Create test source files
     try tmp_dir.dir.writeFile(.{ .sub_path = "main.zig", .data = "fn main() {}" });
     try tmp_dir.dir.writeFile(.{ .sub_path = "test.py", .data = "print('hello')" });
+    try tmp_dir.dir.makePath("zig-out/bin");
+    try tmp_dir.dir.writeFile(.{ .sub_path = "zig-out/bin/banjo", .data = "" });
 
     // Get absolute path
     const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
@@ -518,20 +643,35 @@ test "setup creates .zed/settings.json with detected languages" {
         \\  .success: bool = true
         \\  .message: []const u8
         \\    "Created .zed/settings.json with banjo-notes enabled for:
-        \\  - Zig
         \\  - Python
+        \\  - Zig
         \\
         \\Reload Zed to activate the LSP."
         \\  .settings: []u8
         \\    "{
         \\  "lsp": {
         \\    "banjo-notes": {
-        \\      "binary": { "path": "/Users/joel/Work/banjo/zig-out/bin/banjo", "arguments": ["--lsp"] }
+        \\      "binary": {
+        \\        "path": "<^.*/zig-out/bin/banjo$>",
+        \\        "arguments": [
+        \\          "--lsp"
+        \\        ]
+        \\      }
         \\    }
         \\  },
         \\  "languages": {
-        \\    "Zig": { "language_servers": ["zls", "banjo-notes"] },
-        \\    "Python": { "language_servers": ["pyright", "banjo-notes"] }
+        \\    "Python": {
+        \\      "language_servers": [
+        \\        "pyright",
+        \\        "banjo-notes"
+        \\      ]
+        \\    },
+        \\    "Zig": {
+        \\      "language_servers": [
+        \\        "zls",
+        \\        "banjo-notes"
+        \\      ]
+        \\    }
         \\  }
         \\}
         \\"

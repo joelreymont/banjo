@@ -865,7 +865,7 @@ pub const Agent = struct {
         log.info("Created session {s} in {s} with model {?s}", .{ session_id, cwd, session.model });
 
         // Auto-setup: create .zed/settings.json if missing (enables banjo LSP)
-        const did_setup = self.autoSetupLspIfNeeded(cwd) catch false;
+        const did_setup = try self.autoSetupLspIfNeeded(cwd);
 
         const availability = detectEngines();
         session.availability = availability;
@@ -4196,19 +4196,22 @@ pub const Agent = struct {
         const settings_path = try std.fs.path.join(self.allocator, &.{ cwd, ".zed", "settings.json" });
         defer self.allocator.free(settings_path);
 
-        std.fs.accessAbsolute(settings_path, .{}) catch {
-            // Doesn't exist - run setup
-            log.info("Auto-setup: creating .zed/settings.json for {s}", .{cwd});
-            var result = try notes_commands.executeCommand(self.allocator, cwd, "/setup");
-            defer result.deinit(self.allocator);
+        std.fs.accessAbsolute(settings_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                // Doesn't exist - run setup
+                log.info("Auto-setup: creating .zed/settings.json for {s}", .{cwd});
+                var result = try notes_commands.executeCommand(self.allocator, cwd, "/setup");
+                defer result.deinit(self.allocator);
 
-            if (result.success) {
-                log.info("Auto-setup: LSP enabled for project", .{});
-                return true;
-            } else {
-                log.warn("Auto-setup: {s}", .{result.message});
-                return false;
-            }
+                if (result.success) {
+                    log.info("Auto-setup: LSP enabled for project", .{});
+                    return true;
+                } else {
+                    log.warn("Auto-setup: {s}", .{result.message});
+                    return false;
+                }
+            },
+            else => return err,
         };
 
         // Already exists - nothing to do

@@ -549,48 +549,12 @@ pub fn insertAtLine(allocator: Allocator, file_path: []const u8, line_num: u32, 
     if (line_num == 0) return error.LineOutOfBounds;
 
     // Resolve to a canonical path and use it for the actual file open.
-    const real_path = std.fs.cwd().realpathAlloc(allocator, file_path) catch return error.FileNotFound;
+    const real_path = try std.fs.cwd().realpathAlloc(allocator, file_path);
     defer allocator.free(real_path);
     if (!std.mem.eql(u8, real_path, file_path)) return error.PathChanged;
 
-    // Read file
-    const file = std.fs.openFileAbsolute(real_path, .{ .mode = .read_only }) catch return error.FileNotFound;
-    const content = try file.readToEndAlloc(allocator, 10 * 1024 * 1024);
-    file.close();
-    defer allocator.free(content);
-
-    // Count lines and find insertion point
-    var line_start: usize = 0;
-    var current_line: u32 = 1;
-    var total_lines: u32 = 1;
-    var found = false;
-
-    for (content, 0..) |c, i| {
-        if (!found and current_line == line_num) {
-            line_start = i;
-            found = true;
-        }
-        if (c == '\n') {
-            current_line += 1;
-            total_lines += 1;
-        }
-    }
-
-    // Handle insertion at end of file
-    if (!found) {
-        if (line_num == total_lines + 1) {
-            line_start = content.len;
-        } else {
-            return error.LineOutOfBounds;
-        }
-    }
-
-    // Build new content
-    var new_content: std.ArrayListUnmanaged(u8) = .empty;
-    defer new_content.deinit(allocator);
-    try new_content.appendSlice(allocator, content[0..line_start]);
-    try new_content.appendSlice(allocator, text);
-    try new_content.appendSlice(allocator, content[line_start..]);
+    const file = try std.fs.openFileAbsolute(real_path, .{ .mode = .read_only });
+    defer file.close();
 
     // Atomic write: write to temp file with random suffix, then rename
     var random_bytes: [4]u8 = undefined;
@@ -602,14 +566,60 @@ pub fn insertAtLine(allocator: Allocator, file_path: []const u8, line_num: u32, 
     defer allocator.free(tmp_path);
 
     const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
-    tmp_file.writeAll(new_content.items) catch |err| {
-        tmp_file.close();
+    var tmp_closed = false;
+    defer if (!tmp_closed) tmp_file.close();
+    errdefer {
         std.fs.deleteFileAbsolute(tmp_path) catch |cleanup_err| {
             log.warn("Failed to remove temp file {s}: {}", .{ tmp_path, cleanup_err });
         };
-        return err;
-    };
+    }
+
+    var line: u32 = 1;
+    var at_line_start = true;
+    var inserted = false;
+
+    var reader_buf: [4096]u8 = undefined;
+    var writer_buf: [4096]u8 = undefined;
+    var reader = file.reader(&reader_buf);
+    const r = &reader.interface;
+    var writer = tmp_file.writer(&writer_buf);
+    const w = &writer.interface;
+
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const n = try r.readSliceShort(&buf);
+        if (n == 0) break;
+        var i: usize = 0;
+        while (i < n) {
+            if (!inserted and at_line_start and line == line_num) {
+                try w.writeAll(text);
+                inserted = true;
+            }
+            if (std.mem.indexOfScalarPos(u8, buf[0..n], i, '\n')) |nl| {
+                try w.writeAll(buf[i .. nl + 1]);
+                line += 1;
+                at_line_start = true;
+                i = nl + 1;
+            } else {
+                try w.writeAll(buf[i..n]);
+                at_line_start = false;
+                i = n;
+            }
+        }
+    }
+
+    if (!inserted) {
+        if ((line == line_num and at_line_start) or line + 1 == line_num) {
+            try w.writeAll(text);
+            inserted = true;
+        } else {
+            return error.LineOutOfBounds;
+        }
+    }
+
+    try w.flush();
     tmp_file.close();
+    tmp_closed = true;
 
     // Atomic rename
     std.fs.renameAbsolute(tmp_path, file_path) catch |err| {
@@ -719,6 +729,46 @@ test "parseNoteLine extracts links" {
         \\    [1]: []const u8
         \\      "note-3"
     ).expectEqual(summary);
+}
+
+test "insertAtLine inserts into middle and appends" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try tmp_dir.dir.realpath(".", &path_buf);
+    const file_path = try std.fs.path.join(testing.allocator, &.{ tmp_path, "note.txt" });
+    defer testing.allocator.free(file_path);
+
+    {
+        const file = try std.fs.createFileAbsolute(file_path, .{});
+        defer file.close();
+        try file.writeAll("one\ntwo\nthree");
+    }
+    try insertAtLine(testing.allocator, file_path, 2, "INS\n");
+    {
+        const file = try std.fs.openFileAbsolute(file_path, .{ .mode = .read_only });
+        defer file.close();
+        const content = try file.readToEndAlloc(testing.allocator, 1024);
+        defer testing.allocator.free(content);
+        const expected = "one\nINS\ntwo\nthree";
+        try (ohsnap{}).snap(@src(), expected).diff(content, true);
+    }
+
+    {
+        const file = try std.fs.createFileAbsolute(file_path, .{});
+        defer file.close();
+        try file.writeAll("one\ntwo\n");
+    }
+    try insertAtLine(testing.allocator, file_path, 3, "INS\n");
+    {
+        const file = try std.fs.openFileAbsolute(file_path, .{ .mode = .read_only });
+        defer file.close();
+        const content = try file.readToEndAlloc(testing.allocator, 1024);
+        defer testing.allocator.free(content);
+        const expected = "one\ntwo\nINS\n";
+        try (ohsnap{}).snap(@src(), expected).diff(content, true);
+    }
 }
 
 test "scanFileForNotes finds all notes" {
