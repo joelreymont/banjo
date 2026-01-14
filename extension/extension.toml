@@ -27,8 +27,3 @@ args = ["--agent"]
 archive = "https://github.com/joelreymont/banjo/releases/download/v0.6.1/banjo-linux-x64.tar.gz"
 cmd = "./banjo"
 args = ["--agent"]
-
-# LSP Server for notes
-[language_servers.banjo-notes]
-name = "Banjo Notes"
-languages = ["Zig", "Rust", "Python", "JavaScript", "TypeScript", "Go", "C", "C++", "Ruby", "Elixir", "Markdown"]
