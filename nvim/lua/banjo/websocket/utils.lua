@@ -19,6 +19,13 @@ local M = {}
 -- Seed random number generator once at module load for WebSocket masking
 math.randomseed(os.time() + os.clock() * 1000)
 
+local base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local base64_lookup = {}
+for i = 1, #base64_chars do
+  base64_lookup[base64_chars:sub(i, i)] = i - 1
+end
+base64_lookup["="] = 0
+
 -- Lua 5.1 compatible bitwise operations (arithmetic emulation).
 local function band(a, b)
   local result = 0
@@ -102,7 +109,6 @@ end
 ---@param data string The data to encode
 ---@return string encoded The base64 encoded string
 function M.base64_encode(data)
-  local chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
   local result = {}
   local padding = ""
 
@@ -117,10 +123,10 @@ function M.base64_encode(data)
     local bitmap = a * 65536 + b * 256 + c
 
     -- Use table for efficient string building
-    result[#result + 1] = chars:sub(math.floor(bitmap / 262144) + 1, math.floor(bitmap / 262144) + 1)
-    result[#result + 1] = chars:sub(math.floor((bitmap % 262144) / 4096) + 1, math.floor((bitmap % 262144) / 4096) + 1)
-    result[#result + 1] = chars:sub(math.floor((bitmap % 4096) / 64) + 1, math.floor((bitmap % 4096) / 64) + 1)
-    result[#result + 1] = chars:sub((bitmap % 64) + 1, (bitmap % 64) + 1)
+    result[#result + 1] = base64_chars:sub(math.floor(bitmap / 262144) + 1, math.floor(bitmap / 262144) + 1)
+    result[#result + 1] = base64_chars:sub(math.floor((bitmap % 262144) / 4096) + 1, math.floor((bitmap % 262144) / 4096) + 1)
+    result[#result + 1] = base64_chars:sub(math.floor((bitmap % 4096) / 64) + 1, math.floor((bitmap % 4096) / 64) + 1)
+    result[#result + 1] = base64_chars:sub((bitmap % 64) + 1, (bitmap % 64) + 1)
   end
 
   local encoded = table.concat(result)
@@ -131,20 +137,13 @@ end
 ---@param data string The base64 encoded string
 ---@return string|nil decoded The decoded string, or nil on error (e.g. invalid char)
 function M.base64_decode(data)
-  local chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-  local lookup = {}
-  for i = 1, #chars do
-    lookup[chars:sub(i, i)] = i - 1
-  end
-  lookup["="] = 0
-
   local result = {}
   local buffer = 0
   local bits = 0
 
   for i = 1, #data do
     local char = data:sub(i, i)
-    local value = lookup[char]
+    local value = base64_lookup[char]
 
     if value == nil then
       return nil

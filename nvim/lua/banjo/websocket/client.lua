@@ -9,6 +9,7 @@ local M = {}
 ---@field tcp table vim.loop TCP handle
 ---@field state string "connecting" | "connected" | "closing" | "closed"
 ---@field buffer string Receive buffer for incomplete frames
+---@field buffer_pos number Number of bytes consumed from buffer
 ---@field on_message function Callback for received messages
 ---@field on_connect function Callback when connected
 ---@field on_disconnect function Callback when disconnected
@@ -22,6 +23,7 @@ function M.new(callbacks)
         tcp = nil,
         state = "closed",
         buffer = "",
+        buffer_pos = 0,
         on_message = callbacks.on_message or function() end,
         on_connect = callbacks.on_connect or function() end,
         on_disconnect = callbacks.on_disconnect or function() end,
@@ -31,6 +33,44 @@ end
 
 -- Default connection timeout in milliseconds
 local DEFAULT_CONNECT_TIMEOUT = 5000
+local BUFFER_COMPACT_MIN = 8192
+
+local function buffer_len(client)
+    return #client.buffer - client.buffer_pos
+end
+
+local function compact_buffer(client, force)
+    if client.buffer_pos == 0 then
+        return
+    end
+    if not force then
+        if client.buffer_pos < BUFFER_COMPACT_MIN and client.buffer_pos < (#client.buffer / 2) then
+            return
+        end
+    end
+    if client.buffer_pos >= #client.buffer then
+        client.buffer = ""
+        client.buffer_pos = 0
+        return
+    end
+    client.buffer = client.buffer:sub(client.buffer_pos + 1)
+    client.buffer_pos = 0
+end
+
+local function append_buffer(client, data)
+    if client.buffer_pos > 0 then
+        compact_buffer(client, false)
+    end
+    client.buffer = client.buffer .. data
+end
+
+local function schedule_or_run(fn)
+    if vim.in_fast_event() then
+        vim.schedule(fn)
+        return
+    end
+    fn()
+end
 
 ---Connect to a WebSocket server
 ---@param client WebSocketClient
@@ -49,6 +89,7 @@ function M.connect(client, host, port, path, timeout_ms)
 
     client.state = "connecting"
     client.buffer = ""
+    client.buffer_pos = 0
 
     local tcp = vim.loop.new_tcp()
     if not tcp then
@@ -148,14 +189,15 @@ end
 ---@param data string
 ---@param ws_key string WebSocket key for handshake validation
 function M._process_data(client, data, ws_key)
-    client.buffer = client.buffer .. data
+    append_buffer(client, data)
 
     if client.state == "connecting" then
         -- Look for HTTP response end
-        local header_end = client.buffer:find("\r\n\r\n")
+        local start = client.buffer_pos + 1
+        local header_end = client.buffer:find("\r\n\r\n", start, true)
         if header_end then
-            local response = client.buffer:sub(1, header_end + 3)
-            client.buffer = client.buffer:sub(header_end + 4)
+            local response = client.buffer:sub(start, header_end + 3)
+            client.buffer_pos = header_end + 3
 
             -- Validate handshake response
             if not response:match("^HTTP/1%.1 101") then
@@ -179,6 +221,7 @@ function M._process_data(client, data, ws_key)
                 return
             end
 
+            compact_buffer(client, true)
             client.state = "connected"
             vim.schedule(function()
                 client.on_connect()
@@ -194,16 +237,16 @@ end
 ---Process WebSocket frames from buffer
 ---@param client WebSocketClient
 function M._process_frames(client)
-    while #client.buffer > 0 do
-        local ws_frame, bytes_consumed = frame.parse_frame(client.buffer)
+    while buffer_len(client) > 0 do
+        local ws_frame, bytes_consumed = frame.parse_frame(client.buffer, client.buffer_pos + 1)
         if not ws_frame or bytes_consumed == 0 then
             break -- Need more data
         end
 
-        client.buffer = client.buffer:sub(bytes_consumed + 1)
+        client.buffer_pos = client.buffer_pos + bytes_consumed
 
         if ws_frame.opcode == frame.OPCODE.TEXT or ws_frame.opcode == frame.OPCODE.BINARY then
-            vim.schedule(function()
+            schedule_or_run(function()
                 client.on_message(ws_frame.payload)
             end)
         elseif ws_frame.opcode == frame.OPCODE.PING then
@@ -225,7 +268,8 @@ function M._process_frames(client)
             end
             client.state = "closed"
             client.buffer = "" -- Clear buffer on close
-            vim.schedule(function()
+            client.buffer_pos = 0
+            schedule_or_run(function()
                 client.on_disconnect(code, reason)
             end)
             if client.tcp and not client.tcp:is_closing() then
@@ -234,6 +278,7 @@ function M._process_frames(client)
             return
         end
     end
+    compact_buffer(client, false)
 end
 
 ---Re-encode a frame with client masking

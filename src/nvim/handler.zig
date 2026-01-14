@@ -70,6 +70,7 @@ pub const PermissionState = struct {
 pub const ApprovalState = struct {
     pending_id: ?[]const u8 = null,
     pending_response: ?[]const u8 = null, // String literal, not allocated
+    mutex: std.Thread.Mutex = .{},
 
     pub fn deinit(self: *ApprovalState, allocator: Allocator) void {
         if (self.pending_id) |pid| allocator.free(pid);
@@ -105,7 +106,7 @@ pub const PromptState = struct {
 
 /// Nudge state for auto-continuation
 pub const NudgeState = struct {
-    enabled: bool = true,
+    enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     last_ms: i64 = 0,
 };
 
@@ -122,16 +123,19 @@ pub const Handler = struct {
     should_exit: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     poll_thread: ?std.Thread = null,
 
-    // State for engine/model selection
+    // State for engine/model selection (protected by state_mutex)
     current_engine: Engine = .claude,
     current_model: ?[]const u8 = null,
-    session_active: bool = false,
+    state_mutex: std.Thread.Mutex = .{},
+
+    // Atomic state (accessed from multiple threads)
+    session_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     // Persistent bridges (kept alive across prompts)
     claude_bridge: ?claude_bridge.Bridge = null,
     codex_bridge_inst: ?codex_bridge.CodexBridge = null,
     bridge_cwd: ?[]const u8 = null,
-    prompt_count: u32 = 0,
+    prompt_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     // Grouped state
     permission: PermissionState,
@@ -233,7 +237,10 @@ pub const Handler = struct {
         debugLog("Handler.run starting", .{});
 
         // Configure permission hook and create socket for Claude Code
-        const hook_result = settings.ensurePermissionHook(self.allocator);
+        const hook_result = settings.ensurePermissionHook(self.allocator) catch |err| blk: {
+            log.warn("Failed to ensure permission hook: {}", .{err});
+            break :blk null;
+        };
         self.createPermissionSocket() catch |err| {
             log.warn("Failed to create permission socket: {}", .{err});
         };
@@ -245,8 +252,10 @@ pub const Handler = struct {
         };
 
         // Notify user if permission hook was newly configured
-        if (hook_result == .configured) {
-            log.info("Configured Banjo permission hook - restart Claude Code for interactive prompts", .{});
+        if (hook_result) |result| {
+            if (result == .configured) {
+                log.info("Configured Banjo permission hook - restart Claude Code for interactive prompts", .{});
+            }
         }
 
         if (self.mcp_server) |mcp| {
@@ -254,6 +263,8 @@ pub const Handler = struct {
             mcp.nvim_message_callback = nvimMessageCallback;
             mcp.nvim_connect_callback = nvimConnectCallback;
             mcp.nvim_callback_ctx = @ptrCast(self);
+            mcp.tool_request_callback = toolRequestCallback;
+            mcp.tool_callback_ctx = @ptrCast(self);
 
             mcp.start() catch |err| {
                 log.err("Failed to start MCP server: {}", .{err});
@@ -311,7 +322,7 @@ pub const Handler = struct {
 
         // Emit session_start for every new prompt (resets timer on Lua side)
         debugLog("processQueuedPrompt: emitting session_start", .{});
-        self.session_active = true;
+        self.session_active.store(true, .release);
         self.sendNotification("session_start", protocol.SessionEvent{}) catch |err| {
             log.warn("Failed to send session_start: {}", .{err});
         };
@@ -348,10 +359,19 @@ pub const Handler = struct {
             log.info("Processing continuation prompt for {s}", .{@tagName(continuation.engine)});
             self.cancelled.store(false, .release);
 
-            // Override engine for continuation
-            const saved_engine = self.current_engine;
-            self.current_engine = continuation.engine;
-            defer self.current_engine = saved_engine;
+            // Override engine for continuation (processPrompt reads it under lock)
+            const saved_engine = blk: {
+                self.state_mutex.lock();
+                defer self.state_mutex.unlock();
+                const saved = self.current_engine;
+                self.current_engine = continuation.engine;
+                break :blk saved;
+            };
+            defer {
+                self.state_mutex.lock();
+                defer self.state_mutex.unlock();
+                self.current_engine = saved_engine;
+            }
 
             const cont_req = protocol.PromptRequest{
                 .text = continuation.text,
@@ -473,15 +493,20 @@ pub const Handler = struct {
     fn promptUserForPermission(self: *Handler, client_fd: std.posix.fd_t, req: PermissionHookRequest) void {
         // Store pending state
         if (self.permission.pending_id) |old| self.allocator.free(old);
-        self.permission.pending_id = self.allocator.dupe(u8, req.tool_use_id) catch {
+        self.permission.pending_id = self.allocator.dupe(u8, req.tool_use_id) catch |err| {
+            log.err("Failed to store pending permission id: {}", .{err});
             self.sendPermissionResponse(client_fd, "deny", "out of memory");
             return;
         };
         self.permission.pending_response = null;
 
         // Format tool_input for display
-        const tool_input_str = std.json.Stringify.valueAlloc(self.allocator, req.tool_input, .{}) catch null;
-        defer if (tool_input_str) |s| self.allocator.free(s);
+        const tool_input_str = std.json.Stringify.valueAlloc(self.allocator, req.tool_input, .{}) catch |err| {
+            log.err("Failed to stringify permission tool input: {}", .{err});
+            self.sendPermissionResponse(client_fd, "deny", "out of memory");
+            return;
+        };
+        defer self.allocator.free(tool_input_str);
 
         // Send permission_request notification to Lua UI
         self.sendNotification("permission_request", protocol.PermissionRequest{
@@ -508,25 +533,29 @@ pub const Handler = struct {
             }
 
             if (self.permission.pending_response) |response| {
+                defer {
+                    self.allocator.free(response);
+                    self.permission.pending_response = null;
+                }
                 if (self.permission.pending_id) |pid| {
                     self.allocator.free(pid);
                     self.permission.pending_id = null;
                 }
 
                 if (std.mem.eql(u8, response, "allow_always")) {
-                    const tool_name_copy = self.allocator.dupe(u8, tool_name) catch null;
-                    if (tool_name_copy) |name| {
-                        self.permission.always_allowed.put(name, {}) catch {
-                            self.allocator.free(name);
-                        };
-                    }
+                    const tool_name_copy = self.allocator.dupe(u8, tool_name) catch |err| {
+                        log.warn("Failed to store always-allowed tool name: {}", .{err});
+                        self.sendPermissionResponse(client_fd, "allow", null);
+                        return;
+                    };
+                    self.permission.always_allowed.put(tool_name_copy, {}) catch |err| {
+                        log.warn("Failed to record always-allowed tool: {}", .{err});
+                        self.allocator.free(tool_name_copy);
+                    };
                     self.sendPermissionResponse(client_fd, "allow", null);
                 } else {
                     self.sendPermissionResponse(client_fd, response, null);
                 }
-
-                self.allocator.free(response);
-                self.permission.pending_response = null;
                 return;
             }
 
@@ -559,13 +588,20 @@ pub const Handler = struct {
             return "allow";
         }
 
+        // Read permission mode under lock
+        const mode = blk: {
+            self.state_mutex.lock();
+            defer self.state_mutex.unlock();
+            break :blk self.permission.mode;
+        };
+
         // Auto-approve in bypass mode
-        if (self.permission.mode == .bypassPermissions) {
+        if (mode == .bypassPermissions) {
             return "allow";
         }
 
         // Auto-approve edit tools in acceptEdits mode
-        if (self.permission.mode == .acceptEdits and tool_categories.isEdit(tool_name)) {
+        if (mode == .acceptEdits and tool_categories.isEdit(tool_name)) {
             return "allow";
         }
 
@@ -603,9 +639,18 @@ pub const Handler = struct {
             .writer = &out.writer,
             .options = .{ .emit_null_optional_fields = false },
         };
-        jw.write(PermissionResponse{ .decision = decision, .reason = reason }) catch return;
-        out.writer.writeAll("\n") catch return;
-        const json = out.toOwnedSlice() catch return;
+        jw.write(PermissionResponse{ .decision = decision, .reason = reason }) catch |err| {
+            log.warn("Failed to serialize permission response: {}", .{err});
+            return;
+        };
+        out.writer.writeAll("\n") catch |err| {
+            log.warn("Failed to append newline to permission response: {}", .{err});
+            return;
+        };
+        const json = out.toOwnedSlice() catch |err| {
+            log.warn("Failed to get permission response buffer: {}", .{err});
+            return;
+        };
         defer self.allocator.free(json);
 
         _ = std.posix.write(client_fd, json) catch |err| {
@@ -617,6 +662,18 @@ pub const Handler = struct {
         const self: *Handler = @ptrCast(@alignCast(ctx));
         debugLog("nvimConnectCallback: sending initial state", .{});
         self.sendStateNotification();
+    }
+
+    fn toolRequestCallback(ctx: *anyopaque, tool_name: []const u8, correlation_id: []const u8, args: ?std.json.Value) void {
+        const self: *Handler = @ptrCast(@alignCast(ctx));
+        debugLog("toolRequestCallback: tool={s} corr={s}", .{ tool_name, correlation_id });
+        self.sendNotification("tool_request", protocol.ToolRequest{
+            .tool_name = tool_name,
+            .correlation_id = correlation_id,
+            .arguments = args,
+        }) catch |err| {
+            log.warn("Failed to send tool_request: {}", .{err});
+        };
     }
 
     fn nvimMessageCallback(ctx: *anyopaque, method: []const u8, params: ?std.json.Value) void {
@@ -692,7 +749,14 @@ pub const Handler = struct {
             log.err("Failed to allocate prompt text", .{});
             return;
         };
-        const cwd = if (parsed.value.cwd) |c| self.allocator.dupe(u8, c) catch null else null;
+        const cwd = if (parsed.value.cwd) |c| blk: {
+            const copy = self.allocator.dupe(u8, c) catch |err| {
+                log.err("Failed to allocate prompt cwd: {}", .{err});
+                self.allocator.free(text);
+                return;
+            };
+            break :blk copy;
+        } else null;
 
         // Queue the prompt and signal main thread
         debugLog("handleNvimPrompt: queuing prompt", .{});
@@ -712,8 +776,7 @@ pub const Handler = struct {
 
     fn handleNvimCancel(self: *Handler) void {
         // Emit session_end if session is active
-        if (self.session_active) {
-            self.session_active = false;
+        if (self.session_active.swap(false, .acq_rel)) {
             self.sendNotification("session_end", protocol.SessionEvent{}) catch |err| {
                 log.warn("Failed to send session_end: {}", .{err});
             };
@@ -756,8 +819,9 @@ pub const Handler = struct {
     }
 
     fn handleNvimNudgeToggle(self: *Handler) void {
-        self.nudge.enabled = !self.nudge.enabled;
-        const status = if (self.nudge.enabled) "Nudge enabled" else "Nudge disabled";
+        const was_enabled = self.nudge.enabled.load(.acquire);
+        self.nudge.enabled.store(!was_enabled, .release);
+        const status = if (!was_enabled) "Nudge enabled" else "Nudge disabled";
         self.sendNotification("status", protocol.StatusUpdate{ .text = status }) catch |err| {
             log.warn("Failed to send nudge status: {}", .{err});
         };
@@ -768,7 +832,11 @@ pub const Handler = struct {
         defer parsed.deinit();
 
         if (core_types.engine_map.get(parsed.value.engine)) |engine| {
-            self.current_engine = engine;
+            {
+                self.state_mutex.lock();
+                defer self.state_mutex.unlock();
+                self.current_engine = engine;
+            }
             self.sendNotification("status", protocol.StatusUpdate{
                 .text = if (engine == .claude) "Engine: Claude" else "Engine: Codex",
             }) catch |err| {
@@ -789,17 +857,33 @@ pub const Handler = struct {
 
         // Validate model name
         if (core_types.model_id_set.has(parsed.value.model)) {
-            // Free old model if owned
-            if (self.current_model) |old| {
-                self.allocator.free(old);
-            }
-            self.current_model = self.allocator.dupe(u8, parsed.value.model) catch null;
-
-            var buf: [64]u8 = undefined;
-            const status = std.fmt.bufPrint(&buf, "Model: {s}", .{parsed.value.model}) catch "Model changed";
-            self.sendNotification("status", protocol.StatusUpdate{ .text = status }) catch |err| {
-                log.warn("Failed to send model status: {}", .{err});
+            const model_copy = self.allocator.dupe(u8, parsed.value.model) catch |err| {
+                log.warn("Failed to store model name: {}", .{err});
+                self.sendError("Failed to set model") catch |send_err| {
+                    log.warn("Failed to send model error: {}", .{send_err});
+                };
+                return;
             };
+            {
+                self.state_mutex.lock();
+                defer self.state_mutex.unlock();
+                // Free old model if owned
+                if (self.current_model) |old| {
+                    self.allocator.free(old);
+                }
+                self.current_model = model_copy;
+            }
+
+            const status = std.fmt.allocPrint(self.allocator, "Model: {s}", .{parsed.value.model}) catch |err| blk: {
+                log.warn("Failed to format model status: {}", .{err});
+                break :blk null;
+            };
+            if (status) |text| {
+                defer self.allocator.free(text);
+                self.sendNotification("status", protocol.StatusUpdate{ .text = text }) catch |err| {
+                    log.warn("Failed to send model status: {}", .{err});
+                };
+            }
             self.sendStateNotification();
         } else {
             log.warn("Invalid model: {s}", .{parsed.value.model});
@@ -821,12 +905,21 @@ pub const Handler = struct {
         });
 
         if (mode_map.get(parsed.value.mode)) |mode| {
-            self.permission.mode = mode;
-            var buf: [64]u8 = undefined;
-            const status = std.fmt.bufPrint(&buf, "Mode: {s}", .{mode.toString()}) catch "Mode changed";
-            self.sendNotification("status", protocol.StatusUpdate{ .text = status }) catch |err| {
-                log.warn("Failed to send mode status: {}", .{err});
+            {
+                self.state_mutex.lock();
+                defer self.state_mutex.unlock();
+                self.permission.mode = mode;
+            }
+            const status = std.fmt.allocPrint(self.allocator, "Mode: {s}", .{mode.toString()}) catch |err| blk: {
+                log.warn("Failed to format mode status: {}", .{err});
+                break :blk null;
             };
+            if (status) |text| {
+                defer self.allocator.free(text);
+                self.sendNotification("status", protocol.StatusUpdate{ .text = text }) catch |err| {
+                    log.warn("Failed to send mode status: {}", .{err});
+                };
+            }
             self.sendStateNotification();
         } else {
             log.warn("Unknown mode: {s}", .{parsed.value.mode});
@@ -854,14 +947,17 @@ pub const Handler = struct {
         const parsed = self.parseParams(protocol.ApprovalResponseRequest, params) orelse return;
         defer parsed.deinit();
 
+        // Map to string literal (no allocation needed)
+        const decision = approval_decisions.get(parsed.value.decision) orelse {
+            log.warn("Unknown approval decision: {s}", .{parsed.value.decision});
+            return;
+        };
+
         // Check if this matches the pending approval
+        self.approval.mutex.lock();
+        defer self.approval.mutex.unlock();
         if (self.approval.pending_id) |pending_id| {
             if (std.mem.eql(u8, pending_id, parsed.value.id)) {
-                // Map to string literal (no allocation needed)
-                const decision = approval_decisions.get(parsed.value.decision) orelse {
-                    log.warn("Unknown approval decision: {s}", .{parsed.value.decision});
-                    return;
-                };
                 self.approval.pending_response = decision;
                 log.info("Received approval response: {s} for {s}", .{ decision, parsed.value.id });
             } else {
@@ -880,10 +976,14 @@ pub const Handler = struct {
         if (self.permission.pending_id) |pending_id| {
             if (std.mem.eql(u8, pending_id, parsed.value.id)) {
                 // Store the response
+                const response_copy = self.allocator.dupe(u8, parsed.value.decision) catch |err| {
+                    log.warn("Failed to store permission response: {}", .{err});
+                    return;
+                };
                 if (self.permission.pending_response) |old| {
                     self.allocator.free(old);
                 }
-                self.permission.pending_response = self.allocator.dupe(u8, parsed.value.decision) catch null;
+                self.permission.pending_response = response_copy;
                 log.info("Received permission response: {s} for {s}", .{ parsed.value.decision, parsed.value.id });
             } else {
                 log.warn("Permission response ID mismatch: expected {s}, got {s}", .{ pending_id, parsed.value.id });
@@ -894,25 +994,36 @@ pub const Handler = struct {
     }
 
     fn sendStateNotification(self: *Handler) void {
-        const engine_str: []const u8 = switch (self.current_engine) {
+        // Capture state under lock
+        const state = blk: {
+            self.state_mutex.lock();
+            defer self.state_mutex.unlock();
+            break :blk .{
+                .engine = self.current_engine,
+                .model = self.current_model,
+                .mode = self.permission.mode,
+            };
+        };
+
+        const engine_str: []const u8 = switch (state.engine) {
             .claude => "claude",
             .codex => "codex",
         };
 
-        const session_id = switch (self.current_engine) {
+        const session_id = switch (state.engine) {
             .claude => self.claude_session_id,
             .codex => self.codex_session_id,
         };
 
-        const models: []const core_types.ModelInfo = switch (self.current_engine) {
+        const models: []const core_types.ModelInfo = switch (state.engine) {
             .claude => &claude_bridge.models,
             .codex => &codex_bridge.models,
         };
 
         self.sendNotification("state", protocol.StateResponse{
             .engine = engine_str,
-            .model = self.current_model,
-            .mode = self.permission.mode.toString(),
+            .model = state.model,
+            .mode = state.mode.toString(),
             .session_id = session_id,
             .connected = self.mcp_server != null,
             .models = models,
@@ -929,7 +1040,7 @@ pub const Handler = struct {
         self.sendNotification("debug_info", protocol.DebugInfo{
             .claude_bridge_alive = claude_alive,
             .codex_bridge_alive = codex_alive,
-            .prompt_count = self.prompt_count,
+            .prompt_count = self.prompt_count.load(.acquire),
         }) catch |err| {
             log.err("Failed to send debug_info notification: {}", .{err});
         };
@@ -990,12 +1101,21 @@ pub const Handler = struct {
 
         if (!self.claude_bridge.?.isAlive()) {
             debugLog("ensureClaudeBridge: starting bridge", .{});
-            try self.claude_bridge.?.start(.{
-                .permission_mode = self.permission.mode.toCliArg(),
-                .model = self.current_model,
-                .permission_socket_path = self.permission.socket_path,
-                .continue_last = true, // Always continue last session
-            });
+            // Read mode and model under lock, dupe model to avoid UAF
+            var model_copy: ?[]const u8 = null;
+            const start_opts: claude_bridge.Bridge.StartOptions = blk: {
+                self.state_mutex.lock();
+                defer self.state_mutex.unlock();
+                model_copy = if (self.current_model) |m| try self.allocator.dupe(u8, m) else null;
+                break :blk .{
+                    .permission_mode = self.permission.mode.toCliArg(),
+                    .model = model_copy,
+                    .permission_socket_path = self.permission.socket_path,
+                    .continue_last = true,
+                };
+            };
+            defer if (model_copy) |m| self.allocator.free(m);
+            try self.claude_bridge.?.start(start_opts);
         }
 
         return &self.claude_bridge.?;
@@ -1017,8 +1137,14 @@ pub const Handler = struct {
 
         if (!self.codex_bridge_inst.?.isAlive()) {
             debugLog("ensureCodexBridge: starting bridge", .{});
+            // Read mode under lock
+            const approval_policy = blk: {
+                self.state_mutex.lock();
+                defer self.state_mutex.unlock();
+                break :blk self.permission.mode.toCodexApprovalPolicy();
+            };
             try self.codex_bridge_inst.?.start(.{
-                .approval_policy = self.permission.mode.toCodexApprovalPolicy(),
+                .approval_policy = approval_policy,
                 .resume_last = self.codex_session_id == null, // Resume last if no explicit session
             });
         }
@@ -1027,9 +1153,13 @@ pub const Handler = struct {
     }
 
     fn processPrompt(self: *Handler, prompt_req: protocol.PromptRequest) !void {
-        self.prompt_count += 1;
-        debugLog("processPrompt: entry, engine={s}, count={d}", .{ @tagName(self.current_engine), self.prompt_count });
-        const engine = self.current_engine;
+        const count = self.prompt_count.fetchAdd(1, .acq_rel) + 1;
+        const engine = blk: {
+            self.state_mutex.lock();
+            defer self.state_mutex.unlock();
+            break :blk self.current_engine;
+        };
+        debugLog("processPrompt: entry, engine={s}, count={d}", .{ @tagName(engine), count });
 
         debugLog("processPrompt: sending stream_start notification", .{});
         try self.sendNotification("stream_start", protocol.StreamStart{ .engine = engine });
@@ -1046,7 +1176,7 @@ pub const Handler = struct {
             .cwd = if (prompt_req.cwd) |c| c else self.cwd,
             .cancelled = &self.cancelled,
             .nudge = .{
-                .enabled = self.nudge.enabled,
+                .enabled = self.nudge.enabled.load(.acquire),
                 .cooldown_ms = constants.nudge_cooldown_ms,
                 .last_nudge_ms = &self.nudge.last_ms,
             },
@@ -1277,14 +1407,24 @@ pub const Handler = struct {
         const handler = cb_ctx.handler;
 
         // Store session_id for future prompts (--resume)
+        const session_copy = handler.allocator.dupe(u8, session_id) catch |err| {
+            log.warn("Failed to store session id: {}", .{err});
+            handler.sendNotification("session_id", protocol.SessionIdUpdate{
+                .engine = engine,
+                .session_id = session_id,
+            }) catch |send_err| {
+                log.err("Failed to send session_id notification: {}", .{send_err});
+            };
+            return;
+        };
         switch (engine) {
             .claude => {
                 if (handler.claude_session_id) |old| handler.allocator.free(old);
-                handler.claude_session_id = handler.allocator.dupe(u8, session_id) catch null;
+                handler.claude_session_id = session_copy;
             },
             .codex => {
                 if (handler.codex_session_id) |old| handler.allocator.free(old);
-                handler.codex_session_id = handler.allocator.dupe(u8, session_id) catch null;
+                handler.codex_session_id = session_copy;
             },
         }
 
@@ -1326,8 +1466,9 @@ pub const Handler = struct {
         if (handler.prompt.continuation) |old| {
             handler.allocator.free(old.text);
         }
+        const prompt_copy = try handler.allocator.dupe(u8, prompt);
         handler.prompt.continuation = .{
-            .text = handler.allocator.dupe(u8, prompt) catch return false,
+            .text = prompt_copy,
             .engine = engine,
         };
         log.info("Queued continuation prompt for {s}", .{@tagName(engine)});
@@ -1338,24 +1479,34 @@ pub const Handler = struct {
         const cb_ctx = CallbackContext.from(ctx);
         const handler = cb_ctx.handler;
 
-        if (codexAutoApprovalDecision(handler.permission.mode, kind)) |decision| {
+        // Read mode under lock
+        const mode = blk: {
+            handler.state_mutex.lock();
+            defer handler.state_mutex.unlock();
+            break :blk handler.permission.mode;
+        };
+        if (codexAutoApprovalDecision(mode, kind)) |decision| {
             return decision;
         }
 
         // Convert request_id to string
         var id_buf: [64]u8 = undefined;
         const id_str = switch (request_id) {
-            .integer => |i| std.fmt.bufPrint(&id_buf, "{d}", .{i}) catch "unknown",
+            .integer => |i| try std.fmt.bufPrint(&id_buf, "{d}", .{i}),
             .string => |s| s,
-            else => "unknown",
+            else => return error.InvalidRequestId,
         };
 
         // Store pending approval ID
-        if (handler.approval.pending_id) |old| {
-            handler.allocator.free(old);
+        {
+            handler.approval.mutex.lock();
+            defer handler.approval.mutex.unlock();
+            if (handler.approval.pending_id) |old| {
+                handler.allocator.free(old);
+            }
+            handler.approval.pending_id = try handler.allocator.dupe(u8, id_str);
+            handler.approval.pending_response = null;
         }
-        handler.approval.pending_id = handler.allocator.dupe(u8, id_str) catch return null;
-        handler.approval.pending_response = null;
 
         // Convert kind to risk level
         const risk_level: []const u8 = switch (kind) {
@@ -1364,15 +1515,10 @@ pub const Handler = struct {
         };
 
         // Convert params to arguments string
-        var args_str: ?[]const u8 = null;
-        if (params) |p| {
-            args_str = std.json.Stringify.valueAlloc(handler.allocator, p, .{
-                .emit_null_optional_fields = false,
-            }) catch |err| {
-                log.warn("Failed to stringify approval params: {}", .{err});
-                return null;
-            };
-        }
+        const args_str = if (params) |p|
+            try std.json.Stringify.valueAlloc(handler.allocator, p, .{ .emit_null_optional_fields = false })
+        else
+            null;
         defer if (args_str) |a| handler.allocator.free(a);
 
         // Get tool name from kind
@@ -1401,20 +1547,29 @@ pub const Handler = struct {
         while (std.time.milliTimestamp() - start_time < timeout_ms) {
             // Check if cancelled
             if (handler.cancelled.load(.acquire)) {
-                return "decline";
-            }
-
-            // Check if we have a response
-            if (handler.approval.pending_response) |response| {
-                // Clean up pending state
+                handler.approval.mutex.lock();
+                defer handler.approval.mutex.unlock();
                 if (handler.approval.pending_id) |pid| {
                     handler.allocator.free(pid);
                     handler.approval.pending_id = null;
                 }
+                return "decline";
+            }
 
-                // Response is a string literal - no allocation, no need to free
-                handler.approval.pending_response = null;
-                return response;
+            // Check if we have a response
+            {
+                handler.approval.mutex.lock();
+                defer handler.approval.mutex.unlock();
+                if (handler.approval.pending_response) |response| {
+                    // Clean up pending state
+                    if (handler.approval.pending_id) |pid| {
+                        handler.allocator.free(pid);
+                        handler.approval.pending_id = null;
+                    }
+                    // Response is a string literal - no allocation, no need to free
+                    handler.approval.pending_response = null;
+                    return response;
+                }
             }
 
             // Poll MCP server for incoming messages
@@ -1429,9 +1584,13 @@ pub const Handler = struct {
 
         // Timeout - clean up and decline
         log.warn("Approval request timed out for {s}", .{id_str});
-        if (handler.approval.pending_id) |pid| {
-            handler.allocator.free(pid);
-            handler.approval.pending_id = null;
+        {
+            handler.approval.mutex.lock();
+            defer handler.approval.mutex.unlock();
+            if (handler.approval.pending_id) |pid| {
+                handler.allocator.free(pid);
+                handler.approval.pending_id = null;
+            }
         }
         return "decline";
     }
@@ -1452,7 +1611,7 @@ test "handler init/deinit" {
 
     const summary = .{
         .cancelled = handler.cancelled.load(.acquire),
-        .nudge = handler.nudge.enabled,
+        .nudge = handler.nudge.enabled.load(.acquire),
     };
     try (ohsnap{}).snap(@src(),
         \\nvim.handler.test.handler init/deinit__struct_<^\d+$>
@@ -1472,15 +1631,15 @@ test "handler nudge toggle" {
     var handler = try Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
     defer handler.deinit();
 
-    const initial = handler.nudge.enabled;
+    const initial = handler.nudge.enabled.load(.acquire);
 
     // Toggle nudge (simulate callback)
-    handler.nudge.enabled = !handler.nudge.enabled;
-    const after_first = handler.nudge.enabled;
+    handler.nudge.enabled.store(!initial, .release);
+    const after_first = handler.nudge.enabled.load(.acquire);
 
     // Toggle again
-    handler.nudge.enabled = !handler.nudge.enabled;
-    const after_second = handler.nudge.enabled;
+    handler.nudge.enabled.store(!after_first, .release);
+    const after_second = handler.nudge.enabled.load(.acquire);
     const summary = .{
         .initial = initial,
         .after_first = after_first,
@@ -1937,13 +2096,19 @@ test "permission socket create and close" {
         }
         break :blk false;
     } else false;
-    const stat = if (handler.permission.socket_path) |path| std.fs.cwd().statFile(path) catch null else null;
+    const stat_present = if (handler.permission.socket_path) |path| blk: {
+        _ = std.fs.cwd().statFile(path) catch |err| switch (err) {
+            error.FileNotFound => break :blk false,
+            else => return err,
+        };
+        break :blk true;
+    } else false;
     const before = .{
         .socket = handler.permission.socket != null,
         .socket_path_present = handler.permission.socket_path != null,
         .session_id_present = handler.permission.session_id != null,
         .path_contains = path_contains,
-        .stat_present = stat != null,
+        .stat_present = stat_present,
     };
 
     // Close socket
@@ -2169,16 +2334,22 @@ test "ensureClaudeBridge reuses bridge regardless of cwd" {
     defer handler.deinit();
 
     // First call creates bridge (won't start process since Claude not available in tests)
-    _ = handler.ensureClaudeBridge("/tmp/test1") catch {};
+    if (handler.ensureClaudeBridge("/tmp/test1")) |_| {} else |err| {
+        log.warn("ensureClaudeBridge failed in test: {}", .{err});
+    }
     const first_bridge_ptr = if (handler.claude_bridge) |*b| @intFromPtr(b) else 0;
     const first_cwd_correct = if (handler.bridge_cwd) |c| std.mem.eql(u8, c, "/tmp/test1") else false;
 
     // Second call with same cwd should reuse
-    _ = handler.ensureClaudeBridge("/tmp/test1") catch {};
+    if (handler.ensureClaudeBridge("/tmp/test1")) |_| {} else |err| {
+        log.warn("ensureClaudeBridge failed in test: {}", .{err});
+    }
     const second_bridge_ptr = if (handler.claude_bridge) |*b| @intFromPtr(b) else 0;
 
     // Third call with different cwd should still reuse (cwd locked to first)
-    _ = handler.ensureClaudeBridge("/tmp/test2") catch {};
+    if (handler.ensureClaudeBridge("/tmp/test2")) |_| {} else |err| {
+        log.warn("ensureClaudeBridge failed in test: {}", .{err});
+    }
     const third_bridge_ptr = if (handler.claude_bridge) |*b| @intFromPtr(b) else 0;
     const cwd_unchanged = if (handler.bridge_cwd) |c| std.mem.eql(u8, c, "/tmp/test1") else false;
 
@@ -2209,16 +2380,22 @@ test "ensureCodexBridge reuses bridge for same cwd" {
     defer handler.deinit();
 
     // First call creates bridge
-    _ = handler.ensureCodexBridge("/tmp/test1") catch {};
+    if (handler.ensureCodexBridge("/tmp/test1")) |_| {} else |err| {
+        log.warn("ensureCodexBridge failed in test: {}", .{err});
+    }
     const first_bridge_ptr = if (handler.codex_bridge_inst) |*b| @intFromPtr(b) else 0;
     const first_cwd_correct = if (handler.bridge_cwd) |c| std.mem.eql(u8, c, "/tmp/test1") else false;
 
     // Second call with same cwd should reuse
-    _ = handler.ensureCodexBridge("/tmp/test1") catch {};
+    if (handler.ensureCodexBridge("/tmp/test1")) |_| {} else |err| {
+        log.warn("ensureCodexBridge failed in test: {}", .{err});
+    }
     const second_bridge_ptr = if (handler.codex_bridge_inst) |*b| @intFromPtr(b) else 0;
 
     // Third call with different cwd should create new bridge
-    _ = handler.ensureCodexBridge("/tmp/test2") catch {};
+    if (handler.ensureCodexBridge("/tmp/test2")) |_| {} else |err| {
+        log.warn("ensureCodexBridge failed in test: {}", .{err});
+    }
     const third_cwd_correct = if (handler.bridge_cwd) |c| std.mem.eql(u8, c, "/tmp/test2") else false;
 
     const summary = .{

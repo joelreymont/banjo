@@ -12,6 +12,7 @@ const config = @import("config");
 const log = std.log.scoped(.mcp_server);
 const debug_log = @import("../util/debug_log.zig");
 const json_util = @import("../util/json.zig");
+const byte_queue = @import("../util/byte_queue.zig");
 
 const max_pending_handshakes: usize = 8;
 
@@ -37,13 +38,19 @@ pub const McpServer = struct {
     last_selection: ?OwnedSelection = null,
 
     // Read buffers for WebSocket frames (separate per client)
-    mcp_read_buffer: std.ArrayList(u8) = .empty,
-    nvim_read_buffer: std.ArrayList(u8) = .empty,
+    mcp_read_buffer: byte_queue.ByteQueue = .{},
+    nvim_read_buffer: byte_queue.ByteQueue = .{},
     pending_handshakes: std.AutoHashMap(posix.socket_t, PendingHandshake),
 
+    // Mutex for socket operations (protects nvim_client_socket, mcp_client_socket)
+    socket_mutex: std.Thread.Mutex = .{},
+
+    // Mutex for poll operations (ensures single-threaded polling)
+    poll_mutex: std.Thread.Mutex = .{},
+
     // Callback for sending tool requests to nvim
-    tool_request_callback: ?*const fn (tool_name: []const u8, correlation_id: []const u8, args: ?std.json.Value) void = null,
-    callback_ctx: ?*anyopaque = null,
+    tool_request_callback: ?*const fn (ctx: *anyopaque, tool_name: []const u8, correlation_id: []const u8, args: ?std.json.Value) void = null,
+    tool_callback_ctx: ?*anyopaque = null,
 
     // Callback for nvim messages (prompt, cancel, etc.)
     nvim_message_callback: ?*const fn (ctx: *anyopaque, method: []const u8, params: ?std.json.Value) void = null,
@@ -164,7 +171,10 @@ pub const McpServer = struct {
 
     fn closeSocket(self: *McpServer, socket_ptr: *?posix.socket_t, name: []const u8) void {
         const sock = socket_ptr.* orelse return;
-        const close_frame = websocket.encodeFrame(self.allocator, .close, "") catch null;
+        const close_frame = websocket.encodeFrame(self.allocator, .close, "") catch |err| blk: {
+            log.debug("Failed to encode close frame for {s} client: {}", .{ name, err });
+            break :blk null;
+        };
         if (close_frame) |frame| {
             _ = posix.write(sock, frame) catch |err| {
                 log.debug("Failed to send close frame to {s} client: {}", .{ name, err });
@@ -196,6 +206,9 @@ pub const McpServer = struct {
     /// Poll for events with timeout in milliseconds.
     /// Returns true if should continue polling.
     pub fn poll(self: *McpServer, timeout_ms: i32) !bool {
+        self.poll_mutex.lock();
+        defer self.poll_mutex.unlock();
+
         var fds: [max_pending_handshakes + 3]posix.pollfd = undefined;
         var nfds: usize = 0;
 
@@ -228,7 +241,7 @@ pub const McpServer = struct {
 
         const ready = try posix.poll(fds[0..nfds], timeout_ms);
         if (ready == 0) {
-            // Timeout - check for expired requests
+            // Timeout - still check timeouts and handshakes
             self.checkTimeouts();
             self.expirePendingHandshakes(std.time.milliTimestamp());
             return true;
@@ -274,23 +287,29 @@ pub const McpServer = struct {
             }
         }
 
+        // Check timeouts unconditionally (not just on poll timeout)
+        self.checkTimeouts();
         self.expirePendingHandshakes(std.time.milliTimestamp());
         return true;
     }
 
     fn closeMcpClient(self: *McpServer) void {
+        self.socket_mutex.lock();
+        defer self.socket_mutex.unlock();
         if (self.mcp_client_socket) |sock| {
             posix.close(sock);
             self.mcp_client_socket = null;
-            self.mcp_read_buffer.clearRetainingCapacity();
+            self.mcp_read_buffer.clear();
         }
     }
 
     fn closeNvimClient(self: *McpServer) void {
+        self.socket_mutex.lock();
+        defer self.socket_mutex.unlock();
         if (self.nvim_client_socket) |sock| {
             posix.close(sock);
             self.nvim_client_socket = null;
-            self.nvim_read_buffer.clearRetainingCapacity();
+            self.nvim_read_buffer.clear();
         }
     }
 
@@ -343,6 +362,9 @@ pub const McpServer = struct {
         client: posix.socket_t,
         remainder: []const u8,
     ) !void {
+        self.socket_mutex.lock();
+        defer self.socket_mutex.unlock();
+
         switch (client_kind) {
             .mcp => {
                 if (self.mcp_client_socket) |old| {
@@ -350,9 +372,9 @@ pub const McpServer = struct {
                     posix.close(old);
                 }
                 self.mcp_client_socket = client;
-                self.mcp_read_buffer.clearRetainingCapacity();
+                self.mcp_read_buffer.clear();
                 if (remainder.len > 0) {
-                    try self.mcp_read_buffer.appendSlice(self.allocator, remainder);
+                    try self.mcp_read_buffer.append(self.allocator, remainder);
                 }
                 log.info("Claude CLI connected", .{});
             },
@@ -362,9 +384,9 @@ pub const McpServer = struct {
                     posix.close(old);
                 }
                 self.nvim_client_socket = client;
-                self.nvim_read_buffer.clearRetainingCapacity();
+                self.nvim_read_buffer.clear();
                 if (remainder.len > 0) {
-                    try self.nvim_read_buffer.appendSlice(self.allocator, remainder);
+                    try self.nvim_read_buffer.append(self.allocator, remainder);
                 }
                 log.info("Neovim connected", .{});
                 debugLog("nvim_client_socket set to fd={d}", .{client});
@@ -482,16 +504,16 @@ pub const McpServer = struct {
         };
         if (n == 0) return error.ConnectionClosed;
 
-        try self.mcp_read_buffer.appendSlice(self.allocator, temp_buf[0..n]);
+        try self.mcp_read_buffer.append(self.allocator, temp_buf[0..n]);
 
         // Try to parse complete frames
-        while (self.mcp_read_buffer.items.len >= 2) {
-            const result = websocket.parseFrame(self.mcp_read_buffer.items) catch |err| switch (err) {
+        while (self.mcp_read_buffer.len() >= 2) {
+            const buf = self.mcp_read_buffer.slice();
+            const result = websocket.parseFrame(buf) catch |err| switch (err) {
                 error.NeedMoreData => break,
                 error.ReservedOpcode => {
                     log.warn("Received frame with reserved opcode, closing connection", .{});
-                    posix.close(client);
-                    self.mcp_client_socket = null;
+                    self.closeMcpClient();
                     return;
                 },
                 else => return err,
@@ -506,7 +528,10 @@ pub const McpServer = struct {
                     // Respond with pong
                     const pong = try websocket.encodeFrame(self.allocator, .pong, result.frame.payload);
                     defer self.allocator.free(pong);
-                    _ = try posix.write(client, pong);
+                    self.socket_mutex.lock();
+                    defer self.socket_mutex.unlock();
+                    const sock = self.mcp_client_socket orelse return error.NotConnected;
+                    _ = try posix.write(sock, pong);
                 },
                 .close => {
                     log.info("MCP client sent close frame", .{});
@@ -516,10 +541,7 @@ pub const McpServer = struct {
                 else => {},
             }
 
-            // Remove consumed bytes
-            const remaining = self.mcp_read_buffer.items[result.consumed..];
-            std.mem.copyForwards(u8, self.mcp_read_buffer.items[0..remaining.len], remaining);
-            self.mcp_read_buffer.shrinkRetainingCapacity(remaining.len);
+            self.mcp_read_buffer.consume(result.consumed);
         }
     }
 
@@ -539,11 +561,12 @@ pub const McpServer = struct {
         if (n == 0) return error.ConnectionClosed;
         debugLog("handleNvimClientMessage: read {d} bytes", .{n});
 
-        try self.nvim_read_buffer.appendSlice(self.allocator, temp_buf[0..n]);
+        try self.nvim_read_buffer.append(self.allocator, temp_buf[0..n]);
 
         // Try to parse complete frames
-        while (self.nvim_read_buffer.items.len >= 2) {
-            const result = websocket.parseFrame(self.nvim_read_buffer.items) catch |err| switch (err) {
+        while (self.nvim_read_buffer.len() >= 2) {
+            const buf = self.nvim_read_buffer.slice();
+            const result = websocket.parseFrame(buf) catch |err| switch (err) {
                 error.NeedMoreData => break,
                 error.ReservedOpcode => {
                     log.warn("Received nvim frame with reserved opcode, closing connection", .{});
@@ -562,7 +585,10 @@ pub const McpServer = struct {
                     // Respond with pong
                     const pong = try websocket.encodeFrame(self.allocator, .pong, result.frame.payload);
                     defer self.allocator.free(pong);
-                    _ = try posix.write(client, pong);
+                    self.socket_mutex.lock();
+                    defer self.socket_mutex.unlock();
+                    const sock = self.nvim_client_socket orelse return error.NotConnected;
+                    _ = try posix.write(sock, pong);
                 },
                 .close => {
                     log.info("Nvim client sent close frame", .{});
@@ -572,10 +598,7 @@ pub const McpServer = struct {
                 else => {},
             }
 
-            // Remove consumed bytes
-            const remaining = self.nvim_read_buffer.items[result.consumed..];
-            std.mem.copyForwards(u8, self.nvim_read_buffer.items[0..remaining.len], remaining);
-            self.nvim_read_buffer.shrinkRetainingCapacity(remaining.len);
+            self.nvim_read_buffer.consume(result.consumed);
         }
     }
 
@@ -679,8 +702,12 @@ pub const McpServer = struct {
             return; // Handled locally
         } else |_| {}
 
-        // Forward to Lua via callback
+        // Forward to nvim via callback
         if (self.tool_request_callback) |callback| {
+            const ctx = self.tool_callback_ctx orelse {
+                try self.sendToolError(id, "Tool callback context not set");
+                return;
+            };
             const correlation_id = try self.generateCorrelationId();
             errdefer self.allocator.free(correlation_id);
 
@@ -698,7 +725,7 @@ pub const McpServer = struct {
                 .tool_name = owned_tool_name,
                 .deadline_ms = std.time.milliTimestamp() + constants.tool_request_timeout_ms,
             });
-            callback(owned_tool_name, correlation_id, tool_args);
+            callback(ctx, owned_tool_name, correlation_id, tool_args);
         } else {
             try self.sendToolError(id, "Tool handler not available");
         }
@@ -887,18 +914,17 @@ pub const McpServer = struct {
     }
 
     fn sendMcpWebSocketMessage(self: *McpServer, message: []const u8) !void {
-        const client = self.mcp_client_socket orelse return error.NotConnected;
-
         const frame = try websocket.encodeFrame(self.allocator, .text, message);
         defer self.allocator.free(frame);
 
+        self.socket_mutex.lock();
+        defer self.socket_mutex.unlock();
+        const client = self.mcp_client_socket orelse return error.NotConnected;
         _ = try posix.write(client, frame);
     }
 
     /// Send a JSON-RPC notification to the nvim client
     pub fn sendNvimNotification(self: *McpServer, method: []const u8, params: anytype) !void {
-        const client = self.nvim_client_socket orelse return error.NotConnected;
-
         const json = try jsonrpc.serializeTypedNotification(
             self.allocator,
             method,
@@ -910,6 +936,9 @@ pub const McpServer = struct {
         const frame = try websocket.encodeFrame(self.allocator, .text, json);
         defer self.allocator.free(frame);
 
+        self.socket_mutex.lock();
+        defer self.socket_mutex.unlock();
+        const client = self.nvim_client_socket orelse return error.NotConnected;
         _ = try posix.write(client, frame);
     }
 
