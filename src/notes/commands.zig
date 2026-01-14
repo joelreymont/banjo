@@ -278,7 +278,7 @@ fn findBanjoInPath(allocator: Allocator) !?[]const u8 {
     return null;
 }
 
-fn findBanjoBinary(allocator: Allocator, project_root: []const u8) ![]const u8 {
+fn findBanjoBinary(allocator: Allocator) ![]const u8 {
     if (std.posix.getenv("BANJO_BIN")) |env| {
         return resolveBinPath(allocator, env) catch |err| {
             log.err("BANJO_BIN invalid: {s}: {}", .{ env, err });
@@ -304,10 +304,6 @@ fn findBanjoBinary(allocator: Allocator, project_root: []const u8) ![]const u8 {
         }
         allocator.free(path);
     }
-
-    const dev_path = try std.fs.path.join(allocator, &.{ project_root, "zig-out", "bin", "banjo" });
-    defer allocator.free(dev_path);
-    if (tryBinPath(allocator, "dev", dev_path)) |path| return path;
 
     if (try findBanjoInPath(allocator)) |path| return path;
 
@@ -372,7 +368,7 @@ fn setupLsp(allocator: Allocator, project_root: []const u8) !CommandResult {
     }
 
     // Find banjo binary
-    const banjo_path = findBanjoBinary(allocator, project_root) catch {
+    const banjo_path = findBanjoBinary(allocator) catch {
         return makeResult(allocator, false, "Could not find banjo binary");
     };
     defer allocator.free(banjo_path);
@@ -397,7 +393,7 @@ fn setupLsp(allocator: Allocator, project_root: []const u8) !CommandResult {
 
     const settings = ZedSettings{
         .lsp = .{ .@"banjo-notes" = .{
-            .binary = .{ .path = banjo_path, .arguments = &.{ "--lsp" } },
+            .binary = .{ .path = banjo_path, .arguments = &.{"--lsp"} },
         } },
         .languages = entries.items,
     };
@@ -521,6 +517,7 @@ pub fn parseZedUrl(allocator: Allocator, url: []const u8) !?struct {
 
 const testing = std.testing;
 const ohsnap = @import("ohsnap");
+const test_env = @import("../util/test_env.zig");
 
 test "parseZedUrl extracts file path and line" {
     const url = "[@main.zig (42:1)](file:///Users/joel/project/src/main.zig#L42:1)";
@@ -622,12 +619,18 @@ test "setup creates .zed/settings.json with detected languages" {
     // Create test source files
     try tmp_dir.dir.writeFile(.{ .sub_path = "main.zig", .data = "fn main() {}" });
     try tmp_dir.dir.writeFile(.{ .sub_path = "test.py", .data = "print('hello')" });
-    try tmp_dir.dir.makePath("zig-out/bin");
-    try tmp_dir.dir.writeFile(.{ .sub_path = "zig-out/bin/banjo", .data = "" });
+    try tmp_dir.dir.makePath("bin");
+    try tmp_dir.dir.writeFile(.{ .sub_path = "bin/banjo", .data = "" });
 
     // Get absolute path
     const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
     defer allocator.free(tmp_path);
+
+    const banjo_path = try std.fs.path.join(allocator, &.{ tmp_path, "bin", "banjo" });
+    defer allocator.free(banjo_path);
+
+    var guard = try test_env.EnvVarGuard.set(allocator, "BANJO_BIN", banjo_path);
+    defer guard.deinit();
 
     // Run /setup command
     var result = try executeCommand(allocator, tmp_path, "/setup");
@@ -659,7 +662,7 @@ test "setup creates .zed/settings.json with detected languages" {
         \\  "lsp": {
         \\    "banjo-notes": {
         \\      "binary": {
-        \\        "path": "<^.*/zig-out/bin/banjo$>",
+        \\        "path": "<^.*/bin/banjo$>",
         \\        "arguments": [
         \\          "--lsp"
         \\        ]
