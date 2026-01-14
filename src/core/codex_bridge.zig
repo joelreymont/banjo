@@ -1953,6 +1953,22 @@ test "Codex parseRpcMessageLine detects auth error" {
     ).expectEqual(summary);
 }
 
+test "perf: parseRpcMessageLine budget" {
+    const line = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
+    const iterations: usize = 2000;
+    const budget_ns: u64 = 200 * std.time.ns_per_ms;
+
+    var timer = try std.time.Timer.start();
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        var msg = try CodexBridge.parseRpcMessageLine(&arena, line);
+        msg.arena.deinit();
+    }
+    const elapsed = timer.read();
+    try testing.expect(elapsed <= budget_ns);
+}
+
 const LiveSnapshotError = error{
     Timeout,
     UnexpectedEof,

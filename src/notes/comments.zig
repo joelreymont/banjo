@@ -836,6 +836,43 @@ test "scanFileForNotes captures links in comment blocks" {
     ).expectEqual(summary);
 }
 
+test "perf: scanFileForNotes budget" {
+    const alloc = testing.allocator;
+    const total_lines: usize = 5000;
+    const note_every: usize = 50;
+    const budget_ns: u64 = 250 * std.time.ns_per_ms;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    var note_count: usize = 0;
+    var i: usize = 0;
+    while (i < total_lines) : (i += 1) {
+        if (i % note_every == 0) {
+            var line_buf: [64]u8 = undefined;
+            const line = try std.fmt.bufPrint(&line_buf, "// @banjo[note-{d}] perf\n", .{note_count});
+            note_count += 1;
+            try buf.appendSlice(alloc, line);
+        } else {
+            try buf.appendSlice(alloc, "const x = 1;\n");
+        }
+    }
+
+    const content = try buf.toOwnedSlice(alloc);
+    defer alloc.free(content);
+
+    var timer = try std.time.Timer.start();
+    const notes = try scanFileForNotes(alloc, content);
+    const elapsed = timer.read();
+    defer {
+        for (notes) |*n| @constCast(n).deinit(alloc);
+        alloc.free(notes);
+    }
+
+    try testing.expectEqual(@as(usize, note_count), notes.len);
+    try testing.expect(elapsed <= budget_ns);
+}
+
 test "getCommentPrefix returns correct prefix" {
     const summary = .{
         .zig = getCommentPrefix("main.zig"),
