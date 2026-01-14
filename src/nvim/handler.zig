@@ -1121,7 +1121,10 @@ pub const Handler = struct {
         return &self.claude_bridge.?;
     }
 
-    fn ensureCodexBridge(self: *Handler, cwd: []const u8) !*codex_bridge.CodexBridge {
+    fn ensureCodexInst(self: *Handler, cwd: []const u8) !*codex_bridge.CodexBridge {
+        if (!codex_bridge.CodexBridge.isAvailable()) {
+            return error.CodexUnavailable;
+        }
         // Check if cwd changed - need to restart bridge
         const cwd_changed = if (self.bridge_cwd) |bc| !std.mem.eql(u8, bc, cwd) else true;
         if (cwd_changed) {
@@ -1135,7 +1138,12 @@ pub const Handler = struct {
             self.codex_bridge_inst = codex_bridge.CodexBridge.init(self.allocator, cwd);
         }
 
-        if (!self.codex_bridge_inst.?.isAlive()) {
+        return &self.codex_bridge_inst.?;
+    }
+
+    fn ensureCodexBridge(self: *Handler, cwd: []const u8) !*codex_bridge.CodexBridge {
+        const bridge = try self.ensureCodexInst(cwd);
+        if (!bridge.isAlive()) {
             debugLog("ensureCodexBridge: starting bridge", .{});
             // Read mode under lock
             const approval_policy = blk: {
@@ -1143,13 +1151,13 @@ pub const Handler = struct {
                 defer self.state_mutex.unlock();
                 break :blk self.permission.mode.toCodexApprovalPolicy();
             };
-            try self.codex_bridge_inst.?.start(.{
+            try bridge.start(.{
                 .approval_policy = approval_policy,
                 .resume_last = self.codex_session_id == null, // Resume last if no explicit session
             });
         }
 
-        return &self.codex_bridge_inst.?;
+        return bridge;
     }
 
     fn processPrompt(self: *Handler, prompt_req: protocol.PromptRequest) !void {
@@ -1218,10 +1226,17 @@ pub const Handler = struct {
                 };
             },
             .codex => {
-                const bridge = self.ensureCodexBridge(prompt_ctx.cwd) catch |err| {
-                    log.err("Failed to start Codex bridge: {}", .{err});
-                    try self.sendError("Failed to start Codex");
-                    return;
+                const bridge = self.ensureCodexBridge(prompt_ctx.cwd) catch |err| switch (err) {
+                    error.CodexUnavailable => {
+                        log.err("Codex unavailable: {}", .{err});
+                        try self.sendError("Codex CLI not found. Install codex or set CODEX_EXECUTABLE.");
+                        return;
+                    },
+                    else => {
+                        log.err("Failed to start Codex bridge: {}", .{err});
+                        try self.sendError("Failed to start Codex");
+                        return;
+                    },
                 };
 
                 const inputs = [_]codex_bridge.UserInput{
@@ -1597,6 +1612,7 @@ pub const Handler = struct {
 };
 
 const ohsnap = @import("ohsnap");
+const test_env = @import("../util/test_env.zig");
 
 test "handler init/deinit" {
     const allocator = std.testing.allocator;
@@ -2368,7 +2384,7 @@ test "ensureClaudeBridge reuses bridge regardless of cwd" {
     ).expectEqual(summary);
 }
 
-test "ensureCodexBridge reuses bridge for same cwd" {
+test "ensureCodexInst reuses bridge for same cwd" {
     const allocator = std.testing.allocator;
 
     var stdin_buf: [0]u8 = undefined;
@@ -2379,23 +2395,29 @@ test "ensureCodexBridge reuses bridge for same cwd" {
     var handler = try Handler.init(allocator, stdin.reader().any(), stdout.writer().any());
     defer handler.deinit();
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "codex-stub", .data = "" });
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const stub_path = try std.fs.path.join(allocator, &.{ base, "codex-stub" });
+    defer allocator.free(stub_path);
+
+    var guard_codex = try test_env.EnvVarGuard.set(allocator, "CODEX_EXECUTABLE", stub_path);
+    defer guard_codex.deinit();
+
     // First call creates bridge
-    if (handler.ensureCodexBridge("/tmp/test1")) |_| {} else |err| {
-        log.warn("ensureCodexBridge failed in test: {}", .{err});
-    }
+    _ = try handler.ensureCodexInst("/tmp/test1");
     const first_bridge_ptr = if (handler.codex_bridge_inst) |*b| @intFromPtr(b) else 0;
     const first_cwd_correct = if (handler.bridge_cwd) |c| std.mem.eql(u8, c, "/tmp/test1") else false;
 
     // Second call with same cwd should reuse
-    if (handler.ensureCodexBridge("/tmp/test1")) |_| {} else |err| {
-        log.warn("ensureCodexBridge failed in test: {}", .{err});
-    }
+    _ = try handler.ensureCodexInst("/tmp/test1");
     const second_bridge_ptr = if (handler.codex_bridge_inst) |*b| @intFromPtr(b) else 0;
 
     // Third call with different cwd should create new bridge
-    if (handler.ensureCodexBridge("/tmp/test2")) |_| {} else |err| {
-        log.warn("ensureCodexBridge failed in test: {}", .{err});
-    }
+    _ = try handler.ensureCodexInst("/tmp/test2");
     const third_cwd_correct = if (handler.bridge_cwd) |c| std.mem.eql(u8, c, "/tmp/test2") else false;
 
     const summary = .{
@@ -2404,7 +2426,7 @@ test "ensureCodexBridge reuses bridge for same cwd" {
         .cwd_updated_on_change = third_cwd_correct,
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.ensureCodexBridge reuses bridge for same cwd__struct_<^\d+$>
+        \\nvim.handler.test.ensureCodexInst reuses bridge for same cwd__struct_<^\d+$>
         \\  .same_bridge_reused: bool = true
         \\  .first_cwd_correct: bool = true
         \\  .cwd_updated_on_change: bool = true

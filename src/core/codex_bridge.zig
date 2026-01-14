@@ -635,6 +635,10 @@ pub const CodexBridge = struct {
             self.stdout_file = null;
         }
 
+        if (!CodexBridge.isAvailable()) {
+            return error.CodexUnavailable;
+        }
+
         var args: std.ArrayList([]const u8) = .empty;
         defer args.deinit(self.allocator);
 
