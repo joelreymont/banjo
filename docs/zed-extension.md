@@ -352,6 +352,8 @@ Banjo provides a `/setup` command in the agent panel that automatically:
 
 Usage: Type `/setup` in the Banjo agent panel. This creates project-local settings that work alongside global Zed config.
 
+Banjo does not expose a language server via the extension manifest; the LSP is configured locally through `.zed/settings.json`. Notes are created via LSP code actions once enabled.
+
 ### Example extension structure:
 
 ```

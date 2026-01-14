@@ -50,15 +50,16 @@ Users can add context via @mentions:
 Banjo commands:
 - `/setup lsp` - re-run setup for banjo-notes LSP (`.zed/settings.json`)
 - `/explain` - summarize selected code and insert as note comment
+- `/note` - note creation help (use LSP code actions)
 - `/notes` - list all notes in project
 
 Claude Code commands (`/version`, `/model`, `/compact`, `/review`, `/clear`) forwarded to Claude Code.
 
-Note: Banjo auto-writes `.zed/settings.json` on first session; reload workspace once to activate the LSP.
+Note: Banjo auto-writes `.zed/settings.json` on first session; reload workspace once to activate the LSP. Banjo never edits global Zed settings.
 
 ## Note Creation Workflow
 
-**From code actions (recommended):**
+**From code actions (requires LSP):**
 
 1. Position cursor on a comment line
 2. Press `Cmd+.` to show code actions
@@ -75,6 +76,7 @@ The note is inserted as a comment with a unique ID.
 ## Note Code Actions
 
 Press `Cmd+.` on any line to see available actions:
+Requires banjo-notes LSP enabled via `/setup` (or auto-setup + reload).
 
 | Context | Action | Description |
 |---------|--------|-------------|
