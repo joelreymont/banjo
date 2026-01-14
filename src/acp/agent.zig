@@ -1819,10 +1819,16 @@ pub const Agent = struct {
                 _ = try self.handleAuthRequired(session_id, session, .codex);
                 return err;
             },
+            error.CodexUnavailable => {
+                log.err("Codex unavailable: {}", .{err});
+                session.codex_bridge = null;
+                try self.sendEngineText(session, session_id, .codex, "Codex CLI not found. Install codex or set CODEX_EXECUTABLE.");
+                return err;
+            },
             else => {
                 log.err("Failed to start Codex: {}", .{err});
                 session.codex_bridge = null;
-                try self.sendEngineText(session, session_id, .codex, "Failed to start Codex. Please ensure it is installed and in PATH.");
+                try self.sendEngineText(session, session_id, .codex, "Failed to start Codex. Ensure it is installed and in PATH or set CODEX_EXECUTABLE.");
                 return error.BridgeStartFailed;
             },
         };
