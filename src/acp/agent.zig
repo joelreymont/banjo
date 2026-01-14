@@ -879,8 +879,11 @@ pub const Agent = struct {
         // Also ensure permission hook is configured in ~/.claude/settings.json
         var hook_configured = false;
         if (availability.claude) {
-            const hook_result = settings_loader.ensurePermissionHook(self.allocator);
-            hook_configured = hook_result == .configured;
+            const hook_result = settings_loader.ensurePermissionHook(self.allocator) catch |err| blk: {
+                log.warn("Failed to ensure permission hook: {}", .{err});
+                break :blk null;
+            };
+            hook_configured = if (hook_result) |res| res == .configured else false;
 
             // Create permission socket for non-bypass modes
             if (session.permission_mode != .bypassPermissions and session.permission_socket == null) {
@@ -1202,9 +1205,7 @@ pub const Agent = struct {
         // Check if skill exists
         if (!dots.hasSkill(engine)) {
             log.info("Dots: skill missing, sending creation prompt", .{});
-            const prompt = std.fmt.allocPrint(self.allocator, "{s}", .{dots.skill_prompt}) catch return;
-            defer self.allocator.free(prompt);
-            self.sendDotsPrompt(session, session_id, engine, prompt);
+            self.sendDotsPrompt(session, session_id, engine, dots.skill_prompt);
             return;
         }
 
@@ -1439,7 +1440,10 @@ pub const Agent = struct {
         link: ResourceLinkData,
     ) !bool {
         if (!self.canReadFiles()) return false;
-        const uri_info = parseFileUri(self.allocator, link.uri) orelse return false;
+        const uri_info = parseFileUri(self.allocator, link.uri) catch |err| switch (err) {
+            error.InvalidUri, error.InvalidLine => return false,
+            else => return err,
+        } orelse return false;
         defer uri_info.deinit(self.allocator);
 
         const line = if (uri_info.line_specified) uri_info.line else null;
@@ -1503,7 +1507,11 @@ pub const Agent = struct {
         block: protocol.ContentBlock,
     ) !bool {
         if (block.uri) |uri| {
-            if (parseFileUri(self.allocator, uri)) |uri_info| {
+            const uri_info = parseFileUri(self.allocator, uri) catch |err| switch (err) {
+                error.InvalidUri, error.InvalidLine => return false,
+                else => return err,
+            } orelse return false;
+            {
                 defer uri_info.deinit(self.allocator);
                 try codex_inputs.ensureUnusedCapacity(self.allocator, 1);
                 try codex_input_strings.ensureUnusedCapacity(self.allocator, 1);
@@ -1554,13 +1562,14 @@ pub const Agent = struct {
         if (mime_type) |mime| {
             if (mime_language_map.get(mime)) |lang| return lang;
         }
-
-        if (parseFileUri(self.allocator, uri)) |info| {
-            defer info.deinit(self.allocator);
-            const ext = std.fs.path.extension(info.path);
-            if (ext.len > 1) return ext[1..];
-        }
-        return "text";
+        _ = self;
+        const hash_idx = std.mem.indexOfScalar(u8, uri, '#') orelse uri.len;
+        const path = uri[0..hash_idx];
+        const slash_idx = std.mem.lastIndexOfScalar(u8, path, '/') orelse 0;
+        const name = path[slash_idx..];
+        const dot_idx = std.mem.lastIndexOfScalar(u8, name, '.') orelse return "text";
+        if (dot_idx + 1 >= name.len) return "text";
+        return name[dot_idx + 1 ..];
     }
 
     fn canReadFiles(self: *Agent) bool {
@@ -2128,18 +2137,13 @@ pub const Agent = struct {
         var title_owned: ?[]const u8 = null;
         const tagged_title = blk: {
             if (execute_preview) |preview| {
-                if (!tag_engine) {
-                    if (std.fmt.bufPrint(&title_buf, "{s}: {s}", .{ tool_name, preview }) catch null) |title| {
-                        break :blk title;
-                    }
-                    const owned = try std.fmt.allocPrint(self.allocator, "{s}: {s}", .{ tool_name, preview });
-                    title_owned = owned;
-                    break :blk owned;
-                }
-                if (std.fmt.bufPrint(&title_buf, "[{s}] {s}: {s}", .{ engine.label(), tool_name, preview }) catch null) |title| {
+                if (self.formatToolTitle(&title_buf, engine, tool_name, preview, tag_engine)) |title| {
                     break :blk title;
                 }
-                const owned = try std.fmt.allocPrint(self.allocator, "[{s}] {s}: {s}", .{ engine.label(), tool_name, preview });
+                const owned = if (tag_engine)
+                    try std.fmt.allocPrint(self.allocator, "[{s}] {s}: {s}", .{ engine.label(), tool_name, preview })
+                else
+                    try std.fmt.allocPrint(self.allocator, "{s}: {s}", .{ tool_name, preview });
                 title_owned = owned;
                 break :blk owned;
             }
@@ -2417,7 +2421,7 @@ pub const Agent = struct {
         try session.pending_edit_tools.put(owned_id, edit_info);
     }
 
-    fn consumeEditTool(self: *Agent, session: *Session, engine: Engine, tool_id: []const u8) ?EditInfo {
+    fn consumeEditTool(self: *Agent, session: *Session, engine: Engine, tool_id: []const u8) !?EditInfo {
         if (!self.shouldTagEngine(session)) {
             if (session.pending_edit_tools.fetchRemove(tool_id)) |entry| {
                 self.allocator.free(entry.key);
@@ -2435,7 +2439,7 @@ pub const Agent = struct {
             return null;
         }
 
-        const owned = self.tagToolId(engine, tool_id) catch return null;
+        const owned = try self.tagToolId(engine, tool_id);
         defer self.allocator.free(owned);
         if (session.pending_edit_tools.fetchRemove(owned)) |entry| {
             self.allocator.free(entry.key);
@@ -2543,7 +2547,7 @@ pub const Agent = struct {
         // Check for edit tool diff info
         var edit_info: ?EditInfo = null;
         defer if (edit_info) |info| info.deinit(self.allocator);
-        edit_info = self.consumeEditTool(session, engine, tool_id);
+        edit_info = try self.consumeEditTool(session, engine, tool_id);
 
         const raw = if (raw_output != .null) raw_output else null;
         try self.sendEngineToolResult(session, session_id, engine, tool_id, content, status, null, raw, edit_info);
@@ -2705,7 +2709,7 @@ pub const Agent = struct {
         log.info("Accepted permission socket connection", .{});
 
         // Read request from hook (may arrive in multiple chunks)
-        var buf: [4096]u8 = undefined;
+        var buf: [constants.large_buffer_size]u8 = undefined;
         var total: usize = 0;
         while (total < buf.len) {
             const n = std.posix.read(client_fd, buf[total..]) catch |err| {
@@ -2718,6 +2722,10 @@ pub const Agent = struct {
             if (std.mem.indexOfScalar(u8, buf[0..total], '\n') != null) break;
         }
         if (total == 0) return;
+        // Warn if buffer filled without finding newline (truncation)
+        if (total >= buf.len and std.mem.indexOfScalar(u8, buf[0..total], '\n') == null) {
+            log.warn("Permission request truncated at {d} bytes", .{total});
+        }
 
         // Parse JSON request
         const request_json = std.mem.trimRight(u8, buf[0..total], "\n\r");
@@ -3228,12 +3236,58 @@ pub const Agent = struct {
         return std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ engine.label(), tool_id });
     }
 
+    fn formatToolTitle(
+        self: *Agent,
+        buf: []u8,
+        engine: Engine,
+        tool_name: []const u8,
+        preview: []const u8,
+        tag_engine: bool,
+    ) ?[]const u8 {
+        _ = self;
+        var needed: usize = tool_name.len + preview.len + 2;
+        if (tag_engine) needed += engine.label().len + 3;
+        if (needed > buf.len) return null;
+        var idx: usize = 0;
+        if (tag_engine) {
+            const label = engine.label();
+            buf[idx] = '[';
+            idx += 1;
+            std.mem.copyForwards(u8, buf[idx..][0..label.len], label);
+            idx += label.len;
+            buf[idx] = ']';
+            idx += 1;
+            buf[idx] = ' ';
+            idx += 1;
+        }
+        std.mem.copyForwards(u8, buf[idx..][0..tool_name.len], tool_name);
+        idx += tool_name.len;
+        buf[idx] = ':';
+        idx += 1;
+        buf[idx] = ' ';
+        idx += 1;
+        std.mem.copyForwards(u8, buf[idx..][0..preview.len], preview);
+        idx += preview.len;
+        return buf[0..idx];
+    }
+
     fn formatTagged(self: *Agent, buf: []u8, engine: Engine, text: []const u8) ?[]const u8 {
         _ = self;
         const prefix = engine.label();
         const needed = prefix.len + text.len + 3;
         if (needed > buf.len) return null;
-        return std.fmt.bufPrint(buf, "[{s}] {s}", .{ prefix, text }) catch null;
+        var idx: usize = 0;
+        buf[idx] = '[';
+        idx += 1;
+        std.mem.copyForwards(u8, buf[idx..][0..prefix.len], prefix);
+        idx += prefix.len;
+        buf[idx] = ']';
+        idx += 1;
+        buf[idx] = ' ';
+        idx += 1;
+        std.mem.copyForwards(u8, buf[idx..][0..text.len], text);
+        idx += text.len;
+        return buf[0..idx];
     }
 
     fn formatToolId(self: *Agent, buf: []u8, engine: Engine, tool_id: []const u8) ?[]const u8 {
@@ -3241,7 +3295,14 @@ pub const Agent = struct {
         const prefix = engine.label();
         const needed = prefix.len + tool_id.len + 1;
         if (needed > buf.len) return null;
-        return std.fmt.bufPrint(buf, "{s}:{s}", .{ prefix, tool_id }) catch null;
+        var idx: usize = 0;
+        std.mem.copyForwards(u8, buf[idx..][0..prefix.len], prefix);
+        idx += prefix.len;
+        buf[idx] = ':';
+        idx += 1;
+        std.mem.copyForwards(u8, buf[idx..][0..tool_id.len], tool_id);
+        idx += tool_id.len;
+        return buf[0..idx];
     }
 
     fn handleCancel(self: *Agent, request: jsonrpc.Request) !void {
@@ -3663,9 +3724,9 @@ pub const Agent = struct {
         const label = routeLabel(route);
         var buf: [160]u8 = undefined;
         const msg = if (has_args)
-            (std.fmt.bufPrint(&buf, "Routing mode set to {s}. This command takes no arguments; send your prompt next.", .{label}) catch "Routing mode updated.")
+            try std.fmt.bufPrint(&buf, "Routing mode set to {s}. This command takes no arguments; send your prompt next.", .{label})
         else
-            (std.fmt.bufPrint(&buf, "Routing mode set to {s}.", .{label}) catch "Routing mode updated.");
+            try std.fmt.bufPrint(&buf, "Routing mode set to {s}.", .{label});
 
         try self.sendSessionUpdate(session_id, .{
             .sessionUpdate = .agent_message_chunk,
@@ -3897,14 +3958,14 @@ pub const Agent = struct {
     };
 
     /// Parse file:// URI into path and line number, with URL decoding
-    fn parseFileUri(allocator: Allocator, uri: []const u8) ?FileUri {
+    fn parseFileUri(allocator: Allocator, uri: []const u8) !?FileUri {
         if (!std.mem.startsWith(u8, uri, "file:///")) return null;
-        const uri_path = (lsp_uri.uriToPath(allocator, uri) catch return null) orelse return null;
+        const uri_path = try lsp_uri.uriToPath(allocator, uri) orelse return error.InvalidUri;
         var path: []const u8 = undefined;
         if (uri_path.owned) {
             path = uri_path.path;
         } else {
-            path = allocator.dupe(u8, uri_path.path) catch return null;
+            path = try allocator.dupe(u8, uri_path.path);
         }
         errdefer allocator.free(path);
 
@@ -3914,7 +3975,12 @@ pub const Agent = struct {
         if (hash_idx + 2 < uri.len and uri[hash_idx + 1] == 'L') {
             const line_part = uri[hash_idx + 2 ..];
             const colon_idx = std.mem.indexOfScalar(u8, line_part, ':') orelse line_part.len;
-            line = std.fmt.parseInt(u32, line_part[0..colon_idx], 10) catch 1;
+            if (colon_idx == 0) return error.InvalidLine;
+            line = std.fmt.parseInt(u32, line_part[0..colon_idx], 10) catch |err| switch (err) {
+                error.InvalidCharacter, error.Overflow => return error.InvalidLine,
+                else => return err,
+            };
+            if (line == 0) return error.InvalidLine;
             line_specified = true;
         }
         return .{
@@ -3937,7 +4003,10 @@ pub const Agent = struct {
         try self.sendPlan(session_id, &plan_entries);
 
         // Parse URI
-        const uri_info = parseFileUri(self.allocator, resource.uri) orelse {
+        const uri_info = parseFileUri(self.allocator, resource.uri) catch |err| switch (err) {
+            error.InvalidUri, error.InvalidLine => return self.sendErrorAndEnd(request, session_id, "Invalid file URI"),
+            else => return err,
+        } orelse {
             return self.sendErrorAndEnd(request, session_id, "Invalid file URI");
         };
         defer uri_info.deinit(self.allocator);

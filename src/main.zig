@@ -20,10 +20,16 @@ fn fileLogFn(
     comptime fmt: []const u8,
     args: anytype,
 ) void {
-    const file = log_file orelse return;
+    const file = log_file orelse std.fs.File.stderr();
     const scope_prefix = if (scope == .default) "" else "(" ++ @tagName(scope) ++ ") ";
     const prefix = "[" ++ comptime level.asText() ++ "] " ++ scope_prefix;
-    file.deprecatedWriter().print(prefix ++ fmt ++ "\n", args) catch {};
+    var buf: [8192]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, prefix ++ fmt ++ "\n", args) catch |err| {
+        std.debug.panic("banjo log format failed: {}", .{err});
+    };
+    file.deprecatedWriter().writeAll(msg) catch |err| {
+        std.debug.panic("banjo log write failed: {}", .{err});
+    };
 }
 
 /// Run mode
@@ -58,6 +64,14 @@ const ArgAction = enum {
     help,
 };
 
+const Subcommand = enum {
+    hook,
+};
+
+const HookSubcommand = enum {
+    permission,
+};
+
 const arg_map = std.StaticStringMap(ArgAction).initComptime(.{
     .{ "--agent", .mode_agent },
     .{ "--lsp", .mode_lsp },
@@ -70,6 +84,14 @@ const arg_map = std.StaticStringMap(ArgAction).initComptime(.{
     .{ "--help", .help },
 });
 
+const subcommand_map = std.StaticStringMap(Subcommand).initComptime(.{
+    .{ "hook", .hook },
+});
+
+const hook_map = std.StaticStringMap(HookSubcommand).initComptime(.{
+    .{ "permission", .permission },
+});
+
 fn parseArgs(allocator: std.mem.Allocator) !CliOptions {
     var opts = CliOptions{};
     var args = try std.process.argsWithAllocator(allocator);
@@ -79,16 +101,23 @@ fn parseArgs(allocator: std.mem.Allocator) !CliOptions {
 
     // Check for subcommand first
     if (args.next()) |first_arg| {
-        if (std.mem.eql(u8, first_arg, "hook")) {
-            // Hook subcommand
-            if (args.next()) |hook_type| {
-                if (std.mem.eql(u8, hook_type, "permission")) {
-                    opts.mode = .hook_permission;
-                    return opts;
-                }
+        if (subcommand_map.get(first_arg)) |subcommand| {
+            switch (subcommand) {
+                .hook => {
+                    if (args.next()) |hook_type| {
+                        if (hook_map.get(hook_type)) |hook_cmd| {
+                            switch (hook_cmd) {
+                                .permission => {
+                                    opts.mode = .hook_permission;
+                                    return opts;
+                                },
+                            }
+                        }
+                    }
+                    printHookHelp();
+                    std.process.exit(1);
+                },
             }
-            printHookHelp();
-            std.process.exit(1);
         }
 
         // Not a subcommand, check if it's a flag
@@ -210,16 +239,22 @@ const HookSocketResponse = struct {
 };
 
 /// Debug log to file (hooks stderr may not be visible)
-fn hookDebugLog(comptime fmt: []const u8, args: anytype) void {
-    const file = std.fs.cwd().createFile("/tmp/banjo-hook-debug.log", .{ .truncate = false }) catch return;
+fn hookDebugLog(comptime fmt: []const u8, args: anytype) !void {
+    const file = try std.fs.cwd().createFile("/tmp/banjo-hook-debug.log", .{ .truncate = false });
     defer file.close();
-    file.seekFromEnd(0) catch return;
+    try file.seekFromEnd(0);
     var buf: [1024]u8 = undefined;
     const now = std.time.timestamp();
-    const prefix_len = std.fmt.bufPrint(&buf, "[{d}] ", .{now}) catch return;
-    file.writeAll(prefix_len) catch return;
-    const msg_len = std.fmt.bufPrint(&buf, fmt ++ "\n", args) catch return;
-    file.writeAll(msg_len) catch return;
+    const prefix_len = try std.fmt.bufPrint(&buf, "[{d}] ", .{now});
+    try file.writeAll(prefix_len);
+    const msg_len = try std.fmt.bufPrint(&buf, fmt ++ "\n", args);
+    try file.writeAll(msg_len);
+}
+
+fn hookDebugLogBestEffort(comptime fmt: []const u8, args: anytype) void {
+    hookDebugLog(fmt, args) catch |err| {
+        log.warn("hook debug log failed: {}", .{err});
+    };
 }
 
 /// Run the permission hook - reads from stdin, connects to Banjo socket, returns decision
@@ -229,20 +264,20 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
 
     // Always read stdin first to avoid broken pipe errors
     const input = stdin.readToEndAlloc(allocator, max_input) catch |err| {
-        hookDebugLog("Failed to read stdin: {}", .{err});
+        hookDebugLogBestEffort("Failed to read stdin: {}", .{err});
         log.warn("Failed to read stdin: {}", .{err});
-        return;
+        return err;
     };
     defer allocator.free(input);
 
     // Check for Banjo socket - if not set, exit silently (defer to default permission handling)
     const socket_path = std.posix.getenv("BANJO_PERMISSION_SOCKET") orelse return;
 
-    hookDebugLog("Hook invoked, socket={s}", .{socket_path});
+    hookDebugLogBestEffort("Hook invoked, socket={s}", .{socket_path});
 
     const stdout = std.fs.File.stdout();
 
-    hookDebugLog("Read {d} bytes from stdin", .{input.len});
+    hookDebugLogBestEffort("Read {d} bytes from stdin", .{input.len});
 
     if (input.len == 0) return;
 
@@ -250,30 +285,30 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
     var parsed = std.json.parseFromSlice(HookInput, allocator, input, .{
         .ignore_unknown_fields = true,
     }) catch |err| {
-        hookDebugLog("Failed to parse hook input: {}", .{err});
+        hookDebugLogBestEffort("Failed to parse hook input: {}", .{err});
         log.warn("Failed to parse hook input: {}", .{err});
-        return;
+        return err;
     };
     defer parsed.deinit();
 
     const hook_input = parsed.value;
-    hookDebugLog("Parsed hook: tool={s} session={s}", .{ hook_input.tool_name, hook_input.session_id });
+    hookDebugLogBestEffort("Parsed hook: tool={s} session={s}", .{ hook_input.tool_name, hook_input.session_id });
 
     // Connect to Banjo socket
     const sock = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch |err| {
-        hookDebugLog("Failed to create socket: {}", .{err});
+        hookDebugLogBestEffort("Failed to create socket: {}", .{err});
         log.warn("Failed to create socket: {}", .{err});
-        return;
+        return err;
     };
     defer std.posix.close(sock);
 
     // Set timeout (non-critical, socket works without it)
     const timeout = std.posix.timeval{ .sec = 60, .usec = 0 };
     std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch |err| {
-        hookDebugLog("setsockopt RCVTIMEO failed: {}", .{err});
+        hookDebugLogBestEffort("setsockopt RCVTIMEO failed: {}", .{err});
     };
     std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch |err| {
-        hookDebugLog("setsockopt SNDTIMEO failed: {}", .{err});
+        hookDebugLogBestEffort("setsockopt SNDTIMEO failed: {}", .{err});
     };
 
     // Connect
@@ -282,13 +317,13 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
     const path_len = @min(socket_path.len, addr.path.len - 1);
     @memcpy(addr.path[0..path_len], socket_path[0..path_len]);
 
-    hookDebugLog("Connecting to socket...", .{});
+    hookDebugLogBestEffort("Connecting to socket...", .{});
     std.posix.connect(sock, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un)) catch |err| {
-        hookDebugLog("Failed to connect to socket: {}", .{err});
+        hookDebugLogBestEffort("Failed to connect to socket: {}", .{err});
         log.warn("Failed to connect to socket: {}", .{err});
-        return;
+        return err;
     };
-    hookDebugLog("Connected to socket", .{});
+    hookDebugLogBestEffort("Connected to socket", .{});
 
     // Send request as JSON
     var out: std.io.Writer.Allocating = .init(allocator);
@@ -303,35 +338,35 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
         .tool_use_id = hook_input.tool_use_id,
         .session_id = hook_input.session_id,
     }) catch |err| {
-        hookDebugLog("Failed to serialize request: {}", .{err});
-        return;
+        hookDebugLogBestEffort("Failed to serialize request: {}", .{err});
+        return err;
     };
     out.writer.writeAll("\n") catch |err| {
-        hookDebugLog("Failed to write newline: {}", .{err});
-        return;
+        hookDebugLogBestEffort("Failed to write newline: {}", .{err});
+        return err;
     };
     const request = out.toOwnedSlice() catch |err| {
-        hookDebugLog("Failed to allocate request: {}", .{err});
-        return;
+        hookDebugLogBestEffort("Failed to allocate request: {}", .{err});
+        return err;
     };
     defer allocator.free(request);
 
     _ = std.posix.write(sock, request) catch |err| {
-        hookDebugLog("Failed to write to socket: {}", .{err});
+        hookDebugLogBestEffort("Failed to write to socket: {}", .{err});
         log.warn("Failed to write to socket: {}", .{err});
-        return;
+        return err;
     };
 
     // Read response
     var response_buf: [1024]u8 = undefined;
     const n = std.posix.read(sock, &response_buf) catch |err| {
-        hookDebugLog("Failed to read from socket: {}", .{err});
+        hookDebugLogBestEffort("Failed to read from socket: {}", .{err});
         log.warn("Failed to read from socket: {}", .{err});
-        return;
+        return err;
     };
     if (n == 0) {
-        hookDebugLog("Empty response from socket", .{});
-        return;
+        hookDebugLogBestEffort("Empty response from socket", .{});
+        return error.UnexpectedEof;
     }
 
     const response = std.mem.trimRight(u8, response_buf[0..n], "\n\r");
@@ -340,8 +375,8 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
     var resp_parsed = std.json.parseFromSlice(HookSocketResponse, allocator, response, .{
         .ignore_unknown_fields = true,
     }) catch |err| {
-        hookDebugLog("Failed to parse response: {}", .{err});
-        return;
+        hookDebugLogBestEffort("Failed to parse response: {}", .{err});
+        return err;
     };
     defer resp_parsed.deinit();
 
@@ -355,7 +390,7 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
     });
 
     if (decision_map.get(resp.decision)) |decision| {
-        hookDebugLog("Outputting decision: {s}", .{resp.decision});
+        hookDebugLogBestEffort("Outputting decision: {s}", .{resp.decision});
         switch (decision) {
             .allow => {
                 // Check if we have answers to include (for AskUserQuestion)
@@ -377,24 +412,24 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
                     hook_jw.write(HookOutput{
                         .hookSpecificOutput = .{ .updatedInput = .{ .answers = answers } },
                     }) catch |err| {
-                        hookDebugLog("Failed to write hook output: {}", .{err});
-                        return;
+                        hookDebugLogBestEffort("Failed to write hook output: {}", .{err});
+                        return err;
                     };
                     const hook_json = hook_out.toOwnedSlice() catch |err| {
-                        hookDebugLog("Failed to allocate hook output: {}", .{err});
-                        return;
+                        hookDebugLogBestEffort("Failed to allocate hook output: {}", .{err});
+                        return err;
                     };
                     defer allocator.free(hook_json);
                     stdout.writeAll(hook_json) catch |err| {
-                        hookDebugLog("Failed to write to stdout: {}", .{err});
-                        return;
+                        hookDebugLogBestEffort("Failed to write to stdout: {}", .{err});
+                        return err;
                     };
                 } else {
                     stdout.writeAll(
                         \\{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}
                     ) catch |err| {
-                        hookDebugLog("Failed to write allow to stdout: {}", .{err});
-                        return;
+                        hookDebugLogBestEffort("Failed to write allow to stdout: {}", .{err});
+                        return err;
                     };
                 }
             },
@@ -403,25 +438,25 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
                 if (resp.reason) |reason| {
                     var buf: [512]u8 = undefined;
                     const output = std.fmt.bufPrint(&buf, "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"{s}\"}}}}", .{reason}) catch |err| {
-                        hookDebugLog("Failed to format deny output: {}", .{err});
-                        return;
+                        hookDebugLogBestEffort("Failed to format deny output: {}", .{err});
+                        return err;
                     };
                     stdout.writeAll(output) catch |err| {
-                        hookDebugLog("Failed to write deny to stdout: {}", .{err});
-                        return;
+                        hookDebugLogBestEffort("Failed to write deny to stdout: {}", .{err});
+                        return err;
                     };
                 } else {
                     stdout.writeAll(
                         \\{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Permission denied by Banjo"}}
                     ) catch |err| {
-                        hookDebugLog("Failed to write default deny to stdout: {}", .{err});
-                        return;
+                        hookDebugLogBestEffort("Failed to write default deny to stdout: {}", .{err});
+                        return err;
                     };
                 }
             },
         }
     } else {
-        hookDebugLog("Unknown decision: {s}, deferring to default", .{resp.decision});
+        hookDebugLogBestEffort("Unknown decision: {s}, deferring to default", .{resp.decision});
     }
     // For "ask" or unknown, output nothing - defer to default permission flow
 }
@@ -429,8 +464,18 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
 pub fn main() !void {
     // Initialize file-based logging (writes to /tmp/banjo.log by default)
     const log_path = std.posix.getenv("BANJO_LOG_FILE") orelse "/tmp/banjo.log";
-    log_file = std.fs.cwd().createFile(log_path, .{ .truncate = false }) catch null;
-    if (log_file) |f| f.seekFromEnd(0) catch {};
+    log_file = blk: {
+        const file = std.fs.cwd().createFile(log_path, .{ .truncate = false }) catch |err| {
+            std.debug.print("Failed to open log file {s}: {}\n", .{ log_path, err });
+            break :blk null;
+        };
+        file.seekFromEnd(0) catch |err| {
+            std.debug.print("Failed to seek log file {s}: {}\n", .{ log_path, err });
+            file.close();
+            break :blk null;
+        };
+        break :blk file;
+    };
     defer if (log_file) |f| f.close();
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};

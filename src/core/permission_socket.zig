@@ -147,7 +147,13 @@ test "PermissionSocket create and close" {
 
     const fd_nonzero = sock.fd() != 0;
     const path_contains = std.mem.indexOf(u8, sock.getPath(), "test-session-123") != null;
-    const stat = std.fs.cwd().statFile(sock.getPath()) catch null;
+    const stat_present = blk: {
+        _ = std.fs.cwd().statFile(sock.getPath()) catch |err| switch (err) {
+            error.FileNotFound => break :blk false,
+            else => return err,
+        };
+        break :blk true;
+    };
 
     // Close and verify cleanup
     const path_copy = try allocator.dupe(u8, sock.getPath());
@@ -155,13 +161,19 @@ test "PermissionSocket create and close" {
 
     sock.close();
 
-    const stat2 = std.fs.cwd().statFile(path_copy) catch null;
+    const stat_after = blk: {
+        _ = std.fs.cwd().statFile(path_copy) catch |err| switch (err) {
+            error.FileNotFound => break :blk false,
+            else => return err,
+        };
+        break :blk true;
+    };
 
     var out: std.io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.print(
         "fd_nonzero: {any}\npath_contains: {any}\nstat_present: {any}\nstat_after: {any}\n",
-        .{ fd_nonzero, path_contains, stat != null, stat2 != null },
+        .{ fd_nonzero, path_contains, stat_present, stat_after },
     );
     const snapshot = try out.toOwnedSlice();
     defer allocator.free(snapshot);

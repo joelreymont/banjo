@@ -40,10 +40,16 @@ pub fn init() void {
 
     // Open log file
     const path = posix.getenv("BANJO_LOG_FILE") orelse default_path;
-    global_file = fs.cwd().createFile(path, .{ .truncate = false }) catch null;
-    if (global_file) |f| {
-        f.seekFromEnd(0) catch {};
+    const file = fs.cwd().createFile(path, .{ .truncate = false }) catch |err| {
+        std.debug.print("banjo log init failed for {s}: {}\n", .{ path, err });
+        return;
+    };
+    if (file.seekFromEnd(0)) |_| {} else |err| {
+        std.debug.print("banjo log seek failed for {s}: {}\n", .{ path, err });
+        file.close();
+        return;
     }
+    global_file = file;
 }
 
 /// Deinitialize the logger. Call at shutdown.
@@ -109,29 +115,42 @@ fn log(level: Level, comptime scope: []const u8, comptime fmt: []const u8, args:
     const epoch_secs: u64 = @intCast(ts);
     const epoch_day = std.time.epoch.EpochSeconds{ .secs = epoch_secs };
     const day_secs = epoch_day.getDaySeconds();
-    w.print("{d:0>2}:{d:0>2}:{d:0>2} ", .{
+    if (w.print("{d:0>2}:{d:0>2}:{d:0>2} ", .{
         day_secs.getHoursIntoDay(),
         day_secs.getMinutesIntoHour(),
         day_secs.getSecondsIntoMinute(),
-    }) catch return;
+    })) |_| {} else |err| {
+        std.debug.panic("banjo log timestamp format failed: {}", .{err});
+    }
 
     // Level, scope, and PID
-    w.print("[{s}] [{s}] [pid={d}] ", .{ level.asText(), scope, getPid() }) catch return;
+    if (w.print("[{s}] [{s}] [pid={d}] ", .{ level.asText(), scope, getPid() })) |_| {} else |err| {
+        std.debug.panic("banjo log header format failed: {}", .{err});
+    }
 
     // Message
-    w.print(fmt, args) catch return;
-    w.writeByte('\n') catch return;
+    if (w.print(fmt, args)) |_| {} else |err| {
+        std.debug.panic("banjo log message format failed: {}", .{err});
+    }
+    if (w.writeByte('\n')) |_| {} else |err| {
+        std.debug.panic("banjo log newline write failed: {}", .{err});
+    }
 
     const msg = fbs.getWritten();
 
     // Write to file
     if (global_file) |f| {
-        _ = f.write(msg) catch {};
+        if (f.writeAll(msg)) |_| {} else |err| {
+            global_file = null;
+            std.debug.print("banjo log file write failed: {}\n", .{err});
+        }
     }
 
-    // Also write to stderr for error/warn
-    if (@intFromEnum(level) <= @intFromEnum(Level.warn)) {
-        std.fs.File.stderr().writeAll(msg) catch {};
+    // Also write to stderr for error/warn, or when no log file is available
+    if (global_file == null or @intFromEnum(level) <= @intFromEnum(Level.warn)) {
+        if (std.fs.File.stderr().writeAll(msg)) |_| {} else |err| {
+            std.debug.panic("banjo log stderr write failed: {}", .{err});
+        }
     }
 }
 
