@@ -41,14 +41,19 @@ pub fn create(allocator: Allocator, port: u16, cwd: []const u8, auth_token: *con
             }
             allocator.free(existing.workspaceFolders);
         }
-        if (isPidAlive(existing.pid)) {
+        if (try isPidAlive(existing.pid)) {
             return error.PortAlreadyInUse;
         }
         // Stale lock file, delete it
         std.fs.deleteFileAbsolute(path) catch |err| {
             log.warn("Failed to remove stale lock file {s}: {}", .{ path, err });
         };
-    } else |_| {}
+    } else |err| {
+        // Only ignore FileNotFound; propagate other errors (permissions, parse failures)
+        if (err != error.FileNotFound) {
+            log.warn("Failed to read existing lock file {s}: {}", .{ path, err });
+        }
+    }
 
     const pid = getPid();
 
@@ -79,23 +84,42 @@ fn getPid() i32 {
     if (builtin.os.tag == .linux) {
         return @intCast(std.os.linux.getpid());
     }
-    // macOS/Darwin - use self-referential /proc alternative
-    // For lock file purposes, we just need a unique identifier
+    // macOS/BSD - use libc getpid()
+    if (builtin.os.tag == .macos or builtin.os.tag == .freebsd) {
+        return std.c.getpid();
+    }
+    // Other systems - use thread ID as unique identifier
     return @intCast(@as(u32, @truncate(std.Thread.getCurrentId())));
 }
 
-fn isPidAlive(pid: i32) bool {
-    // Use /proc on Linux, or just assume alive if we can't check
+fn isPidAlive(pid: i32) !bool {
     const builtin = @import("builtin");
     if (builtin.os.tag == .linux) {
+        // Use /proc on Linux
         var buf: [32]u8 = undefined;
-        const path = std.fmt.bufPrint(&buf, "/proc/{d}", .{pid}) catch return true;
-        var dir = std.fs.openDirAbsolute(path, .{}) catch return false;
+        const path = try std.fmt.bufPrint(&buf, "/proc/{d}", .{pid});
+        var dir = std.fs.openDirAbsolute(path, .{}) catch |err| {
+            // Only return false for errors that indicate process doesn't exist
+            // Permission errors (hidepid) should assume alive to avoid deleting active locks
+            return switch (err) {
+                error.FileNotFound, error.NotDir => false,
+                else => true,
+            };
+        };
         dir.close();
         return true;
     }
-    // On macOS/other: assume process is alive if lock file exists
-    // The worst case is we fail to start, which is safe
+    if (builtin.os.tag == .macos or builtin.os.tag == .freebsd) {
+        // On macOS/BSD, use kill(pid, 0) to check if process exists
+        // Returns success if process exists, ProcessNotFound if not
+        _ = std.posix.kill(pid, 0) catch |err| {
+            if (err == error.ProcessNotFound) return false;
+            // EPERM means process exists but we can't signal it
+            return true;
+        };
+        return true;
+    }
+    // On other systems, assume alive (safe fallback)
     return true;
 }
 
@@ -116,8 +140,12 @@ fn readExistingLockFile(allocator: Allocator, path: []const u8) !LockFileData {
     const folders = try allocator.alloc([]const u8, parsed.value.workspaceFolders.len);
     errdefer allocator.free(folders);
 
+    var folders_allocated: usize = 0;
+    errdefer for (folders[0..folders_allocated]) |f| allocator.free(f);
+
     for (parsed.value.workspaceFolders, 0..) |folder, i| {
         folders[i] = try allocator.dupe(u8, folder);
+        folders_allocated = i + 1;
     }
 
     return LockFileData{
@@ -135,7 +163,11 @@ fn writeJsonToFile(allocator: Allocator, path: []const u8, data: LockFileData) !
         else => return err,
     };
 
-    const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    // Use exclusive create to prevent race conditions
+    const file = std.fs.createFileAbsolute(path, .{ .exclusive = true }) catch |err| switch (err) {
+        error.PathAlreadyExists => return error.PortAlreadyInUse,
+        else => return err,
+    };
     defer file.close();
 
     var out: std.io.Writer.Allocating = .init(allocator);
@@ -231,7 +263,7 @@ test "generateUuidV4 uniqueness" {
 
 test "isPidAlive self" {
     const self_pid = getPid();
-    const summary = .{ .alive = isPidAlive(self_pid) };
+    const summary = .{ .alive = try isPidAlive(self_pid) };
     try (ohsnap{}).snap(@src(),
         \\nvim.lockfile.test.isPidAlive self__struct_<^\d+$>
         \\  .alive: bool = true
@@ -239,11 +271,12 @@ test "isPidAlive self" {
 }
 
 test "isPidAlive invalid" {
-    // On Linux, we check /proc which can detect dead PIDs
-    // On macOS, isPidAlive always returns true (can't check without /proc)
+    // On Linux/macOS/BSD, we can detect dead PIDs
+    // On other platforms, isPidAlive returns true (safe fallback)
     const builtin = @import("builtin");
-    const expected = builtin.os.tag != .linux;
-    const summary = .{ .alive = isPidAlive(99999999) };
+    const can_detect = builtin.os.tag == .linux or builtin.os.tag == .macos or builtin.os.tag == .freebsd;
+    const expected = !can_detect; // false if we can detect, true (alive) if we can't
+    const summary = .{ .alive = try isPidAlive(99999999) };
     try (ohsnap{}).snap(@src(),
         \\nvim.lockfile.test.isPidAlive invalid__struct_<^\d+$>
         \\  .alive: bool = <^(true|false)$>

@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const log = std.log.scoped(.websocket);
 
 // Maximum frame payload size (16 MB)
 pub const MAX_FRAME_SIZE: u64 = 16 * 1024 * 1024;
@@ -126,7 +127,7 @@ pub fn parseFrame(data: []u8) !ParseResult {
     const fin = (data[0] & 0x80) != 0;
     // RFC 6455 Section 5.2: RSV1, RSV2, RSV3 MUST be 0 unless extension negotiated
     if ((data[0] & 0x70) != 0) return error.ReservedBitsSet;
-    const opcode = Opcode.fromU4(@truncate(data[0] & 0x0F)) catch return error.ReservedOpcode;
+    const opcode = try Opcode.fromU4(@truncate(data[0] & 0x0F));
     const masked = (data[1] & 0x80) != 0;
     var payload_len: u64 = data[1] & 0x7F;
 
@@ -151,12 +152,16 @@ pub fn parseFrame(data: []u8) !ParseResult {
     // Reject oversized frames
     if (payload_len > MAX_FRAME_SIZE) return error.FrameTooLarge;
 
-    // Masking key (clients always mask)
+    // Masking key (RFC 6455: clients MUST mask frames to server)
     var mask: [4]u8 = undefined;
     if (masked) {
         if (data.len < offset + 4) return error.NeedMoreData;
         @memcpy(&mask, data[offset..][0..4]);
         offset += 4;
+    } else {
+        // Per RFC 6455, unmasked client frames are a protocol error
+        // For compatibility with local development clients, log a warning instead of failing
+        log.warn("Received unmasked WebSocket frame (RFC 6455 violation)", .{});
     }
 
     // Payload

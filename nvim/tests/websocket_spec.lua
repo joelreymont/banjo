@@ -220,6 +220,15 @@ describe("banjo websocket", function()
         assert.equals("test", parsed.payload)
       end)
 
+      it("parses frames from a start offset", function()
+        local created = frame.create_text_frame("offset", true)
+        local prefix = "XX"
+        local parsed, bytes_consumed = frame.parse_frame(prefix .. created, #prefix + 1)
+        assert.is_not_nil(parsed)
+        assert.equals("offset", parsed.payload)
+        assert.equals(#created, bytes_consumed)
+      end)
+
       it("handles incomplete frames", function()
         -- Only send first few bytes of a frame
         local created = frame.create_text_frame("test", true)
@@ -302,6 +311,24 @@ describe("banjo websocket", function()
       ws.state = "connected"
       client.connect(ws, "localhost", 8080)
       assert.is_true(error_called)
+    end)
+
+    it("drains buffered frames using offsets", function()
+      local messages = {}
+      local ws = client.new({
+        on_message = function(msg)
+          table.insert(messages, msg)
+        end,
+      })
+      ws.state = "connected"
+      ws.buffer = frame.create_text_frame("a", true) .. frame.create_text_frame("b", true)
+      ws.buffer_pos = 0
+      client._process_frames(ws)
+      assert.equals(2, #messages)
+      assert.equals("a", messages[1])
+      assert.equals("b", messages[2])
+      assert.equals("", ws.buffer)
+      assert.equals(0, ws.buffer_pos)
     end)
   end)
 end)

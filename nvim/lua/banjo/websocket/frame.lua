@@ -28,6 +28,15 @@ M.OPCODE = {
   PONG = 0xA,
 }
 
+local valid_opcodes = {
+  [M.OPCODE.CONTINUATION] = true,
+  [M.OPCODE.TEXT] = true,
+  [M.OPCODE.BINARY] = true,
+  [M.OPCODE.CLOSE] = true,
+  [M.OPCODE.PING] = true,
+  [M.OPCODE.PONG] = true,
+}
+
 ---@class WebSocketFrame
 ---@field fin boolean Final fragment flag
 ---@field opcode number Frame opcode
@@ -38,18 +47,24 @@ M.OPCODE = {
 
 ---Parse a WebSocket frame from binary data
 ---@param data string The binary frame data
+---@param start_pos number|nil Start position (1-based, default: 1)
 ---@return WebSocketFrame|nil frame The parsed frame, or nil if incomplete/invalid
 ---@return number bytes_consumed Number of bytes consumed from input
-function M.parse_frame(data)
+function M.parse_frame(data, start_pos)
   if type(data) ~= "string" then
     return nil, 0
   end
 
-  if #data < 2 then
+  start_pos = start_pos or 1
+  if start_pos < 1 then
+    return nil, 0
+  end
+
+  if #data < start_pos + 1 then
     return nil, 0 -- Need at least 2 bytes for basic header
   end
 
-  local pos = 1
+  local pos = start_pos
   local byte1 = data:byte(pos)
   local byte2 = data:byte(pos + 1)
 
@@ -68,16 +83,6 @@ function M.parse_frame(data)
 
   local masked = math.floor(byte2 / 128) == 1
   local payload_len = byte2 % 128
-
-  -- Validate opcode (RFC 6455 Section 5.2)
-  local valid_opcodes = {
-    [M.OPCODE.CONTINUATION] = true,
-    [M.OPCODE.TEXT] = true,
-    [M.OPCODE.BINARY] = true,
-    [M.OPCODE.CLOSE] = true,
-    [M.OPCODE.PING] = true,
-    [M.OPCODE.PONG] = true,
-  }
 
   if not valid_opcodes[opcode] then
     return nil, 0 -- Invalid opcode
@@ -179,7 +184,7 @@ function M.parse_frame(data)
     payload = payload,
   }
 
-  return frame, pos - 1
+  return frame, pos - start_pos
 end
 
 ---Create a WebSocket frame
