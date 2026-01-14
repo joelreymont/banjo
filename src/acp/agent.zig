@@ -35,7 +35,7 @@ const ToolProxy = @import("../tools/proxy.zig").ToolProxy;
 const log = std.log.scoped(.agent);
 
 /// Banjo version with git hash
-pub const version = "0.6.2 (" ++ config.git_hash ++ ")";
+pub const version = "0.6.3 (" ++ config.git_hash ++ ")";
 const no_engine_warning = "Banjo Duet could not find Claude Code or Codex. Install one (or set CLAUDE_CODE_EXECUTABLE/CODEX_EXECUTABLE) and restart the agent.";
 const max_context_bytes = 64 * 1024; // cap embedded resource text to keep prompts bounded
 const max_media_preview_bytes = 2048; // small preview for binary media captions
