@@ -1190,18 +1190,21 @@ pub const Agent = struct {
             log.info("Dots: cleaned up dots hooks from Claude settings", .{});
         }
 
-        // Skip if dot CLI not available
-        if (!dots.hasDotCli()) {
-            log.debug("Dots: CLI not available, skipping setup", .{});
-            return;
-        }
-
         // Determine which engine to use
         const engine: Engine = switch (route) {
             .claude => .claude,
             .codex => .codex,
             .duet => .claude, // Default to Claude for duet mode
         };
+
+        // Skip if dot CLI not available
+        if (!dots.hasDotCli()) {
+            log.debug("Dots: CLI not available, skipping setup", .{});
+            self.sendEngineText(session, session_id, engine, "dot CLI not found. Install dot or set DOT_EXECUTABLE.") catch |err| {
+                log.warn("Failed to send dots CLI missing message: {}", .{err});
+            };
+            return;
+        }
 
         // Check if skill exists
         if (!dots.hasSkill(engine)) {
@@ -6704,6 +6707,8 @@ test "dotsSessionSetup skips when no dot CLI" {
     // Mock environment without dot CLI by setting PATH to empty
     var guard_path = try EnvVarGuard.set(testing.allocator, "PATH", "");
     defer guard_path.deinit();
+    var guard_dot = try EnvVarGuard.set(testing.allocator, "DOT_EXECUTABLE", "/tmp/banjo-missing-dot");
+    defer guard_dot.deinit();
 
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session-no-dot"),
@@ -6720,8 +6725,7 @@ test "dotsSessionSetup skips when no dot CLI" {
     // This should skip (no crash, no prompts sent)
     agent.dotsSessionSetup(&session, session.id, .claude);
 
-    // Verify no output was sent (dots was skipped)
+    // Verify user-facing message was sent
     const output = tw.getOutput();
-    // Output should be empty or minimal since dots was skipped
-    try testing.expect(output.len == 0 or std.mem.indexOf(u8, output, "/dot") == null);
+    try testing.expect(std.mem.indexOf(u8, output, "dot CLI not found") != null);
 }

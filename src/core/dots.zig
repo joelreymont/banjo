@@ -1,10 +1,15 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
+const executable = @import("executable.zig");
 
 const Engine = types.Engine;
 const log = std.log.scoped(.dots);
 const max_dot_output_bytes: usize = 128 * 1024;
+const dot_paths = [_][]const u8{
+    "/usr/local/bin/dot",
+    "/opt/homebrew/bin/dot",
+};
 
 // Skill template embedded at compile time
 pub const skill_prompt = @embedFile("dot-skill");
@@ -111,24 +116,11 @@ pub fn skillPath(engine: Engine) []const u8 {
 
 /// Check if dot CLI is available
 pub fn hasDotCli() bool {
-    var args = [_][]const u8{ "dot", "--version" };
-    var child = std.process.Child.init(&args, std.heap.page_allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
+    return executable.isAvailable("DOT_EXECUTABLE", "dot", dot_paths[0..]);
+}
 
-    child.spawn() catch |err| {
-        log.warn("dot --version failed to start: {}", .{err});
-        return false;
-    };
-    const term = child.wait() catch |err| {
-        log.warn("dot --version wait failed: {}", .{err});
-        return false;
-    };
-    return switch (term) {
-        .Exited => |code| code == 0,
-        else => false,
-    };
+fn findDotBinary() []const u8 {
+    return executable.choose("DOT_EXECUTABLE", "dot", dot_paths[0..]);
 }
 
 /// Check if dot skill exists for the given engine
@@ -183,7 +175,11 @@ pub const PendingTasksResult = struct {
 };
 
 pub fn hasPendingTasks(allocator: Allocator, cwd: []const u8) PendingTasksResult {
-    var args = [_][]const u8{ "dot", "ls", "--json" };
+    if (!hasDotCli()) {
+        return .{ .has_tasks = false, .error_msg = "dot CLI not found" };
+    }
+    const dot_bin = findDotBinary();
+    var args = [_][]const u8{ dot_bin, "ls", "--json" };
     var child = std.process.Child.init(&args, allocator);
     child.cwd = cwd;
     child.stdin_behavior = .Ignore;
@@ -394,6 +390,15 @@ fn isDotHook(value: std.json.Value) bool {
 
 const testing = std.testing;
 const ohsnap = @import("ohsnap");
+const test_env = @import("../util/test_env.zig");
+
+fn createDotStub(allocator: Allocator, tmp: *std.testing.TmpDir) ![]const u8 {
+    const stub_name = "dot";
+    try tmp.dir.writeFile(.{ .sub_path = stub_name, .data = "" });
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    return std.fs.path.join(allocator, &.{ base, stub_name });
+}
 
 test "outputHasPendingTasks detects pending tasks" {
     const has_tasks = try outputHasPendingTasks(testing.allocator, "[{\"status\":\"open\"}]");
@@ -533,12 +538,26 @@ test "skill_prompt content snapshot" {
 }
 
 test "hasDotCli returns bool without crash" {
-    // Integration test: actually calls the CLI
-    // We just verify it returns a bool without crashing
+    // Environment test: verify it returns a bool without crashing
     const result = hasDotCli();
     // Result depends on whether dot is installed on test machine
     // Just verify it's a valid bool
     try testing.expect(result == true or result == false);
+}
+
+test "hasDotCli honors DOT_EXECUTABLE" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const stub_path = try createDotStub(testing.allocator, &tmp);
+    defer testing.allocator.free(stub_path);
+
+    var guard_path = try test_env.EnvVarGuard.set(testing.allocator, "PATH", "");
+    defer guard_path.deinit();
+    var guard_dot = try test_env.EnvVarGuard.set(testing.allocator, "DOT_EXECUTABLE", stub_path);
+    defer guard_dot.deinit();
+
+    try testing.expect(hasDotCli());
 }
 
 test "hasSkill with missing skill" {
@@ -769,7 +788,6 @@ test "cleanupClaudeHooks with temp settings file" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_path = try tmp.dir.realpath(".", &path_buf);
 
-    const test_env = @import("../util/test_env.zig");
     var guard = try test_env.EnvVarGuard.set(testing.allocator, "HOME", tmp_path);
     defer guard.deinit();
 
@@ -826,7 +844,6 @@ test "cleanupClaudeHooks returns false when no hooks to clean" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_path = try tmp.dir.realpath(".", &path_buf);
 
-    const test_env = @import("../util/test_env.zig");
     var guard = try test_env.EnvVarGuard.set(testing.allocator, "HOME", tmp_path);
     defer guard.deinit();
 
@@ -842,7 +859,6 @@ test "cleanupClaudeHooks handles missing settings file" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_path = try tmp.dir.realpath(".", &path_buf);
 
-    const test_env = @import("../util/test_env.zig");
     var guard = try test_env.EnvVarGuard.set(testing.allocator, "HOME", tmp_path);
     defer guard.deinit();
 
