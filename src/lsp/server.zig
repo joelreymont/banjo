@@ -45,6 +45,56 @@ const skip_dirs = std.StaticStringMap(void).initComptime(.{
     .{ "__pycache__", {} },
 });
 
+const LineIndex = struct {
+    starts: std.ArrayListUnmanaged(usize) = .empty,
+
+    pub fn init(allocator: Allocator, content: []const u8) !LineIndex {
+        var starts: std.ArrayListUnmanaged(usize) = .empty;
+        if (content.len == 0) return .{ .starts = starts };
+        try starts.append(allocator, 0);
+        for (content, 0..) |c, i| {
+            if (c == '\n' and i + 1 < content.len) {
+                try starts.append(allocator, i + 1);
+            }
+        }
+        return .{ .starts = starts };
+    }
+
+    pub fn deinit(self: *LineIndex, allocator: Allocator) void {
+        self.starts.deinit(allocator);
+    }
+
+    pub fn lineSlice(self: *const LineIndex, content: []const u8, line: u32) ?[]const u8 {
+        const idx = std.math.cast(usize, line) orelse return null;
+        if (idx >= self.starts.items.len) return null;
+        const start = self.starts.items[idx];
+        const end = if (idx + 1 < self.starts.items.len)
+            self.starts.items[idx + 1] - 1
+        else if (content.len > 0 and content[content.len - 1] == '\n')
+            content.len - 1
+        else
+            content.len;
+        return content[start..end];
+    }
+};
+
+const Document = struct {
+    content: []const u8,
+    line_index: LineIndex,
+
+    pub fn init(allocator: Allocator, text: []const u8) !Document {
+        const content = try allocator.dupe(u8, text);
+        errdefer allocator.free(content);
+        const line_index = try LineIndex.init(allocator, content);
+        return .{ .content = content, .line_index = line_index };
+    }
+
+    pub fn deinit(self: *Document, allocator: Allocator) void {
+        self.line_index.deinit(allocator);
+        allocator.free(self.content);
+    }
+};
+
 /// LSP Server state
 pub const Server = struct {
     allocator: Allocator,
@@ -53,7 +103,7 @@ pub const Server = struct {
     initialized: bool,
 
     /// Open documents: uri -> content
-    documents: std.StringHashMap([]const u8),
+    documents: std.StringHashMap(Document),
 
     /// Pending diagnostic publishes: uri -> last_change_timestamp
     pending_diagnostics: std.StringHashMap(i128),
@@ -69,7 +119,7 @@ pub const Server = struct {
             .transport = protocol.Transport.init(allocator, reader, writer),
             .root_uri = null,
             .initialized = false,
-            .documents = std.StringHashMap([]const u8).init(allocator),
+            .documents = std.StringHashMap(Document).init(allocator),
             .pending_diagnostics = std.StringHashMap(i128).init(allocator),
             .pending_note_index = std.StringHashMap(i128).init(allocator),
             .note_index = diagnostics.NoteIndex.init(allocator),
@@ -84,7 +134,7 @@ pub const Server = struct {
         var it = self.documents.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.*);
+            entry.value_ptr.*.deinit(self.allocator);
         }
         self.documents.deinit();
         self.pending_diagnostics.deinit();
@@ -212,8 +262,8 @@ pub const Server = struct {
                     log.warn("Diagnostics clock skew detected (elapsed {d}ns)", .{elapsed});
                 }
                 const uri = entry.key_ptr.*;
-                if (self.documents.get(uri)) |content| {
-                    try self.publishDiagnostics(uri, content);
+                if (self.documents.getPtr(uri)) |doc| {
+                    try self.publishDiagnostics(uri, doc.content);
                 }
                 try to_remove.append(self.allocator, uri);
             }
@@ -241,8 +291,8 @@ pub const Server = struct {
                     log.warn("Note index clock skew detected (elapsed {d}ns)", .{elapsed});
                 }
                 const uri = entry.key_ptr.*;
-                if (self.documents.get(uri)) |content| {
-                    self.updateNoteIndexForUri(uri, content) catch |err| {
+                if (self.documents.getPtr(uri)) |doc| {
+                    self.updateNoteIndexForUri(uri, doc.content) catch |err| {
                         log.warn("Failed to update note index for {s}: {}", .{ uri, err });
                     };
                 }
@@ -364,21 +414,26 @@ pub const Server = struct {
 
         // Store document content
         const uri_copy = try self.allocator.dupe(u8, uri);
-        errdefer self.allocator.free(uri_copy);
-        const text_copy = try self.allocator.dupe(u8, text);
-        errdefer self.allocator.free(text_copy);
+        var doc = Document.init(self.allocator, text) catch |err| {
+            self.allocator.free(uri_copy);
+            return err;
+        };
 
-        const put_result = try self.documents.getOrPut(uri_copy);
+        const put_result = self.documents.getOrPut(uri_copy) catch |err| {
+            doc.deinit(self.allocator);
+            self.allocator.free(uri_copy);
+            return err;
+        };
         if (put_result.found_existing) {
             self.allocator.free(uri_copy);
             _ = self.pending_diagnostics.remove(put_result.key_ptr.*);
-            self.allocator.free(put_result.value_ptr.*);
+            put_result.value_ptr.*.deinit(self.allocator);
         }
-        put_result.value_ptr.* = text_copy;
+        put_result.value_ptr.* = doc;
 
         // Rebuild index and publish diagnostics
         try self.rebuildIndex();
-        try self.publishDiagnostics(uri, text);
+        try self.publishDiagnostics(uri, doc.content);
     }
 
     fn handleDidChange(self: *Server, request: jsonrpc.Request) !void {
@@ -391,29 +446,40 @@ pub const Server = struct {
         if (params.value.contentChanges.len > 0) {
             const new_text = params.value.contentChanges[params.value.contentChanges.len - 1].text;
             var old_has_notes = false;
-            if (self.documents.get(uri)) |old_content| {
-                old_has_notes = hasBanjoMarker(old_content);
+            if (self.documents.getPtr(uri)) |old_doc| {
+                old_has_notes = hasBanjoMarker(old_doc.content);
             }
 
             if (self.documents.fetchRemove(uri)) |old| {
                 _ = self.pending_diagnostics.remove(uri);
                 _ = self.pending_note_index.remove(uri);
                 self.allocator.free(old.key);
-                self.allocator.free(old.value);
+                var old_doc = old.value;
+                old_doc.deinit(self.allocator);
             }
             const uri_copy = try self.allocator.dupe(u8, uri);
-            errdefer self.allocator.free(uri_copy);
-            const text_copy = try self.allocator.dupe(u8, new_text);
-            errdefer self.allocator.free(text_copy);
+            var doc = Document.init(self.allocator, new_text) catch |err| {
+                self.allocator.free(uri_copy);
+                return err;
+            };
+            const put_result = self.documents.getOrPut(uri_copy) catch |err| {
+                doc.deinit(self.allocator);
+                self.allocator.free(uri_copy);
+                return err;
+            };
+            if (put_result.found_existing) {
+                self.allocator.free(uri_copy);
+                put_result.value_ptr.*.deinit(self.allocator);
+            }
+            put_result.value_ptr.* = doc;
 
-            try self.documents.put(uri_copy, text_copy);
-
-            if (shouldScheduleNoteIndexUpdate(old_has_notes, text_copy)) {
-                try self.scheduleNoteIndexUpdate(uri_copy);
+            const stored_uri = put_result.key_ptr.*;
+            if (shouldScheduleNoteIndexUpdate(old_has_notes, doc.content)) {
+                try self.scheduleNoteIndexUpdate(stored_uri);
             }
 
             // Schedule diagnostics with debouncing
-            try self.scheduleDiagnostics(uri_copy);
+            try self.scheduleDiagnostics(stored_uri);
         }
     }
 
@@ -450,7 +516,8 @@ pub const Server = struct {
 
         if (self.documents.fetchRemove(uri)) |old| {
             self.allocator.free(old.key);
-            self.allocator.free(old.value);
+            var old_doc = old.value;
+            old_doc.deinit(self.allocator);
         }
 
         // Clear diagnostics
@@ -468,7 +535,12 @@ pub const Server = struct {
         defer params.deinit();
 
         const uri = params.value.textDocument.uri;
-        const content = params.value.text orelse self.documents.get(uri);
+        const content = if (params.value.text) |text|
+            text
+        else if (self.documents.getPtr(uri)) |doc|
+            doc.content
+        else
+            null;
 
         if (content) |text| {
             try self.rebuildIndex();
@@ -484,12 +556,12 @@ pub const Server = struct {
         const line = params.value.position.line;
         const char = params.value.position.character;
 
-        const content = self.documents.get(uri) orelse {
+        const doc = self.documents.getPtr(uri) orelse {
             try self.transport.writeTypedResponse(request.id, null);
             return;
         };
 
-        const line_content = getLineContent(content, line) orelse {
+        const line_content = getLineContent(&doc.line_index, doc.content, line) orelse {
             try self.transport.writeTypedResponse(request.id, null);
             return;
         };
@@ -522,22 +594,20 @@ pub const Server = struct {
                             const bl_summary = summary.getSummary(bl_note.content, .{ .max_len = 40, .prefer_word_boundary = true });
                             try hover_content.writer.print("> {s}\n", .{bl_summary});
 
-                            const bl_uri = lsp_uri.pathToUri(self.allocator, bl_note.file_path) catch null;
-                            if (bl_uri) |uri_str| {
-                                defer self.allocator.free(uri_str);
-                                if (self.documents.get(uri_str)) |doc_content| {
-                                    const context = getLineContext(doc_content, bl_note.line, 1);
-                                    if (context.before.len > 0 or context.after.len > 0) {
-                                        try hover_content.writer.writeAll("```\n");
-                                        if (context.before.len > 0) {
-                                            try hover_content.writer.print("{s}\n", .{context.before});
-                                        }
-                                        try hover_content.writer.print("-> {s}\n", .{context.current});
-                                        if (context.after.len > 0) {
-                                            try hover_content.writer.print("{s}\n", .{context.after});
-                                        }
-                                        try hover_content.writer.writeAll("```\n");
+                            const bl_uri = try lsp_uri.pathToUri(self.allocator, bl_note.file_path);
+                            defer self.allocator.free(bl_uri);
+                            if (self.documents.getPtr(bl_uri)) |bl_doc| {
+                                const context = getLineContext(bl_doc.content, bl_note.line, 1);
+                                if (context.before.len > 0 or context.after.len > 0) {
+                                    try hover_content.writer.writeAll("```\n");
+                                    if (context.before.len > 0) {
+                                        try hover_content.writer.print("{s}\n", .{context.before});
                                     }
+                                    try hover_content.writer.print("-> {s}\n", .{context.current});
+                                    if (context.after.len > 0) {
+                                        try hover_content.writer.print("{s}\n", .{context.after});
+                                    }
+                                    try hover_content.writer.writeAll("```\n");
                                 }
                             }
                         }
@@ -569,12 +639,12 @@ pub const Server = struct {
         const line = params.value.position.line;
         const char = params.value.position.character;
 
-        const content = self.documents.get(uri) orelse {
+        const doc = self.documents.getPtr(uri) orelse {
             try self.transport.writeTypedResponse(request.id, @as(?protocol.Location, null));
             return;
         };
 
-        const line_content = getLineContent(content, line) orelse {
+        const line_content = getLineContent(&doc.line_index, doc.content, line) orelse {
             try self.transport.writeTypedResponse(request.id, @as(?protocol.Location, null));
             return;
         };
@@ -615,12 +685,12 @@ pub const Server = struct {
         const line = params.value.position.line;
         const char = params.value.position.character;
 
-        const content = self.documents.get(uri) orelse {
+        const doc = self.documents.getPtr(uri) orelse {
             try self.transport.writeTypedResponse(request.id, &[_]protocol.Location{});
             return;
         };
 
-        const line_content = getLineContent(content, line) orelse {
+        const line_content = getLineContent(&doc.line_index, doc.content, line) orelse {
             try self.transport.writeTypedResponse(request.id, &[_]protocol.Location{});
             return;
         };
@@ -675,13 +745,13 @@ pub const Server = struct {
         const line = params.value.position.line;
         const char = params.value.position.character;
 
-        const content = self.documents.get(uri) orelse {
+        const doc = self.documents.getPtr(uri) orelse {
             try self.transport.writeTypedResponse(request.id, protocol.CompletionList{ .items = &.{} });
             return;
         };
 
         // Check if we're after [[
-        const line_content = getLineContent(content, line) orelse {
+        const line_content = getLineContent(&doc.line_index, doc.content, line) orelse {
             try self.transport.writeTypedResponse(request.id, protocol.CompletionList{ .items = &.{} });
             return;
         };
@@ -720,21 +790,21 @@ pub const Server = struct {
         defer if (self_note) |*note| note.deinit(self.allocator);
 
         if (mem.indexOf(u8, line_content, "@banjo[") != null) {
-            if (comments.parseNoteLine(self.allocator, line_content, line + 1) catch null) |note| {
+            if (try comments.parseNoteLine(self.allocator, line_content, line + 1)) |note| {
                 self_note = note;
             }
         }
 
-        const should_insert_note = isCommentLine(content, line + 1);
+        const should_insert_note = isCommentLine(&doc.line_index, doc.content, line);
         if (should_insert_note) {
-            const block_start = findCommentBlockStart(content, line);
-            const block_end = findCommentBlockEnd(content, line);
-            if (commentBlockHasNote(content, block_start, block_end)) {
+            const block_start = findCommentBlockStart(&doc.line_index, doc.content, line);
+            const block_end = findCommentBlockEnd(&doc.line_index, doc.content, line);
+            if (commentBlockHasNote(&doc.line_index, doc.content, block_start, block_end)) {
                 var scan_line = block_start;
                 while (scan_line <= block_end) : (scan_line += 1) {
-                    if (getLineContent(content, scan_line)) |block_line| {
+                    if (getLineContent(&doc.line_index, doc.content, scan_line)) |block_line| {
                         if (mem.indexOf(u8, block_line, "@banjo[") != null) {
-                            if (comments.parseNoteLine(self.allocator, block_line, scan_line + 1) catch null) |note| {
+                            if (try comments.parseNoteLine(self.allocator, block_line, scan_line + 1)) |note| {
                                 self_note = note;
                                 break;
                             }
@@ -742,7 +812,7 @@ pub const Server = struct {
                     }
                 }
             } else {
-                if (getLineContent(content, block_start)) |block_line| {
+                if (getLineContent(&doc.line_index, doc.content, block_start)) |block_line| {
                     if (findCommentInsertOffset(block_line)) |insert_char| {
                         const note_id = comments.generateNoteId();
                         const insert_text = try std.fmt.allocPrint(self.allocator, "@banjo[{s}] ", .{&note_id});
@@ -838,7 +908,7 @@ pub const Server = struct {
         defer params.deinit();
 
         const uri = params.value.textDocument.uri;
-        const content = self.documents.get(uri) orelse {
+        const doc = self.documents.getPtr(uri) orelse {
             try self.transport.writeTypedResponse(request.id, protocol.SemanticTokens{ .data = &.{} });
             return;
         };
@@ -853,10 +923,10 @@ pub const Server = struct {
         // Scan all lines for @banjo[id] and @[text](id) patterns
         var line_num: u32 = 0;
         var line_start: usize = 0;
-        for (content, 0..) |c, i| {
-            if (c == '\n' or i == content.len - 1) {
+        for (doc.content, 0..) |c, i| {
+            if (c == '\n' or i == doc.content.len - 1) {
                 const line_end = if (c == '\n') i else i + 1;
-                const line_content = content[line_start..line_end];
+                const line_content = doc.content[line_start..line_end];
 
                 // Find @banjo[id] pattern
                 if (mem.indexOf(u8, line_content, "@banjo[")) |marker_start| {
@@ -954,7 +1024,7 @@ pub const Server = struct {
             return;
         };
 
-        const content = self.documents.get(uri) orelse {
+        const doc = self.documents.getPtr(uri) orelse {
             try self.transport.writeTypedResponse(request.id, &[_]protocol.CodeAction{});
             return;
         };
@@ -977,14 +1047,14 @@ pub const Server = struct {
             edit_allocs.deinit(self.allocator);
         }
 
-        const line_text = getLineContent(content, line) orelse "";
-        const is_comment = isCommentLine(content, line + 1); // isCommentLine uses 1-indexed
-        const block_start = if (is_comment) findCommentBlockStart(content, line) else line;
-        const block_end = if (is_comment) findCommentBlockEnd(content, line) else line;
-        const block_line_text = if (is_comment) getLineContent(content, block_start) orelse "" else line_text;
+        const line_text = getLineContent(&doc.line_index, doc.content, line) orelse "";
+        const is_comment = isCommentLine(&doc.line_index, doc.content, line);
+        const block_start = if (is_comment) findCommentBlockStart(&doc.line_index, doc.content, line) else line;
+        const block_end = if (is_comment) findCommentBlockEnd(&doc.line_index, doc.content, line) else line;
+        const block_line_text = if (is_comment) getLineContent(&doc.line_index, doc.content, block_start) orelse "" else line_text;
 
         // Skip create action if the comment block already contains a note marker.
-        if (commentBlockHasNote(content, block_start, block_end)) {
+        if (commentBlockHasNote(&doc.line_index, doc.content, block_start, block_end)) {
             try self.transport.writeTypedResponse(request.id, &[_]protocol.CodeAction{});
             return;
         }
@@ -1108,7 +1178,7 @@ pub const Server = struct {
         const line = if (args[1] == .integer) castU32FromI64(args[1].integer) orelse return else return;
         const is_comment = if (args.len > 2 and args[2] == .bool) args[2].bool else true;
 
-        const content = self.documents.get(uri) orelse return;
+        const doc = self.documents.getPtr(uri) orelse return;
         const uri_path = try lsp_uri.uriToPath(self.allocator, uri);
         defer if (uri_path) |parsed| parsed.deinit(self.allocator);
         const file_path = if (uri_path) |parsed| parsed.path else return;
@@ -1117,11 +1187,11 @@ pub const Server = struct {
         const note_id = comments.generateNoteId();
 
         if (is_comment) {
-            const target_line = findCommentBlockStart(content, line - 1);
-            const target_end = findCommentBlockEnd(content, line - 1);
-            if (commentBlockHasNote(content, target_line, target_end)) return;
+            const target_line = findCommentBlockStart(&doc.line_index, doc.content, line - 1);
+            const target_end = findCommentBlockEnd(&doc.line_index, doc.content, line - 1);
+            if (commentBlockHasNote(&doc.line_index, doc.content, target_line, target_end)) return;
 
-            const line_content = getLineContent(content, target_line) orelse return;
+            const line_content = getLineContent(&doc.line_index, doc.content, target_line) orelse return;
             // Comment line: insert @banjo[id] after comment prefix and whitespace
             const insert_char = findCommentInsertOffset(line_content) orelse return;
             const insert_text = try std.fmt.allocPrint(self.allocator, "@banjo[{s}] ", .{&note_id});
@@ -1135,7 +1205,7 @@ pub const Server = struct {
             try self.applyLineEdit(uri, target_line, new_line);
         } else {
             // Code line: insert note comment above
-            const line_content = getLineContent(content, line - 1) orelse return;
+            const line_content = getLineContent(&doc.line_index, doc.content, line - 1) orelse return;
             const prefix = comments.getCommentPrefix(file_path);
             const indent = getIndent(line_content);
             const new_line = try std.fmt.allocPrint(
@@ -1379,7 +1449,7 @@ pub const Server = struct {
         var it = self.documents.iterator();
         while (it.next()) |entry| {
             const uri = entry.key_ptr.*;
-            const content = entry.value_ptr.*;
+            const doc = entry.value_ptr.*;
             const uri_path = try lsp_uri.uriToPath(self.allocator, uri);
             defer if (uri_path) |parsed| parsed.deinit(self.allocator);
             const file_path = if (uri_path) |parsed| parsed.path else continue;
@@ -1390,7 +1460,7 @@ pub const Server = struct {
                 self.allocator.free(path_copy);
             }
 
-            self.addNotesFromContent(file_path, content) catch |err| {
+            self.addNotesFromContent(file_path, doc.content) catch |err| {
                 log.warn("Failed to scan open note file {s}: {}", .{ file_path, err });
                 continue;
             };
@@ -1406,32 +1476,18 @@ pub const Server = struct {
     }
 
     // line is 1-based (note metadata), convert to 0-based for LSP content.
-    fn findNoteAtLine(self: *Server, content: []const u8, line: u32) ?comments.ParsedNote {
-        return comments.parseNoteLine(self.allocator, getLineContent(content, line - 1) orelse return null, line) catch null;
+    fn findNoteAtLine(self: *Server, doc: *const Document, line: u32) !?comments.ParsedNote {
+        return try comments.parseNoteLine(
+            self.allocator,
+            getLineContent(&doc.line_index, doc.content, line - 1) orelse return null,
+            line,
+        );
     }
 };
 
 // line is 0-based (LSP positions).
-fn getLineContent(content: []const u8, line: u32) ?[]const u8 {
-    var current_line: u32 = 0;
-    var start: usize = 0;
-
-    for (content, 0..) |c, i| {
-        if (c == '\n') {
-            if (current_line == line) {
-                return content[start..i];
-            }
-            current_line += 1;
-            start = i + 1;
-        }
-    }
-
-    // Last line without trailing newline
-    if (current_line == line and start < content.len) {
-        return content[start..];
-    }
-
-    return null;
+fn getLineContent(line_index: *const LineIndex, content: []const u8, line: u32) ?[]const u8 {
+    return line_index.lineSlice(content, line);
 }
 
 fn getIndent(line: []const u8) []const u8 {
@@ -1456,17 +1512,28 @@ const CommentPrefix = struct {
     len: usize,
 };
 
+const comment_prefixes = [_]struct {
+    prefix: []const u8,
+    kind: CommentPrefixKind,
+}{
+    .{ .prefix = "<!--", .kind = .html },
+    .{ .prefix = "//", .kind = .slash },
+    .{ .prefix = "--", .kind = .dash },
+    .{ .prefix = "#", .kind = .hash },
+    .{ .prefix = ";", .kind = .semi },
+};
+
 fn getCommentPrefix(trimmed: []const u8) ?CommentPrefix {
-    if (mem.startsWith(u8, trimmed, "<!--")) return .{ .kind = .html, .len = 4 };
-    if (mem.startsWith(u8, trimmed, "//")) return .{ .kind = .slash, .len = 2 };
-    if (mem.startsWith(u8, trimmed, "--")) return .{ .kind = .dash, .len = 2 };
-    if (mem.startsWith(u8, trimmed, "#")) return .{ .kind = .hash, .len = 1 };
-    if (mem.startsWith(u8, trimmed, ";")) return .{ .kind = .semi, .len = 1 };
+    for (comment_prefixes) |entry| {
+        if (mem.startsWith(u8, trimmed, entry.prefix)) {
+            return .{ .kind = entry.kind, .len = entry.prefix.len };
+        }
+    }
     return null;
 }
 
-fn isCommentLine(content: []const u8, line: u32) bool {
-    const line_content = getLineContent(content, line - 1) orelse return false;
+fn isCommentLine(line_index: *const LineIndex, content: []const u8, line: u32) bool {
+    const line_content = getLineContent(line_index, content, line) orelse return false;
     const trimmed = mem.trimLeft(u8, line_content, " \t");
     if (getCommentPrefix(trimmed) != null) {
         // Make sure it's not already a banjo note
@@ -1475,8 +1542,8 @@ fn isCommentLine(content: []const u8, line: u32) bool {
     return false;
 }
 
-fn isCommentBlockLine(content: []const u8, line: u32) bool {
-    const line_content = getLineContent(content, line - 1) orelse return false;
+fn isCommentBlockLine(line_index: *const LineIndex, content: []const u8, line: u32) bool {
+    const line_content = getLineContent(line_index, content, line) orelse return false;
     const trimmed = mem.trimLeft(u8, line_content, " \t");
     return getCommentPrefix(trimmed) != null;
 }
@@ -1624,31 +1691,31 @@ fn findCommentInsertOffset(line_content: []const u8) ?u32 {
     return castU32(leading_spaces + pos);
 }
 
-fn findCommentBlockStart(content: []const u8, line: u32) u32 {
+fn findCommentBlockStart(line_index: *const LineIndex, content: []const u8, line: u32) u32 {
     var current = line;
     while (current > 0) {
         const prev = current - 1;
-        if (!isCommentBlockLine(content, prev + 1)) break;
+        if (!isCommentBlockLine(line_index, content, prev)) break;
         current = prev;
     }
     return current;
 }
 
-fn findCommentBlockEnd(content: []const u8, line: u32) u32 {
+fn findCommentBlockEnd(line_index: *const LineIndex, content: []const u8, line: u32) u32 {
     var current = line;
     while (true) {
         const next = current + 1;
-        if (getLineContent(content, next) == null) break;
-        if (!isCommentBlockLine(content, next + 1)) break;
+        if (getLineContent(line_index, content, next) == null) break;
+        if (!isCommentBlockLine(line_index, content, next)) break;
         current = next;
     }
     return current;
 }
 
-fn commentBlockHasNote(content: []const u8, start_line: u32, end_line: u32) bool {
+fn commentBlockHasNote(line_index: *const LineIndex, content: []const u8, start_line: u32, end_line: u32) bool {
     var line = start_line;
     while (line <= end_line) : (line += 1) {
-        const line_content = getLineContent(content, line) orelse continue;
+        const line_content = getLineContent(line_index, content, line) orelse continue;
         if (mem.indexOf(u8, line_content, "@banjo[") != null) return true;
     }
     return false;
@@ -1738,6 +1805,14 @@ fn getLineContext(content: []const u8, line_num: u32, context_lines: u32) LineCo
 const testing = std.testing;
 const ohsnap = @import("ohsnap");
 
+fn putTestDocument(server: *Server, allocator: Allocator, uri: []const u8, content: []const u8) !void {
+    const uri_copy = try allocator.dupe(u8, uri);
+    errdefer allocator.free(uri_copy);
+    var doc = try Document.init(allocator, content);
+    errdefer doc.deinit(allocator);
+    try server.documents.put(uri_copy, doc);
+}
+
 test "uriToPath strips file:// prefix" {
     const parsed = try lsp_uri.uriToPath(testing.allocator, "file:///home/user/test.zig") orelse return error.TestUnexpectedResult;
     defer parsed.deinit(testing.allocator);
@@ -1770,11 +1845,17 @@ test "hasTodoPattern scans full line" {
 
 test "getLineContent returns correct line" {
     const content = "line 0\nline 1\nline 2";
+    var index = try LineIndex.init(testing.allocator, content);
+    defer index.deinit(testing.allocator);
+    const empty = "";
+    var empty_index = try LineIndex.init(testing.allocator, empty);
+    defer empty_index.deinit(testing.allocator);
     const snapshot = .{
-        .line0 = getLineContent(content, 0),
-        .line1 = getLineContent(content, 1),
-        .line2 = getLineContent(content, 2),
-        .line3 = getLineContent(content, 3),
+        .line0 = getLineContent(&index, content, 0),
+        .line1 = getLineContent(&index, content, 1),
+        .line2 = getLineContent(&index, content, 2),
+        .line3 = getLineContent(&index, content, 3),
+        .empty = getLineContent(&empty_index, empty, 0),
     };
     try (ohsnap{}).snap(@src(),
         \\lsp.server.test.getLineContent returns correct line__struct_<^\d+$>
@@ -1786,36 +1867,42 @@ test "getLineContent returns correct line" {
         \\    "line 2"
         \\  .line3: ?[]const u8
         \\    null
+        \\  .empty: ?[]const u8
+        \\    null
     ).expectEqual(snapshot);
 }
 
 test "isCommentLine detects comments" {
     const content = "code\n// comment\n# python\nmore code";
+    var index = try LineIndex.init(testing.allocator, content);
+    defer index.deinit(testing.allocator);
     const snapshot = .{
-        .line1 = isCommentLine(content, 1),
-        .line2 = isCommentLine(content, 2),
-        .line3 = isCommentLine(content, 3),
-        .line4 = isCommentLine(content, 4),
+        .line0 = isCommentLine(&index, content, 0),
+        .line1 = isCommentLine(&index, content, 1),
+        .line2 = isCommentLine(&index, content, 2),
+        .line3 = isCommentLine(&index, content, 3),
     };
     try (ohsnap{}).snap(@src(),
         \\lsp.server.test.isCommentLine detects comments__struct_<^\d+$>
-        \\  .line1: bool = false
+        \\  .line0: bool = false
+        \\  .line1: bool = true
         \\  .line2: bool = true
-        \\  .line3: bool = true
-        \\  .line4: bool = false
+        \\  .line3: bool = false
     ).expectEqual(snapshot);
 }
 
 test "isCommentLine excludes banjo notes" {
     const content = "// @banjo[abc] note\n// regular comment";
+    var index = try LineIndex.init(testing.allocator, content);
+    defer index.deinit(testing.allocator);
     const snapshot = .{
-        .line1 = isCommentLine(content, 1),
-        .line2 = isCommentLine(content, 2),
+        .line0 = isCommentLine(&index, content, 0),
+        .line1 = isCommentLine(&index, content, 1),
     };
     try (ohsnap{}).snap(@src(),
         \\lsp.server.test.isCommentLine excludes banjo notes__struct_<^\d+$>
-        \\  .line1: bool = false
-        \\  .line2: bool = true
+        \\  .line0: bool = false
+        \\  .line1: bool = true
     ).expectEqual(snapshot);
 }
 
@@ -1883,7 +1970,7 @@ test "executeCreateNote inserts note marker after comment prefix" {
 
     const uri = "file:///test.zig";
     const content = "    //   TODO fix\n";
-    try server.documents.put(try testing.allocator.dupe(u8, uri), try testing.allocator.dupe(u8, content));
+    try putTestDocument(&server, testing.allocator, uri, content);
 
     const args = [_]std.json.Value{
         .{ .string = uri },
@@ -1952,7 +2039,7 @@ test "executeCreateNote inserts on first line of comment block" {
         \\//! Discriminator for decision tree
         \\//! Second line
     ;
-    try server.documents.put(try testing.allocator.dupe(u8, uri), try testing.allocator.dupe(u8, content));
+    try putTestDocument(&server, testing.allocator, uri, content);
 
     const args = [_]std.json.Value{
         .{ .string = uri },
@@ -2017,7 +2104,7 @@ test "executeCreateNote from last line inserts on first block line" {
         \\//! Second line
         \\//! Third line
     ;
-    try server.documents.put(try testing.allocator.dupe(u8, uri), try testing.allocator.dupe(u8, content));
+    try putTestDocument(&server, testing.allocator, uri, content);
 
     const args = [_]std.json.Value{
         .{ .string = uri },
@@ -2083,7 +2170,7 @@ test "completion adds note marker edit when linking from comment line" {
         \\
         \\// @banjo[note-a] First note
     ;
-    try server.documents.put(try testing.allocator.dupe(u8, uri), try testing.allocator.dupe(u8, content));
+    try putTestDocument(&server, testing.allocator, uri, content);
     try server.rebuildIndex();
 
     const request_json =
@@ -2159,7 +2246,7 @@ test "completion does not add note marker edit on non-comment line" {
         \\// @banjo[note-a] First note
         \\const x = 1; @[
     ;
-    try server.documents.put(try testing.allocator.dupe(u8, uri), try testing.allocator.dupe(u8, content));
+    try putTestDocument(&server, testing.allocator, uri, content);
     try server.rebuildIndex();
 
     const request_json =
@@ -2211,7 +2298,7 @@ test "completion excludes self note" {
         .{line},
     );
     defer testing.allocator.free(content);
-    try server.documents.put(try testing.allocator.dupe(u8, uri), try testing.allocator.dupe(u8, content));
+    try putTestDocument(&server, testing.allocator, uri, content);
     try server.rebuildIndex();
 
     const request_json = try std.fmt.allocPrint(
@@ -2268,7 +2355,7 @@ test "note index updates are debounced" {
 
     const uri = "file:///test.zig";
     const initial = "// @banjo[a] First\n";
-    try server.documents.put(try testing.allocator.dupe(u8, uri), try testing.allocator.dupe(u8, initial));
+    try putTestDocument(&server, testing.allocator, uri, initial);
     try server.rebuildIndex();
     const initial_has_a = server.note_index.getNote("a") != null;
 
@@ -2313,7 +2400,7 @@ test "didChange without banjo markers skips note index update" {
 
     const uri = "file:///test.zig";
     const initial = "// regular comment\n";
-    try server.documents.put(try testing.allocator.dupe(u8, uri), try testing.allocator.dupe(u8, initial));
+    try putTestDocument(&server, testing.allocator, uri, initial);
 
     const request_json =
         "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"textDocument/didChange\",\"params\":" ++

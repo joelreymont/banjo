@@ -65,13 +65,13 @@ zed -                        # Read from stdin
 
 ## LSP Configuration
 
-Zed auto-discovers LSP servers. For custom LSP like banjo:
+Zed auto-discovers LSP servers. For the optional Banjo LSP:
 
 ### Project-level config (`.zed/settings.json`)
 ```json
 {
   "lsp": {
-    "banjo": {
+    "banjo-notes": {
       "binary": {
         "path": "/path/to/banjo",
         "arguments": ["--lsp"]
@@ -80,7 +80,7 @@ Zed auto-discovers LSP servers. For custom LSP like banjo:
   },
   "languages": {
     "Zig": {
-      "language_servers": ["banjo", "..."]
+      "language_servers": ["banjo-notes", "..."]
     }
   }
 }

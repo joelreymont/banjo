@@ -81,7 +81,7 @@ For local development or custom agents not installed from extensions:
   "agent_servers": {
     "banjo": {
       "type": "custom",
-      "command": "/Users/joel/Work/banjo/zig-out/bin/banjo",
+      "command": "/path/to/banjo/zig-out/bin/banjo",
       "args": ["--agent"]
     }
   }
@@ -115,10 +115,10 @@ Environment variables in `settings.json` override those in `extension.toml`.
 ## Testing Locally
 
 1. Cmd+Shift+P → `zed: install dev extension`
-2. Select the repo root (contains `extension.toml`)
+2. Select `extension/` (contains `extension.toml`)
 3. Agent appears in Agent Panel dropdown
 
-Note: `extension/` is only the WASM subproject and does not contain a manifest.
+Note: the repo root does not contain a manifest.
 
 ## Useful Zed Commands
 

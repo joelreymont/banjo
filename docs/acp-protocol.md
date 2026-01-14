@@ -469,7 +469,7 @@ banjo-zed/
 ### extension.toml
 
 ```toml
-id = "banjo"
+id = "banjo-acp"
 name = "Banjo"
 version = "0.1.0"
 description = "ACP agent for Claude Code + Codex in Zig"

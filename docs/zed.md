@@ -14,7 +14,7 @@ Banjo Duet runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) an
 - **Auto-continue with Dots** — when Claude pauses at turn limits, Banjo checks for pending [Dots](https://github.com/joelreymont/dots) tasks and automatically continues
 - **Auto-resume sessions** — automatically continues your last conversation
 - **Code notes** — attach notes to code as comments with `/explain`
-- **Auto-setup** — `/setup lsp` configures Zed settings automatically
+- **Auto-setup** — Banjo writes `.zed/settings.json` on first run for LSP diagnostics
 - **Duet routing** — `/claude`, `/codex`, `/duet` switch the active routing mode
 
 ### Commands
@@ -33,13 +33,14 @@ Banjo Duet runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) an
 
 ## Notes
 
-Banjo lets you attach notes to code as `@banjo[id]` comments. Notes appear as LSP diagnostics.
+Banjo lets you attach notes to code as `@banjo[id]` comments. Notes appear as LSP diagnostics once Banjo writes `.zed/settings.json` and you reload the workspace.
 
 ### Quick Start
 
-1. Run `/setup lsp` in the agent panel — automatically configures Zed settings
-2. Write a comment, press `Cmd+.`, select "Create Banjo Note"
-3. Or select code, press `Cmd+>`, type `/explain` to have Claude summarize it
+1. Start a Banjo session — it writes `.zed/settings.json` automatically
+2. Reload workspace (`Cmd+Shift+P` → "workspace: reload") to enable LSP notes
+3. Write a comment, press `Cmd+.`, select "Create Banjo Note"
+4. Or select code, press `Cmd+>`, type `/explain` to have Claude summarize it
 
 ### Creating Notes
 

@@ -22,8 +22,8 @@ Banjo Duet is a Second Brain for your code — run [Claude Code](https://docs.an
 
 ### Zed-specific
 
-- Code notes as `@banjo[id]` comments with LSP diagnostics
-- Auto-setup with `/setup lsp`
+- Code notes as `@banjo[id]` comments
+- LSP diagnostics auto-configured on first run (reload workspace once)
 - Duet routing: `/claude`, `/codex`, `/duet`
 
 ### Neovim-specific
