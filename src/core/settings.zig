@@ -300,7 +300,7 @@ fn getTestTool(idx: u3) []const u8 {
 
 test "property: isAllowed returns true only for added tools" {
     try zcheck.check(struct {
-        fn prop(args: struct { add_idx: u3, check_idx: u3 }) bool {
+        fn prop(args: struct { add_idx: u3, check_idx: u3 }) !bool {
             var settings = Settings.init(testing.allocator);
             defer settings.deinit();
 
@@ -308,11 +308,9 @@ test "property: isAllowed returns true only for added tools" {
             const check_tool = getTestTool(args.check_idx);
 
             // Add the tool
-            const owned = testing.allocator.dupe(u8, add_tool) catch return false;
-            settings.allowed_tools.put(owned, {}) catch {
-                testing.allocator.free(owned);
-                return false;
-            };
+            const owned = try testing.allocator.dupe(u8, add_tool);
+            errdefer testing.allocator.free(owned);
+            try settings.allowed_tools.put(owned, {});
 
             // Check: should be allowed only if same tool
             const is_allowed = settings.isAllowed(check_tool);
@@ -324,7 +322,7 @@ test "property: isAllowed returns true only for added tools" {
 
 test "property: isDenied returns true only for added tools" {
     try zcheck.check(struct {
-        fn prop(args: struct { add_idx: u3, check_idx: u3 }) bool {
+        fn prop(args: struct { add_idx: u3, check_idx: u3 }) !bool {
             var settings = Settings.init(testing.allocator);
             defer settings.deinit();
 
@@ -332,11 +330,9 @@ test "property: isDenied returns true only for added tools" {
             const check_tool = getTestTool(args.check_idx);
 
             // Add to denied
-            const owned = testing.allocator.dupe(u8, add_tool) catch return false;
-            settings.denied_tools.put(owned, {}) catch {
-                testing.allocator.free(owned);
-                return false;
-            };
+            const owned = try testing.allocator.dupe(u8, add_tool);
+            errdefer testing.allocator.free(owned);
+            try settings.denied_tools.put(owned, {});
 
             // Check: should be denied only if same tool
             const is_denied = settings.isDenied(check_tool);
@@ -348,7 +344,7 @@ test "property: isDenied returns true only for added tools" {
 
 test "property: allowed and denied are independent" {
     try zcheck.check(struct {
-        fn prop(args: struct { allow_idx: u3, deny_idx: u3, check_idx: u3 }) bool {
+        fn prop(args: struct { allow_idx: u3, deny_idx: u3, check_idx: u3 }) !bool {
             var settings = Settings.init(testing.allocator);
             defer settings.deinit();
 
@@ -357,18 +353,14 @@ test "property: allowed and denied are independent" {
             const check_tool = getTestTool(args.check_idx);
 
             // Add to allowed
-            const owned_allow = testing.allocator.dupe(u8, allow_tool) catch return false;
-            settings.allowed_tools.put(owned_allow, {}) catch {
-                testing.allocator.free(owned_allow);
-                return false;
-            };
+            const owned_allow = try testing.allocator.dupe(u8, allow_tool);
+            errdefer testing.allocator.free(owned_allow);
+            try settings.allowed_tools.put(owned_allow, {});
 
             // Add to denied
-            const owned_deny = testing.allocator.dupe(u8, deny_tool) catch return false;
-            settings.denied_tools.put(owned_deny, {}) catch {
-                testing.allocator.free(owned_deny);
-                return false;
-            };
+            const owned_deny = try testing.allocator.dupe(u8, deny_tool);
+            errdefer testing.allocator.free(owned_deny);
+            try settings.denied_tools.put(owned_deny, {});
 
             // isAllowed and isDenied should be independent checks
             const is_allowed = settings.isAllowed(check_tool);
@@ -396,28 +388,24 @@ test "property: empty settings allows/denies nothing" {
 
 test "property: multiple tools can be allowed/denied" {
     try zcheck.check(struct {
-        fn prop(args: struct { num_allowed: u2, num_denied: u2 }) bool {
+        fn prop(args: struct { num_allowed: u2, num_denied: u2 }) !bool {
             var settings = Settings.init(testing.allocator);
             defer settings.deinit();
 
             // Add some allowed tools
             for (0..args.num_allowed) |i| {
                 const tool = test_tools[i % test_tools.len];
-                const owned = testing.allocator.dupe(u8, tool) catch return false;
-                settings.allowed_tools.put(owned, {}) catch {
-                    testing.allocator.free(owned);
-                    return false;
-                };
+                const owned = try testing.allocator.dupe(u8, tool);
+                errdefer testing.allocator.free(owned);
+                try settings.allowed_tools.put(owned, {});
             }
 
             // Add some denied tools (from the other end)
             for (0..args.num_denied) |i| {
                 const tool = test_tools[(test_tools.len - 1 - i) % test_tools.len];
-                const owned = testing.allocator.dupe(u8, tool) catch return false;
-                settings.denied_tools.put(owned, {}) catch {
-                    testing.allocator.free(owned);
-                    return false;
-                };
+                const owned = try testing.allocator.dupe(u8, tool);
+                errdefer testing.allocator.free(owned);
+                try settings.denied_tools.put(owned, {});
             }
 
             // Counts should match (accounting for potential duplicates in put)
@@ -449,14 +437,14 @@ test "ensurePermissionHook with temp directory" {
     const tmp_path = try tmp_dir.dir.realpath(".", &path_buf);
 
     // Test ensurePermissionHookInDir (new helper we'll add)
-    const result = ensurePermissionHookInDir(testing.allocator, tmp_path);
+    const result = try ensurePermissionHookInDir(testing.allocator, tmp_path);
 
     // Verify file was updated
     const updated_file = try tmp_dir.dir.openFile(".claude/settings.json", .{});
     defer updated_file.close();
     const content = try updated_file.readToEndAlloc(testing.allocator, 64 * 1024);
     defer testing.allocator.free(content);
-    const result2 = ensurePermissionHookInDir(testing.allocator, tmp_path);
+    const result2 = try ensurePermissionHookInDir(testing.allocator, tmp_path);
     const has_hook = std.mem.indexOf(u8, content, "banjo hook permission") != null;
     const has_pre = std.mem.indexOf(u8, content, "PreToolUse") != null;
 
