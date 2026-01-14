@@ -5566,15 +5566,15 @@ fn buildContentBlocks(
 
 test "property: collectPromptParts finds text regardless of position" {
     try zcheck.check(struct {
-        fn prop(args: struct { num_non_text: u4, text_pos: u4, text: zcheck.String }) bool {
-            var tw = TestWriter.init(testing.allocator) catch return false;
+        fn prop(args: struct { num_non_text: u4, text_pos: u4, text: zcheck.String }) !bool {
+            var tw = try TestWriter.init(testing.allocator);
             defer tw.deinit();
             var agent = Agent.init(testing.allocator, tw.writer.stream, null);
             defer agent.deinit();
 
             var session = Agent.Session{
-                .id = testing.allocator.dupe(u8, "session") catch return false,
-                .cwd = testing.allocator.dupe(u8, ".") catch return false,
+                .id = try testing.allocator.dupe(u8, "session"),
+                .cwd = try testing.allocator.dupe(u8, "."),
                 .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
                 .availability = .{ .claude = true, .codex = true },
                 .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
@@ -5585,10 +5585,10 @@ test "property: collectPromptParts finds text regardless of position" {
             defer session.deinit(testing.allocator);
 
             const text = if (args.text.len == 0) "text" else args.text.slice();
-            const blocks = buildContentBlocks(testing.allocator, args.num_non_text, true, args.text_pos, text) catch return false;
+            const blocks = try buildContentBlocks(testing.allocator, args.num_non_text, true, args.text_pos, text);
             defer testing.allocator.free(blocks);
 
-            var parts = agent.collectPromptParts(&session, session.id, blocks) catch return false;
+            var parts = try agent.collectPromptParts(&session, session.id, blocks);
             defer parts.deinit(testing.allocator);
 
             return parts.user_text != null and std.mem.eql(u8, parts.user_text.?, text);
@@ -5598,15 +5598,15 @@ test "property: collectPromptParts finds text regardless of position" {
 
 test "property: collectPromptParts returns null when no text block" {
     try zcheck.check(struct {
-        fn prop(args: struct { num_non_text: u4 }) bool {
-            var tw = TestWriter.init(testing.allocator) catch return false;
+        fn prop(args: struct { num_non_text: u4 }) !bool {
+            var tw = try TestWriter.init(testing.allocator);
             defer tw.deinit();
             var agent = Agent.init(testing.allocator, tw.writer.stream, null);
             defer agent.deinit();
 
             var session = Agent.Session{
-                .id = testing.allocator.dupe(u8, "session") catch return false,
-                .cwd = testing.allocator.dupe(u8, ".") catch return false,
+                .id = try testing.allocator.dupe(u8, "session"),
+                .cwd = try testing.allocator.dupe(u8, "."),
                 .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
                 .availability = .{ .claude = true, .codex = true },
                 .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
@@ -5616,10 +5616,10 @@ test "property: collectPromptParts returns null when no text block" {
             };
             defer session.deinit(testing.allocator);
 
-            const blocks = buildContentBlocks(testing.allocator, args.num_non_text, false, 0, "") catch return false;
+            const blocks = try buildContentBlocks(testing.allocator, args.num_non_text, false, 0, "");
             defer testing.allocator.free(blocks);
 
-            var parts = agent.collectPromptParts(&session, session.id, blocks) catch return false;
+            var parts = try agent.collectPromptParts(&session, session.id, blocks);
             defer parts.deinit(testing.allocator);
 
             return parts.user_text == null;
@@ -5737,7 +5737,7 @@ test "route_command_map resolves routes" {
 
 test "parseFileUri tolerates malformed percent encoding" {
     const uri = "file:///tmp/%ZZ.txt#L2";
-    var info = Agent.parseFileUri(testing.allocator, uri);
+    var info = try Agent.parseFileUri(testing.allocator, uri);
     defer if (info) |*item| item.deinit(testing.allocator);
     const Summary = struct {
         found: bool,
@@ -5765,7 +5765,7 @@ test "parseFileUri tolerates malformed percent encoding" {
 
 test "parseFileUri keeps incomplete percent sequence" {
     const uri = "file:///tmp/%";
-    var info = Agent.parseFileUri(testing.allocator, uri);
+    var info = try Agent.parseFileUri(testing.allocator, uri);
     defer if (info) |*item| item.deinit(testing.allocator);
     const Summary = struct {
         found: bool,

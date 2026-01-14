@@ -850,7 +850,7 @@ const Bytes48 = zcheck.BoundedSlice(u8, 48);
 const Bytes32 = zcheck.BoundedSlice(u8, 32);
 
 fn checkWithResult(prop: anytype, config: zcheck.Config, label: []const u8) !void {
-    if (zcheck.checkResult(prop, config)) |failure| {
+    if (try zcheck.checkResult(prop, config)) |failure| {
         std.debug.print(
             "zcheck failure: {s}\nseed: {}\noriginal: {any}\nshrunk: {any}\n",
             .{ label, failure.seed, failure.original, failure.shrunk },
@@ -894,7 +894,7 @@ test "lexer terminates on any input" {
 
 test "round-trip: formatNoteComment then parseNoteLine" {
     try checkWithResult(struct {
-        fn prop(args: struct { id: zcheck.Id, content: zcheck.String }) bool {
+        fn prop(args: struct { id: zcheck.Id, content: zcheck.String }) !bool {
             const id = args.id.slice();
             const raw_content = args.content.slice();
             var filtered: [zcheck.String.MAX_LEN]u8 = undefined;
@@ -911,10 +911,10 @@ test "round-trip: formatNoteComment then parseNoteLine" {
 
             // Format and parse
             var buf: [160]u8 = undefined;
-            const formatted = std.fmt.bufPrint(&buf, "// @banjo[{s}] {s}", .{ id, content }) catch return true;
+            const formatted = try std.fmt.bufPrint(&buf, "// @banjo[{s}] {s}", .{ id, content });
 
             const alloc = testing.allocator;
-            var note = parseNoteLine(alloc, formatted, 1) catch return true;
+            var note = try parseNoteLine(alloc, formatted, 1);
             if (note) |*n| {
                 defer n.deinit(alloc);
                 // ID should match

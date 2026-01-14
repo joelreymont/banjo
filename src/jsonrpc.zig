@@ -680,7 +680,7 @@ const zcheck = @import("zcheck");
 const zcheck_seed_base: u64 = 0x5d0a_c19e_0f23_4b7a;
 
 fn checkWithResult(prop: anytype, config: zcheck.Config, label: []const u8) !void {
-    if (zcheck.checkResult(prop, config)) |failure| {
+    if (try zcheck.checkResult(prop, config)) |failure| {
         std.debug.print(
             "zcheck failure: {s}\nseed: {}\noriginal: {any}\nshrunk: {any}\n",
             .{ label, failure.seed, failure.original, failure.shrunk },
@@ -691,17 +691,17 @@ fn checkWithResult(prop: anytype, config: zcheck.Config, label: []const u8) !voi
 
 test "property: response with numeric id roundtrips through JSON" {
     try checkWithResult(struct {
-        fn prop(args: struct { id: i64, result_bool: bool }) bool {
+        fn prop(args: struct { id: i64, result_bool: bool }) !bool {
             const response = Response.success(
                 .{ .number = args.id },
                 .{ .bool = args.result_bool },
             );
 
-            const json = serializeResponse(testing.allocator, response) catch return false;
+            const json = try serializeResponse(testing.allocator, response);
             defer testing.allocator.free(json);
 
             // Parse it back
-            const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{}) catch return false;
+            const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
             defer parsed.deinit();
 
             const obj = parsed.value.object;
@@ -723,13 +723,13 @@ test "property: response with numeric id roundtrips through JSON" {
 
 test "property: error response preserves error code" {
     try zcheck.check(struct {
-        fn prop(args: struct { id: i64, code: i32 }) bool {
+        fn prop(args: struct { id: i64, code: i32 }) !bool {
             const response = Response.err(.{ .number = args.id }, args.code, "test error");
 
-            const json = serializeResponse(testing.allocator, response) catch return false;
+            const json = try serializeResponse(testing.allocator, response);
             defer testing.allocator.free(json);
 
-            const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{}) catch return false;
+            const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
             defer parsed.deinit();
 
             const obj = parsed.value.object;
@@ -743,17 +743,17 @@ test "property: error response preserves error code" {
 
 test "property: request id types are preserved" {
     try zcheck.check(struct {
-        fn prop(args: struct { id: i64, method: zcheck.String }) bool {
+        fn prop(args: struct { id: i64, method: zcheck.String }) !bool {
             // Test numeric ID roundtrip through request serialization
             const request = Request{
                 .method = args.method.slice(),
                 .id = .{ .number = args.id },
             };
 
-            const json = serializeRequest(testing.allocator, request) catch return false;
+            const json = try serializeRequest(testing.allocator, request);
             defer testing.allocator.free(json);
 
-            var parsed_req = parseRequest(testing.allocator, json) catch return false;
+            var parsed_req = try parseRequest(testing.allocator, json);
             defer parsed_req.deinit();
 
             const parsed_id = parsed_req.request.id orelse return false;
@@ -767,16 +767,16 @@ test "property: request id types are preserved" {
 
 test "property: request string id roundtrips" {
     try zcheck.check(struct {
-        fn prop(args: struct { id: zcheck.Id, method: zcheck.String }) bool {
+        fn prop(args: struct { id: zcheck.Id, method: zcheck.String }) !bool {
             const request = Request{
                 .method = args.method.slice(),
                 .id = .{ .string = args.id.slice() },
             };
 
-            const json = serializeRequest(testing.allocator, request) catch return false;
+            const json = try serializeRequest(testing.allocator, request);
             defer testing.allocator.free(json);
 
-            var parsed_req = parseRequest(testing.allocator, json) catch return false;
+            var parsed_req = try parseRequest(testing.allocator, json);
             defer parsed_req.deinit();
 
             const parsed_id = parsed_req.request.id orelse return false;

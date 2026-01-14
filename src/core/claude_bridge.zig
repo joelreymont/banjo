@@ -1654,10 +1654,12 @@ test "property: MessageType.fromString covers all variants" {
             const result = MessageType.fromString(&random_str);
             // Most random 3-byte strings should be unknown
             // (unless they happen to be "user" which is 4 chars, so safe)
-            return result == .unknown or
-                std.mem.eql(u8, &random_str, "sys") or
-                std.mem.eql(u8, &random_str, "use") or
-                std.mem.eql(u8, &random_str, "res");
+            if (result == .unknown) return true;
+            const reserved = [_][]const u8{ "sys", "use", "res" };
+            for (reserved) |tag| {
+                if (std.mem.eql(u8, &random_str, tag)) return true;
+            }
+            return false;
         }
     }.prop, .{ .seed = zcheck_seed_base + 1 });
 }
@@ -1665,21 +1667,21 @@ test "property: MessageType.fromString covers all variants" {
 test "property: getToolName/getToolId extraction preserves input values" {
     // Property: for any tool name and id, extraction returns the original values
     try zcheck.check(struct {
-        fn prop(args: struct { name_seed: u32, id_seed: u32 }) bool {
+        fn prop(args: struct { name_seed: u32, id_seed: u32 }) !bool {
             // Generate deterministic "random" names from seeds
             var name_buf: [16]u8 = undefined;
             var id_buf: [20]u8 = undefined;
-            const name = std.fmt.bufPrint(&name_buf, "Tool_{x}", .{args.name_seed}) catch return false;
-            const id = std.fmt.bufPrint(&id_buf, "toolu_{x}", .{args.id_seed}) catch return false;
+            const name = try std.fmt.bufPrint(&name_buf, "Tool_{x}", .{args.name_seed});
+            const id = try std.fmt.bufPrint(&id_buf, "toolu_{x}", .{args.id_seed});
 
             // Build JSON with these values
             var json_buf: [256]u8 = undefined;
-            const json = std.fmt.bufPrint(&json_buf,
+            const json = try std.fmt.bufPrint(&json_buf,
                 \\{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"{s}","id":"{s}"}}]}}}}
-            , .{ name, id }) catch return false;
+            , .{ name, id });
 
             // Parse and extract
-            const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{}) catch return false;
+            const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
             defer parsed.deinit();
 
             const arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1696,19 +1698,19 @@ test "property: getToolName/getToolId extraction preserves input values" {
 
 test "property: getContent extraction preserves input text" {
     try zcheck.check(struct {
-        fn prop(args: struct { text_seed: u32 }) bool {
+        fn prop(args: struct { text_seed: u32 }) !bool {
             // Generate deterministic text from seed (avoid special chars that break JSON)
             var text_buf: [32]u8 = undefined;
-            const text = std.fmt.bufPrint(&text_buf, "Message_{x}", .{args.text_seed}) catch return false;
+            const text = try std.fmt.bufPrint(&text_buf, "Message_{x}", .{args.text_seed});
 
             // Build JSON
             var json_buf: [256]u8 = undefined;
-            const json = std.fmt.bufPrint(&json_buf,
+            const json = try std.fmt.bufPrint(&json_buf,
                 \\{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{s}"}}]}}}}
-            , .{text}) catch return false;
+            , .{text});
 
             // Parse and extract
-            const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{}) catch return false;
+            const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
             defer parsed.deinit();
 
             const arena = std.heap.ArenaAllocator.init(testing.allocator);

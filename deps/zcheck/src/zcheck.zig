@@ -139,11 +139,11 @@ pub fn Failure(comptime Args: type) type {
 }
 
 /// Run a property test with the given property function.
-/// The property function takes a struct of generated values and returns bool.
+/// The property function takes a struct of generated values and returns bool or !bool.
 /// Returns error if a counterexample is found.
 pub fn check(comptime property: anytype, config: Config) !void {
     const Args = @typeInfo(@TypeOf(property)).@"fn".params[0].type.?;
-    const failure = checkType(Args, property, config);
+    const failure = try checkType(Args, property, config);
 
     if (failure) |details| {
         if (config.expect_failure) {
@@ -164,12 +164,16 @@ pub fn check(comptime property: anytype, config: Config) !void {
 }
 
 /// Run a property test and return failure details (if any) without printing.
-pub fn checkResult(comptime property: anytype, config: Config) ?Failure(@typeInfo(@TypeOf(property)).@"fn".params[0].type.?) {
+pub fn checkResult(comptime property: anytype, config: Config) !?Failure(@typeInfo(@TypeOf(property)).@"fn".params[0].type.?) {
     const Args = @typeInfo(@TypeOf(property)).@"fn".params[0].type.?;
-    return checkType(Args, property, config);
+    return try checkType(Args, property, config);
 }
 
-fn checkType(comptime Args: type, comptime property: anytype, config: Config) ?Failure(Args) {
+fn evalProperty(comptime property: anytype, args: anytype) !bool {
+    return property(args);
+}
+
+fn checkType(comptime Args: type, comptime property: anytype, config: Config) !?Failure(Args) {
     var seed: u64 = config.seed;
     var prng: std.Random.DefaultPrng = undefined;
     var random: std.Random = undefined;
@@ -188,9 +192,9 @@ fn checkType(comptime Args: type, comptime property: anytype, config: Config) ?F
     while (i < config.iterations) : (i += 1) {
         const args = generateWithConfig(Args, random, .{ .use_default_values = config.use_default_values });
 
-        if (!property(args)) {
+        if (!(try evalProperty(property, args))) {
             // Found counterexample, try to shrink it
-            const shrunk = shrinkLoop(Args, property, args, config.max_shrinks, .{ .use_default_values = config.use_default_values });
+            const shrunk = try shrinkLoop(Args, property, args, config.max_shrinks, .{ .use_default_values = config.use_default_values });
             return Failure(Args){
                 .seed = seed,
                 .iteration = i,
@@ -414,12 +418,12 @@ fn generateStruct(comptime T: type, comptime s: std.builtin.Type.Struct, random:
 }
 
 /// Shrink a value toward a simpler form that still fails the property.
-fn shrinkLoop(comptime T: type, comptime property: anytype, initial: T, max_attempts: usize, config: ShrinkConfig) T {
+fn shrinkLoop(comptime T: type, comptime property: anytype, initial: T, max_attempts: usize, config: ShrinkConfig) !T {
     var current = initial;
     var budget: usize = max_attempts;
 
     while (budget > 0) {
-        if (tryShrink(T, current, property, &budget, config)) |simpler| {
+        if (try tryShrink(T, current, property, &budget, config)) |simpler| {
             current = simpler;
             continue;
         }
@@ -433,46 +437,46 @@ const ShrinkConfig = struct {
     use_default_values: bool = true,
 };
 
-fn tryCandidate(comptime T: type, candidate: T, comptime property: anytype, budget: *usize) bool {
+fn tryCandidate(comptime T: type, candidate: T, comptime property: anytype, budget: *usize) !bool {
     if (budget.* == 0) return false;
     budget.* -= 1;
-    return !property(candidate);
+    return !(try evalProperty(property, candidate));
 }
 
-fn tryShrink(comptime T: type, value: T, comptime property: anytype, budget: *usize, config: ShrinkConfig) ?T {
+fn tryShrink(comptime T: type, value: T, comptime property: anytype, budget: *usize, config: ShrinkConfig) !?T {
     if (comptime isBoundedSlice(T)) {
         if (shrinkOnceWithConfig(T, value, config)) |simpler| {
-            if (tryCandidate(T, simpler, property, budget)) return simpler;
+            if (try tryCandidate(T, simpler, property, budget)) return simpler;
         }
-        return shrinkBoundedSliceField(T, value, property, budget, config);
+        return try shrinkBoundedSliceField(T, value, property, budget, config);
     }
 
     return switch (@typeInfo(T)) {
         .int => blk: {
             if (shrinkInt(T, value)) |simpler| {
-                if (tryCandidate(T, simpler, property, budget)) break :blk simpler;
+                if (try tryCandidate(T, simpler, property, budget)) break :blk simpler;
             }
             if (shrinkIntStep(T, value)) |step| {
-                if (tryCandidate(T, step, property, budget)) break :blk step;
+                if (try tryCandidate(T, step, property, budget)) break :blk step;
             }
             break :blk null;
         },
         .@"union" => blk: {
             const Context = struct { budget: *usize };
             var ctx = Context{ .budget = budget };
-            break :blk findUnionCandidate(T, value, config, &ctx, property, struct {
-                fn accept(context: *Context, candidate: T, comptime prop: anytype) bool {
-                    return tryCandidate(T, candidate, prop, context.budget);
+            break :blk try findUnionCandidate(T, value, config, &ctx, property, struct {
+                fn accept(context: *Context, candidate: T, comptime prop: anytype) !bool {
+                    return try tryCandidate(T, candidate, prop, context.budget);
                 }
             }.accept);
         },
         else => blk: {
             if (shrinkOnceWithConfig(T, value, config)) |simpler| {
-                if (tryCandidate(T, simpler, property, budget)) break :blk simpler;
+                if (try tryCandidate(T, simpler, property, budget)) break :blk simpler;
             }
             break :blk switch (@typeInfo(T)) {
-                .array => shrinkArrayField(T, value, property, budget, config),
-                .@"struct" => shrinkStructField(T, value, property, budget, config),
+                .array => try shrinkArrayField(T, value, property, budget, config),
+                .@"struct" => try shrinkStructField(T, value, property, budget, config),
                 else => null,
             };
         },
@@ -609,7 +613,7 @@ fn shrinkArrayField(
     comptime property: anytype,
     budget: *usize,
     config: ShrinkConfig,
-) ?T {
+) !?T {
     const arr = @typeInfo(T).array;
     var i: usize = 0;
     while (i < arr.len) : (i += 1) {
@@ -617,11 +621,11 @@ fn shrinkArrayField(
             const Elem = arr.child;
             const Context = struct { value: *const T, index: usize, budget: *usize };
             var ctx = Context{ .value = &value, .index = i, .budget = budget };
-            if (findUnionCandidate(Elem, value[i], config, &ctx, property, struct {
-                fn accept(context: *Context, candidate_elem: Elem, comptime prop: anytype) bool {
+            if (try findUnionCandidate(Elem, value[i], config, &ctx, property, struct {
+                fn accept(context: *Context, candidate_elem: Elem, comptime prop: anytype) !bool {
                     var candidate = context.value.*;
                     candidate[context.index] = candidate_elem;
-                    return tryCandidate(T, candidate, prop, context.budget);
+                    return try tryCandidate(T, candidate, prop, context.budget);
                 }
             }.accept)) |union_candidate| {
                 var candidate = value;
@@ -631,19 +635,19 @@ fn shrinkArrayField(
             continue;
         }
 
-        if (shrinkOnceWithConfig(arr.child, value[i], config)) |simpler| {
-            var candidate = value;
-            candidate[i] = simpler;
-            if (tryCandidate(T, candidate, property, budget)) return candidate;
-        }
-        if (comptime (@typeInfo(arr.child) == .int)) {
-            if (shrinkIntStep(arr.child, value[i])) |step| {
+            if (shrinkOnceWithConfig(arr.child, value[i], config)) |simpler| {
                 var candidate = value;
-                candidate[i] = step;
-                if (tryCandidate(T, candidate, property, budget)) return candidate;
+                candidate[i] = simpler;
+                if (try tryCandidate(T, candidate, property, budget)) return candidate;
+            }
+            if (comptime (@typeInfo(arr.child) == .int)) {
+                if (shrinkIntStep(arr.child, value[i])) |step| {
+                    var candidate = value;
+                    candidate[i] = step;
+                    if (try tryCandidate(T, candidate, property, budget)) return candidate;
+                }
             }
         }
-    }
     return null;
 }
 
@@ -671,7 +675,7 @@ fn shrinkStructField(
     comptime property: anytype,
     budget: *usize,
     config: ShrinkConfig,
-) ?T {
+) !?T {
     const s = @typeInfo(T).@"struct";
     inline for (s.fields) |field| {
         if (field.is_comptime) {
@@ -684,11 +688,11 @@ fn shrinkStructField(
                 const FieldType = field.type;
                 const Context = struct { value: *const T, budget: *usize };
                 var ctx = Context{ .value = &value, .budget = budget };
-                if (findUnionCandidate(FieldType, field_val, config, &ctx, property, struct {
-                    fn accept(context: *Context, candidate_union: FieldType, comptime prop: anytype) bool {
+                if (try findUnionCandidate(FieldType, field_val, config, &ctx, property, struct {
+                    fn accept(context: *Context, candidate_union: FieldType, comptime prop: anytype) !bool {
                         var candidate = context.value.*;
                         @field(candidate, field.name) = candidate_union;
-                        return tryCandidate(T, candidate, prop, context.budget);
+                        return try tryCandidate(T, candidate, prop, context.budget);
                     }
                 }.accept)) |union_candidate| {
                     var candidate = value;
@@ -700,13 +704,13 @@ fn shrinkStructField(
             if (shrinkOnceWithConfig(field.type, field_val, config)) |simpler| {
                 var candidate = value;
                 @field(candidate, field.name) = simpler;
-                if (tryCandidate(T, candidate, property, budget)) return candidate;
+                if (try tryCandidate(T, candidate, property, budget)) return candidate;
             }
             if (comptime (@typeInfo(field.type) == .int)) {
                 if (shrinkIntStep(field.type, field_val)) |step| {
                     var candidate = value;
                     @field(candidate, field.name) = step;
-                    if (tryCandidate(T, candidate, property, budget)) return candidate;
+                    if (try tryCandidate(T, candidate, property, budget)) return candidate;
                 }
             }
         }
@@ -720,18 +724,18 @@ fn shrinkBoundedSliceField(
     comptime property: anytype,
     budget: *usize,
     config: ShrinkConfig,
-) ?T {
+) !?T {
     const Elem = T.Elem;
     var i: usize = 0;
     while (i < value.len) : (i += 1) {
         if (comptime (@typeInfo(Elem) == .@"union")) {
             const Context = struct { value: *const T, index: usize, budget: *usize };
             var ctx = Context{ .value = &value, .index = i, .budget = budget };
-            if (findUnionCandidate(Elem, value.buf[i], config, &ctx, property, struct {
-                fn accept(context: *Context, candidate_elem: Elem, comptime prop: anytype) bool {
+            if (try findUnionCandidate(Elem, value.buf[i], config, &ctx, property, struct {
+                fn accept(context: *Context, candidate_elem: Elem, comptime prop: anytype) !bool {
                     var candidate = context.value.*;
                     candidate.buf[context.index] = candidate_elem;
-                    return tryCandidate(T, candidate, prop, context.budget);
+                    return try tryCandidate(T, candidate, prop, context.budget);
                 }
             }.accept)) |union_candidate| {
                 var candidate = value;
@@ -743,13 +747,13 @@ fn shrinkBoundedSliceField(
         if (shrinkOnceWithConfig(Elem, value.buf[i], config)) |simpler| {
             var candidate = value;
             candidate.buf[i] = simpler;
-            if (tryCandidate(T, candidate, property, budget)) return candidate;
+            if (try tryCandidate(T, candidate, property, budget)) return candidate;
         }
         if (comptime (@typeInfo(Elem) == .int)) {
             if (shrinkIntStep(Elem, value.buf[i])) |step| {
                 var candidate = value;
                 candidate.buf[i] = step;
-                if (tryCandidate(T, candidate, property, budget)) return candidate;
+                if (try tryCandidate(T, candidate, property, budget)) return candidate;
             }
         }
     }
@@ -779,7 +783,7 @@ fn findUnionCandidate(
     context: anytype,
     comptime property: anytype,
     comptime accept: anytype,
-) ?UnionT {
+) !?UnionT {
     const u = @typeInfo(UnionT).@"union";
     if (u.tag_type == null) return null;
 
@@ -795,12 +799,12 @@ fn findUnionCandidate(
             const payload = @field(value, field.name);
             if (shrinkOnceWithConfig(field.type, payload, config)) |simpler| {
                 const candidate = @unionInit(UnionT, field.name, simpler);
-                if (accept(context, candidate, property)) return candidate;
+                if (try accept(context, candidate, property)) return candidate;
             }
             if (comptime (@typeInfo(field.type) == .int)) {
                 if (shrinkIntStep(field.type, payload)) |step| {
                     const candidate = @unionInit(UnionT, field.name, step);
-                    if (accept(context, candidate, property)) return candidate;
+                    if (try accept(context, candidate, property)) return candidate;
                 }
             }
             break;
@@ -812,7 +816,7 @@ fn findUnionCandidate(
     inline for (u.fields, 0..) |field, i| {
         if (i >= current_index) break;
         const candidate = @unionInit(UnionT, field.name, minimalValue(field.type, config));
-        if (accept(context, candidate, property)) return candidate;
+        if (try accept(context, candidate, property)) return candidate;
     }
     return null;
 }
@@ -984,8 +988,17 @@ test "check fails for false property" {
     }.prop, .{ .iterations = 100, .seed = 12345, .expect_failure = true });
 }
 
+test "check propagates property errors" {
+    const TestErr = error{Injected};
+    try testing.expectError(TestErr.Injected, check(struct {
+        fn prop(_: struct { a: u8 }) TestErr!bool {
+            return TestErr.Injected;
+        }
+    }.prop, .{ .iterations = 1, .seed = 12345 }));
+}
+
 test "checkResult returns failure details" {
-    const failure = checkResult(struct {
+    const failure = try checkResult(struct {
         fn prop(args: struct { a: u8 }) bool {
             return args.a == 0;
         }
@@ -1285,7 +1298,7 @@ test "generate tagged union" {
 
 test "shrink union payload" {
     const U = union(enum) { a: u8, b: u8 };
-    const failure = checkResult(struct {
+    const failure = try checkResult(struct {
         fn prop(args: struct { u: U }) bool {
             return switch (args.u) {
                 .b => |v| v <= 1,
@@ -1304,7 +1317,7 @@ test "shrink union payload" {
 
 test "shrink union switches to earliest tag" {
     const U = union(enum) { a: u8, b: u8 };
-    const failure = checkResult(struct {
+    const failure = try checkResult(struct {
         fn prop(_: struct { u: U }) bool {
             return false;
         }

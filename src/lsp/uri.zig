@@ -103,13 +103,13 @@ test "pathToUri encodes spaces" {
 
 test "pathToUri and uriToPath roundtrip" {
     try zcheck.check(struct {
-        fn property(args: struct { path: zcheck.FilePath }) bool {
+        fn property(args: struct { path: zcheck.FilePath }) !bool {
             var arena = std.heap.ArenaAllocator.init(testing.allocator);
             defer arena.deinit();
 
             const path = args.path.slice();
-            const uri = pathToUri(arena.allocator(), path) catch return false;
-            const parsed = uriToPath(arena.allocator(), uri) catch return false;
+            const uri = try pathToUri(arena.allocator(), path);
+            const parsed = try uriToPath(arena.allocator(), uri);
             if (parsed) |p| {
                 return mem.eql(u8, p.path, path);
             }
