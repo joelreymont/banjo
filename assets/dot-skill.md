@@ -1,4 +1,4 @@
-Create a global skill called "dot" for task tracking. Trigger phrases: "dots", "tasks", "what's next", "add task", "new task", "show tasks", "complete task", "finish task", "start task", "remove task", "find task". The skill:
+Create or update a global skill called "dot" for task tracking. Trigger phrases: "dots", "tasks", "what's next", "add task", "new task", "show tasks", "complete task", "finish task", "start task", "remove task", "find task". The skill:
 
 ---
 name: dot
@@ -31,6 +31,23 @@ dot find "query"             # Search
 3. Do the work
 4. `dot off <id> -r "done"` when complete
 
-## Task Descriptions
+## Task Descriptions (Required Format)
 
-Include context: file:line, root cause, fix approach
+Use this structure in descriptions (-d flag):
+
+file: <path>:<line>        # Primary file location
+cause: <root cause>        # Why this needs to be done
+fix: <approach>            # How to fix/implement
+plan: <path>               # Optional: plan file path
+deps: <dot-id>, ...        # Optional: dependent dots
+
+Example:
+dot add "Fix auth timeout" -d "file: src/auth.zig:142 | cause: token refresh race | fix: add mutex"
+
+## On Session Start
+
+1. Read project guidelines: AGENTS.md (global ~/.agents/ + project ./)
+2. Read instructions: CLAUDE.md (global ~/.claude/ + project ./)
+3. Check active dots: `dot ls --status active`
+4. If plan file in dot description, read it
+5. Continue with current task

@@ -29,6 +29,78 @@ pub fn clearCmd(engine: Engine) []const u8 {
     };
 }
 
+/// Context prompt sent after clearing, prompts agent to read its own context
+pub fn contextPrompt(engine: Engine) []const u8 {
+    return switch (engine) {
+        .claude =>
+        \\Read your project guidelines (AGENTS.md) and instructions (CLAUDE.md).
+        \\Check active dots: `dot ls --status active`
+        \\If the dot description contains a plan file path, read it.
+        \\Continue with the current task.
+        ,
+        .codex =>
+        \\Read your project guidelines (AGENTS.md).
+        \\Check active dots: `dot ls --status active`
+        \\If the dot description contains a plan file path, read it.
+        \\Continue with the current task.
+        ,
+    };
+}
+
+/// Legacy constant for backwards compatibility in tests
+pub const context_prompt = contextPrompt(.claude);
+
+/// Check if command string contains "dot off" with word boundaries
+pub fn containsDotOffStr(cmd: []const u8) bool {
+    var offset: usize = 0;
+    while (std.mem.indexOfPos(u8, cmd, offset, "dot off")) |idx| {
+        // Check leading boundary - must be start of string or preceded by separator
+        if (idx > 0) {
+            const prev = cmd[idx - 1];
+            // Valid separators: space, semicolon, ampersand, pipe, newline, tab, quotes
+            const valid_lead = prev == ' ' or prev == ';' or prev == '&' or
+                prev == '|' or prev == '\n' or prev == '\t' or
+                prev == '"' or prev == '\'' or prev == '(';
+            if (!valid_lead) {
+                offset = idx + 1;
+                continue;
+            }
+        }
+        // Check trailing boundary
+        const after = idx + 7; // "dot off" is 7 chars
+        if (after < cmd.len) {
+            const next = cmd[after];
+            // Valid separators: space, semicolon, ampersand, pipe, newline, tab, quotes, parens
+            const valid_trail = next == ' ' or next == ';' or next == '&' or
+                next == '|' or next == '\n' or next == '\t' or
+                next == '"' or next == '\'' or next == ')';
+            if (!valid_trail) {
+                offset = idx + 1;
+                continue;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+/// Typed struct for Claude Bash tool input
+const BashToolInput = struct {
+    command: []const u8,
+};
+
+/// Check if JSON input (Claude Bash tool) contains "dot off"
+pub fn containsDotOff(input: std.json.Value) bool {
+    const parsed = std.json.parseFromValue(BashToolInput, std.heap.page_allocator, input, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| {
+        log.debug("containsDotOff parse failed (not a Bash tool?): {}", .{err});
+        return false;
+    };
+    defer parsed.deinit();
+    return containsDotOffStr(parsed.value.command);
+}
+
 /// Returns the skill path for the given engine
 pub fn skillPath(engine: Engine) []const u8 {
     return switch (engine) {
@@ -45,8 +117,14 @@ pub fn hasDotCli() bool {
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
 
-    child.spawn() catch return false;
-    const term = child.wait() catch return false;
+    child.spawn() catch |err| {
+        log.warn("dot --version failed to start: {}", .{err});
+        return false;
+    };
+    const term = child.wait() catch |err| {
+        log.warn("dot --version wait failed: {}", .{err});
+        return false;
+    };
     return switch (term) {
         .Exited => |code| code == 0,
         else => false,
@@ -59,19 +137,43 @@ pub fn hasSkill(engine: Engine) bool {
     const path = skillPath(engine);
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const full_path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ home, path }) catch return false;
+    const full_path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ home, path }) catch |err| {
+        log.warn("Failed to format dot skill path: {}", .{err});
+        return false;
+    };
 
-    std.fs.cwd().access(full_path, .{}) catch return false;
-    return true;
+    if (std.fs.cwd().access(full_path, .{})) |_| {
+        return true;
+    } else |err| {
+        return switch (err) {
+            error.FileNotFound, error.AccessDenied => false,
+            else => {
+                log.warn("Failed to access dot skill path {s}: {}", .{ full_path, err });
+                return false;
+            },
+        };
+    }
 }
 
 /// Check if .dots directory exists in given cwd
 pub fn hasDotDir(cwd: []const u8) bool {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = std.fmt.bufPrint(&buf, "{s}/.dots", .{cwd}) catch return false;
+    const path = std.fmt.bufPrint(&buf, "{s}/.dots", .{cwd}) catch |err| {
+        log.warn("Failed to format .dots path: {}", .{err});
+        return false;
+    };
 
-    std.fs.cwd().access(path, .{}) catch return false;
-    return true;
+    if (std.fs.cwd().access(path, .{})) |_| {
+        return true;
+    } else |err| {
+        return switch (err) {
+            error.FileNotFound, error.AccessDenied => false,
+            else => {
+                log.warn("Failed to access .dots path {s}: {}", .{ path, err });
+                return false;
+            },
+        };
+    }
 }
 
 /// Result of checking for pending tasks
@@ -158,7 +260,8 @@ pub fn cleanupClaudeHooks(allocator: Allocator) CleanupResult {
     const home = std.posix.getenv("HOME") orelse return .{ .cleaned = false, .error_msg = "HOME not set" };
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const settings_path = std.fmt.bufPrint(&path_buf, "{s}/.claude/settings.json", .{home}) catch {
+    const settings_path = std.fmt.bufPrint(&path_buf, "{s}/.claude/settings.json", .{home}) catch |err| {
+        log.warn("Failed to format Claude settings path: {}", .{err});
         return .{ .cleaned = false, .error_msg = "path too long" };
     };
 
@@ -746,4 +849,82 @@ test "cleanupClaudeHooks handles missing settings file" {
     const result = cleanupClaudeHooks(testing.allocator);
     try testing.expect(!result.cleaned);
     try testing.expect(result.error_msg != null);
+}
+
+test "contextPrompt Claude mentions required files" {
+    const prompt = contextPrompt(.claude);
+    try testing.expect(std.mem.indexOf(u8, prompt, "AGENTS.md") != null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "CLAUDE.md") != null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "dot ls") != null);
+}
+
+test "contextPrompt Codex excludes CLAUDE.md" {
+    const prompt = contextPrompt(.codex);
+    try testing.expect(std.mem.indexOf(u8, prompt, "AGENTS.md") != null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "CLAUDE.md") == null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "dot ls") != null);
+}
+
+test "containsDotOffStr detects dot off command" {
+    // Should match - basic cases
+    try testing.expect(containsDotOffStr("dot off"));
+    try testing.expect(containsDotOffStr("dot off abc123"));
+    try testing.expect(containsDotOffStr("dot off abc123 -r done"));
+
+    // Should match - with shell separators
+    try testing.expect(containsDotOffStr("git commit && dot off abc"));
+    try testing.expect(containsDotOffStr("echo test; dot off abc"));
+    try testing.expect(containsDotOffStr("echo test | dot off abc"));
+    try testing.expect(containsDotOffStr("dot off abc;"));
+    try testing.expect(containsDotOffStr("dot off abc\n"));
+    try testing.expect(containsDotOffStr("(dot off abc)"));
+    try testing.expect(containsDotOffStr("$(dot off)"));
+    try testing.expect(containsDotOffStr("echo $(dot off abc)"));
+
+    // Should match - with quotes
+    try testing.expect(containsDotOffStr("bash -c \"dot off abc\""));
+    try testing.expect(containsDotOffStr("bash -c 'dot off abc'"));
+
+    // Should NOT match - word boundary violations (leading)
+    try testing.expect(!containsDotOffStr("adot off abc"));
+    try testing.expect(!containsDotOffStr("xdot off"));
+    try testing.expect(!containsDotOffStr("mydot off abc"));
+
+    // Should NOT match - word boundary violations (trailing)
+    try testing.expect(!containsDotOffStr("dot offer"));
+    try testing.expect(!containsDotOffStr("dotoffabc"));
+    try testing.expect(!containsDotOffStr("dot offset"));
+    try testing.expect(!containsDotOffStr("dot offx"));
+
+    // Edge cases
+    try testing.expect(!containsDotOffStr(""));
+    try testing.expect(!containsDotOffStr("dot"));
+    try testing.expect(!containsDotOffStr("dot of"));
+}
+
+test "containsDotOff detects dot off in JSON input" {
+    // Valid Bash tool input with dot off
+    var map1 = std.json.ObjectMap.init(testing.allocator);
+    defer map1.deinit();
+    try map1.put("command", .{ .string = "dot off abc123" });
+    const valid_input = std.json.Value{ .object = map1 };
+    try testing.expect(containsDotOff(valid_input));
+
+    // Valid Bash tool input without dot off
+    var map2 = std.json.ObjectMap.init(testing.allocator);
+    defer map2.deinit();
+    try map2.put("command", .{ .string = "ls -la" });
+    const no_dot_off = std.json.Value{ .object = map2 };
+    try testing.expect(!containsDotOff(no_dot_off));
+
+    // Not an object
+    try testing.expect(!containsDotOff(.null));
+    try testing.expect(!containsDotOff(.{ .string = "dot off" }));
+
+    // Object without command field
+    var map3 = std.json.ObjectMap.init(testing.allocator);
+    defer map3.deinit();
+    try map3.put("other", .{ .string = "value" });
+    const no_command = std.json.Value{ .object = map3 };
+    try testing.expect(!containsDotOff(no_command));
 }

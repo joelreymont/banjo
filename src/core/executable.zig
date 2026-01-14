@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const log = std.log.scoped(.executable);
 
 pub fn choose(env_var: []const u8, program: []const u8, fallback_paths: []const []const u8) []const u8 {
     if (std.posix.getenv(env_var)) |path| return path;
@@ -27,11 +28,29 @@ fn isExecutablePath(path: []const u8) bool {
 
 fn pathExists(path: []const u8) bool {
     if (std.fs.path.isAbsolute(path)) {
-        std.fs.accessAbsolute(path, .{}) catch return false;
-        return true;
+        if (std.fs.accessAbsolute(path, .{})) |_| {
+            return true;
+        } else |err| {
+            return switch (err) {
+                error.FileNotFound, error.AccessDenied => false,
+                else => {
+                    log.warn("Failed to access absolute path {s}: {}", .{ path, err });
+                    return false;
+                },
+            };
+        }
     }
-    std.fs.cwd().access(path, .{}) catch return false;
-    return true;
+    if (std.fs.cwd().access(path, .{})) |_| {
+        return true;
+    } else |err| {
+        return switch (err) {
+            error.FileNotFound, error.AccessDenied => false,
+            else => {
+                log.warn("Failed to access cwd path {s}: {}", .{ path, err });
+                return false;
+            },
+        };
+    }
 }
 
 fn isOnPath(program: []const u8) bool {
@@ -44,7 +63,10 @@ fn isOnPath(program: []const u8) bool {
     while (it.next()) |dir| {
         if (dir.len == 0) continue;
         const dir_path = dir;
-        const full = std.fmt.bufPrint(&buf, "{s}{s}{s}", .{ dir_path, sep, program }) catch continue;
+        const full = std.fmt.bufPrint(&buf, "{s}{s}{s}", .{ dir_path, sep, program }) catch |err| {
+            log.warn("Failed to format PATH candidate for {s}: {}", .{ program, err });
+            continue;
+        };
         if (pathExists(full)) return true;
     }
     return false;

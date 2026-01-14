@@ -78,7 +78,7 @@ pub const SystemSubtype = enum {
     }
 };
 
-const ContentBlock = struct {
+pub const ContentBlock = struct {
     type: ?[]const u8 = null,
     text: ?[]const u8 = null,
     name: ?[]const u8 = null,
@@ -240,7 +240,9 @@ pub const StreamMessage = struct {
         if (self.envelope) |env| return env;
         const parsed = std.json.parseFromValueLeaky(StreamEnvelope, self.arenaAllocator(), self.raw, .{
             .ignore_unknown_fields = true,
-        }) catch return null;
+        }) catch |err| {
+            std.debug.panic("Failed to parse stream envelope: {}", .{err});
+        };
         @constCast(self).envelope = parsed;
         return parsed;
     }
@@ -291,7 +293,15 @@ pub const StreamMessage = struct {
         return self.getToolUse() != null;
     }
 
-    /// Get tool use details from assistant message
+    /// Get raw content blocks for iteration
+    pub fn getContentBlocksSlice(self: *const StreamMessage) ?[]const ContentBlock {
+        if (self.type != .assistant and self.type != .user) return null;
+        const env = self.getEnvelope() orelse return null;
+        const message = env.message orelse return null;
+        return message.content;
+    }
+
+    /// Get tool use details from assistant message (first match only)
     pub fn getToolUse(self: *const StreamMessage) ?ToolUse {
         if (self.type != .assistant) return null;
         const env = self.getEnvelope() orelse return null;
@@ -306,6 +316,24 @@ pub const StreamMessage = struct {
             return .{ .id = id, .name = name, .input = item.input };
         }
         return null;
+    }
+
+    /// Convert a ContentBlock to ToolUse if it's a tool_use block
+    pub fn contentBlockToToolUse(item: ContentBlock) ?ToolUse {
+        const item_type = item.type orelse return null;
+        const block_type = ContentBlockType.fromString(item_type) orelse return null;
+        if (block_type != .tool_use) return null;
+        const name = item.name orelse return null;
+        const id = item.id orelse return null;
+        return .{ .id = id, .name = name, .input = item.input };
+    }
+
+    /// Check if a ContentBlock is a text block and get its text
+    pub fn contentBlockToText(item: ContentBlock) ?[]const u8 {
+        const item_type = item.type orelse return null;
+        const block_type = ContentBlockType.fromString(item_type) orelse return null;
+        if (block_type != .text) return null;
+        return item.text;
     }
 
     /// Get tool result details from assistant message
@@ -561,8 +589,12 @@ pub const Bridge = struct {
             self.stop_requested.store(true, .release);
             if (self.process) |*proc| {
                 // Kill first so reader thread sees EOF
-                _ = proc.kill() catch {};
-                _ = proc.wait() catch {};
+                _ = proc.kill() catch |err| {
+                    log.warn("Failed to kill Claude process: {}", .{err});
+                };
+                _ = proc.wait() catch |err| {
+                    log.warn("Failed to wait for Claude process: {}", .{err});
+                };
                 self.process = null;
                 self.stdout_reader = null;
             }
@@ -771,7 +803,10 @@ pub const Bridge = struct {
                     // Read stderr if available
                     if (child.stderr) |stderr| {
                         var stderr_buf: [4096]u8 = undefined;
-                        const stderr_len = stderr.read(&stderr_buf) catch 0;
+                        const stderr_len = stderr.read(&stderr_buf) catch |read_err| blk: {
+                            log.warn("Failed to read Claude CLI stderr: {}", .{read_err});
+                            break :blk 0;
+                        };
                         if (stderr_len > 0) {
                             log.err("Claude CLI stderr: {s}", .{stderr_buf[0..stderr_len]});
                         }
@@ -841,16 +876,12 @@ pub const Bridge = struct {
 
     fn parseStreamMessageLine(arena: *std.heap.ArenaAllocator, line: []const u8) !StreamMessage {
         const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), line, .{});
-        const envelope = std.json.parseFromValueLeaky(StreamEnvelope, arena.allocator(), parsed.value, .{
+        const envelope = try std.json.parseFromValueLeaky(StreamEnvelope, arena.allocator(), parsed.value, .{
             .ignore_unknown_fields = true,
-        }) catch null;
+        });
 
-        const msg_type = if (envelope) |env|
-            MessageType.fromString(env.type)
-        else
-            .unknown;
-
-        const subtype = if (envelope) |env| env.subtype else null;
+        const msg_type = MessageType.fromString(envelope.type);
+        const subtype = envelope.subtype;
 
         return StreamMessage{
             .type = msg_type,
@@ -1320,7 +1351,7 @@ fn collectClaudeInterruptResult(allocator: Allocator, bridge: *Bridge, timeout_m
             },
             .result => {
                 if (msg.getStopReason()) |reason| {
-                    stop_reason_buf = allocator.dupe(u8, reason) catch null;
+                    stop_reason_buf = try allocator.dupe(u8, reason);
                 }
                 // Caller must free stop_reason if non-null
                 return .{
