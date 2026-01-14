@@ -516,6 +516,11 @@ pub const McpServer = struct {
                     self.closeMcpClient();
                     return;
                 },
+                error.UnmaskedFrame => {
+                    log.warn("Received unmasked MCP frame, closing connection", .{});
+                    self.closeMcpClient();
+                    return;
+                },
                 else => return err,
             };
 
@@ -570,6 +575,11 @@ pub const McpServer = struct {
                 error.NeedMoreData => break,
                 error.ReservedOpcode => {
                     log.warn("Received nvim frame with reserved opcode, closing connection", .{});
+                    self.closeNvimClient();
+                    return;
+                },
+                error.UnmaskedFrame => {
+                    log.warn("Received unmasked nvim frame, closing connection", .{});
                     self.closeNvimClient();
                     return;
                 },

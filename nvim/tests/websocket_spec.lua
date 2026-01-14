@@ -176,6 +176,9 @@ describe("banjo websocket", function()
         local result = frame.create_text_frame("hello", true)
         assert.is_not_nil(result)
         assert.truthy(#result > 0)
+        local parsed = frame.parse_frame(result)
+        assert.is_not_nil(parsed)
+        assert.is_true(parsed.masked)
       end)
 
       it("creates fragmented text frames", function()
@@ -214,24 +217,26 @@ describe("banjo websocket", function()
     describe("frame parsing", function()
       it("parses simple text frames", function()
         -- Create a frame and parse it back
-        local created = frame.create_text_frame("test", true)
+        local created = frame.create_frame(frame.OPCODE.TEXT, "test", true, false)
         local parsed, remaining = frame.parse_frame(created)
         assert.is_not_nil(parsed)
         assert.equals("test", parsed.payload)
+        assert.is_false(parsed.masked)
       end)
 
       it("parses frames from a start offset", function()
-        local created = frame.create_text_frame("offset", true)
+        local created = frame.create_frame(frame.OPCODE.TEXT, "offset", true, false)
         local prefix = "XX"
         local parsed, bytes_consumed = frame.parse_frame(prefix .. created, #prefix + 1)
         assert.is_not_nil(parsed)
         assert.equals("offset", parsed.payload)
         assert.equals(#created, bytes_consumed)
+        assert.is_false(parsed.masked)
       end)
 
       it("handles incomplete frames", function()
         -- Only send first few bytes of a frame
-        local created = frame.create_text_frame("test", true)
+        local created = frame.create_frame(frame.OPCODE.TEXT, "test", true, false)
         local partial = string.sub(created, 1, 2)
         local parsed, remaining = frame.parse_frame(partial)
         assert.is_nil(parsed, "Should return nil for incomplete frame")
@@ -321,7 +326,7 @@ describe("banjo websocket", function()
         end,
       })
       ws.state = "connected"
-      ws.buffer = frame.create_text_frame("a", true) .. frame.create_text_frame("b", true)
+      ws.buffer = frame.create_frame(frame.OPCODE.TEXT, "a", true, false) .. frame.create_frame(frame.OPCODE.TEXT, "b", true, false)
       ws.buffer_pos = 0
       client._process_frames(ws)
       assert.equals(2, #messages)

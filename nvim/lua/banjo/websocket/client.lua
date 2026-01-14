@@ -289,6 +289,9 @@ function M._mask_frame(frame_data)
     -- This is a bit wasteful but ensures correctness
     local ws_frame = frame.parse_frame(frame_data)
     if ws_frame then
+        if ws_frame.masked then
+            return frame_data
+        end
         return frame.create_frame(ws_frame.opcode, ws_frame.payload, ws_frame.fin, true)
     end
     -- RFC 6455: client frames MUST be masked, don't return unmasked frame
