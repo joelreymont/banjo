@@ -30,7 +30,7 @@ pub fn trigger(engine: Engine) []const u8 {
 pub fn clearCmd(engine: Engine) []const u8 {
     return switch (engine) {
         .claude => "/clear",
-        .codex => "/new",
+        .codex => "/clear",
     };
 }
 
@@ -436,7 +436,7 @@ test "clearCmd returns correct command per engine" {
     defer testing.allocator.free(snapshot);
     try (ohsnap{}).snap(@src(),
         \\claude: /clear
-        \\codex: /new
+        \\codex: /clear
         \\
     ).diff(snapshot, true);
 }

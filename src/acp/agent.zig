@@ -587,6 +587,16 @@ pub const Agent = struct {
 
     fn cbSendContinuePrompt(ctx: *anyopaque, engine: Engine, prompt: []const u8) anyerror!bool {
         const pctx = PromptCallbackContext.from(ctx);
+        const clear_prompt_map = std.StaticStringMap(void).initComptime(.{
+            .{ "/clear", {} },
+        });
+        if (clear_prompt_map.has(prompt)) {
+            if (!pctx.agent.restartEngine(pctx.session, pctx.session_id, engine)) {
+                log.err("Failed to restart {s} for clear prompt", .{engine.label()});
+                return false;
+            }
+            return true;
+        }
         switch (engine) {
             .claude => {
                 _ = pctx.agent.sendClaudePromptWithRestart(pctx.session, pctx.session_id, prompt) catch |err| {
@@ -3731,36 +3741,45 @@ pub const Agent = struct {
         slot.* = null;
     }
 
-    fn prepareFreshSessions(self: *Agent, session: *Session) void {
+    fn resetCtx(self: *Agent, session: *Session) void {
         self.clearSessionId(&session.cli_session_id);
         self.clearSessionId(&session.codex_session_id);
         session.force_new_claude = true;
         session.force_new_codex = true;
         session.cancelled.store(false, .release);
         self.clearPendingExecuteTools(session);
+        self.clearPendingEditTools(session);
+        self.clearQuietToolIds(session);
     }
 
-    fn handleRouteCommand(self: *Agent, request: jsonrpc.Request, session_id: []const u8, route: Route, has_args: bool) !void {
-        self.config_defaults.route = route;
-        self.updateAllSessions(.route, .{ .route = route });
-
-        const label = routeLabel(route);
-        var buf: [160]u8 = undefined;
-        const msg = if (has_args)
-            try std.fmt.bufPrint(&buf, "Routing mode set to {s}. This command takes no arguments; send your prompt next.", .{label})
-        else
-            try std.fmt.bufPrint(&buf, "Routing mode set to {s}.", .{label});
-
-        try self.sendSessionUpdate(session_id, .{
-            .sessionUpdate = .agent_message_chunk,
-            .content = .{ .type = "text", .text = msg },
-        });
-        try self.sendEndTurn(request);
+    fn resetEngCtx(self: *Agent, session: *Session, engine: Engine) void {
+        switch (engine) {
+            .claude => {
+                self.clearSessionId(&session.cli_session_id);
+                session.force_new_claude = true;
+            },
+            .codex => {
+                self.clearSessionId(&session.codex_session_id);
+                session.force_new_codex = true;
+            },
+        }
+        session.cancelled.store(false, .release);
+        self.clearPendingExecuteTools(session);
+        self.clearPendingEditTools(session);
+        self.clearQuietToolIds(session);
     }
 
-    /// Handle /new command
-    fn handleNewCommand(self: *Agent, request: jsonrpc.Request, session: *Session, session_id: []const u8) !void {
-        self.prepareFreshSessions(session);
+    fn prepareFreshSessions(self: *Agent, session: *Session) void {
+        self.resetCtx(session);
+    }
+
+    const RestartResult = struct {
+        claude_ok: bool,
+        codex_ok: bool,
+    };
+
+    fn restartSessions(self: *Agent, session: *Session, session_id: []const u8) RestartResult {
+        self.resetCtx(session);
 
         var claude_ok = false;
         var codex_ok = false;
@@ -3787,11 +3806,75 @@ pub const Agent = struct {
             codex_ok = session.codex_bridge != null and session.codex_bridge.?.process != null;
         }
 
+        return .{
+            .claude_ok = claude_ok,
+            .codex_ok = codex_ok,
+        };
+    }
+
+    fn restartEngine(self: *Agent, session: *Session, session_id: []const u8, engine: Engine) bool {
+        self.resetEngCtx(session, engine);
+        switch (engine) {
+            .claude => {
+                if (session.bridge == null) {
+                    session.bridge = Bridge.init(self.allocator, session.cwd);
+                }
+                if (session.bridge) |*b| {
+                    b.stop();
+                    self.startClaudeBridge(session, session_id) catch |err| {
+                        log.err("Failed to restart Claude Code: {}", .{err});
+                        return false;
+                    };
+                    return session.bridge != null and session.bridge.?.process != null;
+                }
+                return false;
+            },
+            .codex => {
+                if (session.codex_bridge == null) {
+                    session.codex_bridge = CodexBridge.init(self.allocator, session.cwd);
+                }
+                if (session.codex_bridge) |*b| {
+                    b.stop();
+                    self.startCodexBridge(session, session_id) catch |err| {
+                        log.err("Failed to restart Codex: {}", .{err});
+                        return false;
+                    };
+                    return session.codex_bridge != null and session.codex_bridge.?.process != null;
+                }
+                return false;
+            },
+        }
+    }
+
+    fn handleRouteCommand(self: *Agent, request: jsonrpc.Request, session_id: []const u8, route: Route, has_args: bool) !void {
+        self.config_defaults.route = route;
+        self.updateAllSessions(.route, .{ .route = route });
+
+        const label = routeLabel(route);
+        var buf: [160]u8 = undefined;
+        const msg = if (has_args)
+            try std.fmt.bufPrint(&buf, "Routing mode set to {s}. This command takes no arguments; send your prompt next.", .{label})
+        else
+            try std.fmt.bufPrint(&buf, "Routing mode set to {s}.", .{label});
+
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .agent_message_chunk,
+            .content = .{ .type = "text", .text = msg },
+        });
+        try self.sendEndTurn(request);
+    }
+
+    /// Handle /clear command
+    fn handleClearCommand(self: *Agent, request: jsonrpc.Request, session: *Session, session_id: []const u8) !void {
+        const restarted = self.restartSessions(session, session_id);
+        const claude_ok = restarted.claude_ok;
+        const codex_ok = restarted.codex_ok;
+
         const status_text = blk: {
-            if (claude_ok and codex_ok) break :blk "Started fresh Claude Code and Codex sessions (no resume).";
-            if (claude_ok and !codex_ok) break :blk "Started fresh Claude Code session (no resume). Codex unavailable or failed to start.";
-            if (!claude_ok and codex_ok) break :blk "Started fresh Codex session (no resume). Claude Code unavailable or failed to start.";
-            break :blk "Failed to start fresh sessions for Claude Code and Codex.";
+            if (claude_ok and codex_ok) break :blk "Cleared conversation context for Claude Code and Codex.";
+            if (claude_ok and !codex_ok) break :blk "Cleared Claude Code context. Codex unavailable or failed to start.";
+            if (!claude_ok and codex_ok) break :blk "Cleared Codex context. Claude Code unavailable or failed to start.";
+            break :blk "Failed to clear sessions for Claude Code and Codex.";
         };
 
         try self.sendSessionUpdate(session_id, .{
@@ -3848,14 +3931,14 @@ pub const Agent = struct {
         }
     }
 
-    const Command = enum { version, note, notes, setup, explain, new, nudge };
+    const Command = enum { version, note, notes, setup, explain, clear, nudge };
     const command_map = std.StaticStringMap(Command).initComptime(.{
         .{ "version", .version },
         .{ "note", .note },
         .{ "notes", .notes },
         .{ "setup", .setup },
         .{ "explain", .explain },
-        .{ "new", .new },
+        .{ "clear", .clear },
         .{ "nudge", .nudge },
     });
 
@@ -3948,11 +4031,11 @@ pub const Agent = struct {
                 };
                 return null;
             },
-            .new => {
-                self.handleNewCommand(request, session, session_id) catch |err| {
-                    log.err("New command failed: {}", .{err});
-                    self.sendErrorAndEnd(request, session_id, "New command failed") catch |send_err| {
-                        log.warn("Failed to send new error: {}", .{send_err});
+            .clear => {
+                self.handleClearCommand(request, session, session_id) catch |err| {
+                    log.err("Clear command failed: {}", .{err});
+                    self.sendErrorAndEnd(request, session_id, "Clear command failed") catch |send_err| {
+                        log.warn("Failed to send clear error: {}", .{send_err});
                     };
                 };
                 return null;
@@ -4265,7 +4348,7 @@ pub const Agent = struct {
         .{ .name = "notes", .description = "List all notes in the project" },
         .{ .name = "note", .description = "Note creation help (code actions)" },
         .{ .name = "version", .description = "Show banjo version" },
-        .{ .name = "new", .description = "Start fresh Claude Code and Codex sessions" },
+        .{ .name = "clear", .description = "Clear conversation context" },
         .{ .name = "nudge", .description = "Toggle auto-continue when dots are pending (on/off)" },
     };
 
@@ -4281,6 +4364,7 @@ pub const Agent = struct {
         .{ "logout", {} },
         .{ "cost", {} },
         .{ "context", {} },
+        .{ "new", {} },
     });
 
     /// Common Claude Code slash commands (static fallback, CLI provides full list on first prompt)
@@ -4372,7 +4456,6 @@ pub const Agent = struct {
         .{ "banjo", {} },
         .{ "notes", {} },
         .{ "version", {} },
-        .{ "new", {} },
         .{ "claude", {} },
         .{ "codex", {} },
         .{ "duet", {} },
@@ -4581,7 +4664,7 @@ const expected_commands_json =
     "{\"name\":\"notes\",\"description\":\"List all notes in the project\"}," ++
     "{\"name\":\"note\",\"description\":\"Note creation help (code actions)\"}," ++
     "{\"name\":\"version\",\"description\":\"Show banjo version\"}," ++
-    "{\"name\":\"new\",\"description\":\"Start fresh Claude Code and Codex sessions\"}," ++
+    "{\"name\":\"clear\",\"description\":\"Clear conversation context\"}," ++
     "{\"name\":\"nudge\",\"description\":\"Toggle auto-continue when dots are pending (on/off)\"}," ++
     "{\"name\":\"claude\",\"description\":\"Switch routing mode to Claude\"}," ++
     "{\"name\":\"codex\",\"description\":\"Switch routing mode to Codex\"}," ++
@@ -6442,6 +6525,15 @@ test "prepareFreshSessions clears resume state" {
     session.codex_session_id = try testing.allocator.dupe(u8, "codex-id");
     const tool_key = try testing.allocator.dupe(u8, "tool");
     try session.pending_execute_tools.put(tool_key, {});
+    const edit_id = try testing.allocator.dupe(u8, "edit");
+    const edit_info = Agent.EditInfo{
+        .path = try testing.allocator.dupe(u8, "file"),
+        .old_text = try testing.allocator.dupe(u8, "old"),
+        .new_text = try testing.allocator.dupe(u8, "new"),
+    };
+    try session.pending_edit_tools.put(edit_id, edit_info);
+    const quiet_id = try testing.allocator.dupe(u8, "quiet");
+    try session.quiet_tool_ids.put(quiet_id, {});
 
     agent.prepareFreshSessions(&session);
     const summary = .{
@@ -6450,6 +6542,8 @@ test "prepareFreshSessions clears resume state" {
         .force_new_claude = session.force_new_claude,
         .force_new_codex = session.force_new_codex,
         .pending_execute_tools = session.pending_execute_tools.count(),
+        .pending_edit_tools = session.pending_edit_tools.count(),
+        .quiet_tool_ids = session.quiet_tool_ids.count(),
     };
     try (ohsnap{}).snap(@src(),
         \\acp.agent.test.prepareFreshSessions clears resume state__struct_<^\d+$>
@@ -6460,6 +6554,8 @@ test "prepareFreshSessions clears resume state" {
         \\  .force_new_claude: bool = true
         \\  .force_new_codex: bool = true
         \\  .pending_execute_tools: u32 = 0
+        \\  .pending_edit_tools: u32 = 0
+        \\  .quiet_tool_ids: u32 = 0
     ).expectEqual(summary);
 }
 
