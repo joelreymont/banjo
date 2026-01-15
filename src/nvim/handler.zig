@@ -1331,6 +1331,7 @@ pub const Handler = struct {
         .onSlashCommands = null, // nvim handles slash commands locally
         .checkAuthRequired = cbCheckAuthRequired,
         .sendContinuePrompt = cbSendContinuePrompt,
+        .restartEngine = cbRestartEngine,
         .onApprovalRequest = cbOnApprovalRequest,
     };
 
@@ -1487,6 +1488,21 @@ pub const Handler = struct {
             .engine = engine,
         };
         log.info("Queued continuation prompt for {s}", .{@tagName(engine)});
+        return true;
+    }
+
+    fn cbRestartEngine(ctx: *anyopaque, engine: Engine) bool {
+        const cb_ctx = CallbackContext.from(ctx);
+        const handler = cb_ctx.handler;
+        switch (engine) {
+            .claude => {
+                if (handler.claude_bridge) |*b| b.stop();
+            },
+            .codex => {
+                if (handler.codex_bridge_inst) |*b| b.stop();
+            },
+        }
+        log.info("Restarted {s} bridge for context reload", .{engine.label()});
         return true;
     }
 
