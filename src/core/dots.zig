@@ -34,10 +34,15 @@ pub fn clearCmd(engine: Engine) []const u8 {
     };
 }
 
-/// Context prompt sent after clearing, prompts agent to use the dot skill
+/// Context prompt sent after clearing, prompts agent to read guidelines and continue
 pub fn contextPrompt(engine: Engine) []const u8 {
     _ = engine;
-    return "Use your dot skill to check active dots and continue working.";
+    return
+        \\Read your project guidelines (AGENTS.md).
+        \\Check active dots: `dot ls --status active`
+        \\If the dot description contains a plan file path, read it.
+        \\Continue with the current task.
+    ;
 }
 
 /// Legacy constant for backwards compatibility in tests
@@ -855,9 +860,10 @@ test "cleanupClaudeHooks handles missing settings file" {
     try testing.expect(result.error_msg != null);
 }
 
-test "contextPrompt invokes dot skill" {
+test "contextPrompt includes AGENTS.md" {
     const prompt = contextPrompt(.claude);
-    try testing.expect(std.mem.indexOf(u8, prompt, "dot skill") != null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "AGENTS.md") != null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "dot ls") != null);
 }
 
 test "containsDotOffStr detects dot off command" {
