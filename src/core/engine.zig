@@ -1455,7 +1455,7 @@ const ContextReloadTracker = struct {
     }
 
     fn hasClearContextTrigger(self: *const ContextReloadTracker) bool {
-        const clear_cmds = [_][]const u8{ "/clear" };
+        const clear_cmds = [_][]const u8{"/clear"};
         const trigger_cmds = [_][]const u8{ "/dot", "$dot" };
         var has_clear = false;
         var has_context = false;
