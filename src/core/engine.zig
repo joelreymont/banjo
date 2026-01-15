@@ -41,7 +41,7 @@ pub const NudgeInputs = struct {
     cooldown_ok: bool,
     has_dots: bool,
     reason_ok: bool,
-    did_work: bool, // True if tools were used
+    did_work: bool, // True if >1 tool was used (filters out simple Q&A)
 
     pub fn shouldNudge(self: NudgeInputs) bool {
         return self.enabled and !self.cancelled and self.cooldown_ok and
@@ -320,7 +320,7 @@ pub fn processClaudeMessages(
                         .cooldown_ok = (now_ms - ctx.nudge.last_nudge_ms.*) >= ctx.nudge.cooldown_ms,
                         .has_dots = dots.hasPendingTasks(ctx.allocator, ctx.cwd).has_tasks,
                         .reason_ok = isNudgeableStopReason(reason),
-                        .did_work = tool_use_count > 0,
+                        .did_work = tool_use_count > 1,
                     };
 
                     log.info("Nudge check: cwd={s}, enabled={}, cancelled={}, cooldown_ok={}, has_dots={}, did_work={} (tools={}), reason={s}, reason_ok={}", .{
@@ -713,7 +713,7 @@ pub fn processCodexMessages(
                 .cooldown_ok = (now_ms - ctx.nudge.last_nudge_ms.*) >= ctx.nudge.cooldown_ms,
                 .has_dots = dots.hasPendingTasks(ctx.allocator, ctx.cwd).has_tasks,
                 .reason_ok = !has_blocking_error, // Codex: no blocking error means OK to nudge
-                .did_work = tool_use_count > 0,
+                .did_work = tool_use_count > 1,
             };
 
             const has_pending_reload = reload_queue.hasPending();
@@ -1284,7 +1284,7 @@ test "integration: processClaudeMessages nudge requires tool use" {
         _ = try processClaudeMessages(&ctx, &bridge);
 
         // Still no nudge because /tmp has no dots (dots.hasPendingTasks returns false)
-        // But the key is: if there WERE dots, it would nudge because tool_use_count > 0
+        // But the key is: if there WERE dots, it would nudge because tool_use_count > 1
         try testing.expect(!tracker.nudge_called);
     }
 }
@@ -1819,9 +1819,9 @@ test "integration: nudge restarts and sends context prompt" {
     defer bridge.deinit();
     bridge.reader_closed = true;
 
-    // Inject: tool_use (to satisfy did_work)
+    // Inject: two tool_uses (to satisfy did_work which requires >1 tool)
     const tool_json =
-        \\{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}]}}
+        \\{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{}},{"type":"tool_use","id":"t2","name":"Bash","input":{}}]}}
     ;
     var arena1 = std.heap.ArenaAllocator.init(testing.allocator);
     const parsed1 = try std.json.parseFromSlice(std.json.Value, arena1.allocator(), tool_json, .{});
