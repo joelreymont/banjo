@@ -138,19 +138,16 @@ fn queueDotsContextReload(queue: *ReloadQueue, engine: Engine) void {
 }
 
 fn sendNextQueuedPrompt(ctx: *PromptContext, engine: Engine, queue: *ReloadQueue) !bool {
-    var sent = false;
-    while (queue.hasPending()) {
-        const prompt = queue.prompts[queue.idx];
-        queue.idx += 1;
-        const ok = try ctx.cb.sendContinuePrompt(engine, prompt);
-        if (!ok) {
-            log.err("context reload: prompt rejected", .{});
-            return false;
-        }
-        emitInjectedPrompt(ctx, prompt);
-        sent = true;
+    if (!queue.hasPending()) return false;
+    const prompt = queue.prompts[queue.idx];
+    queue.idx += 1;
+    const ok = try ctx.cb.sendContinuePrompt(engine, prompt);
+    if (!ok) {
+        log.err("context reload: prompt rejected", .{});
+        return false;
     }
-    return sent;
+    emitInjectedPrompt(ctx, prompt);
+    return true;
 }
 
 /// Process Claude Code messages from an active bridge.
