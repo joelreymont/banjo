@@ -53,7 +53,8 @@ Banjo commands:
 - `/note` - note creation help (use LSP code actions)
 - `/notes` - list all notes in project
 
-Claude Code commands (`/version`, `/model`, `/compact`, `/review`, `/clear`) forwarded to Claude Code.
+Claude Code commands (`/version`, `/model`, `/compact`, `/review`) forwarded to Claude Code.
+`/clear` is handled by Banjo (restarts sessions).
 
 Note: Banjo auto-writes `.zed/settings.json` on first session; reload workspace once to activate the LSP. Banjo never edits global Zed settings.
 

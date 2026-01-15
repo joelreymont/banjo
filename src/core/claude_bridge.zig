@@ -1461,7 +1461,7 @@ test "snapshot: Claude Code live prompt" {
     ).diff(snapshot, true);
 }
 
-test "live: Claude Code /clear resets context" {
+test "live: Claude Code /clear does not reset context" {
     if (!config.live_cli_tests) return error.SkipZigTest;
     if (!Bridge.isAvailable()) return error.SkipZigTest;
 
@@ -1488,7 +1488,7 @@ test "live: Claude Code /clear resets context" {
     const recall_prompt = "What token did I ask you to remember? Reply with NO_MEMORY if you do not remember.";
     var recall = try collectClaudeResponse(testing.allocator, &bridge, recall_prompt);
     defer recall.deinit(testing.allocator);
-    try testing.expectEqualStrings("NO_MEMORY", recall.text);
+    try testing.expectEqualStrings(clear_token, recall.text);
 }
 
 test "snapshot: Claude Code control messages are rejected" {

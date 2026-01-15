@@ -25,7 +25,7 @@ Banjo Duet runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) an
 | `/model` | Show/set model |
 | `/compact` | Compact conversation |
 | `/review` | Review code |
-| `/clear` | Clear conversation |
+| `/clear` | Clear conversation (restart sessions) |
 | `/nudge` | Toggle auto-continue |
 | `/claude` | Route to Claude Code |
 | `/codex` | Route to Codex |

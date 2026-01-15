@@ -252,11 +252,6 @@ Use extmarks with virtual text for in-place status updates (non-destructive).
   - Reset message tracking
   - File: nvim/lua/banjo/commands.lua
 
-- [ ] `/new` - Start new session
-  - Send `session/new` notification to backend
-  - Clear local state
-  - File: nvim/lua/banjo/commands.lua
-
 - [ ] `/model <name>` - Switch model
   - Validate: sonnet, opus, haiku
   - Send `set_model` to backend
@@ -589,7 +584,7 @@ Phase 1.3-1.4 (Output + Status)
            ▼
 Phase 2.1-2.2 (Commands)
   ├── Command parser
-  └── Local commands (/cancel, /clear, /new, /model, /mode, /route)
+  └── Local commands (/cancel, /clear, /model, /mode, /route)
            │
            ▼
 Phase 3 (Sessions)

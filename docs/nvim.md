@@ -96,8 +96,7 @@ Type these in the input buffer:
 | Command | Description |
 |---------|-------------|
 | `/help` | Show available commands |
-| `/clear` | Clear conversation |
-| `/new` | Start new conversation |
+| `/clear` | Clear conversation (restart sessions) |
 | `/cancel` | Cancel current request |
 | `/model <name>` | Set model (sonnet, opus, haiku) |
 | `/mode <name>` | Set permission mode |

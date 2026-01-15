@@ -44,6 +44,7 @@ When using `--input-format stream-json`, send messages as:
 - `message.role` must be "user"
 - `message.content` is the prompt text
 - Live tests show Claude Code rejects `type:"control"` inputs (error: "Expected message type 'user' or 'control', got 'control'").
+- `/clear` does not reset context in stream-json (as of 2.0.76); Banjo restarts the CLI to clear.
 
 The CLI reference does not document image/audio payloads for stream-json input.
 Our live tests with content blocks show:

@@ -112,31 +112,45 @@ fn emitInjectedPrompt(ctx: *PromptContext, prompt: []const u8) void {
     };
 }
 
-fn sendDotsContextReload(ctx: *PromptContext, engine: Engine) !bool {
-    const clear_cmd = dots.clearCmd(engine);
-    const clear_ok = try ctx.cb.sendContinuePrompt(engine, clear_cmd);
-    if (!clear_ok) {
-        log.err("context reload: clear command rejected", .{});
-        return false;
-    }
-    emitInjectedPrompt(ctx, clear_cmd);
+const ReloadQueue = struct {
+    prompts: [3][]const u8 = undefined,
+    len: usize = 0,
+    idx: usize = 0,
 
-    const ctx_prompt = dots.contextPrompt(engine);
-    const ctx_ok = try ctx.cb.sendContinuePrompt(engine, ctx_prompt);
-    if (!ctx_ok) {
-        log.err("context reload: context prompt rejected", .{});
-        return false;
+    fn reset(self: *ReloadQueue) void {
+        self.len = 0;
+        self.idx = 0;
     }
-    emitInjectedPrompt(ctx, ctx_prompt);
 
-    const trigger_cmd = dots.trigger(engine);
-    const trigger_ok = try ctx.cb.sendContinuePrompt(engine, trigger_cmd);
-    if (!trigger_ok) {
-        log.err("context reload: trigger rejected", .{});
-        return false;
+    fn hasPending(self: *const ReloadQueue) bool {
+        return self.idx < self.len;
     }
-    emitInjectedPrompt(ctx, trigger_cmd);
-    return true;
+};
+
+fn queueDotsContextReload(queue: *ReloadQueue, engine: Engine) void {
+    if (queue.hasPending()) return;
+    queue.reset();
+    queue.prompts[0] = dots.clearCmd(engine);
+    queue.prompts[1] = dots.contextPrompt(engine);
+    queue.prompts[2] = dots.trigger(engine);
+    queue.len = 3;
+    queue.idx = 0;
+}
+
+fn sendNextQueuedPrompt(ctx: *PromptContext, engine: Engine, queue: *ReloadQueue) !bool {
+    var sent = false;
+    while (queue.hasPending()) {
+        const prompt = queue.prompts[queue.idx];
+        queue.idx += 1;
+        const ok = try ctx.cb.sendContinuePrompt(engine, prompt);
+        if (!ok) {
+            log.err("context reload: prompt rejected", .{});
+            return false;
+        }
+        emitInjectedPrompt(ctx, prompt);
+        sent = true;
+    }
+    return sent;
 }
 
 /// Process Claude Code messages from an active bridge.
@@ -159,6 +173,7 @@ pub fn processClaudeMessages(
     var dot_off_tool_id: ?[]const u8 = null;
     defer if (dot_off_tool_id) |id| ctx.allocator.free(id);
     var did_context_reload = false;
+    var reload_queue: ReloadQueue = .{};
 
     while (true) {
         if (ctx.isCancelled()) {
@@ -256,8 +271,9 @@ pub fn processClaudeMessages(
                             ctx.allocator.free(id);
                             dot_off_tool_id = null;
                             if (!tool_result.is_error) {
-                                log.info("dot off completed, reloading context", .{});
-                                did_context_reload = try sendDotsContextReload(ctx, engine);
+                                log.info("dot off completed, scheduling context reload", .{});
+                                queueDotsContextReload(&reload_queue, engine);
+                                did_context_reload = true;
                             } else {
                                 log.info("dot off failed, skipping context reload", .{});
                             }
@@ -275,8 +291,9 @@ pub fn processClaudeMessages(
                             ctx.allocator.free(id);
                             dot_off_tool_id = null;
                             if (!tool_result.is_error) {
-                                log.info("dot off completed, reloading context", .{});
-                                did_context_reload = try sendDotsContextReload(ctx, engine);
+                                log.info("dot off completed, scheduling context reload", .{});
+                                queueDotsContextReload(&reload_queue, engine);
+                                did_context_reload = true;
                             } else {
                                 log.info("dot off failed, skipping context reload", .{});
                             }
@@ -288,6 +305,9 @@ pub fn processClaudeMessages(
                 engineDebugLog("result handler entry", .{});
                 const stop_reason_opt = msg.getStopReason();
                 engineDebugLog("result: stop_reason={?s}", .{stop_reason_opt});
+                if (reload_queue.hasPending()) {
+                    if (try sendNextQueuedPrompt(ctx, engine, &reload_queue)) continue;
+                }
                 if (stop_reason_opt) |reason| {
                     const now_ms = std.time.milliTimestamp();
 
@@ -314,9 +334,9 @@ pub fn processClaudeMessages(
                     if (nudge_inputs.shouldNudge() and !did_context_reload) {
                         ctx.nudge.last_nudge_ms.* = now_ms;
                         log.info("Claude Code stopped ({s}); pending dots, clearing and triggering", .{reason});
-                        // Clear context, inject context prompt, then trigger dot skill
-                        _ = try sendDotsContextReload(ctx, .claude);
-                        // Don't continue loop - Claude is done, break and let handler start new session
+                        queueDotsContextReload(&reload_queue, .claude);
+                        did_context_reload = true;
+                        if (try sendNextQueuedPrompt(ctx, .claude, &reload_queue)) continue;
                     } else if (did_context_reload) {
                         log.info("Skipping nudge: already reloaded from dot off", .{});
                     } else if (!nudge_inputs.cooldown_ok) {
@@ -501,6 +521,7 @@ pub fn processCodexMessages(
     var dot_off_tool_id: ?[]const u8 = null;
     defer if (dot_off_tool_id) |id| ctx.allocator.free(id);
     var did_context_reload = false;
+    var reload_queue: ReloadQueue = .{};
 
     while (true) {
         if (ctx.isCancelled()) return .cancelled;
@@ -620,8 +641,9 @@ pub fn processCodexMessages(
                     dot_off_tool_id = null;
                     const exit_ok = (tool_result.exit_code orelse 0) == 0;
                     if (exit_ok) {
-                        log.info("dot off completed, reloading context", .{});
-                        did_context_reload = try sendDotsContextReload(ctx, engine);
+                        log.info("dot off completed, scheduling context reload", .{});
+                        queueDotsContextReload(&reload_queue, engine);
+                        did_context_reload = true;
                     } else {
                         log.info("dot off failed (exit {?}), skipping context reload", .{tool_result.exit_code});
                     }
@@ -690,12 +712,15 @@ pub fn processCodexMessages(
                 .did_work = tool_use_count > 0,
             };
 
-            if (nudge_inputs.shouldNudge() and !did_context_reload) {
+            const has_pending_reload = reload_queue.hasPending();
+            if (has_pending_reload) {
+                if (try sendNextQueuedPrompt(ctx, engine, &reload_queue)) continue;
+            } else if (nudge_inputs.shouldNudge() and !did_context_reload) {
                 ctx.nudge.last_nudge_ms.* = now_ms;
                 log.info("Codex turn completed; pending dots, clearing and triggering", .{});
-                // Clear context, inject context prompt, then trigger dot skill
-                _ = try sendDotsContextReload(ctx, .codex);
-                // Don't continue loop - Codex is done, break and let handler start new session
+                queueDotsContextReload(&reload_queue, .codex);
+                did_context_reload = true;
+                if (try sendNextQueuedPrompt(ctx, .codex, &reload_queue)) continue;
             } else if (did_context_reload) {
                 log.info("Skipping nudge: already reloaded from dot off", .{});
             } else if (has_blocking_error) {
@@ -1364,7 +1389,7 @@ test "dots trigger and clear commands snapshot" {
         \\claude_trigger: /dot
         \\claude_clear: /clear
         \\codex_trigger: $dot
-        \\codex_clear: /new
+        \\codex_clear: /clear
         \\
     ).diff(snapshot, true);
 }
@@ -1430,7 +1455,7 @@ const ContextReloadTracker = struct {
     }
 
     fn hasClearContextTrigger(self: *const ContextReloadTracker) bool {
-        const clear_cmds = [_][]const u8{ "/clear", "/new" };
+        const clear_cmds = [_][]const u8{ "/clear" };
         const trigger_cmds = [_][]const u8{ "/dot", "$dot" };
         var has_clear = false;
         var has_context = false;
@@ -1457,6 +1482,32 @@ const ContextReloadTracker = struct {
         return has_clear and has_context and has_trigger;
     }
 };
+
+fn queueClaudeResult(allocator: Allocator, bridge: *Bridge, reason: []const u8) !void {
+    var buf: [96]u8 = undefined;
+    const json = try std.fmt.bufPrint(&buf, "{{\"type\":\"result\",\"subtype\":\"{s}\"}}", .{reason});
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json, .{});
+    bridge.queue_mutex.lock();
+    try bridge.message_queue.append(allocator, claude_bridge.StreamMessage{
+        .type = .result,
+        .subtype = reason,
+        .raw = parsed.value,
+        .arena = arena,
+    });
+    bridge.queue_mutex.unlock();
+}
+
+fn queueCodexTurn(allocator: Allocator, bridge: *CodexBridge) !void {
+    const arena = std.heap.ArenaAllocator.init(allocator);
+    bridge.queue_mutex.lock();
+    try bridge.pending_messages.append(allocator, codex_bridge.CodexMessage{
+        .event_type = .turn_completed,
+        .turn_status = "completed",
+        .arena = arena,
+    });
+    bridge.queue_mutex.unlock();
+}
 
 fn createTestCallbacks(comptime T: type) EditorCallbacks.VTable {
     const Callbacks = struct {
@@ -1553,18 +1604,9 @@ test "integration: dot off triggers context reload" {
     });
     bridge.queue_mutex.unlock();
 
-    // Inject: result to end the session
-    const end_json = "{\"type\":\"result\",\"result\":{\"stop_reason\":\"end_turn\"}}";
-    var arena3 = std.heap.ArenaAllocator.init(testing.allocator);
-    const parsed3 = try std.json.parseFromSlice(std.json.Value, arena3.allocator(), end_json, .{});
-    bridge.queue_mutex.lock();
-    try bridge.message_queue.append(testing.allocator, claude_bridge.StreamMessage{
-        .type = .result,
-        .subtype = null,
-        .raw = parsed3.value,
-        .arena = arena3,
-    });
-    bridge.queue_mutex.unlock();
+    try queueClaudeResult(testing.allocator, &bridge, "end_turn");
+    try queueClaudeResult(testing.allocator, &bridge, "success");
+    try queueClaudeResult(testing.allocator, &bridge, "success");
 
     _ = try processClaudeMessages(&ctx, &bridge);
 
@@ -1625,18 +1667,7 @@ test "integration: dot off failure skips context reload" {
     });
     bridge.queue_mutex.unlock();
 
-    // Inject: result to end the session
-    const end_json = "{\"type\":\"result\",\"result\":{\"stop_reason\":\"end_turn\"}}";
-    var arena3 = std.heap.ArenaAllocator.init(testing.allocator);
-    const parsed3 = try std.json.parseFromSlice(std.json.Value, arena3.allocator(), end_json, .{});
-    bridge.queue_mutex.lock();
-    try bridge.message_queue.append(testing.allocator, claude_bridge.StreamMessage{
-        .type = .result,
-        .subtype = null,
-        .raw = parsed3.value,
-        .arena = arena3,
-    });
-    bridge.queue_mutex.unlock();
+    try queueClaudeResult(testing.allocator, &bridge, "end_turn");
 
     _ = try processClaudeMessages(&ctx, &bridge);
 
@@ -1719,18 +1750,9 @@ test "integration: dot off skips subsequent nudge" {
     });
     bridge.queue_mutex.unlock();
 
-    // Inject: success result (would normally trigger nudge but did_context_reload blocks it)
-    const end_json = "{\"type\":\"result\",\"result\":{\"stop_reason\":\"success\"}}";
-    var arena3 = std.heap.ArenaAllocator.init(testing.allocator);
-    const parsed3 = try std.json.parseFromSlice(std.json.Value, arena3.allocator(), end_json, .{});
-    bridge.queue_mutex.lock();
-    try bridge.message_queue.append(testing.allocator, claude_bridge.StreamMessage{
-        .type = .result,
-        .subtype = "success", // Stop reason in subtype for nudge check
-        .raw = parsed3.value,
-        .arena = arena3,
-    });
-    bridge.queue_mutex.unlock();
+    try queueClaudeResult(testing.allocator, &bridge, "success");
+    try queueClaudeResult(testing.allocator, &bridge, "success");
+    try queueClaudeResult(testing.allocator, &bridge, "success");
 
     _ = try processClaudeMessages(&ctx, &bridge);
 
@@ -1808,18 +1830,9 @@ test "integration: nudge sends clear, context, trigger in order" {
     });
     bridge.queue_mutex.unlock();
 
-    // Inject: success result (triggers nudge) - subtype carries the stop reason
-    const end_json = "{\"type\":\"result\",\"result\":{\"stop_reason\":\"success\"}}";
-    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
-    const parsed2 = try std.json.parseFromSlice(std.json.Value, arena2.allocator(), end_json, .{});
-    bridge.queue_mutex.lock();
-    try bridge.message_queue.append(testing.allocator, claude_bridge.StreamMessage{
-        .type = .result,
-        .subtype = "success", // Stop reason goes in subtype
-        .raw = parsed2.value,
-        .arena = arena2,
-    });
-    bridge.queue_mutex.unlock();
+    try queueClaudeResult(testing.allocator, &bridge, "success");
+    try queueClaudeResult(testing.allocator, &bridge, "success");
+    try queueClaudeResult(testing.allocator, &bridge, "success");
 
     _ = try processClaudeMessages(&ctx, &bridge);
 
@@ -1903,15 +1916,9 @@ test "integration: Codex dot off triggers context reload" {
     });
     bridge.queue_mutex.unlock();
 
-    // Inject: turn_completed to end the session
-    const arena3 = std.heap.ArenaAllocator.init(testing.allocator);
-    bridge.queue_mutex.lock();
-    try bridge.pending_messages.append(testing.allocator, codex_bridge.CodexMessage{
-        .event_type = .turn_completed,
-        .turn_status = "completed",
-        .arena = arena3,
-    });
-    bridge.queue_mutex.unlock();
+    try queueCodexTurn(testing.allocator, &bridge);
+    try queueCodexTurn(testing.allocator, &bridge);
+    try queueCodexTurn(testing.allocator, &bridge);
 
     _ = try processCodexMessages(&ctx, &bridge);
 
@@ -1971,15 +1978,7 @@ test "integration: Codex dot off failure skips context reload" {
     });
     bridge.queue_mutex.unlock();
 
-    // Inject: turn_completed to end the session
-    const arena3 = std.heap.ArenaAllocator.init(testing.allocator);
-    bridge.queue_mutex.lock();
-    try bridge.pending_messages.append(testing.allocator, codex_bridge.CodexMessage{
-        .event_type = .turn_completed,
-        .turn_status = "completed",
-        .arena = arena3,
-    });
-    bridge.queue_mutex.unlock();
+    try queueCodexTurn(testing.allocator, &bridge);
 
     _ = try processCodexMessages(&ctx, &bridge);
 
