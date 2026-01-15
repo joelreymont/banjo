@@ -1232,10 +1232,9 @@ pub const Agent = struct {
             return;
         }
 
-        // All good - send trigger
-        log.info("Dots: sending trigger", .{});
-        const trigger_cmd = dots.trigger(engine);
-        self.sendDotsPrompt(session, session_id, engine, trigger_cmd);
+        // All good - send context prompt to invoke dot skill
+        log.info("Dots: sending context prompt", .{});
+        self.sendDotsPrompt(session, session_id, engine, dots.contextPrompt(engine));
     }
 
     fn sendDotsPrompt(self: *Agent, session: *Session, session_id: []const u8, engine: Engine, prompt: []const u8) void {
