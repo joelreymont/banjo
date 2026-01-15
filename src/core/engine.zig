@@ -106,22 +106,36 @@ fn elapsedMs(start_ms: i64) u64 {
     return @intCast(now - start_ms);
 }
 
+fn emitInjectedPrompt(ctx: *PromptContext, prompt: []const u8) void {
+    ctx.cb.sendUserMessage(ctx.session_id, prompt) catch |err| {
+        log.warn("Failed to emit injected prompt: {}", .{err});
+    };
+}
+
 fn sendDotsContextReload(ctx: *PromptContext, engine: Engine) !bool {
-    const clear_ok = try ctx.cb.sendContinuePrompt(engine, dots.clearCmd(engine));
+    const clear_cmd = dots.clearCmd(engine);
+    const clear_ok = try ctx.cb.sendContinuePrompt(engine, clear_cmd);
     if (!clear_ok) {
         log.err("context reload: clear command rejected", .{});
         return false;
     }
-    const ctx_ok = try ctx.cb.sendContinuePrompt(engine, dots.contextPrompt(engine));
+    emitInjectedPrompt(ctx, clear_cmd);
+
+    const ctx_prompt = dots.contextPrompt(engine);
+    const ctx_ok = try ctx.cb.sendContinuePrompt(engine, ctx_prompt);
     if (!ctx_ok) {
         log.err("context reload: context prompt rejected", .{});
         return false;
     }
-    const trigger_ok = try ctx.cb.sendContinuePrompt(engine, dots.trigger(engine));
+    emitInjectedPrompt(ctx, ctx_prompt);
+
+    const trigger_cmd = dots.trigger(engine);
+    const trigger_ok = try ctx.cb.sendContinuePrompt(engine, trigger_cmd);
     if (!trigger_ok) {
         log.err("context reload: trigger rejected", .{});
         return false;
     }
+    emitInjectedPrompt(ctx, trigger_cmd);
     return true;
 }
 
@@ -301,11 +315,7 @@ pub fn processClaudeMessages(
                         ctx.nudge.last_nudge_ms.* = now_ms;
                         log.info("Claude Code stopped ({s}); pending dots, clearing and triggering", .{reason});
                         // Clear context, inject context prompt, then trigger dot skill
-                        const clear_cmd = dots.clearCmd(.claude);
-                        const trigger_cmd = dots.trigger(.claude);
-                        _ = try ctx.cb.sendContinuePrompt(.claude, clear_cmd);
-                        _ = try ctx.cb.sendContinuePrompt(.claude, dots.contextPrompt(.claude));
-                        _ = try ctx.cb.sendContinuePrompt(.claude, trigger_cmd);
+                        _ = try sendDotsContextReload(ctx, .claude);
                         // Don't continue loop - Claude is done, break and let handler start new session
                     } else if (did_context_reload) {
                         log.info("Skipping nudge: already reloaded from dot off", .{});
@@ -684,11 +694,7 @@ pub fn processCodexMessages(
                 ctx.nudge.last_nudge_ms.* = now_ms;
                 log.info("Codex turn completed; pending dots, clearing and triggering", .{});
                 // Clear context, inject context prompt, then trigger dot skill
-                const clear_cmd = dots.clearCmd(.codex);
-                const trigger_cmd = dots.trigger(.codex);
-                _ = try ctx.cb.sendContinuePrompt(.codex, clear_cmd);
-                _ = try ctx.cb.sendContinuePrompt(.codex, dots.contextPrompt(.codex));
-                _ = try ctx.cb.sendContinuePrompt(.codex, trigger_cmd);
+                _ = try sendDotsContextReload(ctx, .codex);
                 // Don't continue loop - Codex is done, break and let handler start new session
             } else if (did_context_reload) {
                 log.info("Skipping nudge: already reloaded from dot off", .{});
@@ -1396,6 +1402,7 @@ test "isNudgeableStopReason categorizes stop reasons" {
 // Reusable test fixture for context reload verification
 const ContextReloadTracker = struct {
     prompts: std.ArrayListUnmanaged([]const u8) = .empty,
+    user_msgs: std.ArrayListUnmanaged([]const u8) = .empty,
     allocator: Allocator,
 
     fn init(allocator: Allocator) ContextReloadTracker {
@@ -1405,6 +1412,8 @@ const ContextReloadTracker = struct {
     fn deinit(self: *ContextReloadTracker) void {
         for (self.prompts.items) |p| self.allocator.free(p);
         self.prompts.deinit(self.allocator);
+        for (self.user_msgs.items) |p| self.allocator.free(p);
+        self.user_msgs.deinit(self.allocator);
     }
 
     fn sendContinuePrompt(ctx: *anyopaque, _: Engine, prompt: []const u8) anyerror!bool {
@@ -1412,6 +1421,12 @@ const ContextReloadTracker = struct {
         const copy = try self.allocator.dupe(u8, prompt);
         try self.prompts.append(self.allocator, copy);
         return true;
+    }
+
+    fn sendUserMessage(ctx: *anyopaque, _: []const u8, text: []const u8) anyerror!void {
+        const self: *ContextReloadTracker = @ptrCast(@alignCast(ctx));
+        const copy = try self.allocator.dupe(u8, text);
+        try self.user_msgs.append(self.allocator, copy);
     }
 
     fn hasClearContextTrigger(self: *const ContextReloadTracker) bool {
@@ -1453,7 +1468,9 @@ fn createTestCallbacks(comptime T: type) EditorCallbacks.VTable {
         fn sendThoughtPrefix(_: *anyopaque, _: []const u8, _: Engine) anyerror!void {}
         fn sendToolCall(_: *anyopaque, _: []const u8, _: Engine, _: []const u8, _: []const u8, _: []const u8, _: ToolKind, _: ?std.json.Value) anyerror!void {}
         fn sendToolResult(_: *anyopaque, _: []const u8, _: Engine, _: []const u8, _: ?[]const u8, _: ToolStatus, _: ?std.json.Value) anyerror!void {}
-        fn sendUserMessage(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {}
+        fn sendUserMessage(ctx: *anyopaque, session_id: []const u8, text: []const u8) anyerror!void {
+            return T.sendUserMessage(ctx, session_id, text);
+        }
         fn onTimeout(_: *anyopaque) void {}
         fn onSessionId(_: *anyopaque, _: Engine, _: []const u8) void {}
         fn onSlashCommands(_: *anyopaque, _: []const u8, _: []const []const u8) anyerror!void {}
@@ -1641,6 +1658,8 @@ test "integration: dot off skips subsequent nudge" {
             }
             return true;
         }
+
+        fn sendUserMessage(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {}
     };
 
     var tracker = CountingTracker{ .allocator = testing.allocator };
@@ -1810,6 +1829,9 @@ test "integration: nudge sends clear, context, trigger in order" {
     for (tracker.prompts.items, 0..) |p, i| {
         try out.writer.print("prompt[{d}]: {s}\n", .{ i, p });
     }
+    for (tracker.user_msgs.items, 0..) |p, i| {
+        try out.writer.print("user[{d}]: {s}\n", .{ i, p });
+    }
     const snapshot = try out.toOwnedSlice();
     defer testing.allocator.free(snapshot);
     try (ohsnap{}).snap(@src(),
@@ -1819,6 +1841,12 @@ test "integration: nudge sends clear, context, trigger in order" {
         \\If the dot description contains a plan file path, read it.
         \\Continue with the current task.
         \\prompt[2]: /dot
+        \\user[0]: /clear
+        \\user[1]: Read your project guidelines (AGENTS.md) and instructions (CLAUDE.md).
+        \\Check active dots: `dot ls --status active`
+        \\If the dot description contains a plan file path, read it.
+        \\Continue with the current task.
+        \\user[2]: /dot
         \\
     ).diff(snapshot, true);
 }

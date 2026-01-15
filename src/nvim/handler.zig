@@ -1410,7 +1410,7 @@ pub const Handler = struct {
 
     fn cbSendUserMessage(ctx: *anyopaque, _: []const u8, text: []const u8) anyerror!void {
         const cb_ctx = CallbackContext.from(ctx);
-        try cb_ctx.handler.sendNotification("status", protocol.StatusUpdate{ .text = text });
+        try cb_ctx.handler.sendNotification("user_message", protocol.UserMessage{ .text = text });
     }
 
     fn cbOnTimeout(_: *anyopaque) void {

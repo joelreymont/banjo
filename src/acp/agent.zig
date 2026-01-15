@@ -44,6 +44,7 @@ const resource_line_limit: u32 = 200; // limit resource excerpt lines to reduce 
 const max_tool_preview_bytes: usize = 1024; // keep tool call previews readable in the panel
 const default_model_id = "sonnet";
 const prompt_poll_ms: i64 = 250;
+const nudge_prompt = "work on the next dot";
 
 const SessionConfig = struct {
     auto_resume: bool,
@@ -1232,6 +1233,10 @@ pub const Agent = struct {
                 if (!session.availability.claude) return;
                 _ = self.sendClaudePromptWithRestart(session, session_id, prompt) catch |err| {
                     log.warn("Failed to send dots prompt to Claude: {}", .{err});
+                    return;
+                };
+                self.sendUserMessage(session_id, prompt) catch |err| {
+                    log.warn("Failed to emit dots prompt: {}", .{err});
                 };
             },
             .codex => {
@@ -1239,6 +1244,10 @@ pub const Agent = struct {
                 const inputs = [_]CodexUserInput{.{ .type = "text", .text = prompt }};
                 _ = self.sendCodexPromptWithRestart(session, session_id, inputs[0..]) catch |err| {
                     log.warn("Failed to send dots prompt to Codex: {}", .{err});
+                    return;
+                };
+                self.sendUserMessage(session_id, prompt) catch |err| {
+                    log.warn("Failed to emit dots prompt: {}", .{err});
                 };
             },
         }
@@ -1841,7 +1850,6 @@ pub const Agent = struct {
     /// Trigger a nudge continuation - starts Claude/Codex with the nudge prompt
     fn triggerNudge(self: *Agent, request: jsonrpc.Request, session: *Session, session_id: []const u8) !void {
         _ = request;
-        const nudge_prompt = "work on the next dot";
         switch (session.config.route) {
             .claude, .duet => _ = try self.runClaudePrompt(session, session_id, nudge_prompt),
             .codex => {
@@ -3828,7 +3836,7 @@ pub const Agent = struct {
         if (should_trigger and dots.hasPendingTasks(self.allocator, session.cwd).has_tasks) {
             session.last_nudge_ms = std.time.milliTimestamp();
             log.info("Nudge enabled with pending dots, triggering continuation", .{});
-            try self.sendUserMessage(session_id, "keep going");
+            try self.sendUserMessage(session_id, nudge_prompt);
             _ = try self.triggerNudge(request, session, session_id);
         } else {
             try self.writer.writeTypedResponse(request.id, protocol.PromptResponse{ .stopReason = .end_turn });
