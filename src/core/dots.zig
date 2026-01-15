@@ -34,22 +34,10 @@ pub fn clearCmd(engine: Engine) []const u8 {
     };
 }
 
-/// Context prompt sent after clearing, prompts agent to read its own context
+/// Context prompt sent after clearing, prompts agent to use the dot skill
 pub fn contextPrompt(engine: Engine) []const u8 {
-    return switch (engine) {
-        .claude =>
-        \\Read your project guidelines (AGENTS.md) and instructions (CLAUDE.md).
-        \\Check active dots: `dot ls --status active`
-        \\If the dot description contains a plan file path, read it.
-        \\Continue with the current task.
-        ,
-        .codex =>
-        \\Read your project guidelines (AGENTS.md).
-        \\Check active dots: `dot ls --status active`
-        \\If the dot description contains a plan file path, read it.
-        \\Continue with the current task.
-        ,
-    };
+    _ = engine;
+    return "Use your /dot skill to check active dots and continue working.";
 }
 
 /// Legacy constant for backwards compatibility in tests
@@ -867,18 +855,10 @@ test "cleanupClaudeHooks handles missing settings file" {
     try testing.expect(result.error_msg != null);
 }
 
-test "contextPrompt Claude mentions required files" {
+test "contextPrompt invokes dot skill" {
     const prompt = contextPrompt(.claude);
-    try testing.expect(std.mem.indexOf(u8, prompt, "AGENTS.md") != null);
-    try testing.expect(std.mem.indexOf(u8, prompt, "CLAUDE.md") != null);
-    try testing.expect(std.mem.indexOf(u8, prompt, "dot ls") != null);
-}
-
-test "contextPrompt Codex excludes CLAUDE.md" {
-    const prompt = contextPrompt(.codex);
-    try testing.expect(std.mem.indexOf(u8, prompt, "AGENTS.md") != null);
-    try testing.expect(std.mem.indexOf(u8, prompt, "CLAUDE.md") == null);
-    try testing.expect(std.mem.indexOf(u8, prompt, "dot ls") != null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "/dot") != null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "skill") != null);
 }
 
 test "containsDotOffStr detects dot off command" {

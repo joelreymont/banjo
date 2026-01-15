@@ -132,8 +132,7 @@ fn queueDotsContextReload(queue: *ReloadQueue, engine: Engine) void {
     queue.reset();
     queue.prompts[0] = dots.clearCmd(engine);
     queue.prompts[1] = dots.contextPrompt(engine);
-    queue.prompts[2] = dots.trigger(engine);
-    queue.len = 3;
+    queue.len = 2;
     queue.idx = 0;
 }
 
@@ -1452,31 +1451,13 @@ const ContextReloadTracker = struct {
     }
 
     fn hasClearContextTrigger(self: *const ContextReloadTracker) bool {
-        const clear_cmds = [_][]const u8{"/clear"};
-        const trigger_cmds = [_][]const u8{ "/dot", "$dot" };
         var has_clear = false;
         var has_context = false;
-        var has_trigger = false;
         for (self.prompts.items) |p| {
-            if (!has_clear) {
-                for (clear_cmds) |cmd| {
-                    if (std.mem.eql(u8, p, cmd)) {
-                        has_clear = true;
-                        break;
-                    }
-                }
-            }
-            if (std.mem.indexOf(u8, p, "AGENTS.md") != null) has_context = true;
-            if (!has_trigger) {
-                for (trigger_cmds) |cmd| {
-                    if (std.mem.eql(u8, p, cmd)) {
-                        has_trigger = true;
-                        break;
-                    }
-                }
-            }
+            if (std.mem.eql(u8, p, "/clear")) has_clear = true;
+            if (std.mem.indexOf(u8, p, "/dot skill") != null) has_context = true;
         }
-        return has_clear and has_context and has_trigger;
+        return has_clear and has_context;
     }
 };
 
@@ -1603,11 +1584,10 @@ test "integration: dot off triggers context reload" {
 
     try queueClaudeResult(testing.allocator, &bridge, "end_turn");
     try queueClaudeResult(testing.allocator, &bridge, "success");
-    try queueClaudeResult(testing.allocator, &bridge, "success");
 
     _ = try processClaudeMessages(&ctx, &bridge);
 
-    // Verify context reload was triggered (clear + context_prompt + trigger)
+    // Verify context reload was triggered (clear + context_prompt)
     try testing.expect(tracker.hasClearContextTrigger());
 }
 
@@ -1749,7 +1729,6 @@ test "integration: dot off skips subsequent nudge" {
 
     try queueClaudeResult(testing.allocator, &bridge, "success");
     try queueClaudeResult(testing.allocator, &bridge, "success");
-    try queueClaudeResult(testing.allocator, &bridge, "success");
 
     _ = try processClaudeMessages(&ctx, &bridge);
 
@@ -1758,8 +1737,8 @@ test "integration: dot off skips subsequent nudge" {
     try testing.expectEqual(@as(u32, 1), tracker.reload_count);
 }
 
-test "integration: nudge sends clear, context, trigger in order" {
-    // Test that nudge sends prompts in correct order: clear, context_prompt, trigger
+test "integration: nudge sends clear and context prompt" {
+    // Test that nudge sends prompts: clear, context_prompt (which invokes dot skill)
     // This test requires dot CLI to create real dots for nudge to trigger
     if (!dots.hasDotCli()) return error.SkipZigTest;
 
@@ -1829,7 +1808,6 @@ test "integration: nudge sends clear, context, trigger in order" {
 
     try queueClaudeResult(testing.allocator, &bridge, "success");
     try queueClaudeResult(testing.allocator, &bridge, "success");
-    try queueClaudeResult(testing.allocator, &bridge, "success");
 
     _ = try processClaudeMessages(&ctx, &bridge);
 
@@ -1846,17 +1824,9 @@ test "integration: nudge sends clear, context, trigger in order" {
     defer testing.allocator.free(snapshot);
     try (ohsnap{}).snap(@src(),
         \\prompt[0]: /clear
-        \\prompt[1]: Read your project guidelines (AGENTS.md) and instructions (CLAUDE.md).
-        \\Check active dots: `dot ls --status active`
-        \\If the dot description contains a plan file path, read it.
-        \\Continue with the current task.
-        \\prompt[2]: /dot
+        \\prompt[1]: Use your /dot skill to check active dots and continue working.
         \\user[0]: /clear
-        \\user[1]: Read your project guidelines (AGENTS.md) and instructions (CLAUDE.md).
-        \\Check active dots: `dot ls --status active`
-        \\If the dot description contains a plan file path, read it.
-        \\Continue with the current task.
-        \\user[2]: /dot
+        \\user[1]: Use your /dot skill to check active dots and continue working.
         \\
     ).diff(snapshot, true);
 }
@@ -1915,11 +1885,10 @@ test "integration: Codex dot off triggers context reload" {
 
     try queueCodexTurn(testing.allocator, &bridge);
     try queueCodexTurn(testing.allocator, &bridge);
-    try queueCodexTurn(testing.allocator, &bridge);
 
     _ = try processCodexMessages(&ctx, &bridge);
 
-    // Verify context reload was triggered (clear + context_prompt + trigger)
+    // Verify context reload was triggered (clear + context_prompt)
     try testing.expect(tracker.hasClearContextTrigger());
 }
 
