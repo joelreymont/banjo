@@ -80,6 +80,7 @@ pub const Notification = union(enum) {
     stream_chunk: StreamChunk,
     stream_end: void,
     status: StatusUpdate,
+    user_message: UserMessage,
     tool_call: ToolCall,
     tool_result: ToolResult,
     permission_request: PermissionRequest,
@@ -116,6 +117,10 @@ pub const StreamChunk = struct {
 };
 
 pub const StatusUpdate = struct {
+    text: []const u8,
+};
+
+pub const UserMessage = struct {
     text: []const u8,
 };
 

@@ -474,6 +474,9 @@ function M._handle_message(msg, tabid)
     elseif method == "status" then
         local text = msg.params and msg.params.text or ""
         vim.notify("Banjo: " .. text, vim.log.levels.INFO)
+    elseif method == "user_message" then
+        local text = msg.params and msg.params.text or ""
+        panel.append_user_message(text)
     elseif method == "state" then
         if msg.params then
             b.state.engine = msg.params.engine or b.state.engine
