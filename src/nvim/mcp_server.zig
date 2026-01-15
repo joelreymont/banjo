@@ -362,8 +362,11 @@ pub const McpServer = struct {
         client: posix.socket_t,
         remainder: []const u8,
     ) !void {
+        var cb: ?*const fn (ctx: *anyopaque) void = null;
+        var cb_ctx: ?*anyopaque = null;
+
         self.socket_mutex.lock();
-        defer self.socket_mutex.unlock();
+        errdefer self.socket_mutex.unlock();
 
         switch (client_kind) {
             .mcp => {
@@ -392,12 +395,21 @@ pub const McpServer = struct {
                 debugLog("nvim_client_socket set to fd={d}", .{client});
 
                 // Notify handler to send initial state
-                if (self.nvim_connect_callback) |cb| {
+                if (self.nvim_connect_callback) |cb_fn| {
                     if (self.nvim_callback_ctx) |ctx| {
-                        cb(ctx);
+                        cb = cb_fn;
+                        cb_ctx = ctx;
                     }
                 }
             },
+        }
+
+        self.socket_mutex.unlock();
+
+        if (cb) |cb_fn| {
+            if (cb_ctx) |ctx| {
+                cb_fn(ctx);
+            }
         }
     }
 
@@ -962,6 +974,19 @@ pub const McpServer = struct {
 const testing = std.testing;
 const ohsnap = @import("ohsnap");
 
+const ConnCtx = struct {
+    server: *McpServer,
+    can_lock: bool = false,
+};
+
+fn connCb(ctx: *anyopaque) void {
+    const conn: *ConnCtx = @ptrCast(@alignCast(ctx));
+    if (conn.server.socket_mutex.tryLock()) {
+        conn.can_lock = true;
+        conn.server.socket_mutex.unlock();
+    }
+}
+
 test "queueHandshake returns error at capacity without closing socket" {
     const server = try McpServer.init(testing.allocator, "/tmp");
     defer server.deinit();
@@ -978,6 +1003,31 @@ test "queueHandshake returns error at capacity without closing socket" {
     posix.close(extra);
 
     server.closePendingHandshakes();
+}
+
+test "finishHandshake releases socket lock before nvim callback" {
+    const server = try McpServer.init(testing.allocator, "/tmp");
+    defer server.deinit();
+
+    var ctx = ConnCtx{ .server = server };
+    server.nvim_connect_callback = connCb;
+    server.nvim_callback_ctx = &ctx;
+
+    const sock = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    var owns_sock = true;
+    defer if (owns_sock) posix.close(sock);
+
+    try server.finishHandshake(.nvim, sock, &.{});
+    owns_sock = false;
+
+    const can_lock = ctx.can_lock;
+    server.socket_mutex.lock();
+    const held = server.nvim_client_socket.?;
+    server.nvim_client_socket = null;
+    server.socket_mutex.unlock();
+    posix.close(held);
+
+    try testing.expect(can_lock);
 }
 
 test "McpServer init and deinit" {
