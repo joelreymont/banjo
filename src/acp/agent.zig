@@ -476,6 +476,7 @@ pub const Agent = struct {
         .onSlashCommands = cbOnSlashCommands,
         .checkAuthRequired = cbCheckAuthRequired,
         .sendContinuePrompt = cbSendContinuePrompt,
+        .restartEngine = cbRestartEngine,
         .onApprovalRequest = cbOnApprovalRequest,
     };
 
@@ -587,16 +588,6 @@ pub const Agent = struct {
 
     fn cbSendContinuePrompt(ctx: *anyopaque, engine: Engine, prompt: []const u8) anyerror!bool {
         const pctx = PromptCallbackContext.from(ctx);
-        const clear_prompt_map = std.StaticStringMap(void).initComptime(.{
-            .{ "/clear", {} },
-        });
-        if (clear_prompt_map.has(prompt)) {
-            if (!pctx.agent.restartEngine(pctx.session, pctx.session_id, engine)) {
-                log.err("Failed to restart {s} for clear prompt", .{engine.label()});
-                return false;
-            }
-            return true;
-        }
         switch (engine) {
             .claude => {
                 _ = pctx.agent.sendClaudePromptWithRestart(pctx.session, pctx.session_id, prompt) catch |err| {
@@ -614,6 +605,14 @@ pub const Agent = struct {
                 return true;
             },
         }
+    }
+
+    fn cbRestartEngine(ctx: *anyopaque, engine: Engine) bool {
+        const pctx = PromptCallbackContext.from(ctx);
+        log.info("cbRestartEngine: restarting {s}", .{engine.label()});
+        const ok = pctx.agent.restartEngine(pctx.session, pctx.session_id, engine);
+        log.info("cbRestartEngine: result={}", .{ok});
+        return ok;
     }
 
     fn cbOnApprovalRequest(ctx: *anyopaque, request_id: std.json.Value, kind: callbacks_mod.ApprovalKind, params: ?std.json.Value) anyerror!?[]const u8 {
@@ -1225,16 +1224,8 @@ pub const Agent = struct {
             return;
         }
 
-        // Check if .dots directory exists
-        if (!dots.hasDotDir(session.cwd)) {
-            log.info("Dots: .dots missing, sending init prompt", .{});
-            self.sendDotsPrompt(session, session_id, engine, "Run `dot init` to set up task tracking.");
-            return;
-        }
-
-        // All good - send context prompt to invoke dot skill
-        log.info("Dots: sending context prompt", .{});
-        self.sendDotsPrompt(session, session_id, engine, dots.contextPrompt(engine));
+        // Context prompt for continuing work is handled by engine's nudge logic
+        // This function only handles one-time setup (skill creation)
     }
 
     fn sendDotsPrompt(self: *Agent, session: *Session, session_id: []const u8, engine: Engine, prompt: []const u8) void {
@@ -1922,7 +1913,7 @@ pub const Agent = struct {
         log.debug("runClaudePrompt: entry for session {s}", .{session_id});
         defer self.clearPendingExecuteTools(session);
 
-        const cli_bridge = try self.sendClaudePromptWithRestart(session, session_id, prompt);
+        _ = try self.sendClaudePromptWithRestart(session, session_id, prompt);
         log.debug("runClaudePrompt: prompt sent, calling processClaudeMessages", .{});
 
         var cb_ctx = PromptCallbackContext{
@@ -1949,8 +1940,18 @@ pub const Agent = struct {
             .tag_engine = self.shouldTagEngine(session),
         };
 
-        const engine_stop = try engine_mod.processClaudeMessages(&prompt_ctx, cli_bridge);
-        return toProtocolStopReason(engine_stop);
+        // Loop to handle context reloads (bridge restarts)
+        while (true) {
+            if (session.bridge) |*cli_bridge| {
+                const engine_stop = try engine_mod.processClaudeMessages(&prompt_ctx, cli_bridge);
+                if (engine_stop != .context_reloaded) {
+                    return toProtocolStopReason(engine_stop);
+                }
+                log.debug("runClaudePrompt: context reloaded, continuing with new bridge", .{});
+            } else {
+                return .end_turn;
+            }
+        }
     }
 
     fn toProtocolStopReason(stop: engine_mod.StopReason) protocol.StopReason {
@@ -1960,6 +1961,7 @@ pub const Agent = struct {
             .max_tokens => .max_tokens,
             .max_turn_requests => .max_turn_requests,
             .auth_required => .auth_required,
+            .context_reloaded => .end_turn, // Should not reach here; handled by loop
         };
     }
 
@@ -1985,7 +1987,7 @@ pub const Agent = struct {
         const inputs = input_list.items;
         if (inputs.len == 0) return .end_turn;
 
-        const codex_bridge = self.sendCodexPromptWithRestart(session, session_id, inputs) catch |err| switch (err) {
+        _ = self.sendCodexPromptWithRestart(session, session_id, inputs) catch |err| switch (err) {
             error.AuthRequired => {
                 _ = try self.handleAuthRequired(session_id, session, .codex);
                 return .auth_required;
@@ -2017,8 +2019,18 @@ pub const Agent = struct {
             .tag_engine = self.shouldTagEngine(session),
         };
 
-        const engine_stop = try engine_mod.processCodexMessages(&prompt_ctx, codex_bridge);
-        return toProtocolStopReason(engine_stop);
+        // Loop to handle context reloads (bridge restarts)
+        while (true) {
+            if (session.codex_bridge) |*cdx_bridge| {
+                const engine_stop = try engine_mod.processCodexMessages(&prompt_ctx, cdx_bridge);
+                if (engine_stop != .context_reloaded) {
+                    return toProtocolStopReason(engine_stop);
+                }
+                log.debug("runCodexPrompt: context reloaded, continuing with new bridge", .{});
+            } else {
+                return .end_turn;
+            }
+        }
     }
 
     fn captureCodexSessionId(self: *Agent, session: *Session) void {

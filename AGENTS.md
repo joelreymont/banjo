@@ -41,6 +41,7 @@
 - `std.testing` only for trivial cases, error paths, or when no structured output exists.
 - **NEVER use `testing.expect` to decompose structures field-by-field** - use ohsnap snapshots instead.
 - Always run `zig build test` after major changes or adding tests.
+- Always run `zig build` after tests pass to ensure binary is current.
 
 ## Zed Logs (macOS)
 

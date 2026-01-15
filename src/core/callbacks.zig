@@ -53,6 +53,10 @@ pub const EditorCallbacks = struct {
         // Returns true if prompt was sent and loop should continue, false to break
         sendContinuePrompt: *const fn (ctx: *anyopaque, engine: Engine, prompt: []const u8) anyerror!bool,
 
+        // Restart engine (for context reload - clears session)
+        // Returns true if restart succeeded
+        restartEngine: *const fn (ctx: *anyopaque, engine: Engine) bool,
+
         // Codex approval request handling
         // request_id is the raw JSON value (integer or string)
         // Returns decision string: "approve" or "decline", or null if not handled
@@ -65,6 +69,7 @@ pub const EditorCallbacks = struct {
         max_tokens,
         max_turn_requests,
         auth_required,
+        context_reloaded, // Bridge was restarted, caller should re-invoke with new bridge
     };
 
     pub fn sendText(self: EditorCallbacks, session_id: []const u8, engine: Engine, text: []const u8) !void {
@@ -126,6 +131,10 @@ pub const EditorCallbacks = struct {
 
     pub fn sendContinuePrompt(self: EditorCallbacks, engine: Engine, prompt: []const u8) !bool {
         return self.vtable.sendContinuePrompt(self.ctx, engine, prompt);
+    }
+
+    pub fn restartEngine(self: EditorCallbacks, engine: Engine) bool {
+        return self.vtable.restartEngine(self.ctx, engine);
     }
 
     pub fn onApprovalRequest(self: EditorCallbacks, request_id: std.json.Value, kind: ApprovalKind, params: ?std.json.Value) !?[]const u8 {
