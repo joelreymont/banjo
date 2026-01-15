@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
     const filters = if (test_filter) |filter| &[_][]const u8{filter} else &.{};
 
     // Version and git info
-    const version = "0.6.3";
+    const version = "0.6.4";
     const git_hash = b.run(&.{ "git", "rev-parse", "--short", "HEAD" });
 
     // Build options for version info
