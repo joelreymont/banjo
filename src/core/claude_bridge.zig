@@ -1218,32 +1218,29 @@ const LiveSnapshotError = error{
     AuthRequired,
 };
 
-fn collectClaudeSnapshot(allocator: Allocator, prompt: []const u8) ![]u8 {
-    var bridge = Bridge.init(allocator, ".");
-    defer bridge.deinit();
+const ClaudeResponse = struct {
+    text: []u8,
+    stop_reason: []u8,
 
-    try bridge.start(.{
-        .resume_session_id = null,
-        .continue_last = false,
-        .permission_mode = "default",
-        .model = null,
-    });
-    defer bridge.stop();
+    fn deinit(self: *ClaudeResponse, allocator: Allocator) void {
+        allocator.free(self.text);
+        allocator.free(self.stop_reason);
+    }
+};
 
+fn collectClaudeResponse(allocator: Allocator, bridge: *Bridge, prompt: []const u8) !ClaudeResponse {
     try bridge.sendPrompt(prompt);
 
     var text_buf: std.ArrayList(u8) = .empty;
     defer text_buf.deinit(allocator);
     var saw_delta = false;
-    var stop_reason: []const u8 = "unknown";
     var stop_reason_buf: ?[]u8 = null;
-    defer if (stop_reason_buf) |buf| allocator.free(buf);
     var saw_result = false;
 
     const deadline = std.time.milliTimestamp() + constants.live_snapshot_timeout_ms;
     while (true) {
         if (std.time.milliTimestamp() > deadline) return error.Timeout;
-        var msg = (try readClaudeMessageWithTimeout(&bridge, deadline)) orelse {
+        var msg = (try readClaudeMessageWithTimeout(bridge, deadline)) orelse {
             if (saw_result) break;
             return error.UnexpectedEof;
         };
@@ -1271,7 +1268,6 @@ fn collectClaudeSnapshot(allocator: Allocator, prompt: []const u8) ![]u8 {
             .result => {
                 if (msg.getStopReason()) |reason| {
                     stop_reason_buf = try allocator.dupe(u8, reason);
-                    stop_reason = stop_reason_buf.?;
                 }
                 saw_result = true;
                 break;
@@ -1282,12 +1278,32 @@ fn collectClaudeSnapshot(allocator: Allocator, prompt: []const u8) ![]u8 {
     }
 
     const normalized = try test_utils.normalizeSnapshotText(allocator, text_buf.items);
-    defer allocator.free(normalized);
+    const stop_reason = stop_reason_buf orelse try allocator.dupe(u8, "unknown");
+    return .{
+        .text = normalized,
+        .stop_reason = stop_reason,
+    };
+}
+
+fn collectClaudeSnapshot(allocator: Allocator, prompt: []const u8) ![]u8 {
+    var bridge = Bridge.init(allocator, ".");
+    defer bridge.deinit();
+
+    try bridge.start(.{
+        .resume_session_id = null,
+        .continue_last = false,
+        .permission_mode = "default",
+        .model = null,
+    });
+    defer bridge.stop();
+
+    var response = try collectClaudeResponse(allocator, &bridge, prompt);
+    defer response.deinit(allocator);
 
     return std.fmt.allocPrint(
         allocator,
         "engine: claude\ntext: {s}\nstop_reason: {s}\n",
-        .{ normalized, stop_reason },
+        .{ response.text, response.stop_reason },
     );
 }
 
@@ -1443,6 +1459,36 @@ test "snapshot: Claude Code live prompt" {
         \\stop_reason: success
         \\
     ).diff(snapshot, true);
+}
+
+test "live: Claude Code /clear resets context" {
+    if (!config.live_cli_tests) return error.SkipZigTest;
+    if (!Bridge.isAvailable()) return error.SkipZigTest;
+
+    var bridge = Bridge.init(testing.allocator, ".");
+    defer bridge.deinit();
+
+    try bridge.start(.{
+        .resume_session_id = null,
+        .continue_last = false,
+        .permission_mode = "default",
+        .model = null,
+    });
+    defer bridge.stop();
+
+    const clear_token = "BANJO_CLEAR_TOKEN_9F3B7A";
+    const remember_prompt = "Remember this token exactly: " ++ clear_token ++ ". Reply with ONLY the token.";
+    var remember = try collectClaudeResponse(testing.allocator, &bridge, remember_prompt);
+    defer remember.deinit(testing.allocator);
+    try testing.expectEqualStrings(clear_token, remember.text);
+
+    var clear = try collectClaudeResponse(testing.allocator, &bridge, "/clear");
+    defer clear.deinit(testing.allocator);
+
+    const recall_prompt = "What token did I ask you to remember? Reply with NO_MEMORY if you do not remember.";
+    var recall = try collectClaudeResponse(testing.allocator, &bridge, recall_prompt);
+    defer recall.deinit(testing.allocator);
+    try testing.expectEqualStrings("NO_MEMORY", recall.text);
 }
 
 test "snapshot: Claude Code control messages are rejected" {

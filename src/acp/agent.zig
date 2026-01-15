@@ -2075,6 +2075,11 @@ pub const Agent = struct {
             .sessionUpdate = .user_message_chunk,
             .content = .{ .type = "text", .text = text },
         });
+        if (text.len == 0 or text[text.len - 1] == '\n') return;
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .user_message_chunk,
+            .content = .{ .type = "text", .text = "\n" },
+        });
     }
 
     fn sendEngineThoughtPrefix(self: *Agent, session: *Session, session_id: []const u8, engine: Engine) !void {
