@@ -1,6 +1,6 @@
 id = "banjo-acp"
 name = "Banjo"
-version = "0.6.5"
+version = "0.6.6"
 schema_version = 1
 description = "A Second Brain for your code - Claude Code + Codex agent with notes and backlinks"
 authors = ["Joel Reymont <joelr1@gmail.com>"]
@@ -14,16 +14,16 @@ icon = "icon/banjo.svg"
 
 # Local dev target uses the repo build via the extension/banjo symlink.
 [agent_servers.banjo.targets.darwin-aarch64]
-archive = "https://github.com/joelreymont/banjo/releases/download/v0.6.5/banjo-darwin-arm64.tar.gz"
+archive = "https://github.com/joelreymont/banjo/releases/download/v0.6.6/banjo-darwin-arm64.tar.gz"
 cmd = "./banjo"
 args = ["--agent"]
 
 [agent_servers.banjo.targets.darwin-x86_64]
-archive = "https://github.com/joelreymont/banjo/releases/download/v0.6.5/banjo-darwin-x64.tar.gz"
+archive = "https://github.com/joelreymont/banjo/releases/download/v0.6.6/banjo-darwin-x64.tar.gz"
 cmd = "./banjo"
 args = ["--agent"]
 
 [agent_servers.banjo.targets.linux-x86_64]
-archive = "https://github.com/joelreymont/banjo/releases/download/v0.6.5/banjo-linux-x64.tar.gz"
+archive = "https://github.com/joelreymont/banjo/releases/download/v0.6.6/banjo-linux-x64.tar.gz"
 cmd = "./banjo"
 args = ["--agent"]
