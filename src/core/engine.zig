@@ -1481,7 +1481,7 @@ const ContextReloadTracker = struct {
     fn hasContextReload(self: *const ContextReloadTracker) bool {
         if (self.restart_count == 0) return false;
         for (self.prompts.items) |p| {
-            if (std.mem.indexOf(u8, p, "dot skill") != null) return true;
+            if (std.mem.indexOf(u8, p, "AGENTS.md") != null) return true;
         }
         return false;
     }
@@ -1854,8 +1854,14 @@ test "integration: nudge restarts and sends context prompt" {
     const snapshot = try out.toOwnedSlice();
     defer testing.allocator.free(snapshot);
     try (ohsnap{}).snap(@src(),
-        \\prompt[0]: Use your dot skill to check active dots and continue working.
-        \\user[0]: Use your dot skill to check active dots and continue working.
+        \\prompt[0]: Read your project guidelines (AGENTS.md).
+        \\Check active dots: `dot ls --status active`
+        \\If the dot description contains a plan file path, read it.
+        \\Continue with the current task.
+        \\user[0]: Read your project guidelines (AGENTS.md).
+        \\Check active dots: `dot ls --status active`
+        \\If the dot description contains a plan file path, read it.
+        \\Continue with the current task.
         \\
     ).diff(snapshot, true);
 }
@@ -2085,7 +2091,10 @@ test "context reload caller loop pattern" {
     const p1 = try std.json.parseFromSlice(std.json.Value, arena1.allocator(), tool_json, .{});
     bridge1.queue_mutex.lock();
     try bridge1.message_queue.append(testing.allocator, claude_bridge.StreamMessage{
-        .type = .assistant, .subtype = null, .raw = p1.value, .arena = arena1,
+        .type = .assistant,
+        .subtype = null,
+        .raw = p1.value,
+        .arena = arena1,
     });
     bridge1.queue_mutex.unlock();
 
@@ -2096,7 +2105,10 @@ test "context reload caller loop pattern" {
     const p2 = try std.json.parseFromSlice(std.json.Value, arena2.allocator(), result_json, .{});
     bridge1.queue_mutex.lock();
     try bridge1.message_queue.append(testing.allocator, claude_bridge.StreamMessage{
-        .type = .assistant, .subtype = null, .raw = p2.value, .arena = arena2,
+        .type = .assistant,
+        .subtype = null,
+        .raw = p2.value,
+        .arena = arena2,
     });
     bridge1.queue_mutex.unlock();
 
@@ -2119,7 +2131,10 @@ test "context reload caller loop pattern" {
     const p3 = try std.json.parseFromSlice(std.json.Value, arena3.allocator(), text_json, .{});
     bridge2.queue_mutex.lock();
     try bridge2.message_queue.append(testing.allocator, claude_bridge.StreamMessage{
-        .type = .assistant, .subtype = null, .raw = p3.value, .arena = arena3,
+        .type = .assistant,
+        .subtype = null,
+        .raw = p3.value,
+        .arena = arena3,
     });
     bridge2.queue_mutex.unlock();
 
