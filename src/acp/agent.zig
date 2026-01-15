@@ -969,6 +969,7 @@ pub const Agent = struct {
     }
 
     fn handlePrompt(self: *Agent, request: jsonrpc.Request) !void {
+        log.debug("handlePrompt: entry", .{});
         var response_sent = false;
         errdefer if (!response_sent and !request.isNotification()) {
             self.writer.writeResponse(jsonrpc.Response.err(
@@ -1919,9 +1920,11 @@ pub const Agent = struct {
     }
 
     fn runClaudePrompt(self: *Agent, session: *Session, session_id: []const u8, prompt: []const u8) !protocol.StopReason {
+        log.debug("runClaudePrompt: entry for session {s}", .{session_id});
         defer self.clearPendingExecuteTools(session);
 
         const cli_bridge = try self.sendClaudePromptWithRestart(session, session_id, prompt);
+        log.debug("runClaudePrompt: prompt sent, calling processClaudeMessages", .{});
 
         var cb_ctx = PromptCallbackContext{
             .agent = self,
