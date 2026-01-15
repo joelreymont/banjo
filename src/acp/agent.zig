@@ -3933,7 +3933,7 @@ pub const Agent = struct {
         }
     }
 
-    const Command = enum { version, note, notes, setup, explain, clear, nudge, dot };
+    const Command = enum { version, note, notes, setup, explain, clear, nudge };
     const command_map = std.StaticStringMap(Command).initComptime(.{
         .{ "version", .version },
         .{ "note", .note },
@@ -3942,7 +3942,6 @@ pub const Agent = struct {
         .{ "explain", .explain },
         .{ "clear", .clear },
         .{ "nudge", .nudge },
-        .{ "dot", .dot },
     });
 
     const RouteCommand = struct {
@@ -4051,14 +4050,6 @@ pub const Agent = struct {
                     };
                 };
                 return null;
-            },
-            .dot => {
-                // /dot doesn't work in stream-json mode - replace with context prompt
-                const engine: Engine = switch (session.config.route) {
-                    .claude, .duet => .claude,
-                    .codex => .codex,
-                };
-                return dots.contextPrompt(engine);
             },
         }
     }
