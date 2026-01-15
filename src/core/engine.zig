@@ -1455,7 +1455,7 @@ const ContextReloadTracker = struct {
         var has_context = false;
         for (self.prompts.items) |p| {
             if (std.mem.eql(u8, p, "/clear")) has_clear = true;
-            if (std.mem.indexOf(u8, p, "/dot skill") != null) has_context = true;
+            if (std.mem.indexOf(u8, p, "dot skill") != null) has_context = true;
         }
         return has_clear and has_context;
     }
@@ -1824,9 +1824,9 @@ test "integration: nudge sends clear and context prompt" {
     defer testing.allocator.free(snapshot);
     try (ohsnap{}).snap(@src(),
         \\prompt[0]: /clear
-        \\prompt[1]: Use your /dot skill to check active dots and continue working.
+        \\prompt[1]: Use your dot skill to check active dots and continue working.
         \\user[0]: /clear
-        \\user[1]: Use your /dot skill to check active dots and continue working.
+        \\user[1]: Use your dot skill to check active dots and continue working.
         \\
     ).diff(snapshot, true);
 }

@@ -37,7 +37,7 @@ pub fn clearCmd(engine: Engine) []const u8 {
 /// Context prompt sent after clearing, prompts agent to use the dot skill
 pub fn contextPrompt(engine: Engine) []const u8 {
     _ = engine;
-    return "Use your /dot skill to check active dots and continue working.";
+    return "Use your dot skill to check active dots and continue working.";
 }
 
 /// Legacy constant for backwards compatibility in tests
@@ -857,8 +857,7 @@ test "cleanupClaudeHooks handles missing settings file" {
 
 test "contextPrompt invokes dot skill" {
     const prompt = contextPrompt(.claude);
-    try testing.expect(std.mem.indexOf(u8, prompt, "/dot") != null);
-    try testing.expect(std.mem.indexOf(u8, prompt, "skill") != null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "dot skill") != null);
 }
 
 test "containsDotOffStr detects dot off command" {
