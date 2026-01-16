@@ -232,7 +232,7 @@ test "generateUuidV4 format" {
         .variant_ok = variant == '8' or variant == '9' or variant == 'a' or variant == 'b',
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.lockfile.test.generateUuidV4 format__struct_<^\d+$>
+        \\ws.lockfile.test.generateUuidV4 format__struct_<^\d+$>
         \\  .dashes_ok: bool = true
         \\  .version_ok: bool = true
         \\  .variant_ok: bool = true
@@ -247,7 +247,7 @@ test "generateUuidV4 uniqueness" {
 
     const summary = .{ .unique = !std.mem.eql(u8, &uuid1, &uuid2) };
     try (ohsnap{}).snap(@src(),
-        \\nvim.lockfile.test.generateUuidV4 uniqueness__struct_<^\d+$>
+        \\ws.lockfile.test.generateUuidV4 uniqueness__struct_<^\d+$>
         \\  .unique: bool = true
     ).expectEqual(summary);
 }
@@ -256,7 +256,7 @@ test "isPidAlive self" {
     const self_pid = getPid();
     const summary = .{ .alive = try isPidAlive(self_pid) };
     try (ohsnap{}).snap(@src(),
-        \\nvim.lockfile.test.isPidAlive self__struct_<^\d+$>
+        \\ws.lockfile.test.isPidAlive self__struct_<^\d+$>
         \\  .alive: bool = true
     ).expectEqual(summary);
 }
@@ -269,7 +269,7 @@ test "isPidAlive invalid" {
     const expected = !can_detect; // false if we can detect, true (alive) if we can't
     const summary = .{ .alive = try isPidAlive(99999999) };
     try (ohsnap{}).snap(@src(),
-        \\nvim.lockfile.test.isPidAlive invalid__struct_<^\d+$>
+        \\ws.lockfile.test.isPidAlive invalid__struct_<^\d+$>
         \\  .alive: bool = <^(true|false)$>
     ).expectEqual(summary);
     try std.testing.expectEqual(expected, summary.alive);

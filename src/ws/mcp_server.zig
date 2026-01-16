@@ -732,7 +732,7 @@ test "McpServer init and deinit" {
         .nvim_socket = server.nvim_client_socket,
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.mcp_server.test.McpServer init and deinit__struct_<^\d+$>
+        \\ws.mcp_server.test.McpServer init and deinit__struct_<^\d+$>
         \\  .port: u16 = <^\d+$>
         \\  .nvim_socket: ?i32
         \\    null
@@ -752,7 +752,7 @@ test "McpServer port binding" {
         .different = server1.port != server2.port,
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.mcp_server.test.McpServer port binding__struct_<^\d+$>
+        \\ws.mcp_server.test.McpServer port binding__struct_<^\d+$>
         \\  .port1: u16 = <^\d+$>
         \\  .port2: u16 = <^\d+$>
         \\  .different: bool = true
@@ -781,7 +781,7 @@ test "setNonBlocking and setBlocking toggle O_NONBLOCK" {
         .after_blocking = after_blocking,
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.mcp_server.test.setNonBlocking and setBlocking toggle O_NONBLOCK__struct_<^\d+$>
+        \\ws.mcp_server.test.setNonBlocking and setBlocking toggle O_NONBLOCK__struct_<^\d+$>
         \\  .initial_nonblock: bool = false
         \\  .after_nonblock: bool = true
         \\  .after_blocking: bool = false

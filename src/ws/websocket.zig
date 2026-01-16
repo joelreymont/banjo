@@ -364,7 +364,7 @@ test "encodeFrame small payload" {
         .payload = frame[2..],
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.websocket.test.encodeFrame small payload__struct_<^\d+$>
+        \\ws.websocket.test.encodeFrame small payload__struct_<^\d+$>
         \\  .first: u8 = 129
         \\  .len: u8 = 5
         \\  .payload: []u8
@@ -384,7 +384,7 @@ test "encodeFrame medium payload" {
         .payload = frame[4..],
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.websocket.test.encodeFrame medium payload__struct_<^\d+$>
+        \\ws.websocket.test.encodeFrame medium payload__struct_<^\d+$>
         \\  .first: u8 = 129
         \\  .len: u8 = 126
         \\  .extended_len: u16 = 200
@@ -422,7 +422,7 @@ test "parseFrame masked" {
         .payload = result.frame.payload,
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.websocket.test.parseFrame masked__struct_<^\d+$>
+        \\ws.websocket.test.parseFrame masked__struct_<^\d+$>
         \\  .fin: bool = true
         \\  .opcode: [:0]const u8
         \\    "text"
@@ -448,7 +448,7 @@ test "parseFrame ping" {
         .payload_len = result.frame.payload.len,
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.websocket.test.parseFrame ping__struct_<^\d+$>
+        \\ws.websocket.test.parseFrame ping__struct_<^\d+$>
         \\  .opcode: [:0]const u8
         \\    "ping"
         \\  .payload_len: usize = 0
@@ -468,7 +468,7 @@ test "parseFrame close" {
         .payload_len = result.frame.payload.len,
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.websocket.test.parseFrame close__struct_<^\d+$>
+        \\ws.websocket.test.parseFrame close__struct_<^\d+$>
         \\  .opcode: [:0]const u8
         \\    "close"
         \\  .payload_len: usize = 2
@@ -507,7 +507,7 @@ test "tryParseHandshake parses complete headers" {
         .has_header_end = parsed.header_end > 0,
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.websocket.test.tryParseHandshake parses complete headers__struct_<^\d+$>
+        \\ws.websocket.test.tryParseHandshake parses complete headers__struct_<^\d+$>
         \\  .path: []const u8
         \\    "/nvim"
         \\  .has_header_end: bool = true
@@ -563,7 +563,7 @@ test "performHandshakeWithPath preserves trailing bytes" {
         .remainder_hex = remainder_hex,
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.websocket.test.performHandshakeWithPath preserves trailing bytes__struct_<^\d+$>
+        \\ws.websocket.test.performHandshakeWithPath preserves trailing bytes__struct_<^\d+$>
         \\  .client_kind: [:0]const u8
         \\    "nvim"
         \\  .remainder_hex: ?[]const u8

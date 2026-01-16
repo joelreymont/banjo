@@ -1,7 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
-const websocket = @import("../nvim/websocket.zig");
+const websocket = @import("../ws/websocket.zig");
 const byte_queue = @import("../util/byte_queue.zig");
 const jsonrpc = @import("../jsonrpc.zig");
 
