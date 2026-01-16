@@ -248,3 +248,89 @@ test "ToolProxy request tracking" {
         \\
     ).diff(snapshot, true);
 }
+
+test "ToolProxy request ID uniqueness" {
+    const writer = jsonrpc.Writer.init(testing.allocator, std.io.null_writer.any());
+    var proxy = ToolProxy.init(testing.allocator, writer);
+    defer proxy.deinit();
+
+    const id1 = proxy.next_request_id;
+    proxy.next_request_id += 1;
+    const id2 = proxy.next_request_id;
+    proxy.next_request_id += 1;
+    const id3 = proxy.next_request_id;
+
+    const summary = .{
+        .ids_unique = id1 != id2 and id2 != id3 and id1 != id3,
+        .sequential = id2 == id1 + 1 and id3 == id2 + 1,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\tools.proxy.test.ToolProxy request ID uniqueness__struct_<^\d+$>
+        \\  .ids_unique: bool = true
+        \\  .sequential: bool = true
+    ).expectEqual(summary);
+}
+
+test "ToolProxy handleResponse unknown ID" {
+    const writer = jsonrpc.Writer.init(testing.allocator, std.io.null_writer.any());
+    var proxy = ToolProxy.init(testing.allocator, writer);
+    defer proxy.deinit();
+
+    // Handle response for non-existent ID returns null
+    const method = proxy.handleResponse(999);
+    try testing.expect(method == null);
+}
+
+test "ToolProxy handleError removes pending" {
+    const writer = jsonrpc.Writer.init(testing.allocator, std.io.null_writer.any());
+    var proxy = ToolProxy.init(testing.allocator, writer);
+    defer proxy.deinit();
+
+    try proxy.pending_requests.put(42, .{ .method = "fs/read" });
+    try testing.expect(proxy.isPending(42));
+
+    proxy.handleError(42, .{ .code = -1, .message = "test error" });
+    try testing.expect(!proxy.isPending(42));
+}
+
+test "ToolProxy multiple concurrent requests" {
+    const writer = jsonrpc.Writer.init(testing.allocator, std.io.null_writer.any());
+    var proxy = ToolProxy.init(testing.allocator, writer);
+    defer proxy.deinit();
+
+    // Simulate multiple pending requests
+    try proxy.pending_requests.put(1, .{ .method = "fs/read" });
+    try proxy.pending_requests.put(2, .{ .method = "fs/write" });
+    try proxy.pending_requests.put(3, .{ .method = "terminal/create" });
+
+    const summary = .{
+        .pending_1 = proxy.isPending(1),
+        .pending_2 = proxy.isPending(2),
+        .pending_3 = proxy.isPending(3),
+        .count = proxy.pending_requests.count(),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\tools.proxy.test.ToolProxy multiple concurrent requests__struct_<^\d+$>
+        \\  .pending_1: bool = true
+        \\  .pending_2: bool = true
+        \\  .pending_3: bool = true
+        \\  .count: u32 = 3
+    ).expectEqual(summary);
+
+    // Handle one, others stay pending
+    _ = proxy.handleResponse(2);
+
+    const after = .{
+        .pending_1 = proxy.isPending(1),
+        .pending_2 = proxy.isPending(2),
+        .pending_3 = proxy.isPending(3),
+        .count = proxy.pending_requests.count(),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\tools.proxy.test.ToolProxy multiple concurrent requests__struct_<^\d+$>
+        \\  .pending_1: bool = true
+        \\  .pending_2: bool = false
+        \\  .pending_3: bool = true
+        \\  .count: u32 = 2
+    ).expectEqual(after);
+}
