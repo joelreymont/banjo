@@ -262,8 +262,6 @@ pub const Handler = struct {
             mcp.nvim_message_callback = nvimMessageCallback;
             mcp.nvim_connect_callback = nvimConnectCallback;
             mcp.nvim_callback_ctx = @ptrCast(self);
-            mcp.tool_request_callback = toolRequestCallback;
-            mcp.tool_callback_ctx = @ptrCast(self);
 
             mcp.start() catch |err| {
                 log.err("Failed to start MCP server: {}", .{err});
@@ -661,18 +659,6 @@ pub const Handler = struct {
         const self: *Handler = @ptrCast(@alignCast(ctx));
         debugLog("nvimConnectCallback: sending initial state", .{});
         self.sendStateNotification();
-    }
-
-    fn toolRequestCallback(ctx: *anyopaque, tool_name: []const u8, correlation_id: []const u8, args: ?std.json.Value) void {
-        const self: *Handler = @ptrCast(@alignCast(ctx));
-        debugLog("toolRequestCallback: tool={s} corr={s}", .{ tool_name, correlation_id });
-        self.sendNotification("tool_request", protocol.ToolRequest{
-            .tool_name = tool_name,
-            .correlation_id = correlation_id,
-            .arguments = args,
-        }) catch |err| {
-            log.warn("Failed to send tool_request: {}", .{err});
-        };
     }
 
     fn nvimMessageCallback(ctx: *anyopaque, method: []const u8, params: ?std.json.Value) void {

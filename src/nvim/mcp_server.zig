@@ -7,103 +7,15 @@ const websocket = @import("websocket.zig");
 const protocol = @import("protocol.zig");
 const constants = @import("../core/constants.zig");
 const jsonrpc = @import("../jsonrpc.zig");
-const config = @import("config");
 
 const log = std.log.scoped(.mcp_server);
 const debug_log = @import("../util/debug_log.zig");
-const json_util = @import("../util/json.zig");
 const byte_queue = @import("../util/byte_queue.zig");
-
-// MCP types (to be removed with MCP code)
-pub const SelectionRange = struct {
-    startLine: u32,
-    startCol: u32,
-    endLine: u32,
-    endCol: u32,
-};
-
-const SelectionResult = struct {
-    text: []const u8 = "",
-    file: []const u8 = "",
-    range: ?SelectionRange = null,
-};
-
-const ContentItem = struct {
-    type: []const u8 = "text",
-    text: []const u8,
-};
-
-const ToolCallResult = struct {
-    content: []const ContentItem,
-};
-
-const WorkspaceFoldersResult = struct {
-    folders: []const []const u8,
-};
-
-const InitializeResult = struct {
-    protocolVersion: []const u8 = "2024-11-05",
-    capabilities: struct {
-        logging: struct {} = .{},
-        prompts: struct {} = .{},
-        resources: struct {} = .{},
-        tools: struct {} = .{},
-    } = .{},
-    serverInfo: struct {
-        name: []const u8 = "banjo-neovim",
-        version: []const u8 = "0.1.0",
-    } = .{},
-};
-
-const ToolDefinition = struct {
-    name: []const u8,
-    description: []const u8,
-    inputSchema: struct {
-        type: []const u8 = "object",
-        properties: ?std.json.Value = null,
-        required: ?[]const []const u8 = null,
-    },
-};
-
-const ToolsListResult = struct {
-    tools: []const ToolDefinition,
-};
-
-const ToolsCallParams = struct {
-    name: []const u8,
-    arguments: ?std.json.Value = null,
-};
-
-const McpMethod = struct {
-    pub const Initialize = "initialize";
-    pub const Initialized = "notifications/initialized";
-    pub const ToolsList = "tools/list";
-    pub const ToolsCall = "tools/call";
-};
-
-fn getToolDefinitions() []const ToolDefinition {
-    return &tool_definitions;
-}
-
-const tool_definitions = [_]ToolDefinition{
-    .{ .name = "openFile", .description = "Open a file in the editor", .inputSchema = .{ .required = &[_][]const u8{"filePath"} } },
-    .{ .name = "openDiff", .description = "Show a diff view", .inputSchema = .{ .required = &[_][]const u8{ "old_file_path", "new_file_path", "new_file_contents" } } },
-    .{ .name = "getCurrentSelection", .description = "Get the currently selected text", .inputSchema = .{} },
-    .{ .name = "getLatestSelection", .description = "Get the most recently captured selection", .inputSchema = .{} },
-    .{ .name = "getOpenEditors", .description = "List all currently open editor buffers", .inputSchema = .{} },
-    .{ .name = "getWorkspaceFolders", .description = "Get the workspace folder paths", .inputSchema = .{} },
-    .{ .name = "getDiagnostics", .description = "Get LSP diagnostics", .inputSchema = .{} },
-    .{ .name = "checkDocumentDirty", .description = "Check if a document has unsaved changes", .inputSchema = .{ .required = &[_][]const u8{"filePath"} } },
-    .{ .name = "saveDocument", .description = "Save a document to disk", .inputSchema = .{ .required = &[_][]const u8{"filePath"} } },
-    .{ .name = "closeTab", .description = "Close an editor tab/buffer", .inputSchema = .{ .required = &[_][]const u8{"filePath"} } },
-    .{ .name = "closeAllDiffTabs", .description = "Close all open diff view tabs", .inputSchema = .{} },
-    .{ .name = "executeCode", .description = "Execute code in a Jupyter kernel", .inputSchema = .{} },
-};
 
 const max_pending_handshakes: usize = 8;
 
 fn debugLog(comptime fmt: []const u8, args: anytype) void {
-    debug_log.write("MCP", fmt, args);
+    debug_log.write("WS", fmt, args);
 }
 
 pub const McpServer = struct {
@@ -112,7 +24,6 @@ pub const McpServer = struct {
     nvim_client_socket: ?posix.socket_t = null,
     lock_file: ?lockfile.LockFile = null,
     port: u16,
-    auth_token: [36]u8, // TODO: Remove with auth_token cleanup
     cwd: []const u8,
 
     // Read buffer for WebSocket frames
@@ -125,49 +36,12 @@ pub const McpServer = struct {
     // Mutex for poll operations (ensures single-threaded polling)
     poll_mutex: std.Thread.Mutex = .{},
 
-    // Callback for sending tool requests to nvim
-    tool_request_callback: ?*const fn (ctx: *anyopaque, tool_name: []const u8, correlation_id: []const u8, args: ?std.json.Value) void = null,
-    tool_callback_ctx: ?*anyopaque = null,
-
     // Callback for nvim messages (prompt, cancel, etc.)
     nvim_message_callback: ?*const fn (ctx: *anyopaque, method: []const u8, params: ?std.json.Value) void = null,
     nvim_callback_ctx: ?*anyopaque = null,
 
     // Callback for nvim connection (send initial state)
     nvim_connect_callback: ?*const fn (ctx: *anyopaque) void = null,
-
-    // Type declarations (must come after fields)
-    const OwnedSelection = struct {
-        text: []const u8, // owned
-        file: []const u8, // owned
-        range: ?SelectionRange,
-
-        fn deinit(self: *const OwnedSelection, allocator: Allocator) void {
-            allocator.free(self.text);
-            allocator.free(self.file);
-        }
-
-        fn toResult(self: OwnedSelection) SelectionResult {
-            return .{
-                .text = self.text,
-                .file = self.file,
-                .range = self.range,
-            };
-        }
-    };
-
-    const PendingToolRequest = struct {
-        correlation_id: []const u8, // owned
-        mcp_request_id_json: []const u8, // owned - serialized JSON of the ID
-        tool_name: []const u8, // owned
-        deadline_ms: i64,
-
-        fn deinit(self: *const PendingToolRequest, allocator: Allocator) void {
-            allocator.free(self.correlation_id);
-            allocator.free(self.mcp_request_id_json);
-            allocator.free(self.tool_name);
-        }
-    };
 
     const PendingHandshake = struct {
         buffer: std.ArrayListUnmanaged(u8) = .empty,
@@ -198,16 +72,11 @@ pub const McpServer = struct {
         try posix.getsockname(sock, &bound_addr.any, &addr_len);
         const port = bound_addr.getPort();
 
-        // Generate auth token
-        var auth_token: [36]u8 = undefined;
-        lockfile.generateUuidV4(&auth_token);
-
         const self = try allocator.create(McpServer);
         self.* = McpServer{
             .allocator = allocator,
             .tcp_socket = sock,
             .port = port,
-            .auth_token = auth_token,
             .cwd = cwd,
             .pending_handshakes = std.AutoHashMap(posix.socket_t, PendingHandshake).init(allocator),
         };
@@ -229,7 +98,6 @@ pub const McpServer = struct {
             self.allocator,
             self.port,
             self.cwd,
-            &self.auth_token,
         );
         log.info("MCP server listening on port {d}", .{self.port});
     }
@@ -483,7 +351,7 @@ pub const McpServer = struct {
             return;
         };
 
-        const client_kind = websocket.completeHandshake(fd, parsed.result, self.auth_token[0..]) catch |err| {
+        const client_kind = websocket.completeHandshake(fd, parsed.result) catch |err| {
             log.warn("WebSocket handshake failed: {}", .{err});
             self.closePendingHandshake(fd);
             return;
@@ -525,63 +393,6 @@ pub const McpServer = struct {
         const client = try posix.accept(self.tcp_socket, null, null, 0);
         errdefer posix.close(client);
         try self.queueHandshake(client);
-    }
-
-    fn handleMcpClientMessage(self: *McpServer) !void {
-        const client = self.mcp_client_socket orelse return;
-
-        // Read available data into buffer
-        var temp_buf: [4096]u8 = undefined;
-        const n = posix.read(client, &temp_buf) catch |err| switch (err) {
-            error.WouldBlock => return,
-            else => return err,
-        };
-        if (n == 0) return error.ConnectionClosed;
-
-        try self.mcp_read_buffer.append(self.allocator, temp_buf[0..n]);
-
-        // Try to parse complete frames
-        while (self.mcp_read_buffer.len() >= 2) {
-            const buf = self.mcp_read_buffer.sliceMut();
-            const result = websocket.parseFrame(buf) catch |err| switch (err) {
-                error.NeedMoreData => break,
-                error.ReservedOpcode => {
-                    log.warn("Received frame with reserved opcode, closing connection", .{});
-                    self.closeMcpClient();
-                    return;
-                },
-                error.UnmaskedFrame => {
-                    log.warn("Received unmasked MCP frame, closing connection", .{});
-                    self.closeMcpClient();
-                    return;
-                },
-                else => return err,
-            };
-
-            // Process frame
-            switch (result.frame.opcode) {
-                .text => {
-                    try self.handleMcpJsonRpcMessage(result.frame.payload);
-                },
-                .ping => {
-                    // Respond with pong
-                    const pong = try websocket.encodeFrame(self.allocator, .pong, result.frame.payload);
-                    defer self.allocator.free(pong);
-                    self.socket_mutex.lock();
-                    defer self.socket_mutex.unlock();
-                    const sock = self.mcp_client_socket orelse return error.NotConnected;
-                    _ = try posix.write(sock, pong);
-                },
-                .close => {
-                    log.info("MCP client sent close frame", .{});
-                    self.closeMcpClient();
-                    return;
-                },
-                else => {},
-            }
-
-            self.mcp_read_buffer.consume(result.consumed);
-        }
     }
 
     fn handleNvimClientMessage(self: *McpServer) !void {
@@ -665,213 +476,6 @@ pub const McpServer = struct {
                 callback(ctx, req.method, req.params);
             }
         }
-    }
-
-    fn handleMcpJsonRpcMessage(self: *McpServer, payload: []const u8) !void {
-        const parsed = std.json.parseFromSlice(protocol.JsonRpcRequest, self.allocator, payload, .{
-            .ignore_unknown_fields = true,
-        }) catch {
-            try self.sendMcpError(null, protocol.ErrorCode.ParseError, "Parse error");
-            return;
-        };
-        defer parsed.deinit();
-
-        const req = parsed.value;
-        const method = req.method;
-        const id = req.id;
-
-        // Dispatch by method
-        const method_map = std.StaticStringMap(MethodKind).initComptime(.{
-            .{ McpMethod.Initialize, .initialize },
-            .{ McpMethod.Initialized, .initialized },
-            .{ McpMethod.ToolsList, .tools_list },
-            .{ McpMethod.ToolsCall, .tools_call },
-        });
-
-        const kind = method_map.get(method) orelse {
-            if (id != null) {
-                try self.sendMcpError(id, protocol.ErrorCode.MethodNotFound, "Method not found");
-            }
-            return;
-        };
-
-        switch (kind) {
-            .initialize => try self.handleInitialize(id),
-            .initialized => {}, // Notification, no response needed
-            .tools_list => try self.handleToolsList(id),
-            .tools_call => try self.handleToolsCall(id, req.params),
-        }
-    }
-
-    const MethodKind = enum {
-        initialize,
-        initialized,
-        tools_list,
-        tools_call,
-    };
-
-    fn handleInitialize(self: *McpServer, id: ?std.json.Value) !void {
-        const result = InitializeResult{};
-        try self.sendResult(id, result);
-    }
-
-    fn handleToolsList(self: *McpServer, id: ?std.json.Value) !void {
-        const tools = getToolDefinitions();
-        const result = ToolsListResult{ .tools = tools };
-        try self.sendResult(id, result);
-    }
-
-    fn handleToolsCall(self: *McpServer, id: ?std.json.Value, params: ?std.json.Value) !void {
-        if (id == null) return; // tools/call requires an id
-
-        const tool_params = params orelse {
-            try self.sendMcpError(id, protocol.ErrorCode.InvalidParams, "Missing params");
-            return;
-        };
-
-        // Parse tool name and arguments
-        const parsed = std.json.parseFromValue(ToolsCallParams, self.allocator, tool_params, .{
-            .ignore_unknown_fields = true,
-        }) catch {
-            try self.sendMcpError(id, protocol.ErrorCode.InvalidParams, "Invalid tool call params");
-            return;
-        };
-        defer parsed.deinit();
-
-        const tool_name = parsed.value.name;
-        const tool_args = parsed.value.arguments;
-
-        // Check if this is a local tool (can be handled without Lua)
-        if (self.handleLocalTool(id, tool_name, tool_args)) |_| {
-            return; // Handled locally
-        } else |_| {}
-
-        // Forward to nvim via callback
-        if (self.tool_request_callback) |callback| {
-            const ctx = self.tool_callback_ctx orelse {
-                try self.sendToolError(id, "Tool callback context not set");
-                return;
-            };
-            const correlation_id = try self.generateCorrelationId();
-            errdefer self.allocator.free(correlation_id);
-
-            // Serialize ID to owned string
-            const id_json = try json_util.serializeToJson(self.allocator, id.?);
-            errdefer self.allocator.free(id_json);
-
-            // Dupe tool name
-            const owned_tool_name = try self.allocator.dupe(u8, tool_name);
-            errdefer self.allocator.free(owned_tool_name);
-
-            try self.pending_tool_requests.put(correlation_id, .{
-                .correlation_id = correlation_id,
-                .mcp_request_id_json = id_json,
-                .tool_name = owned_tool_name,
-                .deadline_ms = std.time.milliTimestamp() + constants.tool_request_timeout_ms,
-            });
-            callback(ctx, owned_tool_name, correlation_id, tool_args);
-        } else {
-            try self.sendToolError(id, "Tool handler not available");
-        }
-    }
-
-    fn handleLocalTool(self: *McpServer, id: ?std.json.Value, tool_name: []const u8, args: ?std.json.Value) !void {
-        const local_tools = std.StaticStringMap(LocalTool).initComptime(.{
-            .{ "getWorkspaceFolders", .get_workspace_folders },
-            .{ "getLatestSelection", .get_latest_selection },
-            .{ "executeCode", .execute_code },
-        });
-
-        const tool = local_tools.get(tool_name) orelse return error.NotLocalTool;
-
-        _ = args;
-        switch (tool) {
-            .get_workspace_folders => {
-                const folders = [_][]const u8{self.cwd};
-                const result = WorkspaceFoldersResult{ .folders = &folders };
-                const json_str = try json_util.serializeToJson(self.allocator, result);
-                defer self.allocator.free(json_str);
-                try self.sendToolResultOptional(id, json_str);
-            },
-            .get_latest_selection => {
-                const result = if (self.last_selection) |sel|
-                    sel.toResult()
-                else
-                    SelectionResult{};
-                const json_str = try json_util.serializeToJson(self.allocator, result);
-                defer self.allocator.free(json_str);
-                try self.sendToolResultOptional(id, json_str);
-            },
-            .execute_code => {
-                try self.sendToolError(id, "Jupyter kernel execution not supported in Neovim");
-            },
-        }
-    }
-
-    const LocalTool = enum {
-        get_workspace_folders,
-        get_latest_selection,
-        execute_code,
-    };
-
-    // MCP tool functions removed - MCP code being deleted
-
-    fn sendResult(self: *McpServer, id: ?std.json.Value, result: anytype) !void {
-        try self.sendMcpResultDirect(id, result);
-    }
-
-    fn sendToolResult(self: *McpServer, id: std.json.Value, json_text: []const u8) !void {
-        const content = [_]ContentItem{.{ .text = json_text }};
-        const tool_result = ToolCallResult{ .content = &content };
-        try self.sendMcpResultDirect(id, tool_result);
-    }
-
-    fn sendToolResultOptional(self: *McpServer, id: ?std.json.Value, json_text: []const u8) !void {
-        const content = [_]ContentItem{.{ .text = json_text }};
-        const tool_result = ToolCallResult{ .content = &content };
-        try self.sendMcpResultDirect(id, tool_result);
-    }
-
-    fn sendToolError(self: *McpServer, id: ?std.json.Value, message: []const u8) !void {
-        try self.sendToolErrorImpl(id, message);
-    }
-
-    fn sendToolErrorWithId(self: *McpServer, id: std.json.Value, message: []const u8) !void {
-        try self.sendToolErrorImpl(id, message);
-    }
-
-    fn sendToolErrorImpl(self: *McpServer, id: ?std.json.Value, message: []const u8) !void {
-        const content = [_]ContentItem{.{ .text = message }};
-        const error_result = ToolErrorResult{ .content = &content, .isError = true };
-        try self.sendMcpResultDirect(id, error_result);
-    }
-
-    const ToolErrorResult = struct {
-        content: []const ContentItem,
-        isError: bool,
-    };
-
-    fn sendMcpError(self: *McpServer, id: ?std.json.Value, code: i32, message: []const u8) !void {
-        const json = try jsonrpc.serializeError(self.allocator, id, code, message);
-        defer self.allocator.free(json);
-        try self.sendMcpWebSocketMessage(json);
-    }
-
-    /// Send a JSON-RPC response with result, serializing directly without std.json.Value round-trip
-    fn sendMcpResultDirect(self: *McpServer, id: anytype, result: anytype) !void {
-        const json = try jsonrpc.serializeResponseAny(self.allocator, id, result, .{ .emit_null_optional_fields = false });
-        defer self.allocator.free(json);
-        try self.sendMcpWebSocketMessage(json);
-    }
-
-    fn sendMcpWebSocketMessage(self: *McpServer, message: []const u8) !void {
-        const frame = try websocket.encodeFrame(self.allocator, .text, message);
-        defer self.allocator.free(frame);
-
-        self.socket_mutex.lock();
-        defer self.socket_mutex.unlock();
-        const client = self.mcp_client_socket orelse return error.NotConnected;
-        _ = try posix.write(client, frame);
     }
 
     /// Send a JSON-RPC notification to the nvim client
