@@ -195,3 +195,125 @@ pub const JsonRpcNotification = struct {
     method: []const u8,
     params: ?std.json.Value = null,
 };
+
+// Tests
+const testing = std.testing;
+const ohsnap = @import("ohsnap");
+
+fn jsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]const u8 {
+    return std.json.Stringify.valueAlloc(alloc, value, .{ .emit_null_optional_fields = false });
+}
+
+test "StreamChunk serialization" {
+    const chunk = StreamChunk{ .text = "Hello", .is_thought = false };
+    const json = try jsonAlloc(testing.allocator, chunk);
+    defer testing.allocator.free(json);
+
+    try testing.expectEqualStrings("{\"text\":\"Hello\",\"is_thought\":false}", json);
+}
+
+test "StreamChunk thought serialization" {
+    const chunk = StreamChunk{ .text = "thinking...", .is_thought = true };
+    const json = try jsonAlloc(testing.allocator, chunk);
+    defer testing.allocator.free(json);
+
+    try testing.expectEqualStrings("{\"text\":\"thinking...\",\"is_thought\":true}", json);
+}
+
+test "ToolCall serialization" {
+    const call = ToolCall{
+        .id = "tc-123",
+        .name = "Bash",
+        .label = "Run command",
+        .input = "{\"command\":\"ls\"}",
+    };
+    const json = try jsonAlloc(testing.allocator, call);
+    defer testing.allocator.free(json);
+
+    const summary = .{
+        .has_id = std.mem.indexOf(u8, json, "\"id\":\"tc-123\"") != null,
+        .has_name = std.mem.indexOf(u8, json, "\"name\":\"Bash\"") != null,
+        .has_label = std.mem.indexOf(u8, json, "\"label\":\"Run command\"") != null,
+        .has_input = std.mem.indexOf(u8, json, "\"input\":") != null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\ws.protocol.test.ToolCall serialization__struct_<^\d+$>
+        \\  .has_id: bool = true
+        \\  .has_name: bool = true
+        \\  .has_label: bool = true
+        \\  .has_input: bool = true
+    ).expectEqual(summary);
+}
+
+test "PermissionRequest serialization" {
+    const req = PermissionRequest{
+        .id = "perm-456",
+        .tool_name = "Write",
+        .tool_input = "{\"path\":\"/tmp/test\"}",
+    };
+    const json = try jsonAlloc(testing.allocator, req);
+    defer testing.allocator.free(json);
+
+    const summary = .{
+        .has_id = std.mem.indexOf(u8, json, "\"id\":\"perm-456\"") != null,
+        .has_tool_name = std.mem.indexOf(u8, json, "\"tool_name\":\"Write\"") != null,
+        .has_tool_input = std.mem.indexOf(u8, json, "\"tool_input\":") != null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\ws.protocol.test.PermissionRequest serialization__struct_<^\d+$>
+        \\  .has_id: bool = true
+        \\  .has_tool_name: bool = true
+        \\  .has_tool_input: bool = true
+    ).expectEqual(summary);
+}
+
+test "StateResponse serialization" {
+    const state = StateResponse{
+        .engine = "claude",
+        .mode = "default",
+        .connected = true,
+    };
+    const json = try jsonAlloc(testing.allocator, state);
+    defer testing.allocator.free(json);
+
+    const summary = .{
+        .has_engine = std.mem.indexOf(u8, json, "\"engine\":\"claude\"") != null,
+        .has_mode = std.mem.indexOf(u8, json, "\"mode\":\"default\"") != null,
+        .has_connected = std.mem.indexOf(u8, json, "\"connected\":true") != null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\ws.protocol.test.StateResponse serialization__struct_<^\d+$>
+        \\  .has_engine: bool = true
+        \\  .has_mode: bool = true
+        \\  .has_connected: bool = true
+    ).expectEqual(summary);
+}
+
+test "JsonRpcError serialization" {
+    const err = JsonRpcError{
+        .code = ErrorCode.MethodNotFound,
+        .message = "Method not found",
+    };
+    const json = try jsonAlloc(testing.allocator, err);
+    defer testing.allocator.free(json);
+
+    try testing.expectEqualStrings("{\"code\":-32601,\"message\":\"Method not found\"}", json);
+}
+
+test "ErrorCode constants" {
+    const summary = .{
+        .parse_error = ErrorCode.ParseError,
+        .invalid_request = ErrorCode.InvalidRequest,
+        .method_not_found = ErrorCode.MethodNotFound,
+        .invalid_params = ErrorCode.InvalidParams,
+        .internal_error = ErrorCode.InternalError,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\ws.protocol.test.ErrorCode constants__struct_<^\d+$>
+        \\  .parse_error: comptime_int = -32700
+        \\  .invalid_request: comptime_int = -32600
+        \\  .method_not_found: comptime_int = -32601
+        \\  .invalid_params: comptime_int = -32602
+        \\  .internal_error: comptime_int = -32603
+    ).expectEqual(summary);
+}
