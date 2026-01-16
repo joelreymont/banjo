@@ -144,3 +144,81 @@ pub const EditorCallbacks = struct {
         return null;
     }
 };
+
+// Tests
+const testing = std.testing;
+const ohsnap = @import("ohsnap");
+
+test "ToolStatus enum values" {
+    const summary = .{
+        .pending = @intFromEnum(ToolStatus.pending),
+        .execute = @intFromEnum(ToolStatus.execute),
+        .approved = @intFromEnum(ToolStatus.approved),
+        .denied = @intFromEnum(ToolStatus.denied),
+        .completed = @intFromEnum(ToolStatus.completed),
+        .failed = @intFromEnum(ToolStatus.failed),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.callbacks.test.ToolStatus enum values__struct_<^\d+$>
+        \\  .pending: u3 = 0
+        \\  .execute: u3 = 1
+        \\  .approved: u3 = 2
+        \\  .denied: u3 = 3
+        \\  .completed: u3 = 4
+        \\  .failed: u3 = 5
+    ).expectEqual(summary);
+}
+
+test "ToolKind enum values" {
+    const summary = .{
+        .read = @intFromEnum(ToolKind.read),
+        .edit = @intFromEnum(ToolKind.edit),
+        .execute = @intFromEnum(ToolKind.execute),
+        .browser = @intFromEnum(ToolKind.browser),
+        .other = @intFromEnum(ToolKind.other),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.callbacks.test.ToolKind enum values__struct_<^\d+$>
+        \\  .read: u3 = 0
+        \\  .edit: u3 = 1
+        \\  .execute: u3 = 2
+        \\  .browser: u3 = 3
+        \\  .other: u3 = 4
+    ).expectEqual(summary);
+}
+
+test "ApprovalKind enum values" {
+    const summary = .{
+        .command_execution = @intFromEnum(ApprovalKind.command_execution),
+        .exec_command = @intFromEnum(ApprovalKind.exec_command),
+        .file_change = @intFromEnum(ApprovalKind.file_change),
+        .apply_patch = @intFromEnum(ApprovalKind.apply_patch),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.callbacks.test.ApprovalKind enum values__struct_<^\d+$>
+        \\  .command_execution: u2 = 0
+        \\  .exec_command: u2 = 1
+        \\  .file_change: u2 = 2
+        \\  .apply_patch: u2 = 3
+    ).expectEqual(summary);
+}
+
+test "StopReason enum values" {
+    const summary = .{
+        .end_turn = @intFromEnum(EditorCallbacks.StopReason.end_turn),
+        .cancelled = @intFromEnum(EditorCallbacks.StopReason.cancelled),
+        .max_tokens = @intFromEnum(EditorCallbacks.StopReason.max_tokens),
+        .max_turn_requests = @intFromEnum(EditorCallbacks.StopReason.max_turn_requests),
+        .auth_required = @intFromEnum(EditorCallbacks.StopReason.auth_required),
+        .context_reloaded = @intFromEnum(EditorCallbacks.StopReason.context_reloaded),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.callbacks.test.StopReason enum values__struct_<^\d+$>
+        \\  .end_turn: u3 = 0
+        \\  .cancelled: u3 = 1
+        \\  .max_tokens: u3 = 2
+        \\  .max_turn_requests: u3 = 3
+        \\  .auth_required: u3 = 4
+        \\  .context_reloaded: u3 = 5
+    ).expectEqual(summary);
+}
