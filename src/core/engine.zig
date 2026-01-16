@@ -1857,11 +1857,11 @@ test "integration: nudge restarts and sends context prompt" {
         \\prompt[0]: Read your project guidelines (AGENTS.md).
         \\Check active dots: `dot ls --status active`
         \\If the dot description contains a plan file path, read it.
-        \\Continue with the current task.
+        \\Keep going.
         \\user[0]: Read your project guidelines (AGENTS.md).
         \\Check active dots: `dot ls --status active`
         \\If the dot description contains a plan file path, read it.
-        \\Continue with the current task.
+        \\Keep going.
         \\
     ).diff(snapshot, true);
 }
