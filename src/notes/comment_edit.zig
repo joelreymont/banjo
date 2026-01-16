@@ -162,3 +162,71 @@ pub fn commentBlockHasNote(line_index: *const LineIndex, content: []const u8, st
     }
     return false;
 }
+
+// Tests
+const testing = std.testing;
+const ohsnap = @import("ohsnap");
+
+test "LineIndex init and lineSlice" {
+    const content = "line1\nline2\nline3";
+    var idx = try LineIndex.init(testing.allocator, content);
+    defer idx.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 3), idx.starts.items.len);
+    try testing.expectEqualStrings("line1", idx.lineSlice(content, 0).?);
+    try testing.expectEqualStrings("line2", idx.lineSlice(content, 1).?);
+    try testing.expectEqualStrings("line3", idx.lineSlice(content, 2).?);
+    try testing.expect(idx.lineSlice(content, 3) == null);
+}
+
+test "getIndent extracts leading whitespace" {
+    try testing.expectEqualStrings("", getIndent("no indent"));
+    try testing.expectEqualStrings("  ", getIndent("  two spaces"));
+    try testing.expectEqualStrings("\t", getIndent("\ttab"));
+    try testing.expectEqualStrings("    ", getIndent("    four spaces"));
+}
+
+test "isCommentLine detects comment lines" {
+    const content = "// comment\ncode\n# hash comment";
+    var idx = try LineIndex.init(testing.allocator, content);
+    defer idx.deinit(testing.allocator);
+
+    const summary = .{
+        .slash = isCommentLine(&idx, content, 0),
+        .code = isCommentLine(&idx, content, 1),
+        .hash = isCommentLine(&idx, content, 2),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\notes.comment_edit.test.isCommentLine detects comment lines__struct_<^\d+$>
+        \\  .slash: bool = true
+        \\  .code: bool = false
+        \\  .hash: bool = true
+    ).expectEqual(summary);
+}
+
+test "findCommentInsertOffset finds position after prefix" {
+    try testing.expectEqual(@as(?u32, 3), findCommentInsertOffset("// comment"));
+    try testing.expectEqual(@as(?u32, 4), findCommentInsertOffset("  # comment"));
+    try testing.expect(findCommentInsertOffset("not a comment") == null);
+    try testing.expect(findCommentInsertOffset("") == null);
+}
+
+test "findCommentBlockStart finds block start" {
+    const content = "code\n// comment1\n// comment2\nmore code";
+    var idx = try LineIndex.init(testing.allocator, content);
+    defer idx.deinit(testing.allocator);
+
+    // Line 2 is middle of comment block, should find start at line 1
+    const start = findCommentBlockStart(&idx, content, 2);
+    try testing.expectEqual(@as(u32, 1), start);
+}
+
+test "findCommentBlockEnd finds block end" {
+    const content = "// comment1\n// comment2\n// comment3\ncode";
+    var idx = try LineIndex.init(testing.allocator, content);
+    defer idx.deinit(testing.allocator);
+
+    // Line 0 is start of comment block, should find end at line 2
+    const end = findCommentBlockEnd(&idx, content, 0);
+    try testing.expectEqual(@as(u32, 2), end);
+}
