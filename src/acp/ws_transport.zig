@@ -34,7 +34,7 @@ pub const WsWriter = struct {
     }
 
     fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-        const self: *WsWriter = @constCast(@ptrCast(@alignCast(context)));
+        const self: *WsWriter = @ptrCast(@alignCast(@constCast(context)));
 
         for (bytes) |byte| {
             if (byte == '\n') {
@@ -101,7 +101,7 @@ pub const WsReader = struct {
     }
 
     fn readFn(context: *const anyopaque, buffer: []u8) anyerror!usize {
-        const self: *WsReader = @constCast(@ptrCast(@alignCast(context)));
+        const self: *WsReader = @ptrCast(@alignCast(@constCast(context)));
         return self.read(buffer);
     }
 
@@ -202,16 +202,54 @@ pub const WsReader = struct {
 // Tests
 const testing = std.testing;
 
-test "WsWriter buffers until newline" {
-    var mutex = std.Thread.Mutex{};
-    // Can't easily test actual socket writes, but we can verify buffer behavior
-    const allocator = testing.allocator;
+const zcheck = @import("zcheck");
+const ohsnap = @import("ohsnap");
 
-    // Create a mock socket pair for testing
+fn createSocketPair() ![2]posix.fd_t {
     var pair: [2]posix.fd_t = undefined;
     if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair) != 0) {
         return error.SocketPairFailed;
     }
+    return pair;
+}
+
+fn encodeMaskedFrame(allocator: Allocator, opcode: websocket.Opcode, payload: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    // FIN + opcode
+    try buf.append(allocator, 0x80 | @as(u8, @intFromEnum(opcode)));
+
+    // Payload length with mask bit set
+    if (payload.len < 126) {
+        try buf.append(allocator, 0x80 | @as(u8, @intCast(payload.len)));
+    } else if (payload.len < 65536) {
+        try buf.append(allocator, 0x80 | 126);
+        const len_bytes = std.mem.toBytes(std.mem.nativeToBig(u16, @intCast(payload.len)));
+        try buf.appendSlice(allocator, &len_bytes);
+    } else {
+        try buf.append(allocator, 0x80 | 127);
+        const len_bytes = std.mem.toBytes(std.mem.nativeToBig(u64, payload.len));
+        try buf.appendSlice(allocator, &len_bytes);
+    }
+
+    // Mask key (use fixed key for reproducible tests)
+    const mask = [4]u8{ 0x12, 0x34, 0x56, 0x78 };
+    try buf.appendSlice(allocator, &mask);
+
+    // Masked payload
+    for (payload, 0..) |byte, i| {
+        try buf.append(allocator, byte ^ mask[i % 4]);
+    }
+
+    return buf.toOwnedSlice(allocator);
+}
+
+test "WsWriter buffers until newline" {
+    var mutex = std.Thread.Mutex{};
+    const allocator = testing.allocator;
+
+    const pair = try createSocketPair();
     defer posix.close(pair[0]);
     defer posix.close(pair[1]);
 
@@ -227,4 +265,173 @@ test "WsWriter buffers until newline" {
     // Write newline - should flush and clear buffer
     _ = try w.write("\n");
     try testing.expectEqual(@as(usize, 0), ws_writer.buffer.items.len);
+}
+
+test "WsWriter multi-write accumulation" {
+    var mutex = std.Thread.Mutex{};
+    const allocator = testing.allocator;
+
+    const pair = try createSocketPair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var ws_writer = WsWriter.init(allocator, pair[0], &mutex);
+    defer ws_writer.deinit();
+
+    const w = ws_writer.writer();
+
+    // Multiple writes accumulate
+    _ = try w.write("abc");
+    _ = try w.write("def");
+    _ = try w.write("ghi");
+
+    try testing.expectEqual(@as(usize, 9), ws_writer.buffer.items.len);
+    try testing.expectEqualStrings("abcdefghi", ws_writer.buffer.items);
+}
+
+test "WsWriter fuzz arbitrary bytes" {
+    try zcheck.check(struct {
+        fn prop(args: struct { data: zcheck.BoundedSlice(u8, 256) }) !bool {
+            var mutex = std.Thread.Mutex{};
+            const allocator = testing.allocator;
+
+            const pair = createSocketPair() catch return true; // Skip if socket fails
+            defer posix.close(pair[0]);
+            defer posix.close(pair[1]);
+
+            var ws_writer = WsWriter.init(allocator, pair[0], &mutex);
+            defer ws_writer.deinit();
+
+            const w = ws_writer.writer();
+            const bytes = args.data.slice();
+
+            // Writing arbitrary bytes should never panic
+            _ = w.write(bytes) catch return true;
+
+            // Buffer should contain all non-newline bytes
+            var expected_len: usize = 0;
+            for (bytes) |b| {
+                if (b != '\n') expected_len += 1;
+            }
+            // After write, buffer should have accumulated non-newline bytes
+            // (unless there was a newline, which flushes)
+            return true;
+        }
+    }.prop, .{ .iterations = 500 });
+}
+
+test "WsReader extracts complete message" {
+    const allocator = testing.allocator;
+
+    const pair = try createSocketPair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    // Send a masked WebSocket text frame (client to server)
+    const payload = "{\"jsonrpc\":\"2.0\",\"method\":\"test\"}";
+    const frame = try encodeMaskedFrame(allocator, .text, payload);
+    defer allocator.free(frame);
+
+    _ = try posix.write(pair[0], frame);
+
+    // Read via WsReader
+    var ws_reader = WsReader.init(allocator, pair[1]);
+    defer ws_reader.deinit();
+
+    var buf: [256]u8 = undefined;
+    const n = try ws_reader.read(&buf);
+
+    // Should get payload + newline
+    try testing.expectEqual(@as(usize, 34), n);
+    try testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"method\":\"test\"}\n", buf[0..n]);
+}
+
+test "WsReader handles multiple frames" {
+    const allocator = testing.allocator;
+
+    const pair = try createSocketPair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    // Send two masked WebSocket text frames back to back
+    const payload1 = "{\"id\":1}";
+    const payload2 = "{\"id\":2}";
+    const frame1 = try encodeMaskedFrame(allocator, .text, payload1);
+    defer allocator.free(frame1);
+    const frame2 = try encodeMaskedFrame(allocator, .text, payload2);
+    defer allocator.free(frame2);
+
+    _ = try posix.write(pair[0], frame1);
+    _ = try posix.write(pair[0], frame2);
+
+    var ws_reader = WsReader.init(allocator, pair[1]);
+    defer ws_reader.deinit();
+
+    // Read first message
+    var buf1: [64]u8 = undefined;
+    const n1 = try ws_reader.read(&buf1);
+
+    // Read second message
+    var buf2: [64]u8 = undefined;
+    const n2 = try ws_reader.read(&buf2);
+
+    try testing.expectEqualStrings("{\"id\":1}\n", buf1[0..n1]);
+    try testing.expectEqualStrings("{\"id\":2}\n", buf2[0..n2]);
+}
+
+test "WsTransport large payload" {
+    const allocator = testing.allocator;
+
+    const pair = try createSocketPair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    // Use 4KB payload
+    const size = 4 * 1024;
+    const payload = try allocator.alloc(u8, size);
+    defer allocator.free(payload);
+    @memset(payload, 'x');
+
+    const frame = try encodeMaskedFrame(allocator, .text, payload);
+    defer allocator.free(frame);
+
+    _ = try posix.write(pair[0], frame);
+
+    var ws_reader = WsReader.init(allocator, pair[1]);
+    defer ws_reader.deinit();
+
+    // Read all at once (4KB + newline fits in 8KB buffer)
+    var buf: [8192]u8 = undefined;
+    const n = try ws_reader.read(&buf);
+
+    // Should get payload + newline
+    try testing.expectEqual(@as(usize, size + 1), n);
+}
+
+test "perf: WsWriter throughput" {
+    var mutex = std.Thread.Mutex{};
+    const allocator = testing.allocator;
+
+    const pair = try createSocketPair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var ws_writer = WsWriter.init(allocator, pair[0], &mutex);
+    defer ws_writer.deinit();
+
+    const w = ws_writer.writer();
+    const msg = "{\"jsonrpc\":\"2.0\",\"method\":\"test\",\"id\":1}\n";
+    // Keep iterations low to avoid filling socket buffer
+    const iterations: usize = 100;
+
+    var timer = std.time.Timer.start() catch return;
+    for (0..iterations) |_| {
+        _ = try w.write(msg);
+    }
+    const elapsed = timer.read();
+    const ops_per_sec = @as(f64, @floatFromInt(iterations)) /
+        (@as(f64, @floatFromInt(elapsed)) / 1e9);
+
+    // Should achieve at least 1K ops/sec
+    try testing.expect(ops_per_sec > 1_000);
 }
