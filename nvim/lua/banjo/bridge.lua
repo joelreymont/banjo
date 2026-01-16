@@ -39,7 +39,7 @@ local function get_bridge()
             state = {
                 engine = "claude",
                 model = nil,
-                mode = "Default",
+                mode = "default",
                 session_id = nil,
                 connected = false,
                 session_active = false,
@@ -56,6 +56,11 @@ local function get_bridge()
             },
             preserved = {
                 input_text = nil,
+            },
+            -- ACP protocol state
+            acp = {
+                next_id = 1,
+                pending_requests = {}, -- id -> callback
             },
         }
         -- Wire up bidirectional reference per tab
@@ -280,31 +285,70 @@ function M._connect_websocket(port, tabid)
                 if not my_b or not vim.api.nvim_tabpage_is_valid(my_tabid) then return end
                 -- Reset reconnection state on successful connect
                 my_b.reconnect.attempt = 0
-                vim.notify("Banjo: Connected", vim.log.levels.INFO)
+                lua_debug("[bridge] on_connect: sending ACP initialize")
 
-                -- Switch to correct tab for panel operations
-                local current_tab = vim.api.nvim_get_current_tabpage()
-                local need_switch = current_tab ~= my_tabid
-                if need_switch then
-                    vim.api.nvim_set_current_tabpage(my_tabid)
-                end
+                -- Send ACP initialize request
+                M._send_request(my_tabid, "initialize", {
+                    protocolVersion = 1,
+                    clientCapabilities = {},
+                    clientInfo = { name = "banjo-nvim", version = "0.1.0" },
+                }, function(result, err)
+                    if err then
+                        vim.notify("Banjo: Initialize failed: " .. (err.message or "unknown"), vim.log.levels.ERROR)
+                        return
+                    end
+                    lua_debug("[bridge] initialize response received, sending session/new")
 
-                panel._update_status()
-                -- Restore preserved input if any
-                if my_b.preserved.input_text and my_b.preserved.input_text ~= "" then
-                    panel.set_input_text(my_b.preserved.input_text)
-                    my_b.preserved.input_text = nil
-                end
+                    -- Store agent info
+                    if result and result.agentInfo then
+                        my_b.state.version = result.agentInfo.version
+                    end
 
-                -- Restore permission mode if previously set
-                if my_b.preserved.permission_mode then
-                    M._send_notification("set_permission_mode", { mode = my_b.preserved.permission_mode })
-                end
+                    -- Create new session
+                    M._send_request(my_tabid, "session/new", {
+                        cwd = my_b.reconnect.cwd or vim.fn.getcwd(),
+                    }, function(sess_result, sess_err)
+                        if sess_err then
+                            vim.notify("Banjo: Session creation failed: " .. (sess_err.message or "unknown"), vim.log.levels.ERROR)
+                            return
+                        end
+                        lua_debug("[bridge] session/new response: " .. vim.json.encode(sess_result or {}))
 
-                -- Restore original tab
-                if need_switch and vim.api.nvim_tabpage_is_valid(current_tab) then
-                    vim.api.nvim_set_current_tabpage(current_tab)
-                end
+                        if sess_result then
+                            my_b.state.session_id = sess_result.sessionId
+                            if sess_result.modes then
+                                my_b.state.mode = sess_result.modes.currentModeId or my_b.state.mode
+                            end
+                        end
+
+                        vim.notify("Banjo: Connected", vim.log.levels.INFO)
+                        my_b.state.connected = true
+
+                        -- Switch to correct tab for panel operations
+                        local current_tab = vim.api.nvim_get_current_tabpage()
+                        local need_switch = current_tab ~= my_tabid
+                        if need_switch and vim.api.nvim_tabpage_is_valid(my_tabid) then
+                            vim.api.nvim_set_current_tabpage(my_tabid)
+                        end
+
+                        panel._update_status()
+
+                        -- Restore preserved input if any
+                        if my_b.preserved.input_text and my_b.preserved.input_text ~= "" then
+                            panel.set_input_text(my_b.preserved.input_text)
+                            my_b.preserved.input_text = nil
+                        end
+
+                        -- Restore permission mode if previously set
+                        if my_b.preserved.permission_mode then
+                            M.set_permission_mode(my_b.preserved.permission_mode)
+                        end
+
+                        if need_switch and vim.api.nvim_tabpage_is_valid(current_tab) then
+                            vim.api.nvim_set_current_tabpage(current_tab)
+                        end
+                    end)
+                end)
             end)
         end,
         on_disconnect = function(code, reason)
@@ -352,7 +396,7 @@ function M._connect_websocket(port, tabid)
         end,
     })
 
-    ws_client.connect(b.client, "127.0.0.1", port, "/nvim")
+    ws_client.connect(b.client, "127.0.0.1", port, "/acp")
 end
 
 function M._on_exit(code, tabid)
@@ -432,97 +476,211 @@ function M._handle_message(msg, tabid)
     tabid = tabid or vim.api.nvim_get_current_tabpage()
     local b = bridges[tabid]
     if not b then return end
-    local method = msg.method
-    if not method then
-        -- JSON-RPC response, not notification
+
+    -- Handle JSON-RPC response (has result or error, no method)
+    if msg.result ~= nil or msg.error ~= nil then
+        M._handle_response(msg, tabid)
         return
     end
 
-    -- Switch to correct tab temporarily to ensure panel methods operate on correct state
+    local method = msg.method
+    if not method then return end
+
+    -- Handle JSON-RPC request (has method and id) - server asking us something
+    if msg.id ~= nil then
+        M._handle_request(msg, tabid)
+        return
+    end
+
+    -- Handle JSON-RPC notification (has method, no id)
+    M._handle_notification(msg, tabid)
+end
+
+-- Handle responses to our requests
+function M._handle_response(msg, tabid)
+    local b = bridges[tabid]
+    if not b then return end
+
+    local id = msg.id
+    if id == nil then return end
+
+    local callback = b.acp.pending_requests[id]
+    if callback then
+        b.acp.pending_requests[id] = nil
+        callback(msg.result, msg.error)
+    end
+end
+
+-- Handle requests from server (e.g., permission requests)
+function M._handle_request(msg, tabid)
+    local b = bridges[tabid]
+    if not b then return end
+
+    local method = msg.method
+    lua_debug("_handle_request: " .. method .. " id=" .. tostring(msg.id))
+
+    -- Switch to correct tab for UI operations
     local current_tab = vim.api.nvim_get_current_tabpage()
     local need_switch = current_tab ~= tabid
     if need_switch and vim.api.nvim_tabpage_is_valid(tabid) then
         vim.api.nvim_set_current_tabpage(tabid)
     end
 
-    if method == "stream_start" then
-        local engine = msg.params and msg.params.engine or "claude"
-        panel.start_stream(engine)
-    elseif method == "stream_chunk" then
-        local text = msg.params and msg.params.text or ""
-        local is_thought = msg.params and msg.params.is_thought
-        panel.append(text, is_thought)
-    elseif method == "stream_end" then
-        panel.end_stream()
-        notify_background(tabid, "Banjo: Task complete", vim.log.levels.INFO)
-    elseif method == "tool_call" then
-        local id = msg.params and msg.params.id
-        local name = msg.params and msg.params.name or "?"
-        local label = msg.params and msg.params.label or ""
-        local input = msg.params and msg.params.input
-        panel.show_tool_call(id, name, label, input)
-    elseif method == "tool_result" then
-        local id = msg.params and msg.params.id
-        local status = msg.params and msg.params.status
-        panel.show_tool_result(id, status)
-    elseif method == "tool_request" then
-        M._handle_tool_request(msg.params)
-    elseif method == "error_msg" then
-        local message = msg.params and msg.params.message or "Unknown error"
-        vim.notify("Banjo: " .. message, vim.log.levels.ERROR)
-        notify_background(tabid, "Banjo: Error - " .. message, vim.log.levels.ERROR)
-    elseif method == "status" then
-        local text = msg.params and msg.params.text or ""
-        vim.notify("Banjo: " .. text, vim.log.levels.INFO)
-    elseif method == "user_message" then
-        local text = msg.params and msg.params.text or ""
-        panel.append_user_message(text)
-    elseif method == "state" then
-        if msg.params then
-            b.state.engine = msg.params.engine or b.state.engine
-            b.state.model = msg.params.model
-            b.state.mode = msg.params.mode or b.state.mode
-            b.state.session_id = msg.params.session_id
-            b.state.connected = msg.params.connected or false
-            b.state.models = msg.params.models or {}
-            b.state.version = msg.params.version
-            panel._update_status()
-        end
-    elseif method == "session_id" then
-        if msg.params then
-            b.state.session_id = msg.params.session_id
-            panel._update_status()
-        end
-    elseif method == "session_start" then
-        b.state.session_active = true
-        b.state.session_start_time = vim.loop.now()
-        panel._update_status()
-        panel._start_session_timer()
-    elseif method == "session_end" then
+    if method == "session/request_permission" then
+        M._handle_acp_permission_request(msg, tabid)
+    else
+        -- Unknown request - send error response
+        M._send_response(tabid, msg.id, nil, { code = -32601, message = "Method not found" })
+    end
+
+    if need_switch and vim.api.nvim_tabpage_is_valid(current_tab) then
+        vim.api.nvim_set_current_tabpage(current_tab)
+    end
+end
+
+-- Handle ACP permission request
+function M._handle_acp_permission_request(msg, tabid)
+    local params = msg.params or {}
+    local tool_call = params.toolCall or {}
+    local options = params.options or {}
+
+    local title = tool_call.title or "Unknown tool"
+    local raw_input = tool_call.rawInput
+
+    notify_background(tabid, "Banjo: Permission needed for " .. title, vim.log.levels.WARN)
+
+    ui_prompt.permission({
+        tool_name = title,
+        tool_input = raw_input and vim.json.encode(raw_input) or nil,
+        options = options,
+        on_action = function(decision, option_id)
+            local outcome
+            if decision == "allow" or decision == "allow_always" then
+                outcome = { outcome = "selected", optionId = option_id or "allow_once" }
+            else
+                outcome = { outcome = "cancelled" }
+            end
+            M._send_response(tabid, msg.id, { outcome = outcome }, nil)
+        end,
+    })
+end
+
+-- Handle notifications from server
+function M._handle_notification(msg, tabid)
+    local b = bridges[tabid]
+    if not b then return end
+
+    local method = msg.method
+    local params = msg.params or {}
+
+    -- Switch to correct tab for panel operations
+    local current_tab = vim.api.nvim_get_current_tabpage()
+    local need_switch = current_tab ~= tabid
+    if need_switch and vim.api.nvim_tabpage_is_valid(tabid) then
+        vim.api.nvim_set_current_tabpage(tabid)
+    end
+
+    if method == "session/update" then
+        M._handle_session_update(params, tabid)
+    elseif method == "session/end" then
         b.state.session_active = false
         b.state.session_start_time = nil
         panel._update_status()
         panel._stop_session_timer()
-    elseif method == "approval_request" then
-        if msg.params then
-            notify_background(tabid, "Banjo: Approval needed", vim.log.levels.WARN)
-            M._show_approval_prompt(msg.params)
-        end
-    elseif method == "permission_request" then
-        if msg.params then
-            local tool = msg.params.tool_name or "tool"
-            notify_background(tabid, "Banjo: Permission needed for " .. tool, vim.log.levels.WARN)
-            M._show_permission_prompt(msg.params)
-        end
-    elseif method == "debug_info" then
-        if msg.params then
-            b.debug_info = msg.params
-        end
+        notify_background(tabid, "Banjo: Task complete", vim.log.levels.INFO)
+    -- Legacy protocol support (for backward compat during transition)
+    elseif method == "stream_start" then
+        local engine = params.engine or "claude"
+        panel.start_stream(engine)
+    elseif method == "stream_chunk" then
+        panel.append(params.text or "", params.is_thought)
+    elseif method == "stream_end" then
+        panel.end_stream()
+        notify_background(tabid, "Banjo: Task complete", vim.log.levels.INFO)
+    elseif method == "tool_call" then
+        panel.show_tool_call(params.id, params.name or "?", params.label or "", params.input)
+    elseif method == "tool_result" then
+        panel.show_tool_result(params.id, params.status)
+    elseif method == "tool_request" then
+        M._handle_tool_request(params)
+    elseif method == "error_msg" then
+        local message = params.message or "Unknown error"
+        vim.notify("Banjo: " .. message, vim.log.levels.ERROR)
+        notify_background(tabid, "Banjo: Error - " .. message, vim.log.levels.ERROR)
+    elseif method == "status" then
+        local text = params.text or ""
+        vim.notify("Banjo: " .. text, vim.log.levels.INFO)
+    elseif method == "state" then
+        b.state.engine = params.engine or b.state.engine
+        b.state.model = params.model
+        b.state.mode = params.mode or b.state.mode
+        b.state.session_id = params.session_id
+        b.state.connected = params.connected or false
+        b.state.models = params.models or {}
+        b.state.version = params.version
+        panel._update_status()
     end
 
-    -- Restore original tab
     if need_switch and vim.api.nvim_tabpage_is_valid(current_tab) then
         vim.api.nvim_set_current_tabpage(current_tab)
+    end
+end
+
+-- Handle ACP session/update notification
+function M._handle_session_update(params, tabid)
+    local b = bridges[tabid]
+    if not b then return end
+
+    local update = params.update or {}
+    local update_type = update.sessionUpdate
+
+    if update_type == "agent_message_chunk" then
+        -- Text streaming
+        local content = update.content or {}
+        local text = content.text or ""
+        if text ~= "" then
+            -- Start stream if not already
+            if not b.state.session_active then
+                b.state.session_active = true
+                b.state.session_start_time = vim.loop.now()
+                panel.start_stream(b.state.engine)
+                panel._start_session_timer()
+            end
+            panel.append(text, false)
+        end
+    elseif update_type == "agent_thought_chunk" then
+        -- Thought streaming
+        local content = update.content or {}
+        local text = content.text or ""
+        if text ~= "" then
+            if not b.state.session_active then
+                b.state.session_active = true
+                b.state.session_start_time = vim.loop.now()
+                panel.start_stream(b.state.engine)
+                panel._start_session_timer()
+            end
+            panel.append(text, true)
+        end
+    elseif update_type == "tool_call" then
+        -- Tool invocation
+        local tool_id = update.toolCallId or ""
+        local title = update.title or "?"
+        local kind = update.kind or "other"
+        local raw_input = update.rawInput
+        panel.show_tool_call(tool_id, title, title, raw_input and vim.json.encode(raw_input) or nil)
+    elseif update_type == "tool_call_update" then
+        -- Tool result
+        local tool_id = update.toolCallId or ""
+        local status = update.status or "completed"
+        panel.show_tool_result(tool_id, status)
+    elseif update_type == "current_mode_update" then
+        -- Permission mode changed
+        b.state.mode = update.currentModeId or b.state.mode
+        panel._update_status()
+    elseif update_type == "current_model_update" then
+        -- Model changed
+        b.state.model = update.currentModelId or b.state.model
+        panel._update_status()
     end
 end
 
@@ -595,23 +753,43 @@ end
 
 function M.set_engine(engine)
     local b = get_bridge()
-    M._send_notification("set_engine", { engine = engine })
+    if not b.state.session_id then return end
+    -- ACP uses session/set_config_option for engine
+    M._send_notification("session/set_config_option", {
+        sessionId = b.state.session_id,
+        optionId = "engine",
+        value = engine,
+    })
+    b.state.engine = engine
 end
 
 function M.set_model(model)
     local b = get_bridge()
-    M._send_notification("set_model", { model = model })
+    if not b.state.session_id then return end
+    -- ACP uses session/set_model
+    M._send_notification("session/set_model", {
+        sessionId = b.state.session_id,
+        modelId = model,
+    })
+    b.state.model = model
 end
 
 function M.set_permission_mode(mode)
     local b = get_bridge()
     b.preserved.permission_mode = mode
-    M._send_notification("set_permission_mode", { mode = mode })
+    if not b.state.session_id then return end
+    -- ACP uses session/set_mode
+    M._send_notification("session/set_mode", {
+        sessionId = b.state.session_id,
+        modeId = mode,
+    })
+    b.state.mode = mode
 end
 
 function M.request_state()
-    local b = get_bridge()
-    M._send_notification("get_state", {})
+    -- In ACP, state is obtained from session/new response
+    -- No explicit get_state; update status from current state
+    panel._update_status()
 end
 
 function M._handle_tool_request(params)
@@ -819,6 +997,58 @@ function M._send_tool_response(correlation_id, result, err)
     ws_client.send(b.client, vim.json.encode(response))
 end
 
+-- Send ACP request (with id, expects response)
+function M._send_request(tabid, method, params, callback)
+    local b = bridges[tabid]
+    if not b then return end
+    if not b.client or not ws_client.is_connected(b.client) then
+        lua_debug("_send_request: not connected")
+        return
+    end
+
+    local id = b.acp.next_id
+    b.acp.next_id = b.acp.next_id + 1
+
+    if callback then
+        b.acp.pending_requests[id] = callback
+    end
+
+    local msg = vim.json.encode({
+        jsonrpc = "2.0",
+        id = id,
+        method = method,
+        params = params,
+    })
+    lua_debug("_send_request: " .. method .. " id=" .. tostring(id))
+    ws_client.send(b.client, msg)
+end
+
+-- Send ACP response (for requests from server like permission)
+function M._send_response(tabid, id, result, err)
+    local b = bridges[tabid]
+    if not b then return end
+    if not b.client or not ws_client.is_connected(b.client) then
+        return
+    end
+
+    local msg
+    if err then
+        msg = vim.json.encode({
+            jsonrpc = "2.0",
+            id = id,
+            error = err,
+        })
+    else
+        msg = vim.json.encode({
+            jsonrpc = "2.0",
+            id = id,
+            result = result,
+        })
+    end
+    lua_debug("_send_response: id=" .. tostring(id))
+    ws_client.send(b.client, msg)
+end
+
 function M._send_notification(method, params)
     lua_debug("_send_notification: " .. method)
     local b = get_bridge()
@@ -847,14 +1077,32 @@ function M.send_prompt(text, files)
         vim.notify("Banjo: Not connected", vim.log.levels.WARN)
         return
     end
-
-    local params = { text = text }
-    if files then
-        params.files = files
+    if not b.state.session_id then
+        vim.notify("Banjo: No active session", vim.log.levels.WARN)
+        return
     end
-    params.cwd = vim.fn.getcwd()
 
-    M._send_notification("prompt", params)
+    -- Build ACP prompt request
+    local params = {
+        sessionId = b.state.session_id,
+        prompt = {
+            content = {
+                { type = "text", text = text },
+            },
+        },
+    }
+
+    -- Add file references if provided
+    if files and #files > 0 then
+        for _, file in ipairs(files) do
+            table.insert(params.prompt.content, {
+                type = "text",
+                text = "File: " .. file.path .. (file.content and ("\n```\n" .. file.content .. "\n```") or ""),
+            })
+        end
+    end
+
+    M._send_notification("session/prompt", params)
 end
 
 function M.cancel()
@@ -863,11 +1111,13 @@ function M.cancel()
     b.state.session_active = false
     b.state.session_start_time = nil
 
-    M._send_notification("cancel", {})
+    if b.state.session_id then
+        M._send_notification("session/cancel", { sessionId = b.state.session_id })
+    end
 end
 
 function M.toggle_nudge()
-    local b = get_bridge()
+    -- Nudge is not part of ACP protocol - keep as notification for now
     M._send_notification("nudge_toggle", {})
 end
 
