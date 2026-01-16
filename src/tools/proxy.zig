@@ -281,7 +281,7 @@ test "ToolProxy handleResponse unknown ID" {
     try testing.expect(method == null);
 }
 
-test "ToolProxy handleError removes pending" {
+test "ToolProxy handleResponse removes pending" {
     const writer = jsonrpc.Writer.init(testing.allocator, std.io.null_writer.any());
     var proxy = ToolProxy.init(testing.allocator, writer);
     defer proxy.deinit();
@@ -289,7 +289,9 @@ test "ToolProxy handleError removes pending" {
     try proxy.pending_requests.put(42, .{ .method = "fs/read" });
     try testing.expect(proxy.isPending(42));
 
-    proxy.handleError(42, .{ .code = -1, .message = "test error" });
+    // handleResponse removes and returns method
+    const method = proxy.handleResponse(42);
+    try testing.expectEqualStrings("fs/read", method.?);
     try testing.expect(!proxy.isPending(42));
 }
 
