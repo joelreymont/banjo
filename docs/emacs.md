@@ -16,12 +16,8 @@ Banjo Duet runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) an
 (use-package banjo
   :load-path "/path/to/banjo/emacs"
   :commands (banjo-start banjo-send banjo-toggle)
-  :init
-  (banjo-setup-keybindings)
   :custom
-  (banjo-binary "/path/to/banjo/zig-out/bin/banjo")
-  (banjo-panel-width 80)
-  (banjo-panel-position 'right))
+  (banjo-binary "/path/to/banjo/zig-out/bin/banjo"))
 ```
 
 ### Manual
@@ -30,7 +26,6 @@ Banjo Duet runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) an
 (add-to-list 'load-path "/path/to/banjo/emacs")
 (require 'banjo)
 (setq banjo-binary "/path/to/banjo/zig-out/bin/banjo")
-(banjo-setup-keybindings)
 ```
 
 ### Doom Emacs
@@ -46,30 +41,12 @@ Banjo Duet runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) an
 (use-package! banjo
   :commands (banjo-start banjo-send banjo-toggle banjo-cancel)
   :init
-  (setq banjo-binary "/path/to/banjo/zig-out/bin/banjo")
-
-  ;; Leader keybindings like nvim: SPC a ...
-  (map! :leader
-        (:prefix ("a" . "ai agent")
-         :desc "Toggle panel"      "b" #'banjo-toggle
-         :desc "Send prompt"       "s" #'banjo-send
-         :desc "Send region"       "v" #'banjo-send-region
-         :desc "Cancel"            "c" #'banjo-cancel
-         :desc "Set mode"          "m" #'banjo-set-mode
-         :desc "Set model"         "M" #'banjo-set-model
-         :desc "Set engine"        "e" #'banjo-set-engine
-         :desc "Start"             "S" #'banjo-start
-         :desc "Stop"              "q" #'banjo-stop))
-
-  ;; Panel buffer keybindings (evil normal mode)
-  (after! evil
-    (evil-define-key 'normal banjo-mode-map
-      "q" #'banjo--hide-panel
-      "gr" #'banjo-toggle
-      (kbd "C-c") #'banjo-cancel)))
+  (setq banjo-binary "/path/to/banjo/zig-out/bin/banjo"))
 ```
 
 Then run `doom sync`.
+
+Keybindings are auto-configured: `SPC a` prefix with nvim-style bindings (see below).
 
 ## Usage
 
@@ -103,9 +80,14 @@ Tool calls appear inline:
 
 ## Keybindings
 
+Keybindings are auto-configured when banjo.el loads:
+- **Doom Emacs**: `SPC a` prefix (nvim-style)
+- **Standard Emacs**: `C-c a` prefix
+- **Evil-mode**: Panel buffer bindings (`q`, `gr`, `C-c`)
+
 ### Standard Emacs
 
-Default prefix: `C-c a` (set via `banjo-setup-keybindings`)
+Default prefix: `C-c a`
 
 | Key | Command | Description |
 |-----|---------|-------------|
@@ -121,7 +103,7 @@ Default prefix: `C-c a` (set via `banjo-setup-keybindings`)
 
 ### Doom Emacs (nvim-style)
 
-With the Doom config above, keybindings match Neovim's `<leader>a` prefix:
+Auto-configured to match Neovim's `<leader>a` prefix:
 
 | Key | Command | Description |
 |-----|---------|-------------|

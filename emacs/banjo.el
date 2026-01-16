@@ -475,10 +475,54 @@
     map)
   "Keymap for Banjo commands.")
 
+(defun banjo--doom-p ()
+  "Return non-nil if running in Doom Emacs."
+  (boundp 'doom-version))
+
+(defun banjo--setup-doom-keybindings ()
+  "Set up Doom Emacs keybindings using SPC a prefix."
+  (eval-after-load 'evil
+    '(progn
+       ;; Leader keybindings: SPC a ...
+       (when (fboundp 'map!)
+         (eval '(map! :leader
+                      (:prefix ("a" . "ai agent")
+                       :desc "Toggle panel"      "b" #'banjo-toggle
+                       :desc "Send prompt"       "s" #'banjo-send
+                       :desc "Send region"       "v" #'banjo-send-region
+                       :desc "Cancel"            "c" #'banjo-cancel
+                       :desc "Set mode"          "m" #'banjo-set-mode
+                       :desc "Set model"         "M" #'banjo-set-model
+                       :desc "Set engine"        "e" #'banjo-set-engine
+                       :desc "Start"             "S" #'banjo-start
+                       :desc "Stop"              "q" #'banjo-stop))))
+       ;; Panel buffer keybindings
+       (evil-define-key 'normal banjo-mode-map
+         "q" #'banjo--hide-panel
+         "gr" #'banjo-toggle
+         (kbd "C-c") #'banjo-cancel))))
+
+(defun banjo--setup-evil-panel-bindings ()
+  "Set up evil-mode bindings for the panel buffer."
+  (eval-after-load 'evil
+    '(evil-define-key 'normal banjo-mode-map
+       "q" #'banjo--hide-panel
+       "gr" #'banjo-toggle
+       (kbd "C-c") #'banjo-cancel)))
+
 ;;;###autoload
 (defun banjo-setup-keybindings ()
-  "Set up Banjo keybindings under C-c a prefix."
-  (global-set-key (kbd "C-c a") banjo-command-map))
+  "Set up Banjo keybindings.
+In Doom Emacs: SPC a prefix with nvim-style bindings.
+Otherwise: C-c a prefix."
+  (if (banjo--doom-p)
+      (banjo--setup-doom-keybindings)
+    (progn
+      (global-set-key (kbd "C-c a") banjo-command-map)
+      (banjo--setup-evil-panel-bindings))))
+
+;; Auto-setup when loaded
+(banjo-setup-keybindings)
 
 (provide 'banjo)
 
