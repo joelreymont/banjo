@@ -208,7 +208,10 @@ test "WsWriter buffers until newline" {
     const allocator = testing.allocator;
 
     // Create a mock socket pair for testing
-    const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    var pair: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair) != 0) {
+        return error.SocketPairFailed;
+    }
     defer posix.close(pair[0]);
     defer posix.close(pair[1]);
 

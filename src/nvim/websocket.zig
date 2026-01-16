@@ -79,10 +79,12 @@ pub fn completeHandshake(
     socket_fd: std.posix.socket_t,
     parsed: HandshakeResult,
 ) !ClientKind {
-    // Only /nvim path supported now
-    if (!std.mem.eql(u8, parsed.path, "/nvim")) {
-        return error.InvalidPath;
-    }
+    // Determine client kind from path
+    const path_map = std.StaticStringMap(ClientKind).initComptime(.{
+        .{ "/nvim", .nvim },
+        .{ "/acp", .acp },
+    });
+    const client_kind = path_map.get(parsed.path) orelse return error.InvalidPath;
 
     const magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     var hasher = std.crypto.hash.Sha1.init(.{});
@@ -102,7 +104,7 @@ pub fn completeHandshake(
     try writeAll(socket_fd, &accept_key);
     try writeAll(socket_fd, response_end);
 
-    return .nvim;
+    return client_kind;
 }
 
 /// Parse WebSocket frame from bytes.
@@ -192,7 +194,8 @@ pub fn encodeFrame(allocator: Allocator, opcode: Opcode, payload: []const u8) ![
 }
 
 pub const ClientKind = enum {
-    nvim, // Neovim plugin (no auth)
+    nvim, // Neovim plugin
+    acp, // ACP (Agent Communication Protocol)
 };
 
 pub const HandshakeOutcome = struct {
@@ -561,7 +564,7 @@ test "performHandshakeWithPath preserves trailing bytes" {
     };
     try (ohsnap{}).snap(@src(),
         \\nvim.websocket.test.performHandshakeWithPath preserves trailing bytes__struct_<^\d+$>
-        \\  .client_kind: *const [4:0]u8
+        \\  .client_kind: [:0]const u8
         \\    "nvim"
         \\  .remainder_hex: ?[]const u8
         \\    "8100"
