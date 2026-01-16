@@ -1606,7 +1606,7 @@ test "handler init/deinit" {
         .nudge = handler.nudge.enabled.load(.acquire),
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.handler init/deinit__struct_<^\d+$>
+        \\ws.handler.test.handler init/deinit__struct_<^\d+$>
         \\  .cancelled: bool = false
         \\  .nudge: bool = true
     ).expectEqual(summary);
@@ -1638,7 +1638,7 @@ test "handler nudge toggle" {
         .after_second = after_second,
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.handler nudge toggle__struct_<^\d+$>
+        \\ws.handler.test.handler nudge toggle__struct_<^\d+$>
         \\  .initial: bool = true
         \\  .after_first: bool = false
         \\  .after_second: bool = true
@@ -1663,7 +1663,7 @@ test "handler cancel" {
     const after = handler.cancelled.load(.acquire);
     const summary = .{ .before = before, .after = after };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.handler cancel__struct_<^\d+$>
+        \\ws.handler.test.handler cancel__struct_<^\d+$>
         \\  .before: bool = false
         \\  .after: bool = true
     ).expectEqual(summary);
@@ -1711,7 +1711,7 @@ test "cancelled flag is atomic - concurrent reads" {
     }
     const summary = .{ .read_counts = read_counts };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.cancelled flag is atomic - concurrent reads__struct_<^\d+$>
+        \\ws.handler.test.cancelled flag is atomic - concurrent reads__struct_<^\d+$>
         \\  .read_counts: [4]u32
         \\    [0]: u32 = 10000
         \\    [1]: u32 = 10000
@@ -1757,7 +1757,7 @@ test "cancelled flag is atomic - writer thread sets, reader sees it" {
 
     const summary = .{ .seen_true = seen_true.load(.acquire) };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.cancelled flag is atomic - writer thread sets, reader sees it__struct_<^\d+$>
+        \\ws.handler.test.cancelled flag is atomic - writer thread sets, reader sees it__struct_<^\d+$>
         \\  .seen_true: bool = true
     ).expectEqual(summary);
 }
@@ -1794,7 +1794,7 @@ test "should_exit flag stops poll thread" {
     const after = thread_exited.load(.acquire);
     const summary = .{ .before = before, .after = after };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.should_exit flag stops poll thread__struct_<^\d+$>
+        \\ws.handler.test.should_exit flag stops poll thread__struct_<^\d+$>
         \\  .before: bool = false
         \\  .after: bool = true
     ).expectEqual(summary);
@@ -1830,7 +1830,7 @@ test "prompt queueing - main thread sees queued prompt" {
         .text = if (pending) |item| item.text else null,
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.prompt queueing - main thread sees queued prompt__struct_<^\d+$>
+        \\ws.handler.test.prompt queueing - main thread sees queued prompt__struct_<^\d+$>
         \\  .pending: bool = true
         \\  .text: ?[]const u8
         \\    "test prompt"
@@ -1884,7 +1884,7 @@ test "cancel flag visible across threads during simulated processing" {
 
     const summary = .{ .saw_cancel = processing_saw_cancel.load(.acquire) };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.cancel flag visible across threads during simulated processing__struct_<^\d+$>
+        \\ws.handler.test.cancel flag visible across threads during simulated processing__struct_<^\d+$>
         \\  .saw_cancel: bool = true
     ).expectEqual(summary);
 
@@ -1933,7 +1933,7 @@ test "prompt queue with condition variable wakeup" {
 
     const summary = .{ .got_prompt = waiter_got_prompt.load(.acquire) };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.prompt queue with condition variable wakeup__struct_<^\d+$>
+        \\ws.handler.test.prompt queue with condition variable wakeup__struct_<^\d+$>
         \\  .got_prompt: bool = true
     ).expectEqual(summary);
 
@@ -1957,7 +1957,7 @@ test "protocol JsonRpcRequest parse" {
         .has_params = parsed.value.params != null,
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.protocol JsonRpcRequest parse__struct_<^\d+$>
+        \\ws.handler.test.protocol JsonRpcRequest parse__struct_<^\d+$>
         \\  .method: []const u8
         \\    "prompt"
         \\  .has_params: bool = true
@@ -1981,7 +1981,7 @@ test "protocol PromptRequest parse" {
         .cwd = parsed.value.cwd,
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.protocol PromptRequest parse__struct_<^\d+$>
+        \\ws.handler.test.protocol PromptRequest parse__struct_<^\d+$>
         \\  .text: []const u8
         \\    "hello world"
         \\  .cwd: ?[]const u8
@@ -2039,7 +2039,7 @@ test "generateSessionId format" {
         .all_hex = all_hex,
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.generateSessionId format__struct_<^\d+$>
+        \\ws.handler.test.generateSessionId format__struct_<^\d+$>
         \\  .prefix: bool = true
         \\  .len: usize = 37
         \\  .all_hex: bool = true
@@ -2064,7 +2064,7 @@ test "generateSessionId uniqueness" {
 
     const summary = .{ .unique = !std.mem.eql(u8, id1, id2) };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.generateSessionId uniqueness__struct_<^\d+$>
+        \\ws.handler.test.generateSessionId uniqueness__struct_<^\d+$>
         \\  .unique: bool = true
     ).expectEqual(summary);
 }
@@ -2112,14 +2112,14 @@ test "permission socket create and close" {
     };
     const summary = .{ .before = before, .after = after };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.permission socket create and close__struct_<^\d+$>
-        \\  .before: nvim.handler.test.permission socket create and close__struct_<^\d+$>
+        \\ws.handler.test.permission socket create and close__struct_<^\d+$>
+        \\  .before: ws.handler.test.permission socket create and close__struct_<^\d+$>
         \\    .socket: bool = true
         \\    .socket_path_present: bool = true
         \\    .session_id_present: bool = true
         \\    .path_contains: bool = true
         \\    .stat_present: bool = true
-        \\  .after: nvim.handler.test.permission socket create and close__struct_<^\d+$>
+        \\  .after: ws.handler.test.permission socket create and close__struct_<^\d+$>
         \\    .socket: bool = false
         \\    .socket_path_present: bool = false
     ).expectEqual(summary);
@@ -2150,7 +2150,7 @@ test "checkPermissionAutoApprove safe tools" {
         .edit = handler.checkPermissionAutoApprove("Edit"),
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.checkPermissionAutoApprove safe tools__struct_<^\d+$>
+        \\ws.handler.test.checkPermissionAutoApprove safe tools__struct_<^\d+$>
         \\  .read: ?[]const u8
         \\    "allow"
         \\  .glob: ?[]const u8
@@ -2192,7 +2192,7 @@ test "checkPermissionAutoApprove auto_approve mode" {
         .edit = handler.checkPermissionAutoApprove("Edit"),
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.checkPermissionAutoApprove auto_approve mode__struct_<^\d+$>
+        \\ws.handler.test.checkPermissionAutoApprove auto_approve mode__struct_<^\d+$>
         \\  .bash: ?[]const u8
         \\    "allow"
         \\  .write: ?[]const u8
@@ -2224,7 +2224,7 @@ test "checkPermissionAutoApprove accept_edits mode" {
         .bash = handler.checkPermissionAutoApprove("Bash"),
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.checkPermissionAutoApprove accept_edits mode__struct_<^\d+$>
+        \\ws.handler.test.checkPermissionAutoApprove accept_edits mode__struct_<^\d+$>
         \\  .write: ?[]const u8
         \\    "allow"
         \\  .edit: ?[]const u8
@@ -2245,7 +2245,7 @@ test "codexAutoApprovalDecision respects permission mode" {
         .exec_command = Handler.codexAutoApprovalDecision(.bypassPermissions, .exec_command),
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.codexAutoApprovalDecision respects permission mode__struct_<^\d+$>
+        \\ws.handler.test.codexAutoApprovalDecision respects permission mode__struct_<^\d+$>
         \\  .file_change: ?[]const u8
         \\    "acceptForSession"
         \\  .command_execution: ?[]const u8
@@ -2278,7 +2278,7 @@ test "cbCheckAuthRequired returns auth_required for marker" {
         .no_stop = no_stop == null,
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.cbCheckAuthRequired returns auth_required for marker__struct_<^\d+$>
+        \\ws.handler.test.cbCheckAuthRequired returns auth_required for marker__struct_<^\d+$>
         \\  .stop: ?[:0]const u8
         \\    "auth_required"
         \\  .no_stop: bool = true
@@ -2306,7 +2306,7 @@ test "checkPermissionAutoApprove always_allowed_tools" {
     const after = handler.checkPermissionAutoApprove("Bash");
     const summary = .{ .before = before, .after = after };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.checkPermissionAutoApprove always_allowed_tools__struct_<^\d+$>
+        \\ws.handler.test.checkPermissionAutoApprove always_allowed_tools__struct_<^\d+$>
         \\  .before: ?[]const u8
         \\    null
         \\  .after: ?[]const u8
@@ -2352,7 +2352,7 @@ test "ensureClaudeBridge reuses bridge regardless of cwd" {
         .cwd_unchanged = cwd_unchanged,
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.ensureClaudeBridge reuses bridge regardless of cwd__struct_<^\d+$>
+        \\ws.handler.test.ensureClaudeBridge reuses bridge regardless of cwd__struct_<^\d+$>
         \\  .same_bridge_reused: bool = true
         \\  .bridge_reused_on_cwd_change: bool = true
         \\  .first_cwd_correct: bool = true
@@ -2402,7 +2402,7 @@ test "ensureCodexInst reuses bridge for same cwd" {
         .cwd_updated_on_change = third_cwd_correct,
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.ensureCodexInst reuses bridge for same cwd__struct_<^\d+$>
+        \\ws.handler.test.ensureCodexInst reuses bridge for same cwd__struct_<^\d+$>
         \\  .same_bridge_reused: bool = true
         \\  .first_cwd_correct: bool = true
         \\  .cwd_updated_on_change: bool = true
@@ -2426,7 +2426,7 @@ test "protocol PermissionResponseRequest parse" {
         .decision = parsed.value.decision,
     };
     try (ohsnap{}).snap(@src(),
-        \\nvim.handler.test.protocol PermissionResponseRequest parse__struct_<^\d+$>
+        \\ws.handler.test.protocol PermissionResponseRequest parse__struct_<^\d+$>
         \\  .id: []const u8
         \\    "perm-123"
         \\  .decision: []const u8
