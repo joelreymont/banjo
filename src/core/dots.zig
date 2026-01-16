@@ -39,8 +39,7 @@ pub fn contextPrompt(engine: Engine) []const u8 {
     _ = engine;
     return
         \\Read your project guidelines (AGENTS.md).
-        \\Check active dots: `dot ls --status active`
-        \\If the dot description contains a plan file path, read it.
+        \\Check your dots and pick one to work on.
         \\Keep going.
     ;
 }
@@ -863,7 +862,7 @@ test "cleanupClaudeHooks handles missing settings file" {
 test "contextPrompt includes AGENTS.md" {
     const prompt = contextPrompt(.claude);
     try testing.expect(std.mem.indexOf(u8, prompt, "AGENTS.md") != null);
-    try testing.expect(std.mem.indexOf(u8, prompt, "dot ls") != null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "dots") != null);
 }
 
 test "containsDotOffStr detects dot off command" {
