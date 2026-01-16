@@ -1855,12 +1855,10 @@ test "integration: nudge restarts and sends context prompt" {
     defer testing.allocator.free(snapshot);
     try (ohsnap{}).snap(@src(),
         \\prompt[0]: Read your project guidelines (AGENTS.md).
-        \\Check active dots: `dot ls --status active`
-        \\If the dot description contains a plan file path, read it.
+        \\Check your dots and pick one to work on.
         \\Keep going.
         \\user[0]: Read your project guidelines (AGENTS.md).
-        \\Check active dots: `dot ls --status active`
-        \\If the dot description contains a plan file path, read it.
+        \\Check your dots and pick one to work on.
         \\Keep going.
         \\
     ).diff(snapshot, true);
