@@ -166,13 +166,36 @@ pub const DebugInfo = struct {
     prompt_count: u32,
 };
 
-// JSON-RPC types (re-exported from mcp_types)
-const mcp_types = @import("mcp_types.zig");
-pub const JsonRpcRequest = mcp_types.JsonRpcRequest;
-pub const JsonRpcResponse = mcp_types.JsonRpcResponse;
-pub const JsonRpcError = mcp_types.JsonRpcError;
+// JSON-RPC types
+pub const JsonRpcRequest = struct {
+    jsonrpc: []const u8 = "2.0",
+    method: []const u8,
+    params: ?std.json.Value = null,
+    id: ?std.json.Value = null,
+};
 
-// Notification type (no id field, not in mcp_types)
+pub const JsonRpcResponse = struct {
+    jsonrpc: []const u8 = "2.0",
+    id: ?std.json.Value = null,
+    result: ?std.json.Value = null,
+    @"error": ?JsonRpcError = null,
+};
+
+pub const JsonRpcError = struct {
+    code: i32,
+    message: []const u8,
+    data: ?std.json.Value = null,
+};
+
+pub const ErrorCode = struct {
+    pub const ParseError = -32700;
+    pub const InvalidRequest = -32600;
+    pub const MethodNotFound = -32601;
+    pub const InvalidParams = -32602;
+    pub const InternalError = -32603;
+};
+
+// Notification type (no id field)
 pub const JsonRpcNotification = struct {
     jsonrpc: []const u8 = "2.0",
     method: []const u8,

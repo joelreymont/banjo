@@ -4,7 +4,7 @@ const posix = std.posix;
 
 const lockfile = @import("lockfile.zig");
 const websocket = @import("websocket.zig");
-const mcp_types = @import("mcp_types.zig");
+const protocol = @import("protocol.zig");
 const constants = @import("../core/constants.zig");
 const jsonrpc = @import("../jsonrpc.zig");
 const config = @import("config");
@@ -13,6 +13,92 @@ const log = std.log.scoped(.mcp_server);
 const debug_log = @import("../util/debug_log.zig");
 const json_util = @import("../util/json.zig");
 const byte_queue = @import("../util/byte_queue.zig");
+
+// MCP types (to be removed with MCP code)
+pub const SelectionRange = struct {
+    startLine: u32,
+    startCol: u32,
+    endLine: u32,
+    endCol: u32,
+};
+
+const SelectionResult = struct {
+    text: []const u8 = "",
+    file: []const u8 = "",
+    range: ?SelectionRange = null,
+};
+
+const ContentItem = struct {
+    type: []const u8 = "text",
+    text: []const u8,
+};
+
+const ToolCallResult = struct {
+    content: []const ContentItem,
+};
+
+const WorkspaceFoldersResult = struct {
+    folders: []const []const u8,
+};
+
+const InitializeResult = struct {
+    protocolVersion: []const u8 = "2024-11-05",
+    capabilities: struct {
+        logging: struct {} = .{},
+        prompts: struct {} = .{},
+        resources: struct {} = .{},
+        tools: struct {} = .{},
+    } = .{},
+    serverInfo: struct {
+        name: []const u8 = "banjo-neovim",
+        version: []const u8 = "0.1.0",
+    } = .{},
+};
+
+const ToolDefinition = struct {
+    name: []const u8,
+    description: []const u8,
+    inputSchema: struct {
+        type: []const u8 = "object",
+        properties: ?std.json.Value = null,
+        required: ?[]const []const u8 = null,
+    },
+};
+
+const ToolsListResult = struct {
+    tools: []const ToolDefinition,
+};
+
+const ToolsCallParams = struct {
+    name: []const u8,
+    arguments: ?std.json.Value = null,
+};
+
+const McpMethod = struct {
+    pub const Initialize = "initialize";
+    pub const Initialized = "notifications/initialized";
+    pub const ToolsList = "tools/list";
+    pub const ToolsCall = "tools/call";
+};
+
+fn getToolDefinitions() []const ToolDefinition {
+    return &tool_definitions;
+}
+
+const tool_definitions = [_]ToolDefinition{
+    .{ .name = "openFile", .description = "Open a file in the editor", .inputSchema = .{ .required = &[_][]const u8{"filePath"} } },
+    .{ .name = "openDiff", .description = "Show a diff view", .inputSchema = .{ .required = &[_][]const u8{ "old_file_path", "new_file_path", "new_file_contents" } } },
+    .{ .name = "getCurrentSelection", .description = "Get the currently selected text", .inputSchema = .{} },
+    .{ .name = "getLatestSelection", .description = "Get the most recently captured selection", .inputSchema = .{} },
+    .{ .name = "getOpenEditors", .description = "List all currently open editor buffers", .inputSchema = .{} },
+    .{ .name = "getWorkspaceFolders", .description = "Get the workspace folder paths", .inputSchema = .{} },
+    .{ .name = "getDiagnostics", .description = "Get LSP diagnostics", .inputSchema = .{} },
+    .{ .name = "checkDocumentDirty", .description = "Check if a document has unsaved changes", .inputSchema = .{ .required = &[_][]const u8{"filePath"} } },
+    .{ .name = "saveDocument", .description = "Save a document to disk", .inputSchema = .{ .required = &[_][]const u8{"filePath"} } },
+    .{ .name = "closeTab", .description = "Close an editor tab/buffer", .inputSchema = .{ .required = &[_][]const u8{"filePath"} } },
+    .{ .name = "closeAllDiffTabs", .description = "Close all open diff view tabs", .inputSchema = .{} },
+    .{ .name = "executeCode", .description = "Execute code in a Jupyter kernel", .inputSchema = .{} },
+};
 
 const max_pending_handshakes: usize = 8;
 
@@ -63,14 +149,14 @@ pub const McpServer = struct {
     const OwnedSelection = struct {
         text: []const u8, // owned
         file: []const u8, // owned
-        range: ?mcp_types.SelectionRange,
+        range: ?SelectionRange,
 
         fn deinit(self: *const OwnedSelection, allocator: Allocator) void {
             allocator.free(self.text);
             allocator.free(self.file);
         }
 
-        fn toResult(self: OwnedSelection) mcp_types.SelectionResult {
+        fn toResult(self: OwnedSelection) SelectionResult {
             return .{
                 .text = self.text,
                 .file = self.file,
@@ -368,40 +454,26 @@ pub const McpServer = struct {
         self.socket_mutex.lock();
         errdefer self.socket_mutex.unlock();
 
-        switch (client_kind) {
-            .mcp => {
-                if (self.mcp_client_socket) |old| {
-                    log.info("Closing existing MCP client connection", .{});
-                    posix.close(old);
-                }
-                self.mcp_client_socket = client;
-                self.mcp_read_buffer.clear();
-                if (remainder.len > 0) {
-                    try self.mcp_read_buffer.append(self.allocator, remainder);
-                }
-                log.info("Claude CLI connected", .{});
-            },
-            .nvim => {
-                if (self.nvim_client_socket) |old| {
-                    log.info("Closing existing nvim client connection", .{});
-                    posix.close(old);
-                }
-                self.nvim_client_socket = client;
-                self.nvim_read_buffer.clear();
-                if (remainder.len > 0) {
-                    try self.nvim_read_buffer.append(self.allocator, remainder);
-                }
-                log.info("Neovim connected", .{});
-                debugLog("nvim_client_socket set to fd={d}", .{client});
+        _ = client_kind; // Only .nvim supported now
 
-                // Notify handler to send initial state
-                if (self.nvim_connect_callback) |cb_fn| {
-                    if (self.nvim_callback_ctx) |ctx| {
-                        cb = cb_fn;
-                        cb_ctx = ctx;
-                    }
-                }
-            },
+        if (self.nvim_client_socket) |old| {
+            log.info("Closing existing nvim client connection", .{});
+            posix.close(old);
+        }
+        self.nvim_client_socket = client;
+        self.nvim_read_buffer.clear();
+        if (remainder.len > 0) {
+            try self.nvim_read_buffer.append(self.allocator, remainder);
+        }
+        log.info("Neovim connected", .{});
+        debugLog("nvim_client_socket set to fd={d}", .{client});
+
+        // Notify handler to send initial state
+        if (self.nvim_connect_callback) |cb_fn| {
+            if (self.nvim_callback_ctx) |ctx| {
+                cb = cb_fn;
+                cb_ctx = ctx;
+            }
         }
 
         self.socket_mutex.unlock();
@@ -626,7 +698,7 @@ pub const McpServer = struct {
 
     fn handleNvimJsonRpcMessage(self: *McpServer, payload: []const u8) void {
         debugLog("handleNvimJsonRpcMessage: payload={d} bytes", .{payload.len});
-        const parsed = std.json.parseFromSlice(mcp_types.JsonRpcRequest, self.allocator, payload, .{
+        const parsed = std.json.parseFromSlice(protocol.JsonRpcRequest, self.allocator, payload, .{
             .ignore_unknown_fields = true,
         }) catch {
             log.warn("Failed to parse nvim JSON-RPC message", .{});
@@ -646,10 +718,10 @@ pub const McpServer = struct {
     }
 
     fn handleMcpJsonRpcMessage(self: *McpServer, payload: []const u8) !void {
-        const parsed = std.json.parseFromSlice(mcp_types.JsonRpcRequest, self.allocator, payload, .{
+        const parsed = std.json.parseFromSlice(protocol.JsonRpcRequest, self.allocator, payload, .{
             .ignore_unknown_fields = true,
         }) catch {
-            try self.sendMcpError(null, mcp_types.ErrorCode.ParseError, "Parse error");
+            try self.sendMcpError(null, protocol.ErrorCode.ParseError, "Parse error");
             return;
         };
         defer parsed.deinit();
@@ -660,15 +732,15 @@ pub const McpServer = struct {
 
         // Dispatch by method
         const method_map = std.StaticStringMap(MethodKind).initComptime(.{
-            .{ mcp_types.Method.Initialize, .initialize },
-            .{ mcp_types.Method.Initialized, .initialized },
-            .{ mcp_types.Method.ToolsList, .tools_list },
-            .{ mcp_types.Method.ToolsCall, .tools_call },
+            .{ McpMethod.Initialize, .initialize },
+            .{ McpMethod.Initialized, .initialized },
+            .{ McpMethod.ToolsList, .tools_list },
+            .{ McpMethod.ToolsCall, .tools_call },
         });
 
         const kind = method_map.get(method) orelse {
             if (id != null) {
-                try self.sendMcpError(id, mcp_types.ErrorCode.MethodNotFound, "Method not found");
+                try self.sendMcpError(id, protocol.ErrorCode.MethodNotFound, "Method not found");
             }
             return;
         };
@@ -689,13 +761,13 @@ pub const McpServer = struct {
     };
 
     fn handleInitialize(self: *McpServer, id: ?std.json.Value) !void {
-        const result = mcp_types.InitializeResult{};
+        const result = InitializeResult{};
         try self.sendResult(id, result);
     }
 
     fn handleToolsList(self: *McpServer, id: ?std.json.Value) !void {
-        const tools = mcp_types.getToolDefinitions();
-        const result = mcp_types.ToolsListResult{ .tools = tools };
+        const tools = getToolDefinitions();
+        const result = ToolsListResult{ .tools = tools };
         try self.sendResult(id, result);
     }
 
@@ -703,15 +775,15 @@ pub const McpServer = struct {
         if (id == null) return; // tools/call requires an id
 
         const tool_params = params orelse {
-            try self.sendMcpError(id, mcp_types.ErrorCode.InvalidParams, "Missing params");
+            try self.sendMcpError(id, protocol.ErrorCode.InvalidParams, "Missing params");
             return;
         };
 
         // Parse tool name and arguments
-        const parsed = std.json.parseFromValue(mcp_types.ToolsCallParams, self.allocator, tool_params, .{
+        const parsed = std.json.parseFromValue(ToolsCallParams, self.allocator, tool_params, .{
             .ignore_unknown_fields = true,
         }) catch {
-            try self.sendMcpError(id, mcp_types.ErrorCode.InvalidParams, "Invalid tool call params");
+            try self.sendMcpError(id, protocol.ErrorCode.InvalidParams, "Invalid tool call params");
             return;
         };
         defer parsed.deinit();
@@ -766,7 +838,7 @@ pub const McpServer = struct {
         switch (tool) {
             .get_workspace_folders => {
                 const folders = [_][]const u8{self.cwd};
-                const result = mcp_types.WorkspaceFoldersResult{ .folders = &folders };
+                const result = WorkspaceFoldersResult{ .folders = &folders };
                 const json_str = try json_util.serializeToJson(self.allocator, result);
                 defer self.allocator.free(json_str);
                 try self.sendToolResultOptional(id, json_str);
@@ -775,7 +847,7 @@ pub const McpServer = struct {
                 const result = if (self.last_selection) |sel|
                     sel.toResult()
                 else
-                    mcp_types.SelectionResult{};
+                    SelectionResult{};
                 const json_str = try json_util.serializeToJson(self.allocator, result);
                 defer self.allocator.free(json_str);
                 try self.sendToolResultOptional(id, json_str);
@@ -818,7 +890,7 @@ pub const McpServer = struct {
         }
     }
 
-    pub fn updateSelection(self: *McpServer, selection: mcp_types.SelectionResult) !void {
+    pub fn updateSelection(self: *McpServer, selection: SelectionResult) !void {
         // Free previous selection if any
         if (self.last_selection) |prev| {
             prev.deinit(self.allocator);
@@ -892,14 +964,14 @@ pub const McpServer = struct {
     }
 
     fn sendToolResult(self: *McpServer, id: std.json.Value, json_text: []const u8) !void {
-        const content = [_]mcp_types.ContentItem{.{ .text = json_text }};
-        const tool_result = mcp_types.ToolCallResult{ .content = &content };
+        const content = [_]ContentItem{.{ .text = json_text }};
+        const tool_result = ToolCallResult{ .content = &content };
         try self.sendMcpResultDirect(id, tool_result);
     }
 
     fn sendToolResultOptional(self: *McpServer, id: ?std.json.Value, json_text: []const u8) !void {
-        const content = [_]mcp_types.ContentItem{.{ .text = json_text }};
-        const tool_result = mcp_types.ToolCallResult{ .content = &content };
+        const content = [_]ContentItem{.{ .text = json_text }};
+        const tool_result = ToolCallResult{ .content = &content };
         try self.sendMcpResultDirect(id, tool_result);
     }
 
@@ -912,13 +984,13 @@ pub const McpServer = struct {
     }
 
     fn sendToolErrorImpl(self: *McpServer, id: ?std.json.Value, message: []const u8) !void {
-        const content = [_]mcp_types.ContentItem{.{ .text = message }};
+        const content = [_]ContentItem{.{ .text = message }};
         const error_result = ToolErrorResult{ .content = &content, .isError = true };
         try self.sendMcpResultDirect(id, error_result);
     }
 
     const ToolErrorResult = struct {
-        content: []const mcp_types.ContentItem,
+        content: []const ContentItem,
         isError: bool,
     };
 
