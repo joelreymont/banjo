@@ -255,18 +255,40 @@ function M.permission(opts)
     -- Format tool_input for display (not raw JSON)
     local formatted = format_tool_input(opts.tool_name, opts.tool_input)
 
+    -- Build actions from ACP options if provided, otherwise use defaults
+    local actions
+    if opts.options and #opts.options > 0 then
+        actions = {}
+        local keys = { "y", "a", "n", "x" }
+        for i, opt in ipairs(opts.options) do
+            local key = keys[i] or tostring(i)
+            table.insert(actions, {
+                key = key,
+                label = opt.name or opt.optionId,
+                name = opt.optionId or opt.kind or "allow",
+            })
+        end
+    else
+        actions = {
+            { key = "y", label = "Allow", name = "allow" },
+            { key = "a", label = "Always", name = "allow_always" },
+            { key = "n", label = "Deny", name = "deny" },
+        }
+    end
+
     return M.show({
         title = "PERMISSION REQUEST",
         tool_name = opts.tool_name,
         risk_level = risk_level,
         content = formatted,
-        actions = {
-            { key = "y", label = "Allow", name = "allow" },
-            { key = "a", label = "Always", name = "allow_always" },
-            { key = "n", label = "Deny", name = "deny" },
-        },
+        actions = actions,
         default_action = "deny",
-        on_action = opts.on_action,
+        on_action = function(action)
+            if opts.on_action then
+                -- Pass both the action name and the original optionId
+                opts.on_action(action, action)
+            end
+        end,
     })
 end
 
