@@ -109,26 +109,17 @@ fn debugLog(comptime fmt: []const u8, args: anytype) void {
 pub const McpServer = struct {
     allocator: Allocator,
     tcp_socket: posix.socket_t,
-    mcp_client_socket: ?posix.socket_t = null,
     nvim_client_socket: ?posix.socket_t = null,
     lock_file: ?lockfile.LockFile = null,
     port: u16,
-    auth_token: [36]u8,
+    auth_token: [36]u8, // TODO: Remove with auth_token cleanup
     cwd: []const u8,
 
-    // Tool request management
-    pending_tool_requests: std.StringHashMap(PendingToolRequest),
-    next_request_id: u64 = 0,
-
-    // Selection cache for getLatestSelection (owned strings)
-    last_selection: ?OwnedSelection = null,
-
-    // Read buffers for WebSocket frames (separate per client)
-    mcp_read_buffer: byte_queue.ByteQueue = .{},
+    // Read buffer for WebSocket frames
     nvim_read_buffer: byte_queue.ByteQueue = .{},
     pending_handshakes: std.AutoHashMap(posix.socket_t, PendingHandshake),
 
-    // Mutex for socket operations (protects nvim_client_socket, mcp_client_socket)
+    // Mutex for socket operations (protects nvim_client_socket)
     socket_mutex: std.Thread.Mutex = .{},
 
     // Mutex for poll operations (ensures single-threaded polling)
@@ -218,7 +209,6 @@ pub const McpServer = struct {
             .port = port,
             .auth_token = auth_token,
             .cwd = cwd,
-            .pending_tool_requests = std.StringHashMap(PendingToolRequest).init(allocator),
             .pending_handshakes = std.AutoHashMap(posix.socket_t, PendingHandshake).init(allocator),
         };
 
@@ -227,20 +217,9 @@ pub const McpServer = struct {
 
     pub fn deinit(self: *McpServer) void {
         self.stop();
-        // Clean up any remaining pending requests
-        var iter = self.pending_tool_requests.iterator();
-        while (iter.next()) |entry| {
-            entry.value_ptr.deinit(self.allocator);
-        }
-        self.pending_tool_requests.deinit();
         self.closePendingHandshakes();
         self.pending_handshakes.deinit();
-        self.mcp_read_buffer.deinit(self.allocator);
         self.nvim_read_buffer.deinit(self.allocator);
-        // Free owned selection data
-        if (self.last_selection) |sel| {
-            sel.deinit(self.allocator);
-        }
         self.allocator.destroy(self);
     }
 
@@ -272,7 +251,6 @@ pub const McpServer = struct {
     }
 
     pub fn stop(self: *McpServer) void {
-        self.closeSocket(&self.mcp_client_socket, "MCP");
         self.closeSocket(&self.nvim_client_socket, "nvim");
 
         // Delete lock file
@@ -304,12 +282,6 @@ pub const McpServer = struct {
             nfds += 1;
         }
 
-        // Poll MCP client socket if connected
-        if (self.mcp_client_socket) |sock| {
-            fds[nfds] = .{ .fd = sock, .events = posix.POLL.IN, .revents = 0 };
-            nfds += 1;
-        }
-
         // Poll nvim client socket if connected
         if (self.nvim_client_socket) |sock| {
             fds[nfds] = .{ .fd = sock, .events = posix.POLL.IN, .revents = 0 };
@@ -327,8 +299,7 @@ pub const McpServer = struct {
 
         const ready = try posix.poll(fds[0..nfds], timeout_ms);
         if (ready == 0) {
-            // Timeout - still check timeouts and handshakes
-            self.checkTimeouts();
+            // Timeout - check handshakes
             self.expirePendingHandshakes(std.time.milliTimestamp());
             return true;
         }
@@ -340,11 +311,6 @@ pub const McpServer = struct {
                 if (fd.fd == self.tcp_socket) {
                     self.acceptConnection() catch |err| {
                         log.warn("Accept failed: {}", .{err});
-                    };
-                } else if (self.mcp_client_socket != null and fd.fd == self.mcp_client_socket.?) {
-                    self.handleMcpClientMessage() catch |err| {
-                        log.warn("MCP client message failed: {}", .{err});
-                        self.closeMcpClient();
                     };
                 } else if (self.nvim_client_socket != null and fd.fd == self.nvim_client_socket.?) {
                     debugLog("poll: nvim socket has data", .{});
@@ -358,10 +324,6 @@ pub const McpServer = struct {
             }
             // Guard: socket may have been closed in error handler above
             if (fd.revents & posix.POLL.HUP != 0 or fd.revents & posix.POLL.ERR != 0) {
-                if (self.mcp_client_socket != null and fd.fd == self.mcp_client_socket.?) {
-                    log.info("MCP client disconnected", .{});
-                    self.closeMcpClient();
-                }
                 if (self.nvim_client_socket != null and fd.fd == self.nvim_client_socket.?) {
                     log.info("Nvim client disconnected", .{});
                     self.closeNvimClient();
@@ -373,20 +335,8 @@ pub const McpServer = struct {
             }
         }
 
-        // Check timeouts unconditionally (not just on poll timeout)
-        self.checkTimeouts();
         self.expirePendingHandshakes(std.time.milliTimestamp());
         return true;
-    }
-
-    fn closeMcpClient(self: *McpServer) void {
-        self.socket_mutex.lock();
-        defer self.socket_mutex.unlock();
-        if (self.mcp_client_socket) |sock| {
-            posix.close(sock);
-            self.mcp_client_socket = null;
-            self.mcp_read_buffer.clear();
-        }
     }
 
     fn closeNvimClient(self: *McpServer) void {
@@ -864,100 +814,7 @@ pub const McpServer = struct {
         execute_code,
     };
 
-    pub fn handleToolResponse(self: *McpServer, correlation_id: []const u8, result: ?[]const u8, err: ?[]const u8) !void {
-        // Use fetchRemove to atomically remove and get the entry
-        // This avoids dangling pointer issues since the key IS the correlation_id in the value
-        const kv = self.pending_tool_requests.fetchRemove(correlation_id) orelse {
-            log.warn("Unknown correlation id: {s}", .{correlation_id});
-            return;
-        };
-        const pending = kv.value;
-        defer pending.deinit(self.allocator);
-
-        // Parse the ID back from JSON
-        var id_parsed = std.json.parseFromSlice(std.json.Value, self.allocator, pending.mcp_request_id_json, .{}) catch {
-            log.err("Failed to parse stored request ID for {s}", .{correlation_id});
-            return;
-        };
-        defer id_parsed.deinit();
-
-        if (err) |error_msg| {
-            try self.sendToolErrorWithId(id_parsed.value, error_msg);
-        } else if (result) |r| {
-            try self.sendToolResult(id_parsed.value, r);
-        } else {
-            try self.sendToolErrorWithId(id_parsed.value, "No result");
-        }
-    }
-
-    pub fn updateSelection(self: *McpServer, selection: SelectionResult) !void {
-        // Free previous selection if any
-        if (self.last_selection) |prev| {
-            prev.deinit(self.allocator);
-        }
-
-        // Duplicate strings to take ownership
-        const text = try self.allocator.dupe(u8, selection.text);
-        errdefer self.allocator.free(text);
-        const file = try self.allocator.dupe(u8, selection.file);
-
-        self.last_selection = .{
-            .text = text,
-            .file = file,
-            .range = selection.range,
-        };
-    }
-
-    fn generateCorrelationId(self: *McpServer) ![]const u8 {
-        const id = self.next_request_id;
-        self.next_request_id += 1;
-        return try std.fmt.allocPrint(self.allocator, "tool-{d}", .{id});
-    }
-
-    fn checkTimeouts(self: *McpServer) void {
-        const now = std.time.milliTimestamp();
-        var to_remove: std.ArrayList([]const u8) = .empty;
-        defer to_remove.deinit(self.allocator);
-
-        // Collect keys that have timed out (dupe to avoid use-after-free during removal)
-        var iter = self.pending_tool_requests.iterator();
-        while (iter.next()) |entry| {
-            if (entry.value_ptr.deadline_ms < now) {
-                const key_copy = self.allocator.dupe(u8, entry.key_ptr.*) catch |err| {
-                    log.err("Failed to allocate key copy for timeout removal: {}", .{err});
-                    continue;
-                };
-                to_remove.append(self.allocator, key_copy) catch |err| {
-                    self.allocator.free(key_copy);
-                    log.err("Failed to track timed-out request for removal: {}", .{err});
-                    continue;
-                };
-            }
-        }
-
-        for (to_remove.items) |key_copy| {
-            defer self.allocator.free(key_copy);
-
-            // Use fetchRemove to atomically remove and get ownership of key/value
-            if (self.pending_tool_requests.fetchRemove(key_copy)) |kv| {
-                const pending = kv.value;
-                // Note: kv.key == pending.correlation_id (same allocation)
-                // pending.deinit() frees correlation_id, so don't free kv.key separately
-
-                // Parse the ID back from JSON and send timeout error
-                var id_parsed = std.json.parseFromSlice(std.json.Value, self.allocator, pending.mcp_request_id_json, .{}) catch {
-                    pending.deinit(self.allocator);
-                    continue;
-                };
-                defer id_parsed.deinit();
-
-                self.sendToolErrorWithId(id_parsed.value, "Tool request timed out") catch |err| {
-                    log.warn("Failed to send tool timeout error: {}", .{err});
-                };
-                pending.deinit(self.allocator);
-            }
-        }
-    }
+    // MCP tool functions removed - MCP code being deleted
 
     fn sendResult(self: *McpServer, id: ?std.json.Value, result: anytype) !void {
         try self.sendMcpResultDirect(id, result);
@@ -1107,14 +964,11 @@ test "McpServer init and deinit" {
     defer server.deinit();
     const summary = .{
         .port = server.port,
-        .mcp_socket = server.mcp_client_socket,
         .nvim_socket = server.nvim_client_socket,
     };
     try (ohsnap{}).snap(@src(),
         \\nvim.mcp_server.test.McpServer init and deinit__struct_<^\d+$>
         \\  .port: u16 = <^\d+$>
-        \\  .mcp_socket: ?i32
-        \\    null
         \\  .nvim_socket: ?i32
         \\    null
     ).expectEqual(summary);

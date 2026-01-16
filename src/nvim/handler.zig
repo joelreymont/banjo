@@ -1052,40 +1052,15 @@ pub const Handler = struct {
     }
 
     fn handleNvimToolResponse(self: *Handler, params: ?std.json.Value) void {
-        const parsed = self.parseParams(ToolResponseParams, params) orelse return;
-        defer parsed.deinit();
-
-        if (self.mcp_server) |mcp| {
-            mcp.handleToolResponse(
-                parsed.value.correlation_id,
-                parsed.value.result,
-                parsed.value.@"error",
-            ) catch |err| {
-                log.warn("Failed to handle tool response: {}", .{err});
-            };
-        }
+        // MCP tool response handling removed
+        _ = self;
+        _ = params;
     }
 
     fn handleNvimSelectionChanged(self: *Handler, params: ?std.json.Value) void {
-        const parsed = self.parseParams(protocol.SelectionInfo, params) orelse return;
-        defer parsed.deinit();
-
-        if (self.mcp_server) |mcp| {
-            const range: ?mcp_server_mod.SelectionRange = if (parsed.value.range) |r| .{
-                .startLine = r.start_line,
-                .startCol = r.start_col,
-                .endLine = r.end_line,
-                .endCol = r.end_col,
-            } else null;
-
-            mcp.updateSelection(.{
-                .text = parsed.value.content orelse "",
-                .file = parsed.value.file,
-                .range = range,
-            }) catch |err| {
-                log.warn("Failed to update selection cache: {}", .{err});
-            };
-        }
+        // MCP selection tracking removed - will be replaced with ACP
+        _ = self;
+        _ = params;
     }
 
     fn ensureClaudeBridge(self: *Handler, cwd: []const u8) !*claude_bridge.Bridge {
