@@ -7,6 +7,8 @@ const websocket = @import("websocket.zig");
 const protocol = @import("protocol.zig");
 const constants = @import("../core/constants.zig");
 const jsonrpc = @import("../jsonrpc.zig");
+const ws_transport = @import("../acp/ws_transport.zig");
+const Agent = @import("../acp/agent.zig").Agent;
 
 const log = std.log.scoped(.mcp_server);
 const debug_log = @import("../util/debug_log.zig");
@@ -42,6 +44,40 @@ pub const McpServer = struct {
 
     // Callback for nvim connection (send initial state)
     nvim_connect_callback: ?*const fn (ctx: *anyopaque) void = null,
+
+    // ACP client connection
+    acp_client: ?*AcpConnection = null,
+
+    const AcpConnection = struct {
+        socket: posix.socket_t,
+        agent: Agent,
+        ws_writer: ws_transport.WsWriter,
+        ws_reader: ws_transport.WsReader,
+        jsonrpc_reader: jsonrpc.Reader,
+
+        fn init(allocator: Allocator, socket: posix.socket_t, mutex: *std.Thread.Mutex) !*AcpConnection {
+            const conn = try allocator.create(AcpConnection);
+            conn.* = .{
+                .socket = socket,
+                .ws_writer = ws_transport.WsWriter.init(allocator, socket, mutex),
+                .ws_reader = ws_transport.WsReader.init(allocator, socket),
+                .jsonrpc_reader = undefined,
+                .agent = undefined,
+            };
+            conn.jsonrpc_reader = jsonrpc.Reader.init(allocator, conn.ws_reader.reader());
+            conn.agent = Agent.init(allocator, conn.ws_writer.writer(), &conn.jsonrpc_reader);
+            return conn;
+        }
+
+        fn deinit(self: *AcpConnection, allocator: Allocator) void {
+            self.agent.deinit();
+            self.ws_writer.deinit();
+            self.ws_reader.deinit();
+            self.jsonrpc_reader.deinit();
+            posix.close(self.socket);
+            allocator.destroy(self);
+        }
+    };
 
     const PendingHandshake = struct {
         buffer: std.ArrayListUnmanaged(u8) = .empty,
@@ -141,7 +177,7 @@ pub const McpServer = struct {
         self.poll_mutex.lock();
         defer self.poll_mutex.unlock();
 
-        var fds: [max_pending_handshakes + 3]posix.pollfd = undefined;
+        var fds: [max_pending_handshakes + 4]posix.pollfd = undefined;
         var nfds: usize = 0;
 
         const can_accept = self.pending_handshakes.count() < max_pending_handshakes;
@@ -153,6 +189,12 @@ pub const McpServer = struct {
         // Poll nvim client socket if connected
         if (self.nvim_client_socket) |sock| {
             fds[nfds] = .{ .fd = sock, .events = posix.POLL.IN, .revents = 0 };
+            nfds += 1;
+        }
+
+        // Poll ACP client socket if connected
+        if (self.acp_client) |conn| {
+            fds[nfds] = .{ .fd = conn.socket, .events = posix.POLL.IN, .revents = 0 };
             nfds += 1;
         }
 
@@ -171,7 +213,7 @@ pub const McpServer = struct {
             self.expirePendingHandshakes(std.time.milliTimestamp());
             return true;
         }
-        debugLog("poll: ready={d}, nfds={d}, nvim_connected={}", .{ ready, nfds, self.nvim_client_socket != null });
+        debugLog("poll: ready={d}, nfds={d}, nvim_connected={}, acp_connected={}", .{ ready, nfds, self.nvim_client_socket != null, self.acp_client != null });
 
         // Handle events
         for (fds[0..nfds]) |fd| {
@@ -186,6 +228,12 @@ pub const McpServer = struct {
                         log.warn("Nvim client message failed: {}", .{err});
                         self.closeNvimClient();
                     };
+                } else if (self.acp_client != null and fd.fd == self.acp_client.?.socket) {
+                    debugLog("poll: acp socket has data", .{});
+                    self.handleAcpClientMessage() catch |err| {
+                        log.warn("ACP client message failed: {}", .{err});
+                        self.closeAcpClient();
+                    };
                 } else if (self.pending_handshakes.getPtr(fd.fd)) |pending| {
                     self.handlePendingHandshake(fd.fd, pending);
                 }
@@ -195,6 +243,10 @@ pub const McpServer = struct {
                 if (self.nvim_client_socket != null and fd.fd == self.nvim_client_socket.?) {
                     log.info("Nvim client disconnected", .{});
                     self.closeNvimClient();
+                }
+                if (self.acp_client != null and fd.fd == self.acp_client.?.socket) {
+                    log.info("ACP client disconnected", .{});
+                    self.closeAcpClient();
                 }
                 if (self.pending_handshakes.contains(fd.fd)) {
                     log.info("Handshake client disconnected", .{});
@@ -214,6 +266,15 @@ pub const McpServer = struct {
             posix.close(sock);
             self.nvim_client_socket = null;
             self.nvim_read_buffer.clear();
+        }
+    }
+
+    fn closeAcpClient(self: *McpServer) void {
+        self.socket_mutex.lock();
+        defer self.socket_mutex.unlock();
+        if (self.acp_client) |conn| {
+            conn.deinit(self.allocator);
+            self.acp_client = null;
         }
     }
 
@@ -266,13 +327,18 @@ pub const McpServer = struct {
         client: posix.socket_t,
         remainder: []const u8,
     ) !void {
+        switch (client_kind) {
+            .nvim => try self.finishNvimHandshake(client, remainder),
+            .acp => try self.finishAcpHandshake(client, remainder),
+        }
+    }
+
+    fn finishNvimHandshake(self: *McpServer, client: posix.socket_t, remainder: []const u8) !void {
         var cb: ?*const fn (ctx: *anyopaque) void = null;
         var cb_ctx: ?*anyopaque = null;
 
         self.socket_mutex.lock();
         errdefer self.socket_mutex.unlock();
-
-        _ = client_kind; // Only .nvim supported now
 
         if (self.nvim_client_socket) |old| {
             log.info("Closing existing nvim client connection", .{});
@@ -301,6 +367,30 @@ pub const McpServer = struct {
                 cb_fn(ctx);
             }
         }
+    }
+
+    fn finishAcpHandshake(self: *McpServer, client: posix.socket_t, remainder: []const u8) !void {
+        self.socket_mutex.lock();
+        defer self.socket_mutex.unlock();
+
+        // Close existing ACP connection if any
+        if (self.acp_client) |old| {
+            log.info("Closing existing ACP client connection", .{});
+            old.deinit(self.allocator);
+        }
+
+        // Create new ACP connection
+        const conn = try AcpConnection.init(self.allocator, client, &self.socket_mutex);
+        errdefer conn.deinit(self.allocator);
+
+        // Add any remainder data to the reader buffer
+        if (remainder.len > 0) {
+            try conn.ws_reader.frame_buffer.append(self.allocator, remainder);
+        }
+
+        self.acp_client = conn;
+        log.info("ACP client connected", .{});
+        debugLog("acp_client_socket set to fd={d}", .{client});
     }
 
     fn handlePendingHandshake(self: *McpServer, fd: posix.socket_t, pending: *PendingHandshake) void {
@@ -500,6 +590,77 @@ pub const McpServer = struct {
     /// Check if nvim client is connected
     pub fn isNvimConnected(self: *McpServer) bool {
         return self.nvim_client_socket != null;
+    }
+
+    fn handleAcpClientMessage(self: *McpServer) !void {
+        debugLog("handleAcpClientMessage: entry", .{});
+        const conn = self.acp_client orelse return;
+
+        // Read available data into frame buffer
+        var temp_buf: [4096]u8 = undefined;
+        const n = posix.read(conn.socket, &temp_buf) catch |err| switch (err) {
+            error.WouldBlock => {
+                debugLog("handleAcpClientMessage: WouldBlock", .{});
+                return;
+            },
+            else => return err,
+        };
+        if (n == 0) return error.ConnectionClosed;
+        debugLog("handleAcpClientMessage: read {d} bytes", .{n});
+
+        try conn.ws_reader.frame_buffer.append(self.allocator, temp_buf[0..n]);
+
+        // Try to parse complete frames
+        while (conn.ws_reader.frame_buffer.len() >= 2) {
+            const buf = conn.ws_reader.frame_buffer.sliceMut();
+            const result = websocket.parseFrame(buf) catch |err| switch (err) {
+                error.NeedMoreData => break,
+                error.ReservedOpcode => {
+                    log.warn("Received ACP frame with reserved opcode, closing", .{});
+                    self.closeAcpClient();
+                    return;
+                },
+                error.UnmaskedFrame => {
+                    log.warn("Received unmasked ACP frame, closing", .{});
+                    self.closeAcpClient();
+                    return;
+                },
+                else => return err,
+            };
+
+            switch (result.frame.opcode) {
+                .text => {
+                    try self.handleAcpJsonRpcMessage(result.frame.payload);
+                },
+                .ping => {
+                    const pong = try websocket.encodeFrame(self.allocator, .pong, result.frame.payload);
+                    defer self.allocator.free(pong);
+                    self.socket_mutex.lock();
+                    defer self.socket_mutex.unlock();
+                    if (self.acp_client) |c| {
+                        _ = try posix.write(c.socket, pong);
+                    }
+                },
+                .close => {
+                    log.info("ACP client sent close frame", .{});
+                    self.closeAcpClient();
+                    return;
+                },
+                else => {},
+            }
+
+            conn.ws_reader.frame_buffer.consume(result.consumed);
+        }
+    }
+
+    fn handleAcpJsonRpcMessage(self: *McpServer, payload: []const u8) !void {
+        debugLog("handleAcpJsonRpcMessage: payload={d} bytes", .{payload.len});
+        const conn = self.acp_client orelse return;
+
+        var parsed = try jsonrpc.parseMessage(self.allocator, payload);
+        defer parsed.deinit();
+
+        try conn.agent.handleMessage(parsed.message);
     }
 };
 
