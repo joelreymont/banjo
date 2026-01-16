@@ -576,3 +576,122 @@ pub const SetConfigOptionResponse = struct {
 };
 
 pub const PermissionMode = permission_mode.PermissionMode;
+
+// Tests
+const testing = std.testing;
+const ohsnap = @import("ohsnap");
+
+fn jsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]const u8 {
+    return std.json.Stringify.valueAlloc(alloc, value, .{ .emit_null_optional_fields = false });
+}
+
+test "SessionUpdate serialization" {
+    const update = SessionUpdate.textChunk("sess-123", "Hello world");
+    const json = try jsonAlloc(testing.allocator, update);
+    defer testing.allocator.free(json);
+
+    try (ohsnap{}).snap(@src(),
+        \\{"sessionId":"sess-123","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello world"}}}
+    ).diff(json, true);
+}
+
+test "SessionUpdate tool_call serialization" {
+    const update = SessionUpdate.toolCall("sess-123", "tc-456", "Read file", .read);
+    const json = try jsonAlloc(testing.allocator, update);
+    defer testing.allocator.free(json);
+
+    try (ohsnap{}).snap(@src(),
+        \\{"sessionId":"sess-123","update":{"sessionUpdate":"tool_call","toolCallId":"tc-456","title":"Read file","kind":"read","status":"pending"}}
+    ).diff(json, true);
+}
+
+test "PermissionRequest serialization" {
+    const req = PermissionRequest{
+        .sessionId = "sess-123",
+        .toolCall = .{
+            .toolCallId = "tc-456",
+            .title = "Run bash",
+            .kind = .execute,
+            .status = .pending,
+        },
+        .options = &.{
+            .{ .kind = .allow_once, .name = "Allow", .optionId = "opt-1" },
+            .{ .kind = .reject_once, .name = "Reject", .optionId = "opt-2" },
+        },
+    };
+    const json = try jsonAlloc(testing.allocator, req);
+    defer testing.allocator.free(json);
+
+    const summary = .{
+        .has_session = std.mem.indexOf(u8, json, "sess-123") != null,
+        .has_tool_call = std.mem.indexOf(u8, json, "tc-456") != null,
+        .has_options = std.mem.indexOf(u8, json, "allow_once") != null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.protocol.test.PermissionRequest serialization__struct_<^\d+$>
+        \\  .has_session: bool = true
+        \\  .has_tool_call: bool = true
+        \\  .has_options: bool = true
+    ).expectEqual(summary);
+}
+
+test "StopReason serialization" {
+    const end_turn = try jsonAlloc(testing.allocator, StopReason.end_turn);
+    defer testing.allocator.free(end_turn);
+    const cancelled = try jsonAlloc(testing.allocator, StopReason.cancelled);
+    defer testing.allocator.free(cancelled);
+    const max_tokens = try jsonAlloc(testing.allocator, StopReason.max_tokens);
+    defer testing.allocator.free(max_tokens);
+    const auth_required = try jsonAlloc(testing.allocator, StopReason.auth_required);
+    defer testing.allocator.free(auth_required);
+
+    try testing.expectEqualStrings("\"end_turn\"", end_turn);
+    try testing.expectEqualStrings("\"cancelled\"", cancelled);
+    try testing.expectEqualStrings("\"max_tokens\"", max_tokens);
+    try testing.expectEqualStrings("\"auth_required\"", auth_required);
+}
+
+test "ToolCallStatus serialization" {
+    const pending_json = try jsonAlloc(testing.allocator, SessionUpdate.ToolCallStatus.pending);
+    defer testing.allocator.free(pending_json);
+    const in_progress_json = try jsonAlloc(testing.allocator, SessionUpdate.ToolCallStatus.in_progress);
+    defer testing.allocator.free(in_progress_json);
+    const completed_json = try jsonAlloc(testing.allocator, SessionUpdate.ToolCallStatus.completed);
+    defer testing.allocator.free(completed_json);
+    const failed_json = try jsonAlloc(testing.allocator, SessionUpdate.ToolCallStatus.failed);
+    defer testing.allocator.free(failed_json);
+
+    // Verify enum values serialize to expected JSON strings
+    try testing.expectEqualStrings("\"pending\"", pending_json);
+    try testing.expectEqualStrings("\"in_progress\"", in_progress_json);
+    try testing.expectEqualStrings("\"completed\"", completed_json);
+    try testing.expectEqualStrings("\"failed\"", failed_json);
+}
+
+test "ContentBlock text variant" {
+    const block = ContentBlock{ .type = "text", .text = "Hello" };
+    const json = try jsonAlloc(testing.allocator, block);
+    defer testing.allocator.free(json);
+
+    try (ohsnap{}).snap(@src(),
+        \\{"type":"text","text":"Hello"}
+    ).diff(json, true);
+}
+
+test "ContentBlock image variant" {
+    const block = ContentBlock{ .type = "image", .data = "base64data", .mimeType = "image/png" };
+    const json = try jsonAlloc(testing.allocator, block);
+    defer testing.allocator.free(json);
+
+    const summary = .{
+        .has_type = std.mem.indexOf(u8, json, "\"type\":\"image\"") != null,
+        .has_data = std.mem.indexOf(u8, json, "base64data") != null,
+        .has_mime = std.mem.indexOf(u8, json, "image/png") != null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.protocol.test.ContentBlock image variant__struct_<^\d+$>
+        \\  .has_type: bool = true
+        \\  .has_data: bool = true
+        \\  .has_mime: bool = true
+    ).expectEqual(summary);
+}
