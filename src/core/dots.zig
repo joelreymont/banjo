@@ -37,10 +37,10 @@ pub fn clearCmd(engine: Engine) []const u8 {
 /// Context prompt sent after clearing, prompts agent to read guidelines and continue
 pub fn contextPrompt(engine: Engine) []const u8 {
     _ = engine;
-    return
-        \\Read your project guidelines (AGENTS.md).
-        \\Check your dots and pick one to work on.
-        \\Keep going.
+    return 
+    \\Read your project guidelines (AGENTS.md).
+    \\Check your dots and pick one to work on.
+    \\Keep going.
     ;
 }
 

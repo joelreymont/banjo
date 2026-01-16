@@ -54,7 +54,6 @@ pub const ParseResult = struct {
 
 pub const HandshakeResult = struct {
     path: []const u8,
-    auth_token: ?[]const u8,
     ws_key: []const u8,
 };
 
@@ -66,7 +65,6 @@ pub const HandshakeParse = struct {
 pub fn deinitHandshakeResult(allocator: Allocator, result: *const HandshakeResult) void {
     allocator.free(result.path);
     allocator.free(result.ws_key);
-    if (result.auth_token) |token| allocator.free(token);
 }
 
 pub fn tryParseHandshake(allocator: Allocator, buffer: []const u8) !?HandshakeParse {
@@ -80,10 +78,7 @@ pub fn tryParseHandshake(allocator: Allocator, buffer: []const u8) !?HandshakePa
 pub fn completeHandshake(
     socket_fd: std.posix.socket_t,
     parsed: HandshakeResult,
-    expected_auth_token: []const u8,
 ) !ClientKind {
-    _ = expected_auth_token; // No longer used, auth removed with MCP
-
     // Only /nvim path supported now
     if (!std.mem.eql(u8, parsed.path, "/nvim")) {
         return error.InvalidPath;
@@ -207,7 +202,7 @@ pub const HandshakeOutcome = struct {
 
 /// Perform WebSocket handshake on a socket.
 /// Returns the client kind based on path.
-pub fn performHandshakeWithPath(allocator: Allocator, socket_fd: std.posix.socket_t, expected_auth_token: []const u8) !HandshakeOutcome {
+pub fn performHandshakeWithPath(allocator: Allocator, socket_fd: std.posix.socket_t) !HandshakeOutcome {
     var header_buf: [max_handshake_bytes]u8 = undefined;
     var total_read: usize = 0;
 
@@ -231,7 +226,7 @@ pub fn performHandshakeWithPath(allocator: Allocator, socket_fd: std.posix.socke
     const parsed = (try tryParseHandshake(allocator, header_buf[0..total_read])) orelse return error.HeadersTooLarge;
     defer deinitHandshakeResult(allocator, &parsed.result);
 
-    const client_kind = try completeHandshake(socket_fd, parsed.result, expected_auth_token);
+    const client_kind = try completeHandshake(socket_fd, parsed.result);
 
     var remainder: ?[]u8 = null;
     if (parsed.header_end < total_read) {
@@ -250,9 +245,6 @@ fn parseHttpHeaders(allocator: Allocator, headers: []const u8) !HandshakeResult 
 
     var ws_key: ?[]const u8 = null;
     errdefer if (ws_key) |k| allocator.free(k);
-
-    var auth_token: ?[]const u8 = null;
-    errdefer if (auth_token) |t| allocator.free(t);
 
     // RFC 6455 required headers
     var has_upgrade = false;
@@ -281,8 +273,6 @@ fn parseHttpHeaders(allocator: Allocator, headers: []const u8) !HandshakeResult 
 
         if (parseHeader(line, "Sec-WebSocket-Key: ")) |value| {
             ws_key = try allocator.dupe(u8, value);
-        } else if (parseHeader(line, "x-claude-code-ide-authorization: ")) |value| {
-            auth_token = try allocator.dupe(u8, value);
         } else if (std.ascii.startsWithIgnoreCase(line, "Upgrade:")) {
             // Check for "websocket" (case-insensitive)
             const value = std.mem.trim(u8, line["Upgrade:".len..], " \t");
@@ -314,7 +304,6 @@ fn parseHttpHeaders(allocator: Allocator, headers: []const u8) !HandshakeResult 
     return .{
         .path = final_path,
         .ws_key = ws_key.?,
-        .auth_token = auth_token,
     };
 }
 
@@ -543,7 +532,6 @@ test "performHandshakeWithPath preserves trailing bytes" {
     const server = try std.posix.accept(listener, null, null, 0);
     defer std.posix.close(server);
 
-    const auth = "token-123";
     const request =
         "GET /nvim HTTP/1.1\r\n" ++
         "Host: localhost\r\n" ++
@@ -551,7 +539,6 @@ test "performHandshakeWithPath preserves trailing bytes" {
         "Connection: Upgrade\r\n" ++
         "Sec-WebSocket-Version: 13\r\n" ++
         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
-        "x-claude-code-ide-authorization: token-123\r\n" ++
         "\r\n";
     const extra = [_]u8{ 0x81, 0x00 };
     var write_buf: [request.len + extra.len]u8 = undefined;
@@ -559,7 +546,7 @@ test "performHandshakeWithPath preserves trailing bytes" {
     @memcpy(write_buf[request.len..], &extra);
     try writeAll(client, &write_buf);
 
-    const outcome = try performHandshakeWithPath(testing.allocator, server, auth);
+    const outcome = try performHandshakeWithPath(testing.allocator, server);
     defer if (outcome.remainder) |bytes| testing.allocator.free(bytes);
 
     const remainder_hex: ?[]const u8 = if (outcome.remainder) |bytes|

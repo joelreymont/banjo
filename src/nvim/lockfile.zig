@@ -4,7 +4,6 @@ const log = std.log.scoped(.nvim_lockfile);
 
 pub const LockFile = struct {
     path: []const u8,
-    auth_token: [36]u8,
     port: u16,
     allocator: Allocator,
 
@@ -25,17 +24,15 @@ pub const LockFileData = struct {
     workspaceFolders: []const []const u8,
     ideName: []const u8 = "Banjo-Neovim",
     transport: []const u8 = "ws",
-    authToken: []const u8,
 };
 
-pub fn create(allocator: Allocator, port: u16, cwd: []const u8, auth_token: *const [36]u8) !LockFile {
+pub fn create(allocator: Allocator, port: u16, cwd: []const u8) !LockFile {
     const path = try getLockFilePath(allocator, port);
     errdefer allocator.free(path);
 
     // Check for stale lock file
     if (readExistingLockFile(allocator, path)) |existing| {
         defer {
-            allocator.free(existing.authToken);
             for (existing.workspaceFolders) |folder| {
                 allocator.free(folder);
             }
@@ -61,14 +58,12 @@ pub fn create(allocator: Allocator, port: u16, cwd: []const u8, auth_token: *con
     const data = LockFileData{
         .pid = pid,
         .workspaceFolders = &workspace_folders,
-        .authToken = auth_token,
     };
 
     try writeJsonToFile(allocator, path, data);
 
     return LockFile{
         .path = path,
-        .auth_token = auth_token.*,
         .port = port,
         .allocator = allocator,
     };
@@ -130,13 +125,10 @@ fn readExistingLockFile(allocator: Allocator, path: []const u8) !LockFileData {
     const content = try file.readToEndAlloc(allocator, 4096);
     defer allocator.free(content);
 
-    const parsed = try std.json.parseFromSlice(LockFileData, allocator, content, .{});
+    const parsed = try std.json.parseFromSlice(LockFileData, allocator, content, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
 
     // Deep copy values we need
-    const auth_token = try allocator.dupe(u8, parsed.value.authToken);
-    errdefer allocator.free(auth_token);
-
     const folders = try allocator.alloc([]const u8, parsed.value.workspaceFolders.len);
     errdefer allocator.free(folders);
 
@@ -151,7 +143,6 @@ fn readExistingLockFile(allocator: Allocator, path: []const u8) !LockFileData {
     return LockFileData{
         .pid = parsed.value.pid,
         .workspaceFolders = folders,
-        .authToken = auth_token,
     };
 }
 

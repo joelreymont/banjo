@@ -143,12 +143,6 @@ pub const PermissionRequest = struct {
     tool_input: ?[]const u8 = null, // JSON string preview of tool input
 };
 
-pub const ToolRequest = struct {
-    tool_name: []const u8,
-    correlation_id: []const u8,
-    arguments: ?std.json.Value = null,
-};
-
 pub const SessionIdUpdate = struct {
     engine: Engine,
     session_id: []const u8,
