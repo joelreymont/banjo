@@ -3,7 +3,6 @@ const Allocator = std.mem.Allocator;
 
 const protocol = @import("protocol.zig");
 const mcp_server_mod = @import("mcp_server.zig");
-const mcp_types = @import("mcp_types.zig");
 const core_types = @import("../core/types.zig");
 const Engine = core_types.Engine;
 const callbacks_mod = @import("../core/callbacks.zig");
@@ -1072,7 +1071,7 @@ pub const Handler = struct {
         defer parsed.deinit();
 
         if (self.mcp_server) |mcp| {
-            const range: ?mcp_types.SelectionRange = if (parsed.value.range) |r| .{
+            const range: ?mcp_server_mod.SelectionRange = if (parsed.value.range) |r| .{
                 .startLine = r.start_line,
                 .startCol = r.start_col,
                 .endLine = r.end_line,

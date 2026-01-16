@@ -82,19 +82,11 @@ pub fn completeHandshake(
     parsed: HandshakeResult,
     expected_auth_token: []const u8,
 ) !ClientKind {
-    const client_kind: ClientKind = if (std.mem.eql(u8, parsed.path, "/nvim"))
-        .nvim
-    else
-        .mcp;
+    _ = expected_auth_token; // No longer used, auth removed with MCP
 
-    if (client_kind == .mcp) {
-        if (parsed.auth_token) |token| {
-            if (!std.mem.eql(u8, token, expected_auth_token)) {
-                return error.InvalidAuthToken;
-            }
-        } else {
-            return error.MissingAuthToken;
-        }
+    // Only /nvim path supported now
+    if (!std.mem.eql(u8, parsed.path, "/nvim")) {
+        return error.InvalidPath;
     }
 
     const magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -115,7 +107,7 @@ pub fn completeHandshake(
     try writeAll(socket_fd, &accept_key);
     try writeAll(socket_fd, response_end);
 
-    return client_kind;
+    return .nvim;
 }
 
 /// Parse WebSocket frame from bytes.
@@ -205,7 +197,6 @@ pub fn encodeFrame(allocator: Allocator, opcode: Opcode, payload: []const u8) ![
 }
 
 pub const ClientKind = enum {
-    mcp, // Claude CLI with auth token
     nvim, // Neovim plugin (no auth)
 };
 
@@ -251,16 +242,6 @@ pub fn performHandshakeWithPath(allocator: Allocator, socket_fd: std.posix.socke
         .client_kind = client_kind,
         .remainder = remainder,
     };
-}
-
-/// Perform WebSocket handshake on a socket (MCP auth required).
-/// Legacy function for backwards compatibility.
-pub fn performHandshake(allocator: Allocator, socket_fd: std.posix.socket_t, expected_auth_token: []const u8) !void {
-    const outcome = try performHandshakeWithPath(allocator, socket_fd, expected_auth_token);
-    defer if (outcome.remainder) |extra| allocator.free(extra);
-    if (outcome.client_kind != .mcp) {
-        return error.InvalidPath;
-    }
 }
 
 fn parseHttpHeaders(allocator: Allocator, headers: []const u8) !HandshakeResult {
@@ -593,7 +574,7 @@ test "performHandshakeWithPath preserves trailing bytes" {
     };
     try (ohsnap{}).snap(@src(),
         \\nvim.websocket.test.performHandshakeWithPath preserves trailing bytes__struct_<^\d+$>
-        \\  .client_kind: [:0]const u8
+        \\  .client_kind: *const [4:0]u8
         \\    "nvim"
         \\  .remainder_hex: ?[]const u8
         \\    "8100"
