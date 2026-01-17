@@ -40,6 +40,15 @@
     (execute-kbd-macro keys)
     (accept-process-output nil 0.05)))
 
+(defun banjo-test--send-from-input (text)
+  (banjo-test--exec-command "banjo-focus-input")
+  (let ((input (banjo--get-input-buffer)))
+    (with-current-buffer input
+      (let ((inhibit-read-only t))
+        (erase-buffer))))
+  (execute-kbd-macro (vconcat text (kbd "RET")))
+  (accept-process-output nil 0.05))
+
 (defun banjo-test--e2e-run (engine prompt)
   (let* ((lib (locate-library "banjo"))
          (emacs-dir (and lib (file-name-directory lib)))
@@ -73,7 +82,7 @@
           (setq banjo--process-output "")
           (banjo-test--exec-command "banjo-start")
           (should (banjo-test--wait-until (lambda () banjo--session-id) 15.0))
-          (banjo-test--exec-command "banjo-send" prompt)
+          (banjo-test--send-from-input prompt)
           (should (banjo-test--wait-until #'banjo-test--assistant-output-p 20.0)))
       (banjo-test--exec-command "banjo-stop")
       (delete-directory temp-dir t))))
@@ -104,6 +113,18 @@
             (should (get-text-property (match-beginning 0) 'banjo-code-block))
             (should-not (get-text-property (match-beginning 0) 'banjo-link))))
       (delete-file tmp))))
+
+(ert-deftest banjo-test-panel-layout ()
+  (let ((banjo--output-buffer "*banjo-test-output*")
+        (banjo--input-buffer "*banjo-test-input*"))
+    (banjo-test--exec-command "banjo-focus-input")
+    (let ((out-win (get-buffer-window (banjo--get-output-buffer)))
+          (in-win (get-buffer-window (banjo--get-input-buffer))))
+      (should out-win)
+      (should in-win)
+      (let* ((out-edges (window-edges out-win))
+             (in-edges (window-edges in-win)))
+        (should (< (nth 1 out-edges) (nth 1 in-edges)))))))
 
 (ert-deftest banjo-test-doom-prefix-availability ()
   (let ((orig-bound (boundp 'doom-leader-map))
