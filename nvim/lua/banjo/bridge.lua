@@ -7,10 +7,14 @@ local M = {}
 
 -- Debug logging
 local function lua_debug(msg)
+    if not vim.g.banjo_debug then
+        return
+    end
     local ok, _ = pcall(function()
         local line = os.date("%H:%M:%S ") .. msg
         vim.fn.writefile({line}, "/tmp/banjo-lua-debug.log", "a")
     end)
+    _ = ok
 end
 
 -- Per-tab bridge b.state (indexed by tabpage handle)
