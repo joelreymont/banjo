@@ -827,6 +827,7 @@ pub const CodexBridge = struct {
                     self.pending_messages.clearRetainingCapacity();
                     self.pending_head = 0;
                 }
+                self.queue_cond.signal();
                 return msg;
             }
 
@@ -848,6 +849,15 @@ pub const CodexBridge = struct {
 
     fn enqueueMessage(self: *CodexBridge, msg: CodexMessage) void {
         self.queue_mutex.lock();
+        while ((self.pending_messages.items.len - self.pending_head) >= constants.bridge_queue_max_messages) {
+            if (self.stop_requested.load(.acquire)) {
+                self.queue_mutex.unlock();
+                var owned = msg;
+                owned.deinit();
+                return;
+            }
+            self.queue_cond.wait(&self.queue_mutex);
+        }
         self.pending_messages.append(self.allocator, msg) catch |err| {
             log.err("Failed to queue Codex message: {}", .{err});
             var owned = msg;
@@ -1157,6 +1167,7 @@ pub const CodexBridge = struct {
     fn parseRpcMessageLine(arena: *std.heap.ArenaAllocator, line: []const u8) !RpcMessage {
         const parsed = try std.json.parseFromSlice(RpcEnvelope, arena.allocator(), line, .{
             .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
         });
 
         const envelope = parsed.value;
@@ -1197,55 +1208,19 @@ pub const CodexBridge = struct {
             var keep_arena = false;
             defer if (!keep_arena) arena.deinit();
 
-            const line = (try self.readLine(arena.allocator(), deadline_ms)) orelse return null;
+            const stdout = self.stdout_file orelse return error.NoStdout;
+            const line = (try io_utils.readLine(
+                self.allocator,
+                &self.line_buffer,
+                stdout.deprecatedReader().any(),
+                stdout.handle,
+                deadline_ms,
+                max_json_line_bytes,
+            )) orelse return null;
 
             const msg = try parseRpcMessageLine(&arena, line);
             keep_arena = true;
             return msg;
-        }
-    }
-
-    fn readLine(self: *CodexBridge, arena: Allocator, deadline_ms: ?i64) !?[]const u8 {
-        while (true) {
-            const pending = self.line_buffer.slice();
-            if (std.mem.indexOfScalar(u8, pending, '\n')) |nl| {
-                if (nl == 0) {
-                    self.line_buffer.consume(nl + 1);
-                    continue;
-                }
-                if (nl > max_json_line_bytes) return error.LineTooLong;
-                const line = try arena.alloc(u8, nl);
-                @memcpy(line, pending[0..nl]);
-                self.line_buffer.consume(nl + 1);
-                return line;
-            }
-
-            if (deadline_ms) |deadline| {
-                const now = std.time.milliTimestamp();
-                if (now >= deadline) return error.Timeout;
-                const slice_ms = io_utils.pollSliceMs(deadline, now);
-                const readable = try waitForReadable(self, slice_ms);
-                if (!readable) continue;
-            } else {
-                _ = try waitForReadable(self, -1);
-            }
-
-            const stdout = self.stdout_file orelse return error.NoStdout;
-            var buf: [4096]u8 = undefined;
-            const count = stdout.read(&buf) catch |err| switch (err) {
-                error.WouldBlock => continue,
-                else => return err,
-            };
-            if (count == 0) {
-                if (self.line_buffer.len() == 0) return null;
-                const remaining = self.line_buffer.slice();
-                const line = try arena.alloc(u8, remaining.len);
-                @memcpy(line, remaining);
-                self.line_buffer.clear();
-                return line;
-            }
-            try self.line_buffer.append(self.allocator, buf[0..count]);
-            if (self.line_buffer.len() > max_json_line_bytes) return error.LineTooLong;
         }
     }
 
@@ -2057,12 +2032,6 @@ fn hasBufferedData(bridge: *CodexBridge) bool {
     return bridge.line_buffer.len() > 0;
 }
 
-fn waitForReadable(bridge: *CodexBridge, timeout_ms: i32) !bool {
-    const proc = bridge.process orelse return error.NotStarted;
-    const stdout = proc.stdout orelse return error.NoStdout;
-    return io_utils.waitForReadable(stdout.handle, timeout_ms);
-}
-
 fn waitForTurnCompleted(bridge: *CodexBridge, timeout_ms: i64) !void {
     const deadline = std.time.milliTimestamp() + timeout_ms;
 
@@ -2085,11 +2054,11 @@ test "Codex app-server supports multi-turn prompts in one process" {
 
     const first_inputs = [_]UserInput{.{ .type = "text", .text = "say hello in one word" }};
     try bridge.sendPrompt(first_inputs[0..]);
-    try waitForTurnCompleted(&bridge, 20000);
+    try waitForTurnCompleted(&bridge, constants.live_turn_timeout_ms);
 
     const second_inputs = [_]UserInput{.{ .type = "text", .text = "say goodbye in one word" }};
     try bridge.sendPrompt(second_inputs[0..]);
-    try waitForTurnCompleted(&bridge, 20000);
+    try waitForTurnCompleted(&bridge, constants.live_turn_timeout_ms);
 }
 
 fn waitForTurnStarted(bridge: *CodexBridge, timeout_ms: i64) !void {
@@ -2132,20 +2101,20 @@ test "Codex interrupt stops turn and returns interrupted status" {
     defer bridge.stop();
 
     // Start a prompt that will take a while to complete
-    const inputs = [_]UserInput{.{ .type = "text", .text = "Write a 500 word essay about the history of computing." }};
+    const inputs = [_]UserInput{.{ .type = "text", .text = "Write the numbers 1 through 200, one per line." }};
     try bridge.sendPrompt(inputs[0..]);
 
     // Wait for turn to actually start
-    try waitForTurnStarted(&bridge, 10000);
+    try waitForTurnStarted(&bridge, constants.live_stream_start_timeout_ms);
 
     // Small delay to ensure streaming has begun
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(100 * std.time.ns_per_ms);
 
     // Send interrupt
     bridge.interrupt();
 
     // Collect result - should get turn_completed with interrupted status
-    const result = try collectInterruptResult(&bridge, 10000);
+    const result = try collectInterruptResult(&bridge, constants.live_turn_timeout_ms);
 
     try (ohsnap{}).snap(@src(),
         \\core.codex_bridge.InterruptResult
@@ -2165,14 +2134,14 @@ test "Codex bridge handles interrupt then processes new prompt" {
     defer bridge.stop();
 
     // First turn: start, interrupt
-    const inputs = [_]UserInput{.{ .type = "text", .text = "Count to 100 slowly." }};
+    const inputs = [_]UserInput{.{ .type = "text", .text = "Count from 1 to 50, one number per line." }};
     try bridge.sendPrompt(inputs[0..]);
-    try waitForTurnStarted(&bridge, 10000);
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    try waitForTurnStarted(&bridge, constants.live_stream_start_timeout_ms);
+    std.Thread.sleep(100 * std.time.ns_per_ms);
     bridge.interrupt();
 
     // Wait for turn_completed with interrupted status
-    const result = try collectInterruptResult(&bridge, 10000);
+    const result = try collectInterruptResult(&bridge, constants.live_turn_timeout_ms);
     try testing.expect(result.got_turn_completed);
     try testing.expect(result.status_is_interrupted);
 
@@ -2184,7 +2153,7 @@ test "Codex bridge handles interrupt then processes new prompt" {
     try bridge.sendPrompt(inputs2[0..]);
 
     var got_response = false;
-    const deadline2 = std.time.milliTimestamp() + 30000;
+    const deadline2 = std.time.milliTimestamp() + constants.live_snapshot_timeout_ms;
     while (std.time.milliTimestamp() < deadline2) {
         var msg = bridge.readMessageWithTimeout(deadline2) catch break orelse break;
         defer msg.deinit();
@@ -2221,7 +2190,7 @@ test "Codex bridge restarts after process exit" {
     try bridge.sendPrompt(inputs[0..]);
 
     var got_response = false;
-    const deadline = std.time.milliTimestamp() + 30000;
+    const deadline = std.time.milliTimestamp() + constants.live_snapshot_timeout_ms;
     while (std.time.milliTimestamp() < deadline) {
         var msg = bridge.readMessageWithTimeout(deadline) catch break orelse break;
         defer msg.deinit();
@@ -2233,6 +2202,65 @@ test "Codex bridge restarts after process exit" {
 
     bridge.stop();
     try testing.expect(got_response);
+}
+
+test "Codex queue blocks when full" {
+    var bridge = CodexBridge.init(testing.allocator, ".");
+    defer bridge.deinit();
+
+    var i: usize = 0;
+    while (i < constants.bridge_queue_max_messages) : (i += 1) {
+        const msg = CodexMessage{
+            .event_type = .agent_message_delta,
+            .text = "x",
+            .arena = std.heap.ArenaAllocator.init(testing.allocator),
+        };
+        bridge.enqueueMessage(msg);
+    }
+
+    const Shared = struct {
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    };
+    var state = Shared{};
+
+    const extra = CodexMessage{
+        .event_type = .agent_message_delta,
+        .text = "x",
+        .arena = std.heap.ArenaAllocator.init(testing.allocator),
+    };
+    const ctx = struct {
+        bridge: *CodexBridge,
+        msg: CodexMessage,
+        state: *Shared,
+    }{ .bridge = &bridge, .msg = extra, .state = &state };
+
+    const thread_fn = struct {
+        fn run(arg: @TypeOf(ctx)) void {
+            arg.state.started.store(true, .release);
+            arg.bridge.enqueueMessage(arg.msg);
+            arg.state.done.store(true, .release);
+        }
+    }.run;
+
+    const thread = try std.Thread.spawn(.{}, thread_fn, .{ctx});
+    defer thread.join();
+
+    while (!state.started.load(.acquire)) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+    try testing.expect(!state.done.load(.acquire));
+
+    var popped = (try bridge.popMessage(null)) orelse return error.TestUnexpectedResult;
+    popped.deinit();
+
+    bridge.queue_mutex.lock();
+    const pending_len = bridge.pending_messages.items.len - bridge.pending_head;
+    bridge.queue_mutex.unlock();
+
+    try testing.expect(pending_len <= constants.bridge_queue_max_messages);
 }
 
 test "Codex resume_last resumes most recent thread for cwd" {
@@ -2249,7 +2277,7 @@ test "Codex resume_last resumes most recent thread for cwd" {
     const inputs1 = [_]UserInput{.{ .type = "text", .text = "Say OK" }};
     try bridge.sendPrompt(inputs1[0..]);
 
-    const deadline1 = std.time.milliTimestamp() + 30000;
+    const deadline1 = std.time.milliTimestamp() + constants.live_turn_timeout_ms;
     while (std.time.milliTimestamp() < deadline1) {
         var msg = bridge.readMessageWithTimeout(deadline1) catch break orelse break;
         defer msg.deinit();

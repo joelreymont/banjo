@@ -1,5 +1,6 @@
 const std = @import("std");
 const io_utils = @import("core/io_utils.zig");
+const byte_queue = @import("util/byte_queue.zig");
 const Allocator = std.mem.Allocator;
 const max_jsonrpc_line_bytes: usize = 4 * 1024 * 1024;
 
@@ -124,6 +125,7 @@ pub fn parseRequest(allocator: Allocator, json_str: []const u8) !ParsedRequest {
 
     const parsed = try std.json.parseFromSlice(Envelope, arena.allocator(), json_str, .{
         .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
     });
     const env = parsed.value;
 
@@ -145,6 +147,7 @@ pub fn parseMessage(allocator: Allocator, json_str: []const u8) !ParsedMessage {
 
     const parsed = try std.json.parseFromSlice(Envelope, arena.allocator(), json_str, .{
         .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
     });
     const message = try parseMessageFromEnvelope(parsed.value);
     return .{ .message = message, .arena = arena };
@@ -394,14 +397,14 @@ pub fn serializeRequest(allocator: Allocator, request: Request) ![]u8 {
 pub const Reader = struct {
     stream: std.io.AnyReader,
     allocator: Allocator,
-    buffer: std.ArrayList(u8),
+    line_buffer: byte_queue.ByteQueue,
     fd: ?std.posix.fd_t = null,
 
     pub fn init(allocator: Allocator, stream: std.io.AnyReader) Reader {
         return .{
             .stream = stream,
             .allocator = allocator,
-            .buffer = .empty,
+            .line_buffer = .{},
             .fd = null,
         };
     }
@@ -410,61 +413,39 @@ pub const Reader = struct {
         return .{
             .stream = stream,
             .allocator = allocator,
-            .buffer = .empty,
+            .line_buffer = .{},
             .fd = fd,
         };
     }
 
     pub fn deinit(self: *Reader) void {
-        self.buffer.deinit(self.allocator);
+        self.line_buffer.deinit(self.allocator);
     }
 
     /// Read the next JSON-RPC message (newline-delimited)
     pub fn next(self: *Reader) !?ParsedRequest {
-        self.buffer.clearRetainingCapacity();
-
-        // Read until newline
-        while (true) {
-            const byte = self.stream.readByte() catch |e| switch (e) {
-                error.EndOfStream => {
-                    if (self.buffer.items.len == 0) return null;
-                    break;
-                },
-                else => return e,
-            };
-
-            if (byte == '\n') break;
-            try self.buffer.append(self.allocator, byte);
-            if (self.buffer.items.len > max_jsonrpc_line_bytes) return error.LineTooLong;
-        }
-
-        if (self.buffer.items.len == 0) return null;
-
-        const parsed = try parseRequest(self.allocator, self.buffer.items);
-        return parsed;
+        const line = (try io_utils.readLine(
+            self.allocator,
+            &self.line_buffer,
+            self.stream,
+            self.fd,
+            null,
+            max_jsonrpc_line_bytes,
+        )) orelse return null;
+        return try parseRequest(self.allocator, line);
     }
 
     /// Read the next JSON-RPC message (request/notification/response)
     pub fn nextMessage(self: *Reader) !?ParsedMessage {
-        self.buffer.clearRetainingCapacity();
-
-        while (true) {
-            const byte = self.stream.readByte() catch |e| switch (e) {
-                error.EndOfStream => {
-                    if (self.buffer.items.len == 0) return null;
-                    break;
-                },
-                else => return e,
-            };
-
-            if (byte == '\n') break;
-            try self.buffer.append(self.allocator, byte);
-            if (self.buffer.items.len > max_jsonrpc_line_bytes) return error.LineTooLong;
-        }
-
-        if (self.buffer.items.len == 0) return null;
-
-        return try parseMessage(self.allocator, self.buffer.items);
+        const line = (try io_utils.readLine(
+            self.allocator,
+            &self.line_buffer,
+            self.stream,
+            self.fd,
+            null,
+            max_jsonrpc_line_bytes,
+        )) orelse return null;
+        return try parseMessage(self.allocator, line);
     }
 
     /// Read the next JSON-RPC message with a deadline (milliseconds since epoch).
@@ -472,31 +453,15 @@ pub const Reader = struct {
         if (self.fd == null) {
             return self.nextMessage();
         }
-        self.buffer.clearRetainingCapacity();
-
-        while (true) {
-            const now = std.time.milliTimestamp();
-            if (now >= deadline_ms) return error.Timeout;
-            const timeout_ms = io_utils.pollSliceMs(deadline_ms, now);
-            const ready = try io_utils.waitForReadable(self.fd.?, timeout_ms);
-            if (!ready) continue;
-
-            const byte = self.stream.readByte() catch |e| switch (e) {
-                error.EndOfStream => {
-                    if (self.buffer.items.len == 0) return null;
-                    break;
-                },
-                else => return e,
-            };
-
-            if (byte == '\n') break;
-            try self.buffer.append(self.allocator, byte);
-            if (self.buffer.items.len > max_jsonrpc_line_bytes) return error.LineTooLong;
-        }
-
-        if (self.buffer.items.len == 0) return null;
-
-        return try parseMessage(self.allocator, self.buffer.items);
+        const line = (try io_utils.readLine(
+            self.allocator,
+            &self.line_buffer,
+            self.stream,
+            self.fd,
+            deadline_ms,
+            max_jsonrpc_line_bytes,
+        )) orelse return null;
+        return try parseMessage(self.allocator, line);
     }
 };
 
@@ -641,6 +606,60 @@ test "parse notification (no id)" {
         \\  .method: []const u8
         \\    "notify"
         \\  .notification: bool = true
+    ).expectEqual(summary);
+}
+
+const ChunkedReader = struct {
+    data: []const u8,
+    chunk: usize,
+    pos: usize = 0,
+
+    pub fn reader(self: *ChunkedReader) std.io.AnyReader {
+        return .{
+            .context = self,
+            .readFn = readFn,
+        };
+    }
+
+    fn readFn(context: *const anyopaque, out: []u8) anyerror!usize {
+        const self: *ChunkedReader = @ptrCast(@alignCast(@constCast(context)));
+        if (self.pos >= self.data.len) return 0;
+        const remaining = self.data[self.pos..];
+        const take = @min(out.len, @min(remaining.len, self.chunk));
+        @memcpy(out[0..take], remaining[0..take]);
+        self.pos += take;
+        return take;
+    }
+};
+
+test "Reader reads chunked messages" {
+    const input =
+        \\{"jsonrpc":"2.0","method":"one"}
+        \\{"jsonrpc":"2.0","method":"two"}
+    ;
+    var chunked = ChunkedReader{ .data = input, .chunk = 3 };
+    var reader = Reader.init(testing.allocator, chunked.reader());
+    defer reader.deinit();
+
+    var first = (try reader.next()) orelse return error.TestUnexpectedResult;
+    defer first.deinit();
+    var second = (try reader.next()) orelse return error.TestUnexpectedResult;
+    defer second.deinit();
+    var third = try reader.next();
+    defer if (third) |*parsed| parsed.deinit();
+
+    const summary = .{
+        .first = first.request.method,
+        .second = second.request.method,
+        .third = third == null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\jsonrpc.test.Reader reads chunked messages__struct_<^\d+$>
+        \\  .first: []const u8
+        \\    "one"
+        \\  .second: []const u8
+        \\    "two"
+        \\  .third: bool = true
     ).expectEqual(summary);
 }
 

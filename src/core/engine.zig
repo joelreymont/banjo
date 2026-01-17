@@ -268,87 +268,49 @@ pub fn processClaudeMessages(
                 if (msg.getToolResult()) |tool_result| {
                     const status: ToolStatus = if (tool_result.is_error) .failed else .completed;
                     try ctx.cb.sendToolResult(ctx.session_id, engine, tool_result.id, tool_result.content, status, tool_result.raw);
-                    // Check if this is the dot off tool result - only reload on success
-                    if (dot_off_tool_id) |id| {
-                        if (std.mem.eql(u8, tool_result.id, id)) {
-                            ctx.allocator.free(id);
-                            dot_off_tool_id = null;
-                            if (!tool_result.is_error) {
-                                log.info("dot off completed, scheduling context reload", .{});
-                                reload_queue.schedule(engine);
-                                did_context_reload = true;
-                            } else {
-                                log.info("dot off failed, skipping context reload", .{});
-                            }
-                        }
-                    }
+                    handleDotOffResult(
+                        ctx,
+                        engine,
+                        tool_result.id,
+                        !tool_result.is_error,
+                        null,
+                        &dot_off_tool_id,
+                        &reload_queue,
+                        &did_context_reload,
+                    );
                 }
             },
             .user => {
                 if (msg.getToolResult()) |tool_result| {
                     const status: ToolStatus = if (tool_result.is_error) .failed else .completed;
                     try ctx.cb.sendToolResult(ctx.session_id, engine, tool_result.id, tool_result.content, status, tool_result.raw);
-                    // Check if this is the dot off tool result - only reload on success
-                    if (dot_off_tool_id) |id| {
-                        if (std.mem.eql(u8, tool_result.id, id)) {
-                            ctx.allocator.free(id);
-                            dot_off_tool_id = null;
-                            if (!tool_result.is_error) {
-                                log.info("dot off completed, scheduling context reload", .{});
-                                reload_queue.schedule(engine);
-                                did_context_reload = true;
-                            } else {
-                                log.info("dot off failed, skipping context reload", .{});
-                            }
-                        }
-                    }
+                    handleDotOffResult(
+                        ctx,
+                        engine,
+                        tool_result.id,
+                        !tool_result.is_error,
+                        null,
+                        &dot_off_tool_id,
+                        &reload_queue,
+                        &did_context_reload,
+                    );
                 }
             },
             .result => {
                 engineDebugLog("result handler entry", .{});
                 const stop_reason_opt = msg.getStopReason();
                 engineDebugLog("result: stop_reason={?s}", .{stop_reason_opt});
-                if (reload_queue.hasPending()) {
-                    if (try sendQueuedReload(ctx, engine, &reload_queue)) return .context_reloaded;
-                }
                 if (stop_reason_opt) |reason| {
-                    const now_ms = std.time.milliTimestamp();
-
-                    const nudge_inputs = NudgeInputs{
-                        .enabled = ctx.nudge.enabled,
-                        .cancelled = ctx.isCancelled(),
-                        .cooldown_ok = (now_ms - ctx.nudge.last_nudge_ms.*) >= ctx.nudge.cooldown_ms,
-                        .has_dots = dots.hasPendingTasks(ctx.allocator, ctx.cwd).has_tasks,
-                        .reason_ok = isNudgeableStopReason(reason),
-                        .did_work = tool_use_count > 1,
-                    };
-
-                    log.info("Nudge check: cwd={s}, enabled={}, cancelled={}, cooldown_ok={}, has_dots={}, did_work={} (tools={}), reason={s}, reason_ok={}", .{
-                        ctx.cwd,
-                        nudge_inputs.enabled,
-                        nudge_inputs.cancelled,
-                        nudge_inputs.cooldown_ok,
-                        nudge_inputs.has_dots,
-                        nudge_inputs.did_work,
-                        tool_use_count,
+                    const resolved = try handleStopReason(
+                        ctx,
+                        engine,
                         reason,
-                        nudge_inputs.reason_ok,
-                    });
-
-                    if (nudge_inputs.shouldNudge() and !did_context_reload) {
-                        ctx.nudge.last_nudge_ms.* = now_ms;
-                        log.info("Claude Code stopped ({s}); pending dots, clearing and triggering", .{reason});
-                        reload_queue.schedule(.claude);
-                        did_context_reload = true;
-                        if (try sendQueuedReload(ctx, .claude, &reload_queue)) return .context_reloaded;
-                    } else if (did_context_reload) {
-                        log.info("Skipping nudge: already reloaded from dot off", .{});
-                    } else if (!nudge_inputs.cooldown_ok) {
-                        log.info("Claude Code stopped ({s}); not nudging due to cooldown", .{reason});
-                    } else if (!nudge_inputs.did_work) {
-                        log.info("Claude Code stopped ({s}); not nudging (no tools used)", .{reason});
-                    }
-                    stop_reason = mapCliStopReason(reason);
+                        tool_use_count,
+                        &reload_queue,
+                        &did_context_reload,
+                    );
+                    if (resolved == .context_reloaded) return resolved;
+                    stop_reason = resolved;
                 }
                 engineDebugLog("result: breaking out of loop", .{});
                 break;
@@ -467,6 +429,88 @@ fn sendTaggedContent(
 
 fn sendEngineText(ctx: *PromptContext, engine: Engine, text: []const u8) !void {
     return sendTaggedContent(ctx, engine, text, constants.large_buffer_size, EditorCallbacks.sendText);
+}
+
+fn handleDotOffResult(
+    ctx: *PromptContext,
+    engine: Engine,
+    tool_id: []const u8,
+    exit_ok: bool,
+    exit_code: ?i64,
+    dot_off_tool_id: *?[]const u8,
+    reload_queue: *ReloadQueue,
+    did_context_reload: *bool,
+) void {
+    if (dot_off_tool_id.*) |id| {
+        if (std.mem.eql(u8, tool_id, id)) {
+            ctx.allocator.free(id);
+            dot_off_tool_id.* = null;
+            if (exit_ok) {
+                log.info("dot off completed, scheduling context reload", .{});
+                reload_queue.schedule(engine);
+                did_context_reload.* = true;
+            } else {
+                if (exit_code) |code| {
+                    log.info("dot off failed (exit {d}), skipping context reload", .{code});
+                } else {
+                    log.info("dot off failed, skipping context reload", .{});
+                }
+            }
+        }
+    }
+}
+
+fn handleStopReason(
+    ctx: *PromptContext,
+    engine: Engine,
+    reason: []const u8,
+    tool_use_count: u32,
+    reload_queue: *ReloadQueue,
+    did_context_reload: *bool,
+) !StopReason {
+    if (reload_queue.hasPending()) {
+        if (try sendQueuedReload(ctx, engine, reload_queue)) return .context_reloaded;
+    }
+
+    const now_ms = std.time.milliTimestamp();
+    const nudge_inputs = NudgeInputs{
+        .enabled = ctx.nudge.enabled,
+        .cancelled = ctx.isCancelled(),
+        .cooldown_ok = (now_ms - ctx.nudge.last_nudge_ms.*) >= ctx.nudge.cooldown_ms,
+        .has_dots = dots.hasPendingTasks(ctx.allocator, ctx.cwd).has_tasks,
+        .reason_ok = isNudgeableStopReason(reason),
+        .did_work = tool_use_count > 1,
+    };
+
+    log.info("Nudge check: cwd={s}, enabled={}, cancelled={}, cooldown_ok={}, has_dots={}, did_work={} (tools={}), reason={s}, reason_ok={}", .{
+        ctx.cwd,
+        nudge_inputs.enabled,
+        nudge_inputs.cancelled,
+        nudge_inputs.cooldown_ok,
+        nudge_inputs.has_dots,
+        nudge_inputs.did_work,
+        tool_use_count,
+        reason,
+        nudge_inputs.reason_ok,
+    });
+
+    if (nudge_inputs.shouldNudge() and !did_context_reload.*) {
+        ctx.nudge.last_nudge_ms.* = now_ms;
+        log.info("{s} stopped ({s}); pending dots, clearing and triggering", .{ engine.label(), reason });
+        reload_queue.schedule(engine);
+        did_context_reload.* = true;
+        if (try sendQueuedReload(ctx, engine, reload_queue)) return .context_reloaded;
+    } else if (did_context_reload.*) {
+        log.info("Skipping nudge: already reloaded from dot off", .{});
+    } else if (!nudge_inputs.reason_ok) {
+        log.info("{s} stopped ({s}); not nudging due to stop reason", .{ engine.label(), reason });
+    } else if (!nudge_inputs.cooldown_ok) {
+        log.info("{s} stopped ({s}); not nudging due to cooldown", .{ engine.label(), reason });
+    } else if (!nudge_inputs.did_work) {
+        log.info("{s} stopped ({s}); not nudging (no tools used)", .{ engine.label(), reason });
+    }
+
+    return mapCliStopReason(reason);
 }
 
 fn mapCliStopReason(cli_reason: []const u8) StopReason {
@@ -638,21 +682,17 @@ pub fn processCodexMessages(
         if (msg.getToolResult()) |tool_result| {
             const status = exitCodeStatus(tool_result.exit_code);
             try ctx.cb.sendToolResult(ctx.session_id, engine, tool_result.id, tool_result.content, status, tool_result.raw);
-            // Check if this is the dot off tool result - only reload on success
-            if (dot_off_tool_id) |id| {
-                if (std.mem.eql(u8, tool_result.id, id)) {
-                    ctx.allocator.free(id);
-                    dot_off_tool_id = null;
-                    const exit_ok = (tool_result.exit_code orelse 0) == 0;
-                    if (exit_ok) {
-                        log.info("dot off completed, scheduling context reload", .{});
-                        reload_queue.schedule(engine);
-                        did_context_reload = true;
-                    } else {
-                        log.info("dot off failed (exit {?}), skipping context reload", .{tool_result.exit_code});
-                    }
-                }
-            }
+            const exit_ok = (tool_result.exit_code orelse 0) == 0;
+            handleDotOffResult(
+                ctx,
+                engine,
+                tool_result.id,
+                exit_ok,
+                tool_result.exit_code,
+                &dot_off_tool_id,
+                &reload_queue,
+                &did_context_reload,
+            );
             continue;
         }
 
@@ -704,36 +744,22 @@ pub fn processCodexMessages(
             }
 
             const has_max_turn_error = if (msg.turn_error) |err| isCodexMaxTurnError(err) else false;
-            const has_blocking_error = msg.turn_error != null and !has_max_turn_error;
-            const now_ms = std.time.milliTimestamp();
-
-            const nudge_inputs = NudgeInputs{
-                .enabled = ctx.nudge.enabled,
-                .cancelled = ctx.isCancelled(),
-                .cooldown_ok = (now_ms - ctx.nudge.last_nudge_ms.*) >= ctx.nudge.cooldown_ms,
-                .has_dots = dots.hasPendingTasks(ctx.allocator, ctx.cwd).has_tasks,
-                .reason_ok = !has_blocking_error, // Codex: no blocking error means OK to nudge
-                .did_work = tool_use_count > 1,
-            };
-
-            const has_pending_reload = reload_queue.hasPending();
-            if (has_pending_reload) {
-                if (try sendQueuedReload(ctx, engine, &reload_queue)) return .context_reloaded;
-            } else if (nudge_inputs.shouldNudge() and !did_context_reload) {
-                ctx.nudge.last_nudge_ms.* = now_ms;
-                log.info("Codex turn completed; pending dots, clearing and triggering", .{});
-                reload_queue.schedule(.codex);
-                did_context_reload = true;
-                if (try sendQueuedReload(ctx, .codex, &reload_queue)) return .context_reloaded;
-            } else if (did_context_reload) {
-                log.info("Skipping nudge: already reloaded from dot off", .{});
-            } else if (has_blocking_error) {
-                log.info("Codex turn completed; not nudging due to error", .{});
-            } else if (!nudge_inputs.cooldown_ok) {
-                log.info("Codex turn completed; not nudging due to cooldown", .{});
-            } else if (!nudge_inputs.did_work) {
-                log.info("Codex turn completed; not nudging (no tools used)", .{});
-            }
+            const reason = if (msg.turn_error == null)
+                "success"
+            else if (has_max_turn_error)
+                "error_max_turns"
+            else
+                "error_blocking";
+            const resolved = try handleStopReason(
+                ctx,
+                engine,
+                reason,
+                tool_use_count,
+                &reload_queue,
+                &did_context_reload,
+            );
+            if (resolved == .context_reloaded) return resolved;
+            stop_reason = resolved;
         }
 
         if (msg.isTurnCompleted()) break;

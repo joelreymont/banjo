@@ -4,6 +4,7 @@ const posix = std.posix;
 const websocket = @import("../ws/websocket.zig");
 const byte_queue = @import("../util/byte_queue.zig");
 const jsonrpc = @import("../jsonrpc.zig");
+const io_utils = @import("../core/io_utils.zig");
 
 /// WebSocket writer that wraps outgoing JSON messages in WebSocket frames.
 /// Buffers writes until a newline, then sends as a single text frame.
@@ -57,12 +58,7 @@ pub const WsWriter = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var sent: usize = 0;
-        while (sent < frame.len) {
-            const n = try posix.write(self.socket, frame[sent..]);
-            if (n == 0) return error.ConnectionClosed;
-            sent += n;
-        }
+        try io_utils.writeAll(self.socket, frame);
     }
 };
 
@@ -166,7 +162,7 @@ pub const WsReader = struct {
                         // Send pong
                         const pong = try websocket.encodeFrame(self.allocator, .pong, result.frame.payload);
                         defer self.allocator.free(pong);
-                        _ = try posix.write(self.socket, pong);
+                        try io_utils.writeAll(self.socket, pong);
                         self.frame_buffer.consume(result.consumed);
                         continue;
                     },
@@ -308,14 +304,14 @@ test "WsWriter fuzz arbitrary bytes" {
             // Writing arbitrary bytes should never panic
             _ = w.write(bytes) catch return true;
 
-            // Buffer should contain all non-newline bytes
-            var expected_len: usize = 0;
-            for (bytes) |b| {
-                if (b != '\n') expected_len += 1;
+            var last_nl: ?usize = null;
+            for (bytes, 0..) |b, i| {
+                if (b == '\n') last_nl = i;
             }
-            // After write, buffer should have accumulated non-newline bytes
-            // (unless there was a newline, which flushes)
-            return true;
+            const start = if (last_nl) |idx| idx + 1 else 0;
+            const expected = bytes[start..];
+            if (ws_writer.buffer.items.len != expected.len) return false;
+            return std.mem.eql(u8, ws_writer.buffer.items, expected);
         }
     }.prop, .{ .iterations = 500 });
 }
@@ -332,7 +328,7 @@ test "WsReader extracts complete message" {
     const frame = try encodeMaskedFrame(allocator, .text, payload);
     defer allocator.free(frame);
 
-    _ = try posix.write(pair[0], frame);
+    try io_utils.writeAll(pair[0], frame);
 
     // Read via WsReader
     var ws_reader = WsReader.init(allocator, pair[1]);
@@ -361,8 +357,8 @@ test "WsReader handles multiple frames" {
     const frame2 = try encodeMaskedFrame(allocator, .text, payload2);
     defer allocator.free(frame2);
 
-    _ = try posix.write(pair[0], frame1);
-    _ = try posix.write(pair[0], frame2);
+    try io_utils.writeAll(pair[0], frame1);
+    try io_utils.writeAll(pair[0], frame2);
 
     var ws_reader = WsReader.init(allocator, pair[1]);
     defer ws_reader.deinit();
@@ -395,7 +391,7 @@ test "WsTransport large payload" {
     const frame = try encodeMaskedFrame(allocator, .text, payload);
     defer allocator.free(frame);
 
-    _ = try posix.write(pair[0], frame);
+    try io_utils.writeAll(pair[0], frame);
 
     var ws_reader = WsReader.init(allocator, pair[1]);
     defer ws_reader.deinit();

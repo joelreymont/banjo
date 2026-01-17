@@ -225,6 +225,7 @@ pub const StreamMessage = struct {
     type: MessageType,
     subtype: ?[]const u8 = null,
     envelope: ?StreamEnvelope = null,
+    envelope_failed: bool = false,
     raw: std.json.Value,
     arena: std.heap.ArenaAllocator,
 
@@ -238,10 +239,13 @@ pub const StreamMessage = struct {
 
     fn getEnvelope(self: *const StreamMessage) ?StreamEnvelope {
         if (self.envelope) |env| return env;
+        if (self.envelope_failed) return null;
         const parsed = std.json.parseFromValueLeaky(StreamEnvelope, self.arenaAllocator(), self.raw, .{
             .ignore_unknown_fields = true,
         }) catch |err| {
-            std.debug.panic("Failed to parse stream envelope: {}", .{err});
+            log.warn("Failed to parse stream envelope: {}", .{err});
+            @constCast(self).envelope_failed = true;
+            return null;
         };
         @constCast(self).envelope = parsed;
         return parsed;
@@ -914,6 +918,7 @@ pub const Bridge = struct {
                     self.message_queue.clearRetainingCapacity();
                     self.queue_head = 0;
                 }
+                self.queue_cond.signal();
                 return msg;
             }
 
@@ -967,6 +972,14 @@ pub const Bridge = struct {
             bridgeDebugLog("readerMain: got message #{d}, type={s}", .{ msg_count, @tagName(msg.type) });
 
             self.queue_mutex.lock();
+            while ((self.message_queue.items.len - self.queue_head) >= constants.bridge_queue_max_messages) {
+                if (self.stop_requested.load(.acquire)) {
+                    self.queue_mutex.unlock();
+                    msg.deinit();
+                    return;
+                }
+                self.queue_cond.wait(&self.queue_mutex);
+            }
             self.message_queue.append(self.allocator, msg) catch |err| {
                 self.queue_mutex.unlock();
                 log.err("Failed to queue Claude message: {}", .{err});
@@ -1521,15 +1534,15 @@ test "Claude Code SIGINT interrupt stops streaming" {
         .model = null,
     });
 
-    // Start a long prompt
-    try bridge.sendPrompt("Write a 500 word essay about the history of computing.");
+    // Start a long prompt to guarantee streaming
+    try bridge.sendPrompt("Write the numbers 1 through 200, one per line.");
 
     // Wait for actual content to start streaming (not just init messages)
-    const got_content = try waitForClaudeStreamStart(&bridge, 30000);
+    const got_content = try waitForClaudeStreamStart(&bridge, constants.live_stream_start_timeout_ms);
     try testing.expect(got_content);
 
     // Small delay to ensure content is flowing
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    std.Thread.sleep(100 * std.time.ns_per_ms);
 
     // Verify alive before interrupt
     try testing.expect(bridge.isAlive());
@@ -1551,14 +1564,14 @@ test "Bridge restarts after SIGINT and processes new prompt" {
     // First session: start, prompt, interrupt
     try bridge.start(.{ .permission_mode = "default" });
 
-    try bridge.sendPrompt("Count to 100 slowly.");
-    _ = try waitForClaudeStreamStart(&bridge, 30000);
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    try bridge.sendPrompt("Count from 1 to 50, one number per line.");
+    _ = try waitForClaudeStreamStart(&bridge, constants.live_stream_start_timeout_ms);
+    std.Thread.sleep(100 * std.time.ns_per_ms);
     bridge.interrupt();
 
     // Wait for process to exit after interrupt
     var exit_seen = false;
-    const deadline = std.time.milliTimestamp() + 10000;
+    const deadline = std.time.milliTimestamp() + constants.live_restart_timeout_ms;
     while (std.time.milliTimestamp() < deadline) {
         if (!bridge.isAlive()) {
             exit_seen = true;
@@ -1576,7 +1589,7 @@ test "Bridge restarts after SIGINT and processes new prompt" {
     try bridge.sendPrompt("Say exactly: hello world");
 
     var got_response = false;
-    const deadline2 = std.time.milliTimestamp() + 30000;
+    const deadline2 = std.time.milliTimestamp() + constants.live_snapshot_timeout_ms;
     while (std.time.milliTimestamp() < deadline2) {
         var msg = bridge.readMessageWithTimeout(deadline2) catch break orelse break;
         defer msg.deinit();
@@ -1605,7 +1618,7 @@ test "interrupt and continue preserves session context" {
     try bridge.sendPrompt("Remember the secret word: BANANA. Acknowledge with OK.");
 
     // Wait for acknowledgment
-    const deadline1 = std.time.milliTimestamp() + 30000;
+    const deadline1 = std.time.milliTimestamp() + constants.live_snapshot_timeout_ms;
     while (std.time.milliTimestamp() < deadline1) {
         var msg = bridge.readMessageWithTimeout(deadline1) catch break orelse break;
         defer msg.deinit();
@@ -1624,7 +1637,7 @@ test "interrupt and continue preserves session context" {
     // Ask about the secret - verify we can send/receive after restart
     try bridge.sendPrompt("What was the secret word I told you? Reply with just the word.");
     var got_response = false;
-    const deadline2 = std.time.milliTimestamp() + 30000;
+    const deadline2 = std.time.milliTimestamp() + constants.live_snapshot_timeout_ms;
     while (std.time.milliTimestamp() < deadline2) {
         var msg = bridge.readMessageWithTimeout(deadline2) catch break orelse break;
         defer msg.deinit();

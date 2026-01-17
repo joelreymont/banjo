@@ -402,35 +402,19 @@ pub const Handler = struct {
         debugLog("pollThreadFn exiting", .{});
     }
 
-    const PermissionHookRequest = struct {
-        tool_name: []const u8,
-        tool_input: std.json.Value,
-        tool_use_id: []const u8,
-        session_id: []const u8,
-    };
-
     fn pollPermissionSocket(self: *Handler) void {
         const sock = self.permission.socket orelse return;
 
         // Non-blocking accept
-        const client_fd = std.posix.accept(sock, null, null, std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC) catch |err| {
-            if (err == error.WouldBlock) return;
-            log.warn("Permission socket accept error: {}", .{err});
-            return;
-        };
+        const client_fd = permission_socket.tryAccept(sock) orelse return;
         defer std.posix.close(client_fd);
 
-        // Read and parse request
-        var buf: [constants.large_buffer_size]u8 = undefined;
-        const json_str = self.readPermissionRequest(client_fd, &buf) orelse return;
-
-        const parsed = std.json.parseFromSlice(PermissionHookRequest, self.allocator, json_str, .{
-            .ignore_unknown_fields = true,
-        }) catch |err| {
+        const deadline_ms = std.time.milliTimestamp() + constants.socket_read_timeout_ms;
+        const parsed = permission_socket.readRequest(self.allocator, client_fd, deadline_ms) catch |err| {
             log.warn("Failed to parse permission request: {}", .{err});
             self.sendPermissionResponse(client_fd, "deny", null);
             return;
-        };
+        } orelse return;
         defer parsed.deinit();
         const req = parsed.value;
 
@@ -448,46 +432,7 @@ pub const Handler = struct {
         self.promptUserForPermission(client_fd, req);
     }
 
-    fn readPermissionRequest(self: *Handler, client_fd: std.posix.fd_t, buf: *[constants.large_buffer_size]u8) ?[]const u8 {
-        _ = self;
-        var total_read: usize = 0;
-        var poll_fds = [_]std.posix.pollfd{.{
-            .fd = client_fd,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
-
-        const read_deadline = std.time.milliTimestamp() + constants.socket_read_timeout_ms;
-        while (total_read < buf.len - 1) {
-            const remaining = read_deadline - std.time.milliTimestamp();
-            if (remaining <= 0) {
-                log.warn("Permission socket read timeout", .{});
-                return null;
-            }
-
-            const poll_result = std.posix.poll(&poll_fds, @intCast(@min(remaining, 1000))) catch |err| {
-                log.warn("Permission socket poll error: {}", .{err});
-                return null;
-            };
-
-            if (poll_result == 0) continue;
-            if (poll_fds[0].revents & std.posix.POLL.IN == 0) continue;
-
-            const n = std.posix.read(client_fd, buf[total_read..]) catch |err| {
-                if (err == error.WouldBlock) continue;
-                log.warn("Permission socket read error: {}", .{err});
-                return null;
-            };
-            if (n == 0) break;
-            total_read += n;
-            if (std.mem.indexOfScalar(u8, buf[0..total_read], '\n') != null) break;
-        }
-
-        if (total_read == 0) return null;
-        return std.mem.trimRight(u8, buf[0..total_read], "\n\r");
-    }
-
-    fn promptUserForPermission(self: *Handler, client_fd: std.posix.fd_t, req: PermissionHookRequest) void {
+    fn promptUserForPermission(self: *Handler, client_fd: std.posix.fd_t, req: permission_socket.HookRequest) void {
         // Store pending state
         if (self.permission.pending_id) |old| self.allocator.free(old);
         self.permission.pending_id = self.allocator.dupe(u8, req.tool_use_id) catch |err| {
@@ -623,34 +568,11 @@ pub const Handler = struct {
         };
     }
 
-    const PermissionResponse = struct {
-        decision: []const u8,
-        reason: ?[]const u8 = null,
-    };
-
     fn sendPermissionResponse(self: *Handler, client_fd: std.posix.socket_t, decision: []const u8, reason: ?[]const u8) void {
-        var out: std.io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-
-        var jw: std.json.Stringify = .{
-            .writer = &out.writer,
-            .options = .{ .emit_null_optional_fields = false },
-        };
-        jw.write(PermissionResponse{ .decision = decision, .reason = reason }) catch |err| {
-            log.warn("Failed to serialize permission response: {}", .{err});
-            return;
-        };
-        out.writer.writeAll("\n") catch |err| {
-            log.warn("Failed to append newline to permission response: {}", .{err});
-            return;
-        };
-        const json = out.toOwnedSlice() catch |err| {
-            log.warn("Failed to get permission response buffer: {}", .{err});
-            return;
-        };
-        defer self.allocator.free(json);
-
-        _ = std.posix.write(client_fd, json) catch |err| {
+        permission_socket.writeResponse(self.allocator, client_fd, .{
+            .decision = decision,
+            .reason = reason,
+        }) catch |err| {
             log.warn("Failed to send permission response: {}", .{err});
         };
     }

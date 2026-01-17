@@ -119,21 +119,21 @@ fn log(level: Level, comptime scope: []const u8, comptime fmt: []const u8, args:
         day_secs.getHoursIntoDay(),
         day_secs.getMinutesIntoHour(),
         day_secs.getSecondsIntoMinute(),
-    })) |_| {} else |err| {
-        std.debug.panic("banjo log timestamp format failed: {}", .{err});
+    })) |_| {} else |_| {
+        return;
     }
 
     // Level, scope, and PID
-    if (w.print("[{s}] [{s}] [pid={d}] ", .{ level.asText(), scope, getPid() })) |_| {} else |err| {
-        std.debug.panic("banjo log header format failed: {}", .{err});
+    if (w.print("[{s}] [{s}] [pid={d}] ", .{ level.asText(), scope, getPid() })) |_| {} else |_| {
+        return;
     }
 
     // Message
-    if (w.print(fmt, args)) |_| {} else |err| {
-        std.debug.panic("banjo log message format failed: {}", .{err});
+    if (w.print(fmt, args)) |_| {} else |_| {
+        return;
     }
-    if (w.writeByte('\n')) |_| {} else |err| {
-        std.debug.panic("banjo log newline write failed: {}", .{err});
+    if (w.writeByte('\n')) |_| {} else |_| {
+        return;
     }
 
     const msg = fbs.getWritten();
@@ -148,9 +148,7 @@ fn log(level: Level, comptime scope: []const u8, comptime fmt: []const u8, args:
 
     // Also write to stderr for error/warn, or when no log file is available
     if (global_file == null or @intFromEnum(level) <= @intFromEnum(Level.warn)) {
-        if (std.fs.File.stderr().writeAll(msg)) |_| {} else |err| {
-            std.debug.panic("banjo log stderr write failed: {}", .{err});
-        }
+        std.fs.File.stderr().writeAll(msg) catch {};
     }
 }
 

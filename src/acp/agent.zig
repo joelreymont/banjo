@@ -2745,44 +2745,16 @@ pub const Agent = struct {
         };
 
         // Try to accept a connection (non-blocking)
-        var client_addr: std.posix.sockaddr.un = undefined;
-        var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.un);
-        const client_fd = std.posix.accept(sock, @ptrCast(&client_addr), &addr_len, 0) catch |err| {
-            if (err == error.WouldBlock) return; // No pending connection
-            log.warn("Permission socket accept error: {}", .{err});
-            return;
-        };
+        const client_fd = permission_socket.tryAccept(sock) orelse return;
         defer std.posix.close(client_fd);
         log.info("Accepted permission socket connection", .{});
 
-        // Read request from hook (may arrive in multiple chunks)
-        var buf: [constants.large_buffer_size]u8 = undefined;
-        var total: usize = 0;
-        while (total < buf.len) {
-            const n = std.posix.read(client_fd, buf[total..]) catch |err| {
-                log.warn("Permission socket read error: {}", .{err});
-                return;
-            };
-            if (n == 0) break; // EOF
-            total += n;
-            // Check if we have a complete line (JSON ends with newline)
-            if (std.mem.indexOfScalar(u8, buf[0..total], '\n') != null) break;
-        }
-        if (total == 0) return;
-        // Warn if buffer filled without finding newline (truncation)
-        if (total >= buf.len and std.mem.indexOfScalar(u8, buf[0..total], '\n') == null) {
-            log.warn("Permission request truncated at {d} bytes", .{total});
-        }
-
-        // Parse JSON request
-        const request_json = std.mem.trimRight(u8, buf[0..total], "\n\r");
-        var parsed = std.json.parseFromSlice(PermissionHookRequest, self.allocator, request_json, .{
-            .ignore_unknown_fields = true,
-        }) catch |err| {
+        const deadline_ms = std.time.milliTimestamp() + constants.socket_read_timeout_ms;
+        var parsed = permission_socket.readRequest(self.allocator, client_fd, deadline_ms) catch |err| {
             log.warn("Permission hook request parse error: {}", .{err});
             self.sendPermissionResponse(client_fd, "ask", null);
             return;
-        };
+        } orelse return;
         defer parsed.deinit();
 
         const req = parsed.value;
@@ -2812,74 +2784,31 @@ pub const Agent = struct {
         };
 
         // Send response back to hook
-        self.sendPermissionResponse(client_fd, decision.behavior, decision.message);
+        self.sendPermissionResponse(client_fd, decision.behavior, decision.reason);
     }
-
-    const PermissionHookRequest = struct {
-        tool_name: []const u8,
-        tool_input: std.json.Value,
-        tool_use_id: []const u8,
-        session_id: []const u8,
-    };
 
     const PermissionDecision = struct {
         behavior: []const u8, // "allow", "deny", "ask"
-        message: ?[]const u8,
+        reason: ?[]const u8,
     };
 
-    const PermissionSocketResponse = struct {
-        decision: []const u8,
-        message: ?[]const u8 = null,
-    };
-
-    fn sendPermissionResponse(self: *Agent, fd: std.posix.fd_t, decision: []const u8, message: ?[]const u8) void {
-        var out: std.io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-
-        var jw: std.json.Stringify = .{
-            .writer = &out.writer,
-            .options = .{ .emit_null_optional_fields = false },
-        };
-        jw.write(PermissionSocketResponse{ .decision = decision, .message = message }) catch |err| {
-            log.warn("Failed to serialize permission response: {}", .{err});
-            return;
-        };
-        out.writer.writeAll("\n") catch |err| {
-            log.warn("Failed to write newline: {}", .{err});
-            return;
-        };
-        const json = out.toOwnedSlice() catch |err| {
-            log.warn("Failed to get permission response: {}", .{err});
-            return;
-        };
-        defer self.allocator.free(json);
-
-        _ = std.posix.write(fd, json) catch |err| {
+    fn sendPermissionResponse(self: *Agent, fd: std.posix.fd_t, decision: []const u8, reason: ?[]const u8) void {
+        permission_socket.writeResponse(self.allocator, fd, .{
+            .decision = decision,
+            .reason = reason,
+        }) catch |err| {
             log.warn("Failed to send permission response: {}", .{err});
         };
     }
-
-    const AskUserQuestionSocketResponse = struct {
-        decision: []const u8 = "allow",
-        answers: std.json.ArrayHashMap([]const u8),
-    };
 
     fn sendAskUserQuestionResponse(self: *Agent, fd: std.posix.fd_t, header: []const u8, answer: []const u8) !void {
         var answers = std.json.ArrayHashMap([]const u8){};
         try answers.map.put(self.allocator, header, answer);
         defer answers.map.deinit(self.allocator);
-
-        var out: std.io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        var jw: std.json.Stringify = .{
-            .writer = &out.writer,
-            .options = .{ .emit_null_optional_fields = false },
-        };
-        try jw.write(AskUserQuestionSocketResponse{ .answers = answers });
-        try out.writer.writeByte('\n');
-        const response = try out.toOwnedSlice();
-        defer self.allocator.free(response);
-        _ = try std.posix.write(fd, response);
+        try permission_socket.writeResponse(self.allocator, fd, .{
+            .decision = "allow",
+            .answers = answers,
+        });
     }
 
     // AskUserQuestion input schema
@@ -2899,7 +2828,7 @@ pub const Agent = struct {
         };
     };
 
-    fn handleAskUserQuestion(self: *Agent, session: *Session, client_fd: std.posix.fd_t, req: PermissionHookRequest) !void {
+    fn handleAskUserQuestion(self: *Agent, session: *Session, client_fd: std.posix.fd_t, req: permission_socket.HookRequest) !void {
         // Parse the AskUserQuestion input
         const parsed = std.json.parseFromValue(AskUserQuestionInput, self.allocator, req.tool_input, .{
             .ignore_unknown_fields = true,
@@ -3017,21 +2946,21 @@ pub const Agent = struct {
         .{ "reject_once", .deny },
     });
 
-    fn requestPermissionFromClient(self: *Agent, session: *Session, req: PermissionHookRequest) !PermissionDecision {
+    fn requestPermissionFromClient(self: *Agent, session: *Session, req: permission_socket.HookRequest) !PermissionDecision {
         // Auto-approve safe internal and read-only tools
         if (tool_categories.isSafe(req.tool_name)) {
-            return .{ .behavior = "allow", .message = null };
+            return .{ .behavior = "allow", .reason = null };
         }
 
         // Check if user previously granted "Always Allow" for this tool
         if (session.always_allowed_tools.contains(req.tool_name)) {
-            return .{ .behavior = "allow", .message = null };
+            return .{ .behavior = "allow", .reason = null };
         }
 
         // In acceptEdits mode, also auto-approve edit tools
         if (session.permission_mode == .acceptEdits) {
             if (tool_categories.isEdit(req.tool_name)) {
-                return .{ .behavior = "allow", .message = null };
+                return .{ .behavior = "allow", .reason = null };
             }
         }
 
@@ -3069,7 +2998,7 @@ pub const Agent = struct {
         // Wait for response
         var response = self.waitForResponse(session, .{ .number = request_id }) catch |err| {
             if (err == error.Cancelled) {
-                return .{ .behavior = "deny", .message = "Cancelled" };
+                return .{ .behavior = "deny", .reason = "Cancelled" };
             }
             return err;
         };
@@ -3077,14 +3006,14 @@ pub const Agent = struct {
 
         // Parse response
         if (response.message != .response) {
-            return .{ .behavior = "ask", .message = null };
+            return .{ .behavior = "ask", .reason = null };
         }
         const resp = response.message.response;
         if (resp.result) |result| {
             const outcome = std.json.parseFromValue(protocol.PermissionResponse, self.allocator, result, .{
                 .ignore_unknown_fields = true,
             }) catch {
-                return .{ .behavior = "ask", .message = null };
+                return .{ .behavior = "ask", .reason = null };
             };
             defer outcome.deinit();
 
@@ -3094,23 +3023,23 @@ pub const Agent = struct {
                     switch (action) {
                         .allow_always => {
                             const key = self.allocator.dupe(u8, req.tool_name) catch {
-                                return .{ .behavior = "allow", .message = null };
+                                return .{ .behavior = "allow", .reason = null };
                             };
                             session.always_allowed_tools.put(key, {}) catch {
                                 self.allocator.free(key);
                             };
-                            return .{ .behavior = "allow", .message = null };
+                            return .{ .behavior = "allow", .reason = null };
                         },
-                        .allow_once => return .{ .behavior = "allow", .message = null },
-                        .deny => return .{ .behavior = "deny", .message = "Permission denied" },
+                        .allow_once => return .{ .behavior = "allow", .reason = null },
+                        .deny => return .{ .behavior = "deny", .reason = "Permission denied" },
                     }
                 }
             } else if (outcome.value.outcome.outcome == .cancelled) {
-                return .{ .behavior = "deny", .message = "Cancelled" };
+                return .{ .behavior = "deny", .reason = "Cancelled" };
             }
         }
 
-        return .{ .behavior = "ask", .message = null };
+        return .{ .behavior = "ask", .reason = null };
     }
 
     fn parsePermissionOutcome(self: *Agent, response: jsonrpc.Response) !protocol.PermissionOutcome {
@@ -5027,7 +4956,7 @@ test "Agent requestPermissionFromClient stores allow_always choice" {
     defer session.deinit(testing.allocator);
 
     // First call - should prompt and store
-    const req = Agent.PermissionHookRequest{
+    const req = permission_socket.HookRequest{
         .tool_name = "Bash",
         .tool_use_id = "tc-1",
         .tool_input = .{ .string = "echo hello" },
