@@ -24,6 +24,7 @@ const comments = @import("../notes/comments.zig");
 const notes_commands = @import("../notes/commands.zig");
 const permission_socket = @import("../core/permission_socket.zig");
 const constants = @import("../core/constants.zig");
+const io_utils = @import("../core/io_utils.zig");
 const tool_categories = @import("../core/tool_categories.zig");
 const session_id_util = @import("../core/session_id.zig");
 const auth_markers = @import("../core/auth_markers.zig");
@@ -31,6 +32,7 @@ const lsp_uri = @import("../lsp/uri.zig");
 const config = @import("config");
 const test_env = @import("../util/test_env.zig");
 const ToolProxy = @import("../tools/proxy.zig").ToolProxy;
+const ws_protocol = @import("../ws/protocol.zig");
 
 const log = std.log.scoped(.agent);
 
@@ -195,6 +197,7 @@ fn routeLabel(route: Route) []const u8 {
 const InitializeParams = struct {
     protocolVersion: ?i64 = null,
     clientCapabilities: ?protocol.ClientCapabilities = null,
+    clientInfo: ?protocol.ClientInfo = null,
 };
 
 const NewSessionParams = struct {
@@ -216,6 +219,9 @@ const SetModeParams = struct {
 
 const SetModelParams = protocol.SetModelRequest;
 const SetConfigParams = protocol.SetConfigOptionRequest;
+const GetDebugInfoParams = struct {
+    sessionId: ?[]const u8 = null,
+};
 
 const ResumeSessionParams = struct {
     sessionId: []const u8,
@@ -278,12 +284,15 @@ pub const Agent = struct {
     reader: ?*jsonrpc.Reader = null,
     sessions: std.StringHashMap(*Session),
     client_capabilities: ?protocol.ClientCapabilities = null,
+    supports_session_options: bool = false,
     next_tool_call_id: u64 = 0,
     next_request_id: i64 = 1,
     config_defaults: SessionConfig,
     tool_proxy: ToolProxy,
     pending_response_numbers: std.AutoHashMap(i64, jsonrpc.ParsedMessage),
     pending_response_strings: std.StringHashMap(jsonrpc.ParsedMessage),
+    pending_mutex: std.Thread.Mutex = .{},
+    pending_cond: std.Thread.Condition = .{},
 
     const EditInfo = struct {
         path: []const u8,
@@ -335,6 +344,7 @@ pub const Agent = struct {
         prompt_queue: std.ArrayListUnmanaged(QueuedPrompt) = .empty,
         last_nudge_ms: i64 = 0,
         dots_setup_done: bool = false,
+        prompt_count: u32 = 0,
 
         const QueuedPrompt = struct {
             request_id: jsonrpc.Request.Id,
@@ -705,6 +715,7 @@ pub const Agent = struct {
         .{ "session/set_mode", handleSetMode },
         .{ "session/set_model", handleSetModel },
         .{ "session/set_config_option", handleSetConfig },
+        .{ "get_debug_info", handleGetDebugInfo },
         .{ "unstable_resumeSession", handleResumeSession },
     });
 
@@ -732,6 +743,29 @@ pub const Agent = struct {
             .request => |request| try self.handleRequest(request),
             .notification => |notification| try self.handleNotification(notification),
             .response => |response| try self.handleResponse(response),
+        }
+    }
+
+    /// Handle a parsed JSON-RPC message (owns arena for responses).
+    pub fn handleParsedMessage(self: *Agent, parsed: jsonrpc.ParsedMessage) !void {
+        switch (parsed.message) {
+            .response => {
+                self.stashResponse(parsed) catch |err| {
+                    var owned = parsed;
+                    owned.deinit();
+                    return err;
+                };
+            },
+            .request => |request| {
+                var owned = parsed;
+                defer owned.deinit();
+                try self.handleRequest(request);
+            },
+            .notification => |notification| {
+                var owned = parsed;
+                defer owned.deinit();
+                try self.handleNotification(notification);
+            },
         }
     }
 
@@ -784,6 +818,10 @@ pub const Agent = struct {
                 if (caps.fs) |fs| fs.readTextFile else null,
                 caps.terminal,
             });
+        }
+
+        if (params.clientInfo) |info| {
+            self.supports_session_options = std.mem.startsWith(u8, info.name, "banjo-");
         }
 
         try self.sendInitializeResponse(request);
@@ -915,10 +953,28 @@ pub const Agent = struct {
             .currentModeId = @tagName(session.permission_mode),
         };
 
+        var config_options: ?[]const protocol.SessionConfigOption = null;
+        var model_state: ?protocol.SessionModelState = null;
+        if (self.supports_session_options) {
+            const opts = buildConfigOptions(session);
+            config_options = opts[0..];
+
+            const engine = switch (session.config.route) {
+                .claude => .claude,
+                .codex => .codex,
+                .duet => session.config.primary_agent,
+            };
+            model_state = .{
+                .availableModels = getModelsForEngine(engine),
+                .currentModelId = session.model orelse default_model_id,
+            };
+        }
+
         // Build response - must be sent BEFORE session updates
-        // Note: configOptions and models are not yet supported by Zed's ACP client
         const result = protocol.NewSessionResponse{
             .sessionId = session_id,
+            .configOptions = config_options,
+            .models = model_state,
             .modes = mode_state,
         };
         try self.writer.writeTypedResponse(request.id, result);
@@ -1040,6 +1096,7 @@ pub const Agent = struct {
             return; // Response will be sent when queued prompt is processed
         }
         session.handling_prompt = true;
+        session.prompt_count += 1;
         defer {
             session.handling_prompt = false;
             if (!session.processing_queue) {
@@ -2652,11 +2709,37 @@ pub const Agent = struct {
     }
 
     fn waitForResponse(self: *Agent, session: *Session, request_id: jsonrpc.Request.Id) !jsonrpc.ParsedMessage {
-        const reader = self.reader orelse return error.NoReader;
+        const reader = self.reader;
         var parsed: ?jsonrpc.ParsedMessage = null;
         defer if (parsed) |*msg| msg.deinit();
 
         const deadline_ms = std.time.milliTimestamp() + constants.rpc_timeout_ms;
+
+        if (reader == null) {
+            while (true) {
+                if (session.cancelled.load(.acquire)) {
+                    return error.Cancelled;
+                }
+                if (self.takePendingResponse(request_id)) |response_msg| {
+                    return response_msg;
+                }
+
+                const now = std.time.milliTimestamp();
+                if (now >= deadline_ms) return error.Timeout;
+                const slice_ms = io_utils.pollSliceMs(deadline_ms, now);
+                const timeout_ns: u64 = @as(u64, @intCast(slice_ms)) * std.time.ns_per_ms;
+
+                self.pending_mutex.lock();
+                if (self.takePendingResponseLocked(request_id)) |response_msg| {
+                    self.pending_mutex.unlock();
+                    return response_msg;
+                }
+                self.pending_cond.timedWait(&self.pending_mutex, timeout_ns) catch |err| switch (err) {
+                    error.Timeout => {},
+                };
+                self.pending_mutex.unlock();
+            }
+        }
 
         const State = enum {
             read_message,
@@ -2678,7 +2761,7 @@ pub const Agent = struct {
                         msg.deinit();
                         parsed = null;
                     }
-                    parsed = (try reader.nextMessageWithTimeout(deadline_ms)) orelse return error.UnexpectedEof;
+                    parsed = (try reader.?.nextMessageWithTimeout(deadline_ms)) orelse return error.UnexpectedEof;
                     state = .dispatch_message;
                     continue :state;
                 },
@@ -3080,29 +3163,43 @@ pub const Agent = struct {
             owned.deinit();
             return;
         };
+
+        self.pending_mutex.lock();
+        defer self.pending_mutex.unlock();
+
         switch (id) {
             .number => |num| {
                 if (self.pending_response_numbers.fetchRemove(num)) |entry| {
                     var owned = entry.value;
                     owned.deinit();
                 }
-                try self.pending_response_numbers.put(num, msg);
+                self.pending_response_numbers.put(num, msg) catch |err| {
+                    var owned = msg;
+                    owned.deinit();
+                    return err;
+                };
             },
             .string => |str| {
                 if (self.pending_response_strings.fetchRemove(str)) |entry| {
                     var owned = entry.value;
                     owned.deinit();
                 }
-                try self.pending_response_strings.put(str, msg);
+                self.pending_response_strings.put(str, msg) catch |err| {
+                    var owned = msg;
+                    owned.deinit();
+                    return err;
+                };
             },
             .null => {
                 var owned = msg;
                 owned.deinit();
             },
         }
+
+        self.pending_cond.signal();
     }
 
-    fn takePendingResponse(self: *Agent, request_id: jsonrpc.Request.Id) ?jsonrpc.ParsedMessage {
+    fn takePendingResponseLocked(self: *Agent, request_id: jsonrpc.Request.Id) ?jsonrpc.ParsedMessage {
         return switch (request_id) {
             .number => |num| blk: {
                 if (self.pending_response_numbers.fetchRemove(num)) |entry| break :blk entry.value;
@@ -3116,7 +3213,16 @@ pub const Agent = struct {
         };
     }
 
+    fn takePendingResponse(self: *Agent, request_id: jsonrpc.Request.Id) ?jsonrpc.ParsedMessage {
+        self.pending_mutex.lock();
+        defer self.pending_mutex.unlock();
+        return self.takePendingResponseLocked(request_id);
+    }
+
     fn clearPendingResponses(self: *Agent) void {
+        self.pending_mutex.lock();
+        defer self.pending_mutex.unlock();
+
         var num_it = self.pending_response_numbers.iterator();
         while (num_it.next()) |entry| {
             var owned = entry.value_ptr.*;
@@ -3528,6 +3634,75 @@ pub const Agent = struct {
         try self.writer.writeTypedResponse(request.id, protocol.SetConfigOptionResponse{
             .configOptions = config_options[0..],
         });
+    }
+
+    fn handleGetDebugInfo(self: *Agent, request: jsonrpc.Request) !void {
+        var session_id: ?[]const u8 = null;
+        if (request.params) |params| {
+            if (std.json.parseFromValue(GetDebugInfoParams, self.allocator, params, .{
+                .ignore_unknown_fields = true,
+            })) |parsed| {
+                defer parsed.deinit();
+                session_id = parsed.value.sessionId;
+            } else |err| {
+                log.warn("Failed to parse get_debug_info params: {}", .{err});
+            }
+        }
+
+        var claude_alive = false;
+        var codex_alive = false;
+        var total: u64 = 0;
+
+        if (session_id) |sid| {
+            const session = self.sessions.get(sid) orelse {
+                if (!request.isNotification()) {
+                    try self.writer.writeResponse(jsonrpc.Response.err(
+                        request.id,
+                        jsonrpc.Error.InvalidParams,
+                        "Session not found",
+                    ));
+                }
+                return;
+            };
+            if (session.bridge) |*b| {
+                claude_alive = b.isAlive();
+            }
+            if (session.codex_bridge) |*b| {
+                codex_alive = b.isAlive();
+            }
+            total = session.prompt_count;
+        } else {
+            var it = self.sessions.iterator();
+            while (it.next()) |entry| {
+                const session = entry.value_ptr.*;
+                if (!claude_alive) {
+                    if (session.bridge) |*b| {
+                        if (b.isAlive()) claude_alive = true;
+                    }
+                }
+                if (!codex_alive) {
+                    if (session.codex_bridge) |*b| {
+                        if (b.isAlive()) codex_alive = true;
+                    }
+                }
+                total += session.prompt_count;
+            }
+        }
+
+        const prompt_count: u32 = if (total > std.math.maxInt(u32))
+            std.math.maxInt(u32)
+        else
+            @intCast(total);
+
+        try self.writer.writeTypedNotification("debug_info", ws_protocol.DebugInfo{
+            .claude_bridge_alive = claude_alive,
+            .codex_bridge_alive = codex_alive,
+            .prompt_count = prompt_count,
+        });
+
+        if (!request.isNotification()) {
+            try self.writer.writeTypedResponse(request.id, protocol.EmptyResponse{});
+        }
     }
 
     fn updateAllSessions(self: *Agent, config_id: ConfigOptionId, update: SessionConfigUpdate) void {
