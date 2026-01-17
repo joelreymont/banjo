@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
+const io_utils = @import("../core/io_utils.zig");
 
 const lockfile = @import("lockfile.zig");
 const websocket = @import("websocket.zig");
@@ -145,7 +146,7 @@ pub const McpServer = struct {
             break :blk null;
         };
         if (close_frame) |frame| {
-            _ = posix.write(sock, frame) catch |err| {
+            io_utils.writeAll(sock, frame) catch |err| {
                 log.debug("Failed to send close frame to {s} client: {}", .{ name, err });
             };
             self.allocator.free(frame);
@@ -533,7 +534,7 @@ pub const McpServer = struct {
                     self.socket_mutex.lock();
                     defer self.socket_mutex.unlock();
                     const sock = self.nvim_client_socket orelse return error.NotConnected;
-                    _ = try posix.write(sock, pong);
+                    try io_utils.writeAll(sock, pong);
                 },
                 .close => {
                     log.info("Nvim client sent close frame", .{});
@@ -584,7 +585,7 @@ pub const McpServer = struct {
         self.socket_mutex.lock();
         defer self.socket_mutex.unlock();
         const client = self.nvim_client_socket orelse return error.NotConnected;
-        _ = try posix.write(client, frame);
+        try io_utils.writeAll(client, frame);
     }
 
     /// Check if nvim client is connected
@@ -638,7 +639,7 @@ pub const McpServer = struct {
                     self.socket_mutex.lock();
                     defer self.socket_mutex.unlock();
                     if (self.acp_client) |c| {
-                        _ = try posix.write(c.socket, pong);
+                        try io_utils.writeAll(c.socket, pong);
                     }
                 },
                 .close => {

@@ -1,7 +1,23 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const byte_queue = @import("../util/byte_queue.zig");
+const constants = @import("constants.zig");
+const io_utils = @import("io_utils.zig");
 
 const log = std.log.scoped(.permission_socket);
+
+pub const HookRequest = struct {
+    tool_name: []const u8,
+    tool_input: std.json.Value,
+    tool_use_id: []const u8,
+    session_id: []const u8,
+};
+
+pub const HookResponse = struct {
+    decision: []const u8 = "ask",
+    reason: ?[]const u8 = null,
+    answers: ?std.json.ArrayHashMap([]const u8) = null,
+};
 
 /// Result of creating a permission socket.
 pub const CreateResult = struct {
@@ -62,6 +78,55 @@ pub fn tryAccept(socket: std.posix.socket_t) ?std.posix.socket_t {
         log.warn("Permission socket accept error: {}", .{err});
         return null;
     };
+}
+
+pub fn readRequest(allocator: Allocator, fd: std.posix.fd_t, deadline_ms: i64) !?std.json.Parsed(HookRequest) {
+    return readParsed(HookRequest, allocator, fd, deadline_ms);
+}
+
+pub fn readResponse(allocator: Allocator, fd: std.posix.fd_t, deadline_ms: i64) !?std.json.Parsed(HookResponse) {
+    return readParsed(HookResponse, allocator, fd, deadline_ms);
+}
+
+pub fn writeRequest(allocator: Allocator, fd: std.posix.fd_t, request: HookRequest) !void {
+    try writeJson(allocator, fd, request);
+}
+
+pub fn writeResponse(allocator: Allocator, fd: std.posix.fd_t, response: HookResponse) !void {
+    try writeJson(allocator, fd, response);
+}
+
+fn readParsed(comptime T: type, allocator: Allocator, fd: std.posix.fd_t, deadline_ms: i64) !?std.json.Parsed(T) {
+    var queue: byte_queue.ByteQueue = .{};
+    defer queue.deinit(allocator);
+    const file = std.fs.File{ .handle = fd };
+    const line = (try io_utils.readLine(
+        allocator,
+        &queue,
+        file.deprecatedReader().any(),
+        fd,
+        deadline_ms,
+        constants.large_buffer_size,
+    )) orelse return null;
+    const parsed = try std.json.parseFromSlice(T, allocator, line, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    return parsed;
+}
+
+fn writeJson(allocator: Allocator, fd: std.posix.fd_t, value: anytype) !void {
+    var out: std.io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var jw: std.json.Stringify = .{
+        .writer = &out.writer,
+        .options = .{ .emit_null_optional_fields = false },
+    };
+    try jw.write(value);
+    try out.writer.writeByte('\n');
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+    try io_utils.writeAll(fd, json);
 }
 
 // RAII wrapper for convenience
@@ -185,4 +250,67 @@ test "PermissionSocket create and close" {
         \\stat_after: false
         \\
     ).diff(snapshot, true);
+}
+
+test "permission socket read/write roundtrip" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const ohsnap = @import("ohsnap");
+
+    const req_fds = try std.posix.pipe();
+    defer std.posix.close(req_fds[0]);
+    defer std.posix.close(req_fds[1]);
+
+    const request = HookRequest{
+        .tool_name = "Bash",
+        .tool_input = .{ .string = "ls" },
+        .tool_use_id = "tool-1",
+        .session_id = "session-1",
+    };
+    try writeRequest(allocator, req_fds[1], request);
+    var parsed_req = (try readRequest(allocator, req_fds[0], std.time.milliTimestamp() + 1000)) orelse {
+        return error.TestUnexpectedResult;
+    };
+    defer parsed_req.deinit();
+
+    const req_summary = .{
+        .tool_name = parsed_req.value.tool_name,
+        .tool_use_id = parsed_req.value.tool_use_id,
+        .session_id = parsed_req.value.session_id,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.permission_socket.test.permission socket read/write roundtrip__struct_<^\d+$>
+        \\  .tool_name: []const u8
+        \\    "Bash"
+        \\  .tool_use_id: []const u8
+        \\    "tool-1"
+        \\  .session_id: []const u8
+        \\    "session-1"
+    ).expectEqual(req_summary);
+
+    const resp_fds = try std.posix.pipe();
+    defer std.posix.close(resp_fds[0]);
+    defer std.posix.close(resp_fds[1]);
+
+    const response = HookResponse{
+        .decision = "allow",
+        .reason = "ok",
+    };
+    try writeResponse(allocator, resp_fds[1], response);
+    var parsed_resp = (try readResponse(allocator, resp_fds[0], std.time.milliTimestamp() + 1000)) orelse {
+        return error.TestUnexpectedResult;
+    };
+    defer parsed_resp.deinit();
+
+    const resp_summary = .{
+        .decision = parsed_resp.value.decision,
+        .reason = parsed_resp.value.reason,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.permission_socket.test.permission socket read/write roundtrip__struct_<^\d+$>
+        \\  .decision: []const u8
+        \\    "allow"
+        \\  .reason: ?[]const u8
+        \\    "ok"
+    ).expectEqual(resp_summary);
 }

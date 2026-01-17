@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const io_utils = @import("../core/io_utils.zig");
 const log = std.log.scoped(.websocket);
 
 // Maximum frame payload size (16 MB)
@@ -100,9 +101,9 @@ pub fn completeHandshake(
         "Connection: Upgrade\r\n" ++
         "Sec-WebSocket-Accept: ";
     const response_end = "\r\n\r\n";
-    try writeAll(socket_fd, response_template);
-    try writeAll(socket_fd, &accept_key);
-    try writeAll(socket_fd, response_end);
+    try io_utils.writeAll(socket_fd, response_template);
+    try io_utils.writeAll(socket_fd, &accept_key);
+    try io_utils.writeAll(socket_fd, response_end);
 
     return client_kind;
 }
@@ -315,15 +316,6 @@ fn parseHeader(line: []const u8, prefix: []const u8) ?[]const u8 {
         return line[prefix.len..];
     }
     return null;
-}
-
-fn writeAll(fd: std.posix.socket_t, buf: []const u8) !void {
-    var offset: usize = 0;
-    while (offset < buf.len) {
-        const n = try std.posix.write(fd, buf[offset..]);
-        if (n == 0) return error.ConnectionClosed;
-        offset += n;
-    }
 }
 
 // Tests
@@ -547,7 +539,7 @@ test "performHandshakeWithPath preserves trailing bytes" {
     var write_buf: [request.len + extra.len]u8 = undefined;
     @memcpy(write_buf[0..request.len], request);
     @memcpy(write_buf[request.len..], &extra);
-    try writeAll(client, &write_buf);
+    try io_utils.writeAll(client, &write_buf);
 
     const outcome = try performHandshakeWithPath(testing.allocator, server);
     defer if (outcome.remainder) |bytes| testing.allocator.free(bytes);

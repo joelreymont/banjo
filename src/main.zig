@@ -3,7 +3,9 @@ const jsonrpc = @import("jsonrpc.zig");
 const Agent = @import("acp/agent.zig").Agent;
 const LspServer = @import("lsp/server.zig").Server;
 const DaemonHandler = @import("ws/handler.zig").Handler;
+const constants = @import("core/constants.zig");
 const config = @import("config");
+const permission_socket = @import("core/permission_socket.zig");
 
 const log = std.log.scoped(.banjo);
 
@@ -24,11 +26,13 @@ fn fileLogFn(
     const scope_prefix = if (scope == .default) "" else "(" ++ @tagName(scope) ++ ") ";
     const prefix = "[" ++ comptime level.asText() ++ "] " ++ scope_prefix;
     var buf: [8192]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, prefix ++ fmt ++ "\n", args) catch |err| {
-        std.debug.panic("banjo log format failed: {}", .{err});
+    const msg = std.fmt.bufPrint(&buf, prefix ++ fmt ++ "\n", args) catch {
+        return;
     };
-    file.deprecatedWriter().writeAll(msg) catch |err| {
-        std.debug.panic("banjo log write failed: {}", .{err});
+    file.deprecatedWriter().writeAll(msg) catch {
+        if (file.handle != std.fs.File.stderr().handle) {
+            std.fs.File.stderr().writeAll(msg) catch {};
+        }
     };
 }
 
@@ -226,19 +230,6 @@ const HookInput = struct {
     permission_mode: []const u8 = "",
 };
 
-const HookSocketRequest = struct {
-    tool_name: []const u8,
-    tool_input: std.json.Value,
-    tool_use_id: []const u8,
-    session_id: []const u8,
-};
-
-const HookSocketResponse = struct {
-    decision: []const u8 = "ask",
-    reason: ?[]const u8 = null,
-    answers: ?std.json.Value = null,
-};
-
 /// Debug log to file (hooks stderr may not be visible)
 fn hookDebugLog(comptime fmt: []const u8, args: anytype) !void {
     const file = try std.fs.cwd().createFile("/tmp/banjo-hook-debug.log", .{ .truncate = false });
@@ -304,7 +295,8 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
     defer std.posix.close(sock);
 
     // Set timeout (non-critical, socket works without it)
-    const timeout = std.posix.timeval{ .sec = 60, .usec = 0 };
+    const timeout_secs: i64 = @divTrunc(constants.hook_socket_timeout_ms, 1000);
+    const timeout = std.posix.timeval{ .sec = timeout_secs, .usec = 0 };
     std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch |err| {
         hookDebugLogBestEffort("setsockopt RCVTIMEO failed: {}", .{err});
     };
@@ -326,61 +318,26 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
     };
     hookDebugLogBestEffort("Connected to socket", .{});
 
-    // Send request as JSON
-    var out: std.io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    var jw: std.json.Stringify = .{
-        .writer = &out.writer,
-        .options = .{ .emit_null_optional_fields = false },
-    };
-    jw.write(HookSocketRequest{
+    permission_socket.writeRequest(allocator, sock, .{
         .tool_name = hook_input.tool_name,
         .tool_input = hook_input.tool_input,
         .tool_use_id = hook_input.tool_use_id,
         .session_id = hook_input.session_id,
     }) catch |err| {
-        hookDebugLogBestEffort("Failed to serialize request: {}", .{err});
-        return err;
-    };
-    out.writer.writeAll("\n") catch |err| {
-        hookDebugLogBestEffort("Failed to write newline: {}", .{err});
-        return err;
-    };
-    const request = out.toOwnedSlice() catch |err| {
-        hookDebugLogBestEffort("Failed to allocate request: {}", .{err});
-        return err;
-    };
-    defer allocator.free(request);
-
-    _ = std.posix.write(sock, request) catch |err| {
         hookDebugLogBestEffort("Failed to write to socket: {}", .{err});
         log.warn("Failed to write to socket: {}", .{err});
         return err;
     };
 
-    // Read response
-    var response_buf: [1024]u8 = undefined;
-    const n = std.posix.read(sock, &response_buf) catch |err| {
-        hookDebugLogBestEffort("Failed to read from socket: {}", .{err});
-        log.warn("Failed to read from socket: {}", .{err});
-        return err;
-    };
-    if (n == 0) {
-        hookDebugLogBestEffort("Empty response from socket", .{});
-        return error.UnexpectedEof;
-    }
-
-    const response = std.mem.trimRight(u8, response_buf[0..n], "\n\r");
-
-    // Parse response
-    var resp_parsed = std.json.parseFromSlice(HookSocketResponse, allocator, response, .{
-        .ignore_unknown_fields = true,
-    }) catch |err| {
+    const response_deadline = std.time.milliTimestamp() + constants.hook_socket_timeout_ms;
+    var resp_parsed = permission_socket.readResponse(allocator, sock, response_deadline) catch |err| {
         hookDebugLogBestEffort("Failed to parse response: {}", .{err});
         return err;
+    } orelse {
+        hookDebugLogBestEffort("Empty response from socket", .{});
+        return error.UnexpectedEof;
     };
     defer resp_parsed.deinit();
-
     const resp = resp_parsed.value;
 
     // Output Claude Code hook format for PreToolUse
@@ -407,7 +364,7 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
                         hookSpecificOutput: struct {
                             hookEventName: []const u8 = "PreToolUse",
                             permissionDecision: []const u8 = "allow",
-                            updatedInput: struct { answers: std.json.Value },
+                            updatedInput: struct { answers: std.json.ArrayHashMap([]const u8) },
                         },
                     };
                     hook_jw.write(HookOutput{
