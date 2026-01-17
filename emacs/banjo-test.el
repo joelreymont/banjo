@@ -36,7 +36,7 @@
     (unwind-protect
         (progn
           (setq doom-leader-map (make-sparse-keymap))
-          (should (banjo--doom-prefix-available-p "a"))
+          (should-not (banjo--doom-prefix-available-p "a"))
           (define-key doom-leader-map (kbd "a") (make-sparse-keymap))
           (should (banjo--doom-prefix-available-p "a"))
           (define-key doom-leader-map (kbd "a") #'ignore)
