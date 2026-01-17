@@ -40,6 +40,253 @@
   :type '(choice (const left) (const right))
   :group 'banjo)
 
+(defcustom banjo-enable-links t
+  "Whether to detect and activate file/URL links in output."
+  :type 'boolean
+  :group 'banjo)
+
+;; Faces
+
+(defface banjo-face-user
+  '((t :inherit font-lock-string-face))
+  "Face for user prompts."
+  :group 'banjo)
+
+(defface banjo-face-assistant
+  '((t :inherit default))
+  "Face for assistant output."
+  :group 'banjo)
+
+(defface banjo-face-thought
+  '((t :inherit shadow))
+  "Face for assistant thoughts."
+  :group 'banjo)
+
+(defface banjo-face-tool
+  '((t :inherit font-lock-function-name-face))
+  "Face for tool call lines."
+  :group 'banjo)
+
+(defface banjo-face-tool-success
+  '((t :inherit success))
+  "Face for successful tool calls."
+  :group 'banjo)
+
+(defface banjo-face-tool-fail
+  '((t :inherit error))
+  "Face for failed tool calls."
+  :group 'banjo)
+
+(defface banjo-face-tool-pending
+  '((t :inherit warning))
+  "Face for pending tool calls."
+  :group 'banjo)
+
+(defface banjo-face-link
+  '((t :inherit link))
+  "Face for links."
+  :group 'banjo)
+
+(defface banjo-face-code
+  '((t :inherit font-lock-constant-face))
+  "Face for code fences."
+  :group 'banjo)
+
+(defface banjo-face-code-block
+  '((t :inherit font-lock-constant-face :extend t))
+  "Face for code block contents."
+  :group 'banjo)
+
+(defface banjo-face-inline-code
+  '((t :inherit font-lock-constant-face))
+  "Face for inline code."
+  :group 'banjo)
+
+(defface banjo-face-header
+  '((t :inherit font-lock-keyword-face))
+  "Face for markdown headers."
+  :group 'banjo)
+
+(defface banjo-face-blockquote
+  '((t :inherit shadow))
+  "Face for blockquotes."
+  :group 'banjo)
+
+(defface banjo-face-list-bullet
+  '((t :inherit font-lock-keyword-face))
+  "Face for list bullets."
+  :group 'banjo)
+
+(defface banjo-face-hr
+  '((t :inherit shadow))
+  "Face for horizontal rules."
+  :group 'banjo)
+
+;; Font-lock
+
+(defconst banjo--font-lock-keywords
+  `(
+    ("^\\s-*#\\{1,6\\}\\s-+.*$" . 'banjo-face-header)
+    ("^\\s-*```.*$" . 'banjo-face-code)
+    ("^\\s-*>.*$" . 'banjo-face-blockquote)
+    ("`[^`\n]+`" . 'banjo-face-inline-code)
+    ("^\\s-*\\([0-9]+\\.\\)\\s-+" (1 'banjo-face-list-bullet))
+    ("^\\s-*\\([-*+]\\)\\s-+" (1 'banjo-face-list-bullet))
+    ("^\\s-*[-_*]\\{3,\\}\\s-*$" . 'banjo-face-hr)
+    ("^\\s-*\\([.vx>]\\)\\s-+.*$" . 'banjo-face-tool)
+    ("^\\s-*\\(v\\)\\s-+" (1 'banjo-face-tool-success))
+    ("^\\s-*\\(x\\)\\s-+" (1 'banjo-face-tool-fail))
+    ("^\\s-*\\([.>]\\)\\s-+" (1 'banjo-face-tool-pending))
+    ("\\*\\*[^*\n]+\\*\\*" . 'bold)))
+
+;; Link detection
+
+(defconst banjo--url-regexp
+  "\\(https?://[^][(){}<>\"' \t\n]+\\)")
+
+(defconst banjo--file-link-regexp
+  "\\b\\([[:alnum:]_./~+-]+\\):\\([0-9]+\\)\\(?::\\([0-9]+\\)\\)?")
+
+(defconst banjo--file-hash-link-regexp
+  "\\b\\([[:alnum:]_./~+-]+\\)#L\\([0-9]+\\)\\(?:C\\([0-9]+\\)\\)?\\(?:-L[0-9]+\\)?")
+
+(defconst banjo--file-path-regexp
+  "\\b\\([~./][[:alnum:]_./~+-]+\\|[[:alnum:]_./~+-]+/[[:alnum:]_./~+-]+\\)\\b")
+
+(defconst banjo--code-line-buffer-max 2048
+  "Maximum buffered characters for incremental fence detection.")
+
+(defvar-local banjo--code-block-open nil
+  "Non-nil when inside a fenced code block.")
+
+(defvar-local banjo--code-line-buffer ""
+  "Accumulated partial line for fenced code parsing.")
+
+(defun banjo--resolve-path (path)
+  "Resolve PATH against the current buffer default directory."
+  (if (file-name-absolute-p path)
+      path
+    (expand-file-name path default-directory)))
+
+(defun banjo--open-file-link (path line col)
+  "Open PATH at LINE and optional COL."
+  (let ((file (banjo--resolve-path path)))
+    (when (file-exists-p file)
+      (find-file-other-window file)
+      (goto-char (point-min))
+      (forward-line (max 0 (1- line)))
+      (when col
+        (move-to-column (max 0 (1- col)))))))
+
+(defun banjo--make-link-button (beg end action help)
+  "Create a link button from BEG to END."
+  (make-text-button
+   beg end
+   'action action
+   'follow-link t
+   'help-echo help
+   'face 'banjo-face-link
+   'banjo-link t))
+
+(defun banjo--apply-buttons (beg end)
+  "Create link buttons in region BEG..END."
+  (when banjo-enable-links
+    (save-excursion
+      (save-match-data
+        (goto-char beg)
+        (while (re-search-forward banjo--url-regexp end t)
+          (let* ((url (match-string 1))
+                 (b (match-beginning 1))
+                 (e (match-end 1)))
+            (unless (or (get-text-property b 'banjo-link)
+                        (get-text-property b 'banjo-code-block))
+              (banjo--make-link-button
+               b e
+               (lambda (_btn) (browse-url url))
+               url))))
+        (goto-char beg)
+        (while (re-search-forward banjo--file-link-regexp end t)
+          (let* ((path (match-string 1))
+                 (line (string-to-number (match-string 2)))
+                 (col (match-string 3))
+                 (b (match-beginning 1))
+                 (e (match-end 0))
+                 (abs (banjo--resolve-path path)))
+            (when (and (file-exists-p abs)
+                       (not (get-text-property b 'banjo-link))
+                       (not (get-text-property b 'banjo-code-block)))
+              (banjo--make-link-button
+               b e
+               (lambda (_btn)
+                 (banjo--open-file-link path line (and col (string-to-number col))))
+               (format "Open %s:%d%s" path line (if col (format ":%s" col) ""))))))
+        (goto-char beg)
+        (while (re-search-forward banjo--file-hash-link-regexp end t)
+          (let* ((path (match-string 1))
+                 (line (string-to-number (match-string 2)))
+                 (col (match-string 3))
+                 (b (match-beginning 1))
+                 (e (match-end 0))
+                 (abs (banjo--resolve-path path)))
+            (when (and (file-exists-p abs)
+                       (not (get-text-property b 'banjo-link))
+                       (not (get-text-property b 'banjo-code-block)))
+              (banjo--make-link-button
+               b e
+               (lambda (_btn)
+                 (banjo--open-file-link path line (and col (string-to-number col))))
+               (format "Open %s#L%d%s" path line (if col (format "C%s" col) ""))))))
+        (goto-char beg)
+        (while (re-search-forward banjo--file-path-regexp end t)
+          (let* ((path (match-string 1))
+                 (b (match-beginning 1))
+                 (e (match-end 1))
+                 (abs (banjo--resolve-path path)))
+            (when (and (file-exists-p abs)
+                       (not (get-text-property b 'banjo-link))
+                       (not (get-text-property b 'banjo-code-block)))
+              (banjo--make-link-button
+               b e
+               (lambda (_btn) (banjo--open-file-link path 1 nil))
+               (format "Open %s" path)))))))))
+
+(defun banjo--apply-code-blocks (beg end start-open)
+  "Apply code block faces between BEG and END."
+  (let ((open start-open))
+    (save-excursion
+      (goto-char beg)
+      (beginning-of-line)
+      (while (< (point) end)
+        (let* ((line-beg (point))
+               (line-end (line-end-position))
+               (line (buffer-substring-no-properties line-beg line-end)))
+          (if (string-match-p "^\\s-*```" line)
+              (progn
+                (add-face-text-property line-beg line-end 'banjo-face-code t)
+                (add-text-properties line-beg line-end '(banjo-code-block t))
+                (setq open (not open)))
+            (when open
+              (add-face-text-property line-beg line-end 'banjo-face-code-block t)
+              (add-text-properties line-beg line-end '(banjo-code-block t)))))
+        (forward-line 1)))))
+
+(defun banjo--update-code-blocks (text)
+  "Update code block state from streamed TEXT."
+  (let* ((data (concat banjo--code-line-buffer text)))
+    (when (> (length data) banjo--code-line-buffer-max)
+      (if (string-match-p "\n" data)
+          (setq data (substring data (- (length data) banjo--code-line-buffer-max)))
+        (setq data (substring data 0 banjo--code-line-buffer-max))))
+    (let* ((parts (split-string data "\n"))
+           (line-count (length parts))
+           (i 0))
+      (while (< i (1- line-count))
+        (let ((line (nth i parts)))
+          (when (string-match-p "^\\s-*```" line)
+            (setq banjo--code-block-open (not banjo--code-block-open))))
+        (setq i (1+ i)))
+      (setq banjo--code-line-buffer (nth (1- line-count) parts)))))
+
 ;; State
 
 (defvar banjo--process nil "Daemon process.")
@@ -81,7 +328,12 @@
   "Major mode for Banjo output."
   (setq-local buffer-read-only t)
   (setq-local truncate-lines nil)
-  (setq-local word-wrap t))
+  (setq-local word-wrap t)
+  (setq-local banjo--code-block-open nil)
+  (setq-local banjo--code-line-buffer "")
+  (setq-local font-lock-defaults '(banjo--font-lock-keywords))
+  (setq-local font-lock-multiline t)
+  (font-lock-mode 1))
 
 (defun banjo--get-output-buffer ()
   "Get or create the output buffer."
@@ -97,9 +349,16 @@
     (with-current-buffer buf
       (let ((inhibit-read-only t))
         (goto-char (point-max))
-        (if face
-            (insert (propertize text 'face face))
-          (insert text))
+        (let ((beg (point)))
+          (insert text)
+          (let ((end (point))
+                (prev-open banjo--code-block-open))
+            (banjo--update-code-blocks text)
+            (when face
+              (add-face-text-property beg end face t))
+            (banjo--apply-code-blocks beg end prev-open)
+            (banjo--apply-buttons beg end)
+            (font-lock-ensure beg end)))
         (goto-char (point-max))))
     ;; Scroll to bottom in all windows showing buffer
     (dolist (win (get-buffer-window-list buf nil t))
@@ -112,6 +371,8 @@
   (let ((buf (banjo--get-output-buffer)))
     (with-current-buffer buf
       (let ((inhibit-read-only t))
+        (setq banjo--code-block-open nil)
+        (setq banjo--code-line-buffer "")
         (erase-buffer)))))
 
 ;; Panel
@@ -245,7 +506,7 @@
           (unless banjo--streaming
             (setq banjo--streaming t)
             (banjo--show-panel))
-          (banjo--append-output text))))
+          (banjo--append-output text 'banjo-face-assistant))))
      ((string= update-type "agent_thought_chunk")
       (let* ((content (alist-get 'content update))
              (text (alist-get 'text content)))
@@ -253,19 +514,28 @@
           (unless banjo--streaming
             (setq banjo--streaming t)
             (banjo--show-panel))
-          (banjo--append-output text 'italic))))
+          (banjo--append-output text 'banjo-face-thought))))
      ((string= update-type "tool_call")
       (let ((tool-id (alist-get 'toolCallId update))
             (title (alist-get 'title update)))
         (puthash tool-id title banjo--tool-calls)
-        (banjo--append-output (format "\n%s %s" "○" title) 'font-lock-function-name-face)))
+        (banjo--append-output (format "\n%s %s" "." title) 'banjo-face-tool)))
      ((string= update-type "tool_call_update")
       (let* ((tool-id (alist-get 'toolCallId update))
              (status (alist-get 'status update))
              (title (gethash tool-id banjo--tool-calls)))
         (when title
-          (let ((icon (if (string= status "completed") "✓" "✗")))
-            (banjo--append-output (format " → %s\n" icon) 'font-lock-function-name-face)))))
+          (let* ((icon (cond
+                        ((string= status "completed") "v")
+                        ((string= status "failed") "x")
+                        ((string= status "running") ">")
+                        ((string= status "pending") ".")
+                        (t ".")))
+                 (face (cond
+                        ((string= status "completed") 'banjo-face-tool-success)
+                        ((string= status "failed") 'banjo-face-tool-fail)
+                        (t 'banjo-face-tool-pending))))
+            (banjo--append-output (format " -> %s\n" icon) face)))))
      ((string= update-type "current_mode_update")
       (plist-put banjo--state :mode (alist-get 'currentModeId update))
       (banjo--update-mode-line))
@@ -393,7 +663,7 @@
   (unless banjo--session-id
     (user-error "Banjo not connected. Run M-x banjo-start"))
   (banjo--clear-output)
-  (banjo--append-output (format "> %s\n\n" prompt) 'font-lock-comment-face)
+  (banjo--append-output (format "> %s\n\n" prompt) 'banjo-face-user)
   (setq banjo--streaming nil)
   (banjo--send-notification
    "session/prompt"
