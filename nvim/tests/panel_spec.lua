@@ -95,6 +95,100 @@ describe("banjo panel", function()
     end)
   end)
 
+  describe("links", function()
+    it("marks #L file links", function()
+      panel.open()
+      helpers.wait(50)
+
+      local env = helpers.setup_test_env()
+      local cwd = vim.fn.getcwd()
+      vim.cmd("cd " .. env.dir)
+
+      local ok, err = pcall(function()
+        panel.append("test.lua#L2")
+        helpers.wait(50)
+
+        local link_data = panel._get_link_data()
+        local found = nil
+        for _, data in pairs(link_data) do
+          if data and data.type == "file" then
+            found = data
+            break
+          end
+        end
+
+        assert.truthy(found, "Expected file link extmark")
+        assert.equals(vim.loop.fs_realpath(env.file), found.path)
+        assert.equals(2, found.line)
+      end)
+
+      vim.cmd("cd " .. cwd)
+      env.cleanup()
+
+      if not ok then
+        error(err)
+      end
+    end)
+  end)
+
+  describe("code blocks", function()
+    it("highlights fenced blocks", function()
+      panel.open()
+      helpers.wait(50)
+
+      panel.append("```\ncode line\n```\n")
+      helpers.wait(50)
+
+      local buf = helpers.get_banjo_buffer()
+      local ns_id = vim.api.nvim_create_namespace("banjo")
+      local extmarks = vim.api.nvim_buf_get_extmarks(buf, ns_id, 0, -1, { details = true })
+
+      local has_code = false
+      for _, mark in ipairs(extmarks) do
+        local details = mark[4] or {}
+        if details.hl_group == "BanjoCodeBlock" then
+          has_code = true
+          break
+        end
+      end
+
+      assert.is_true(has_code, "Expected code block highlight")
+    end)
+
+    it("stops highlighting after closing fence", function()
+      panel.open()
+      helpers.wait(50)
+
+      panel.append("```\ncode line\n```\nplain\n")
+      helpers.wait(50)
+
+      local buf = helpers.get_banjo_buffer()
+      local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+      local plain_idx = nil
+      for i, line in ipairs(lines) do
+        if line == "plain" then
+          plain_idx = i - 1
+          break
+        end
+      end
+      assert.truthy(plain_idx, "Expected plain line in buffer")
+
+      local ns_id = vim.api.nvim_create_namespace("banjo")
+      local extmarks = vim.api.nvim_buf_get_extmarks(buf, ns_id, 0, -1, { details = true })
+      local has_plain_code = false
+      for _, mark in ipairs(extmarks) do
+        local line = mark[2]
+        local details = mark[4] or {}
+        if line == plain_idx and details.hl_group == "BanjoCodeBlock" then
+          has_plain_code = true
+          break
+        end
+      end
+
+      assert.is_false(has_plain_code, "Expected code block to end before plain line")
+    end)
+  end)
+
   describe("clear", function()
     it("removes all content", function()
       panel.open()

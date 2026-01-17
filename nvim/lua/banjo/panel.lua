@@ -1,8 +1,20 @@
 -- Banjo panel: Chat UI with output section and input field
 local M = {}
 
--- Debug logging
+-- Global config
+local config = {
+    width = 50,
+    position = "right",
+    input_height = 3,
+    title = " Banjo ",
+    debug = false,
+}
+
+-- Debug logging (opt-in)
 local function lua_debug(msg)
+    if not vim.g.banjo_debug then
+        return
+    end
     local ok, err = pcall(function()
         local line = os.date("%H:%M:%S ") .. "[panel] " .. msg
         vim.fn.writefile({line}, "/tmp/banjo-lua-debug.log", "a")
@@ -12,23 +24,29 @@ local function lua_debug(msg)
     end
 end
 
--- Log on module load (deferred to ensure vim is ready)
-vim.schedule(function()
-    lua_debug("MODULE LOADED")
-end)
-
 -- Global namespaces (process-wide identifiers)
 local ns_id = vim.api.nvim_create_namespace("banjo")
 local ns_tools = vim.api.nvim_create_namespace("banjo_tools")
 local ns_links = vim.api.nvim_create_namespace("banjo_links")
 
--- Global config
-local config = {
-    width = 50,
-    position = "right",
-    input_height = 3,
-    title = " Banjo ",
-}
+local function setup_highlights()
+    local set_hl = vim.api.nvim_set_hl
+    set_hl(0, "BanjoUser", { link = "String" })
+    set_hl(0, "BanjoAssistant", { link = "Normal" })
+    set_hl(0, "BanjoThought", { link = "Comment" })
+    set_hl(0, "BanjoTool", { link = "Function" })
+    set_hl(0, "BanjoToolOk", { link = "DiagnosticOk" })
+    set_hl(0, "BanjoToolErr", { link = "DiagnosticError" })
+    set_hl(0, "BanjoToolPending", { link = "DiagnosticWarn" })
+    set_hl(0, "BanjoLink", { link = "Underlined" })
+    set_hl(0, "BanjoCodeFence", { link = "Special" })
+    set_hl(0, "BanjoInlineCode", { link = "Special" })
+    set_hl(0, "BanjoHeader", { link = "Title" })
+    set_hl(0, "BanjoQuote", { link = "Comment" })
+    set_hl(0, "BanjoListBullet", { link = "Delimiter" })
+    set_hl(0, "BanjoStatus", { link = "Comment" })
+    set_hl(0, "BanjoCodeBlock", { link = "Special" })
+end
 
 -- Per-tab state storage (indexed by tabpage handle)
 local states = {}
@@ -47,13 +65,17 @@ local function get_state()
             current_engine = nil,
             pending_scroll = false,
             tool_extmarks = {},
+            link_data = {},
+            stat_cache = {},
+            stat_cache_size = 0,
             thought_blocks = {},
             thought_buffer = nil,
             thought_start_line = nil,
             code_blocks = {},
-            code_buffer = nil,
             code_start_line = nil,
             code_lang = nil,
+            code_scan_line = -1,
+            code_line_partial = false,
             history = nil,
             last_manual_scroll_time = 0,
             session_timer = nil,
@@ -65,6 +87,21 @@ end
 
 function M.setup(opts)
     config = vim.tbl_deep_extend("force", config, opts or {})
+    if opts and opts.debug ~= nil then
+        vim.g.banjo_debug = opts.debug
+    elseif vim.g.banjo_debug == nil then
+        vim.g.banjo_debug = config.debug
+    end
+    setup_highlights()
+end
+
+local function set_output_keymaps(buf)
+    vim.keymap.set("n", "gf", function()
+        M.open_link_under_cursor()
+    end, { buffer = buf, silent = true, nowait = true })
+    vim.keymap.set("n", "<CR>", function()
+        M.open_link_under_cursor()
+    end, { buffer = buf, silent = true, nowait = true })
 end
 
 function M.set_bridge(b)
@@ -127,6 +164,7 @@ local function create_output_buffer()
     vim.b[state.output_buf].blink_cmp_enabled = false
 
     vim.api.nvim_buf_set_name(state.output_buf, bufname)
+    set_output_keymaps(state.output_buf)
 
     return state.output_buf
 end
@@ -801,15 +839,19 @@ function M.clear()
 
     -- Reset tool tracking
     state.tool_extmarks = {}
+    state.link_data = {}
+    state.stat_cache = {}
+    state.stat_cache_size = 0
 
     -- Reset thought/code tracking state to prevent memory leak and incorrect behavior
     state.thought_blocks = {}
     state.thought_buffer = nil
     state.thought_start_line = nil
     state.code_blocks = {}
-    state.code_buffer = nil
     state.code_start_line = nil
     state.code_lang = nil
+    state.code_scan_line = -1
+    state.code_line_partial = false
 end
 
 function M.append_user_message(text)
@@ -831,7 +873,7 @@ function M.append_user_message(text)
 
     -- Highlight user input with distinct color (String highlight)
     for i = start_line + 1, start_line + #lines do
-        vim.api.nvim_buf_add_highlight(state.output_buf, ns_id, "String", i, 0, -1)
+        vim.api.nvim_buf_add_highlight(state.output_buf, ns_id, "BanjoUser", i, 0, -1)
     end
 
     M._scroll_to_bottom()
@@ -845,9 +887,10 @@ function M.start_stream(engine)
     -- Reset streaming state to ensure clean slate (prevents state leakage from cancelled streams)
     state.thought_buffer = nil
     state.thought_start_line = nil
-    state.code_buffer = nil
     state.code_start_line = nil
     state.code_lang = nil
+    state.code_scan_line = -1
+    state.code_line_partial = false
 
     create_output_buffer()
     create_panel()
@@ -869,9 +912,10 @@ function M.end_stream()
     -- Reset streaming state in case of unclosed tags
     state.thought_buffer = nil
     state.thought_start_line = nil
-    state.code_buffer = nil
     state.code_start_line = nil
     state.code_lang = nil
+    state.code_scan_line = -1
+    state.code_line_partial = false
 
     M._update_status()
 end
@@ -927,44 +971,6 @@ function M.append(text, is_thought)
         state.thought_buffer = nil
     end
 
-    -- Accumulate text for code fence detection
-    state.code_buffer = (state.code_buffer or "") .. text
-
-    -- Check for opening fence: ```lang
-    if not state.code_start_line then
-        local fence_start, fence_end, lang = state.code_buffer:find("```([%w]*)")
-        if fence_start then
-            local line_count = vim.api.nvim_buf_line_count(state.output_buf)
-            state.code_start_line = line_count - 1
-            state.code_lang = lang ~= "" and lang or nil
-            -- Reset buffer after detecting opening tag to prevent memory leak
-            state.code_buffer = ""
-        end
-    else
-        -- Check for closing fence: ```
-        local fence_end = state.code_buffer:find("```", 4)
-        if fence_end then
-            local line_count = vim.api.nvim_buf_line_count(state.output_buf)
-            local end_line = line_count
-
-            table.insert(state.code_blocks, {
-                start_line = state.code_start_line,
-                end_line = end_line,
-                lang = state.code_lang,
-            })
-
-            -- Apply syntax highlighting if language is specified
-            if state.code_lang then
-                M._highlight_code_block(state.code_start_line, end_line, state.code_lang)
-            end
-
-            state.code_start_line = nil
-            state.code_lang = nil
-            state.code_buffer = nil
-        end
-    end
-
-    local lines = vim.split(text, "\n", { plain = true })
     local line_count = vim.api.nvim_buf_line_count(state.output_buf)
     local last_line = vim.api.nvim_buf_get_lines(state.output_buf, line_count - 1, line_count, false)[1] or ""
 
@@ -975,6 +981,9 @@ function M.append(text, is_thought)
         line_count = line_count + 1
         last_line = ""
     end
+
+    local did_append_to_last = last_line ~= ""
+    local lines = vim.split(text, "\n", { plain = true })
 
     -- If last line is blank (separator), don't consume it - add new lines after
     if last_line == "" then
@@ -996,21 +1005,78 @@ function M.append(text, is_thought)
         local start_line = line_count - 1
         local end_line = vim.api.nvim_buf_line_count(state.output_buf)
         for i = start_line, end_line - 1 do
-            vim.api.nvim_buf_add_highlight(state.output_buf, ns_id, "Comment", i, 0, -1)
+            vim.api.nvim_buf_add_highlight(state.output_buf, ns_id, "BanjoThought", i, 0, -1)
         end
     end
 
+    local mark_start = line_count - 1
+    local mark_end = vim.api.nvim_buf_line_count(state.output_buf)
+
+    local scan_start = mark_start
+    if not did_append_to_last then
+        scan_start = mark_start + 1
+    end
+    if state.code_line_partial then
+        local pending_line = state.code_scan_line + 1
+        if pending_line < scan_start then
+            scan_start = pending_line
+        end
+    end
+    if scan_start < 0 then
+        scan_start = 0
+    end
+    if scan_start < mark_end then
+        M._update_code_fences(scan_start, mark_end)
+    end
+    local ends_with_newline = text:sub(-1) == "\n"
+    local last_idx = mark_end - 1
+    if ends_with_newline then
+        state.code_line_partial = false
+        state.code_scan_line = last_idx
+    else
+        state.code_line_partial = true
+        state.code_scan_line = math.max(last_idx - 1, -1)
+    end
+
+    -- Clear link extmarks in updated range to avoid duplicates
+    local removed_links = vim.api.nvim_buf_get_extmarks(
+        state.output_buf,
+        ns_links,
+        { mark_start, 0 },
+        { mark_end - 1, -1 },
+        {}
+    )
+    for _, mark in ipairs(removed_links) do
+        state.link_data[mark[1]] = nil
+    end
+    vim.api.nvim_buf_clear_namespace(state.output_buf, ns_links, mark_start, mark_end)
+
     -- Detect and mark markdown headers
-    M._mark_markdown_headers(line_count - 1, vim.api.nvim_buf_line_count(state.output_buf))
+    M._mark_markdown_headers(mark_start, mark_end)
 
     -- Detect and mark inline formatting
-    M._mark_inline_formatting(line_count - 1, vim.api.nvim_buf_line_count(state.output_buf))
+    M._mark_inline_formatting(mark_start, mark_end)
+
+    -- Highlight lines while inside an open code block
+    M._mark_open_code_block(mark_start, mark_end)
+
+    -- Detect and mark code fences
+    M._mark_code_fences(mark_start, mark_end)
+
+    -- Detect and mark blockquotes
+    M._mark_blockquotes(mark_start, mark_end)
 
     -- Detect and render lists
-    M._mark_lists(line_count - 1, vim.api.nvim_buf_line_count(state.output_buf))
+    M._mark_lists(mark_start, mark_end)
 
     -- Detect and mark file paths
-    M._mark_file_paths(line_count - 1, vim.api.nvim_buf_line_count(state.output_buf))
+    M._mark_file_paths(mark_start, mark_end)
+
+    -- Detect and mark file:// URIs
+    M._mark_file_uris(mark_start, mark_end)
+
+    -- Detect and mark URLs
+    M._mark_urls(mark_start, mark_end)
 
     -- Defer scroll to avoid excessive updates during fast streaming
     if not state.pending_scroll then
@@ -1039,7 +1105,7 @@ function M.append_status(msg)
     vim.api.nvim_buf_set_lines(state.output_buf, line_count, line_count, false, { "", line })
 
     -- Highlight as comment
-    vim.api.nvim_buf_add_highlight(state.output_buf, ns_id, "Comment", line_count + 1, 0, -1)
+    vim.api.nvim_buf_add_highlight(state.output_buf, ns_id, "BanjoStatus", line_count + 1, 0, -1)
 
     M._scroll_to_bottom()
 end
@@ -1149,9 +1215,9 @@ function M.show_tool_call(id, name, label, input)
 
     local line
     if display_label then
-        line = string.format("  %s **%s** `%s`", "○", name, display_label)
+        line = string.format("  %s **%s** `%s`", ".", name, display_label)
     else
-        line = string.format("  %s **%s**", "○", name)
+        line = string.format("  %s **%s**", ".", name)
     end
 
     local line_count = vim.api.nvim_buf_line_count(state.output_buf)
@@ -1167,6 +1233,9 @@ function M.show_tool_call(id, name, label, input)
         local all_lines = { line }
         vim.list_extend(all_lines, formatted_lines)
         vim.api.nvim_buf_set_lines(state.output_buf, line_count, line_count, false, all_lines)
+        for i = line_count + 1, line_count + #formatted_lines do
+            vim.api.nvim_buf_add_highlight(state.output_buf, ns_id, "BanjoCodeBlock", i, 0, -1)
+        end
 
         -- Mark that we need a newline before next text append (only when we have input lines)
         state.needs_newline_after_tool = true
@@ -1184,10 +1253,17 @@ function M.show_tool_call(id, name, label, input)
         vim.api.nvim_buf_set_lines(state.output_buf, line_count, line_count, false, { line })
     end
 
+    -- Highlight tool header line
+    vim.api.nvim_buf_add_highlight(state.output_buf, ns_id, "BanjoTool", line_count, 0, -1)
+
     -- Store extmark for later update, keyed by tool_id from backend
     if id then
         local mark_id = vim.api.nvim_buf_set_extmark(state.output_buf, ns_tools, line_count, 0, {})
-        state.tool_extmarks[id] = { mark_id = mark_id, line = line_count }
+        local icon_mark = vim.api.nvim_buf_set_extmark(state.output_buf, ns_tools, line_count, 2, {
+            end_col = 3,
+            hl_group = "BanjoToolPending",
+        })
+        state.tool_extmarks[id] = { mark_id = mark_id, line = line_count, icon_mark = icon_mark }
     end
 
     M._scroll_to_bottom()
@@ -1199,13 +1275,17 @@ function M.show_tool_result(id, status)
         return
     end
 
-    local icon = "✓"
+    local icon = "v"
+    local hl = "BanjoToolOk"
     if status == "failed" then
-        icon = "✗"
+        icon = "x"
+        hl = "BanjoToolErr"
     elseif status == "running" then
-        icon = "▶"
+        icon = ">"
+        hl = "BanjoToolPending"
     elseif status == "pending" then
-        icon = "○"
+        icon = "."
+        hl = "BanjoToolPending"
     end
 
     -- Try to find and update existing tool line by exact ID match
@@ -1222,6 +1302,13 @@ function M.show_tool_result(id, status)
             local suffix = vim.fn.strcharpart(current_line, 3)     -- everything after icon
             local new_line = prefix .. icon .. suffix
             vim.api.nvim_buf_set_lines(state.output_buf, line_num, line_num + 1, false, { new_line })
+            if info.icon_mark then
+                vim.api.nvim_buf_del_extmark(state.output_buf, ns_tools, info.icon_mark)
+            end
+            info.icon_mark = vim.api.nvim_buf_set_extmark(state.output_buf, ns_tools, line_num, 2, {
+                end_col = 3,
+                hl_group = hl,
+            })
             return
         end
     end
@@ -1240,13 +1327,13 @@ function M._build_status(panel_state)
     -- Connection status
     local connected = panel_state.bridge and panel_state.bridge.is_running and panel_state.bridge.is_running()
     if connected then
-        table.insert(parts, "%#DiagnosticOk#●%*")
+        table.insert(parts, "%#DiagnosticOk#*%*")
     else
         local bridge_state = panel_state.bridge and panel_state.bridge.get_state and panel_state.bridge.get_state() or {}
         if bridge_state.reconnect_attempt and bridge_state.reconnect_attempt > 0 then
-            table.insert(parts, string.format("%%#DiagnosticWarn#○(%d)%%*", bridge_state.reconnect_attempt))
+            table.insert(parts, string.format("%%#DiagnosticWarn#o(%d)%%*", bridge_state.reconnect_attempt))
         else
-            table.insert(parts, "%#DiagnosticError#○%*")
+            table.insert(parts, "%#DiagnosticError#o%*")
         end
     end
 
@@ -1350,7 +1437,7 @@ function M._mark_markdown_headers(start_line, end_line)
         local line_text = vim.api.nvim_buf_get_lines(state.output_buf, line_num, line_num + 1, false)[1]
         if line_text and vim.startswith(vim.trim(line_text), "#") then
             -- Apply bold highlight
-            vim.api.nvim_buf_add_highlight(state.output_buf, ns_id, "Bold", line_num, 0, -1)
+            vim.api.nvim_buf_add_highlight(state.output_buf, ns_id, "BanjoHeader", line_num, 0, -1)
         end
     end
 end
@@ -1408,7 +1495,7 @@ function M._mark_inline_formatting(start_line, end_line)
             if not s then break end
             vim.api.nvim_buf_set_extmark(state.output_buf, ns_id, line_num, s - 1, {
                 end_col = e,
-                hl_group = "Special",
+                hl_group = "BanjoInlineCode",
             })
             col = e + 1
         end
@@ -1439,7 +1526,7 @@ function M._mark_lists(start_line, end_line)
             -- This preserves the original buffer content for copy/paste
             vim.api.nvim_buf_set_extmark(state.output_buf, ns_id, line_num, indent_end - 1, {
                 end_col = indent_end, -- Cover the - or * character
-                virt_text = { { "•", "Normal" } },
+                virt_text = { { "-", "BanjoListBullet" } },
                 virt_text_pos = "overlay",
             })
             goto continue
@@ -1451,37 +1538,246 @@ function M._mark_lists(start_line, end_line)
     end
 end
 
+function M._update_code_fences(start_line, end_line)
+    local state = get_state()
+    if not state.output_buf or not vim.api.nvim_buf_is_valid(state.output_buf) then
+        return
+    end
+
+    for line_num = start_line, end_line - 1 do
+        local line_text = vim.api.nvim_buf_get_lines(state.output_buf, line_num, line_num + 1, false)[1]
+        if line_text and vim.startswith(vim.trim(line_text), "```") then
+            local lang = line_text:match("^%s*```([%w]*)") or ""
+            if state.code_start_line then
+                local end_line_idx = line_num + 1
+                table.insert(state.code_blocks, {
+                    start_line = state.code_start_line,
+                    end_line = end_line_idx,
+                    lang = state.code_lang,
+                })
+                M._highlight_code_block(state.code_start_line, end_line_idx, state.code_lang)
+                state.code_start_line = nil
+                state.code_lang = nil
+            else
+                state.code_start_line = line_num
+                state.code_lang = lang ~= "" and lang or nil
+            end
+        end
+    end
+end
+
+function M._mark_open_code_block(start_line, end_line)
+    local state = get_state()
+    if not state.output_buf or not vim.api.nvim_buf_is_valid(state.output_buf) then
+        return
+    end
+    if not state.code_start_line then
+        return
+    end
+
+    for line_num = start_line, end_line - 1 do
+        if line_num <= state.code_start_line then
+            goto continue
+        end
+        local line_text = vim.api.nvim_buf_get_lines(state.output_buf, line_num, line_num + 1, false)[1]
+        if line_text and vim.startswith(vim.trim(line_text), "```") then
+            goto continue
+        end
+        vim.api.nvim_buf_add_highlight(state.output_buf, ns_id, "BanjoCodeBlock", line_num, 0, -1)
+        ::continue::
+    end
+end
+
+function M._mark_code_fences(start_line, end_line)
+    local state = get_state()
+    if not state.output_buf or not vim.api.nvim_buf_is_valid(state.output_buf) then
+        return
+    end
+
+    for line_num = start_line, end_line - 1 do
+        local line_text = vim.api.nvim_buf_get_lines(state.output_buf, line_num, line_num + 1, false)[1]
+        if line_text and vim.startswith(vim.trim(line_text), "```") then
+            vim.api.nvim_buf_add_highlight(state.output_buf, ns_id, "BanjoCodeFence", line_num, 0, -1)
+        end
+    end
+end
+
+function M._mark_blockquotes(start_line, end_line)
+    local state = get_state()
+    if not state.output_buf or not vim.api.nvim_buf_is_valid(state.output_buf) then
+        return
+    end
+
+    for line_num = start_line, end_line - 1 do
+        local line_text = vim.api.nvim_buf_get_lines(state.output_buf, line_num, line_num + 1, false)[1]
+        if line_text and vim.startswith(vim.trim(line_text), ">") then
+            vim.api.nvim_buf_add_highlight(state.output_buf, ns_id, "BanjoQuote", line_num, 0, -1)
+        end
+    end
+end
+
+local function resolve_path(state, path)
+    if path:match("^/") or path:match("^%a:[/\\]") then
+        return path
+    end
+    local cwd = (state.bridge and state.bridge.reconnect and state.bridge.reconnect.cwd) or vim.fn.getcwd()
+    return vim.fn.fnamemodify(cwd .. "/" .. path, ":p")
+end
+
+local function stat_cached(state, path)
+    local cached = state.stat_cache[path]
+    if cached ~= nil then
+        return cached
+    end
+    local stat = vim.loop.fs_stat(path)
+    if stat and stat.type == "file" then
+        state.stat_cache[path] = true
+        state.stat_cache_size = state.stat_cache_size + 1
+        if state.stat_cache_size > 256 then
+            state.stat_cache = {}
+            state.stat_cache_size = 0
+        end
+        return true
+    end
+    return false
+end
+
+local function set_link_extmark(state, buf, line_num, s, e, data)
+    local id = vim.api.nvim_buf_set_extmark(buf, ns_links, line_num, s - 1, {
+        end_col = e,
+        hl_group = "BanjoLink",
+    })
+    state.link_data[id] = data
+end
+
 function M._mark_file_paths(start_line, end_line)
     local state = get_state()
     if not state.output_buf or not vim.api.nvim_buf_is_valid(state.output_buf) then
         return
     end
 
-    -- Pattern matches: path/to/file:123 (with optional extension)
-    -- Supports: file.ext:123, /abs/path/file.ext:123, Makefile:10, etc.
-    local pattern = "([%w_/.%-]+):(%d+)"
+    local pattern_colon = "([%w_./~%-]+):(%d+):?(%d*)"
+    local pattern_hash = "([%w_./~%-]+)#L(%d+)C?(%d*)"
+    local pattern_bare = "([%w_./~%-]+/[%w_./~%-]+)"
+
+    local function add_file_link(line_num, s, e, file_path, line_number, col_number)
+        local abs_path = resolve_path(state, file_path)
+        if stat_cached(state, abs_path) then
+            local col_val = tonumber(col_number)
+            set_link_extmark(state, state.output_buf, line_num, s, e, {
+                type = "file",
+                path = abs_path,
+                line = tonumber(line_number) or 1,
+                col = col_val and col_val > 0 and col_val or nil,
+            })
+        end
+    end
+
+    local function scan(line_text, line_num, pattern, handler)
+        local col = 1
+        while true do
+            local s, e, a, b, c = string.find(line_text, pattern, col)
+            if not s then
+                break
+            end
+            handler(line_num, s, e, a, b, c)
+            col = e + 1
+        end
+    end
+
+    for line_num = start_line, end_line - 1 do
+        local line_text = vim.api.nvim_buf_get_lines(state.output_buf, line_num, line_num + 1, false)[1]
+        if line_text then
+            scan(line_text, line_num, pattern_colon, function(ln, s, e, file_path, line_number, col_number)
+                add_file_link(ln, s, e, file_path, line_number, col_number)
+            end)
+            scan(line_text, line_num, pattern_hash, function(ln, s, e, file_path, line_number, col_number)
+                add_file_link(ln, s, e, file_path, line_number, col_number)
+            end)
+            scan(line_text, line_num, pattern_bare, function(ln, s, e, file_path)
+                local next_char = line_text:sub(e + 1, e + 1)
+                if next_char == ":" or next_char == "#" then
+                    return
+                end
+                add_file_link(ln, s, e, file_path, 1, nil)
+            end)
+        end
+    end
+end
+
+local function parse_file_uri(uri)
+    local path_part, fragment = uri:match("^(file://[^#]+)#?(.*)$")
+    if not path_part or path_part == "" then
+        return nil
+    end
+    local ok, path = pcall(vim.uri_to_fname, path_part)
+    if not ok or not path or path == "" then
+        return nil
+    end
+    local line = 1
+    local col = nil
+    if fragment and fragment ~= "" then
+        local l, c = fragment:match("^L(%d+)C?(%d*)$")
+        if l then
+            line = tonumber(l) or 1
+            col = tonumber(c)
+        end
+    end
+    return path, line, col
+end
+
+function M._mark_file_uris(start_line, end_line)
+    local state = get_state()
+    if not state.output_buf or not vim.api.nvim_buf_is_valid(state.output_buf) then
+        return
+    end
+
+    local pattern = "(file://[^%s%]%[%)>\"']+)"
 
     for line_num = start_line, end_line - 1 do
         local line_text = vim.api.nvim_buf_get_lines(state.output_buf, line_num, line_num + 1, false)[1]
         if line_text then
             local col = 1
             while true do
-                local s, e, file_path, line_number = string.find(line_text, pattern, col)
+                local s, e, uri = string.find(line_text, pattern, col)
                 if not s then
                     break
                 end
-
-                -- Validate that the file exists to avoid false positives
-                -- Use vim.loop.fs_stat for efficient file existence check
-                local stat = vim.loop.fs_stat(file_path)
-                if stat and stat.type == "file" then
-                    -- Create extmark with virtual text for underline effect
-                    vim.api.nvim_buf_set_extmark(state.output_buf, ns_links, line_num, s - 1, {
-                        end_col = e,
-                        hl_group = "Underlined",
-                    })
+                local path, line, column = parse_file_uri(uri)
+                if path then
+                    if stat_cached(state, path) then
+                        set_link_extmark(state, state.output_buf, line_num, s, e, {
+                            type = "file",
+                            path = path,
+                            line = line or 1,
+                            col = column,
+                        })
+                    end
                 end
+                col = e + 1
+            end
+        end
+    end
+end
 
+function M._mark_urls(start_line, end_line)
+    local state = get_state()
+    if not state.output_buf or not vim.api.nvim_buf_is_valid(state.output_buf) then
+        return
+    end
+
+    local pattern = "(https?://[^%s%]%[%)>\"']+)"
+
+    for line_num = start_line, end_line - 1 do
+        local line_text = vim.api.nvim_buf_get_lines(state.output_buf, line_num, line_num + 1, false)[1]
+        if line_text then
+            local col = 1
+            while true do
+                local s, e, url = string.find(line_text, pattern, col)
+                if not s then
+                    break
+                end
+                set_link_extmark(state, state.output_buf, line_num, s, e, { type = "url", url = url })
                 col = e + 1
             end
         end
@@ -1494,27 +1790,73 @@ function M._highlight_code_block(start_line, end_line, lang)
         return
     end
 
-    -- Map common language aliases
-    local lang_map = {
-        js = "javascript",
-        ts = "typescript",
-        py = "python",
-        rb = "ruby",
-        sh = "bash",
-        md = "markdown",
-    }
-    local filetype = lang_map[lang] or lang
+    _ = lang
+    for i = start_line, end_line - 1 do
+        local line_text = vim.api.nvim_buf_get_lines(state.output_buf, i, i + 1, false)[1]
+        if line_text and vim.startswith(vim.trim(line_text), "```") then
+            goto continue
+        end
+        vim.api.nvim_buf_add_highlight(state.output_buf, ns_id, "BanjoCodeBlock", i, 0, -1)
+        ::continue::
+    end
+end
 
-    -- Use treesitter for syntax highlighting
-    local ok, ts_highlight = pcall(require, "vim.treesitter.highlighter")
-    if not ok then
+function M.open_link_under_cursor()
+    local state = get_state()
+    if not state.output_buf or not vim.api.nvim_buf_is_valid(state.output_buf) then
+        return
+    end
+    if not state.output_win or not vim.api.nvim_win_is_valid(state.output_win) then
         return
     end
 
-    -- Apply Comment highlight to code block as fallback
-    for i = start_line, end_line - 1 do
-        vim.api.nvim_buf_add_highlight(state.output_buf, ns_id, "Special", i, 0, -1)
+    local row, col = unpack(vim.api.nvim_win_get_cursor(state.output_win))
+    local marks = vim.api.nvim_buf_get_extmarks(
+        state.output_buf,
+        ns_links,
+        { row - 1, 0 },
+        { row - 1, -1 },
+        { details = true }
+    )
+    local best = nil
+    local best_priority = -1
+    local best_len = nil
+    for _, mark in ipairs(marks) do
+        local mcol = mark[3]
+        local details = mark[4] or {}
+        local end_col = details.end_col or mcol
+        if col >= mcol and col <= end_col then
+            local data = state.link_data[mark[1]]
+            if data then
+                local priority = data.type == "url" and 2 or 1
+                local len = end_col - mcol
+                if priority > best_priority or (priority == best_priority and (best_len == nil or len < best_len)) then
+                    best = data
+                    best_priority = priority
+                    best_len = len
+                end
+            end
+        end
     end
+    if best and best.type == "file" then
+        vim.cmd("edit " .. vim.fn.fnameescape(best.path))
+        local lnum = best.line or 1
+        local cnum = best.col or 1
+        vim.api.nvim_win_set_cursor(0, { lnum, math.max(cnum - 1, 0) })
+        return
+    elseif best and best.type == "url" then
+        if vim.ui and vim.ui.open then
+            vim.ui.open(best.url)
+        else
+            vim.notify(best.url, vim.log.levels.INFO)
+        end
+        return
+    end
+end
+
+function M._get_link_data()
+    local state = get_state()
+    return state.link_data
 end
 
 function M._scroll_to_bottom(panel_state)
