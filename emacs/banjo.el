@@ -45,6 +45,11 @@
   :type 'boolean
   :group 'banjo)
 
+(defcustom banjo-doom-leader-prefix "a"
+  "Doom leader prefix for Banjo bindings (e.g. \"a\" -> SPC a ...)."
+  :type 'string
+  :group 'banjo)
+
 ;; Faces
 
 (defface banjo-face-user
@@ -749,28 +754,40 @@
   "Return non-nil if running in Doom Emacs."
   (boundp 'doom-version))
 
+(defun banjo--doom-prefix-available-p (prefix)
+  "Return non-nil if PREFIX is free or a keymap in `doom-leader-map`."
+  (when (boundp 'doom-leader-map)
+    (let* ((key (kbd prefix))
+           (binding (lookup-key doom-leader-map key)))
+      (or (null binding)
+          (eq binding 'undefined)
+          (keymapp binding)))))
+
 (defun banjo--setup-doom-keybindings ()
   "Set up Doom Emacs keybindings using SPC a prefix."
-  (eval-after-load 'evil
-    '(progn
-       ;; Leader keybindings: SPC a ...
-       (when (fboundp 'map!)
-         (eval '(map! :leader
-                      (:prefix ("a" . "ai agent")
-                       :desc "Toggle panel"      "b" #'banjo-toggle
-                       :desc "Send prompt"       "s" #'banjo-send
-                       :desc "Send region"       "v" #'banjo-send-region
-                       :desc "Cancel"            "c" #'banjo-cancel
-                       :desc "Set mode"          "m" #'banjo-set-mode
-                       :desc "Set model"         "M" #'banjo-set-model
-                       :desc "Set engine"        "e" #'banjo-set-engine
-                       :desc "Start"             "S" #'banjo-start
-                       :desc "Stop"              "q" #'banjo-stop))))
-       ;; Panel buffer keybindings
-       (evil-define-key 'normal banjo-mode-map
-         "q" #'banjo--hide-panel
-         "gr" #'banjo-toggle
-         (kbd "C-c") #'banjo-cancel))))
+  (with-eval-after-load 'doom-keybinds
+    ;; Leader keybindings: SPC <prefix> ...
+    (when (fboundp 'map!)
+      (let ((prefix banjo-doom-leader-prefix))
+        (if (banjo--doom-prefix-available-p prefix)
+            (eval `(map! :leader
+                         (:prefix (,prefix . "ai agent")
+                          :desc "Toggle panel"      "b" #'banjo-toggle
+                          :desc "Send prompt"       "s" #'banjo-send
+                          :desc "Send region"       "v" #'banjo-send-region
+                          :desc "Cancel"            "c" #'banjo-cancel
+                          :desc "Set mode"          "m" #'banjo-set-mode
+                          :desc "Set model"         "M" #'banjo-set-model
+                          :desc "Set engine"        "e" #'banjo-set-engine
+                          :desc "Start"             "S" #'banjo-start
+                          :desc "Stop"              "q" #'banjo-stop)))
+          (message "Banjo: leader prefix %s is not a keymap; set `banjo-doom-leader-prefix`" prefix)))))
+  (with-eval-after-load 'evil
+    ;; Panel buffer keybindings
+    (evil-define-key 'normal banjo-mode-map
+      "q" #'banjo--hide-panel
+      "gr" #'banjo-toggle
+      (kbd "C-c") #'banjo-cancel)))
 
 (defun banjo--setup-evil-panel-bindings ()
   "Set up evil-mode bindings for the panel buffer."
