@@ -60,6 +60,9 @@ local function get_bridge()
             },
             preserved = {
                 input_text = nil,
+                permission_mode = nil,
+                engine = nil,
+                model = nil,
             },
             -- ACP protocol state
             acp = {
@@ -199,11 +202,17 @@ function M.stop()
         vim.api.nvim_del_augroup_by_id(b.autocmd_group)
         b.autocmd_group = nil
     end
+    b.state.connected = false
+    b.state.session_id = nil
+    b.state.models = {}
+    b.state.model = nil
+    b.state.session_active = false
+    b.state.session_start_time = nil
 end
 
 function M.is_running()
     local b = get_bridge()
-    return b.client ~= nil and ws_client.is_connected(b.client)
+    return b.client ~= nil and ws_client.is_connected(b.client) and b.state.connected
 end
 
 function M.get_mcp_port()
@@ -287,6 +296,10 @@ function M._connect_websocket(port, tabid)
             vim.schedule(function()
                 local my_b = bridges[my_tabid]
                 if not my_b or not vim.api.nvim_tabpage_is_valid(my_tabid) then return end
+                my_b.state.connected = false
+                my_b.state.session_id = nil
+                my_b.state.models = {}
+                my_b.state.model = nil
                 -- Reset reconnection state on successful connect
                 my_b.reconnect.attempt = 0
                 lua_debug("[bridge] on_connect: sending ACP initialize")
@@ -294,7 +307,7 @@ function M._connect_websocket(port, tabid)
                 -- Send ACP initialize request
                 M._send_request(my_tabid, "initialize", {
                     protocolVersion = 1,
-                    clientCapabilities = {},
+                    clientCapabilities = vim.empty_dict(),
                     clientInfo = { name = "banjo-nvim", version = "0.1.0" },
                 }, function(result, err)
                     if err then
@@ -323,6 +336,10 @@ function M._connect_websocket(port, tabid)
                             if sess_result.modes then
                                 my_b.state.mode = sess_result.modes.currentModeId or my_b.state.mode
                             end
+                            if sess_result.models then
+                                my_b.state.models = sess_result.models.availableModels or {}
+                                my_b.state.model = sess_result.models.currentModelId or my_b.state.model
+                            end
                         end
 
                         vim.notify("Banjo: Connected", vim.log.levels.INFO)
@@ -347,6 +364,12 @@ function M._connect_websocket(port, tabid)
                         if my_b.preserved.permission_mode then
                             M.set_permission_mode(my_b.preserved.permission_mode)
                         end
+                        if my_b.preserved.engine then
+                            M.set_engine(my_b.preserved.engine)
+                        end
+                        if my_b.preserved.model then
+                            M.set_model(my_b.preserved.model)
+                        end
 
                         if need_switch and vim.api.nvim_tabpage_is_valid(current_tab) then
                             vim.api.nvim_set_current_tabpage(current_tab)
@@ -361,6 +384,12 @@ function M._connect_websocket(port, tabid)
                 local my_b = bridges[my_tabid]
                 if my_b then
                     my_b.client = nil
+                    my_b.state.connected = false
+                    my_b.state.session_id = nil
+                    my_b.state.models = {}
+                    my_b.state.model = nil
+                    my_b.state.session_active = false
+                    my_b.state.session_start_time = nil
                     -- Switch to correct tab for panel operations
                     local current_tab = vim.api.nvim_get_current_tabpage()
                     local need_switch = current_tab ~= my_tabid
@@ -424,8 +453,12 @@ function M._on_exit(code, tabid)
     end
 
     -- Clear session b.state on disconnect
+    b.state.connected = false
     b.state.session_active = false
     b.state.session_start_time = nil
+    b.state.session_id = nil
+    b.state.models = {}
+    b.state.model = nil
 
     if code ~= 0 then
         vim.notify("Banjo: Process exited with code " .. code, vim.log.levels.WARN)
@@ -593,6 +626,15 @@ function M._handle_notification(msg, tabid)
         panel._stop_session_timer()
         notify_background(tabid, "Banjo: Task complete", vim.log.levels.INFO)
     -- Legacy protocol support (for backward compat during transition)
+    elseif method == "session_start" then
+        b.state.session_active = true
+        b.state.session_start_time = vim.loop.now()
+        panel._start_session_timer()
+    elseif method == "session_end" then
+        b.state.session_active = false
+        b.state.session_start_time = nil
+        panel._update_status()
+        panel._stop_session_timer()
     elseif method == "stream_start" then
         local engine = params.engine or "claude"
         panel.start_stream(engine)
@@ -607,6 +649,10 @@ function M._handle_notification(msg, tabid)
         panel.show_tool_result(params.id, params.status)
     elseif method == "tool_request" then
         M._handle_tool_request(params)
+    elseif method == "approval_request" then
+        M._show_approval_prompt(params)
+    elseif method == "permission_request" then
+        M._show_permission_prompt(params)
     elseif method == "error_msg" then
         local message = params.message or "Unknown error"
         vim.notify("Banjo: " .. message, vim.log.levels.ERROR)
@@ -614,6 +660,8 @@ function M._handle_notification(msg, tabid)
     elseif method == "status" then
         local text = params.text or ""
         vim.notify("Banjo: " .. text, vim.log.levels.INFO)
+    elseif method == "debug_info" then
+        b.debug_info = params
     elseif method == "state" then
         b.state.engine = params.engine or b.state.engine
         b.state.model = params.model
@@ -745,7 +793,11 @@ end
 function M.get_debug_info()
     local b = get_bridge()
     b.debug_info = nil
-    M._send_notification("get_debug_info", {})
+    local params = {}
+    if b.state.session_id then
+        params.sessionId = b.state.session_id
+    end
+    M._send_notification("get_debug_info", params)
     -- Wait for response (up to 1s)
     local start = vim.loop.now()
     while not b.debug_info and (vim.loop.now() - start) < 1000 do
@@ -757,25 +809,37 @@ end
 
 function M.set_engine(engine)
     local b = get_bridge()
-    if not b.state.session_id then return end
+    b.preserved.engine = engine
+    if not b.state.session_id then
+        b.state.engine = engine
+        panel._update_status()
+        return
+    end
     -- ACP uses session/set_config_option for engine
     M._send_notification("session/set_config_option", {
         sessionId = b.state.session_id,
-        optionId = "engine",
+        configId = "route",
         value = engine,
     })
     b.state.engine = engine
+    panel._update_status()
 end
 
 function M.set_model(model)
     local b = get_bridge()
-    if not b.state.session_id then return end
+    b.preserved.model = model
+    if not b.state.session_id then
+        b.state.model = model
+        panel._update_status()
+        return
+    end
     -- ACP uses session/set_model
     M._send_notification("session/set_model", {
         sessionId = b.state.session_id,
         modelId = model,
     })
     b.state.model = model
+    panel._update_status()
 end
 
 function M.set_permission_mode(mode)
