@@ -755,13 +755,11 @@
   (boundp 'doom-version))
 
 (defun banjo--doom-prefix-available-p (prefix)
-  "Return non-nil if PREFIX is free or a keymap in `doom-leader-map`."
+  "Return non-nil if PREFIX is a keymap in `doom-leader-map`."
   (when (boundp 'doom-leader-map)
     (let* ((key (kbd prefix))
            (binding (lookup-key doom-leader-map key)))
-      (or (null binding)
-          (eq binding 'undefined)
-          (keymapp binding)))))
+      (keymapp binding))))
 
 (defun banjo--setup-doom-keybindings ()
   "Set up Doom Emacs keybindings using SPC a prefix."
