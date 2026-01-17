@@ -17,6 +17,7 @@
 
 (require 'websocket)
 (require 'json)
+(require 'subr-x)
 
 ;; Customization
 
@@ -38,6 +39,16 @@
 (defcustom banjo-panel-position 'right
   "Position of the Banjo panel."
   :type '(choice (const left) (const right))
+  :group 'banjo)
+
+(defcustom banjo-input-height 6
+  "Height of the Banjo input window."
+  :type 'integer
+  :group 'banjo)
+
+(defcustom banjo-input-header "Message Banjo Duet (Local) - RET send, C-j newline, / for commands"
+  "Header line for the Banjo input buffer."
+  :type 'string
   :group 'banjo)
 
 (defcustom banjo-enable-links t
@@ -303,10 +314,13 @@
 (defvar banjo--state nil "Current state (engine, model, mode).")
 (defvar banjo--streaming nil "Whether we're currently streaming output.")
 (defvar banjo--tool-calls (make-hash-table :test 'equal) "Active tool calls.")
+(defvar banjo--process-output ""
+  "Accumulated output from the Banjo daemon process.")
 
 ;; Buffer names
 
 (defconst banjo--output-buffer "*banjo*" "Output buffer name.")
+(defconst banjo--input-buffer "*banjo-input*" "Input buffer name.")
 
 ;; Mode line
 
@@ -340,12 +354,38 @@
   (setq-local font-lock-multiline t)
   (font-lock-mode 1))
 
+(defvar banjo-input-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'banjo-input-send)
+    (define-key map (kbd "C-c C-c") #'banjo-input-send)
+    (define-key map (kbd "C-c C-k") #'banjo-cancel)
+    (define-key map (kbd "C-j") #'newline)
+    map)
+  "Keymap for Banjo input.")
+
+(define-derived-mode banjo-input-mode text-mode "BanjoInput"
+  "Major mode for Banjo input."
+  (setq-local header-line-format banjo-input-header)
+  (setq-local truncate-lines nil)
+  (setq-local word-wrap t))
+
+(define-key banjo-mode-map (kbd "i") #'banjo-focus-input)
+(define-key banjo-mode-map (kbd "RET") #'banjo-focus-input)
+
 (defun banjo--get-output-buffer ()
   "Get or create the output buffer."
   (let ((buf (get-buffer-create banjo--output-buffer)))
     (with-current-buffer buf
       (unless (eq major-mode 'banjo-mode)
         (banjo-mode)))
+    buf))
+
+(defun banjo--get-input-buffer ()
+  "Get or create the input buffer."
+  (let ((buf (get-buffer-create banjo--input-buffer)))
+    (with-current-buffer buf
+      (unless (eq major-mode 'banjo-input-mode)
+        (banjo-input-mode)))
     buf))
 
 (defun banjo--append-output (text &optional face)
@@ -384,20 +424,41 @@
 
 (defun banjo--show-panel ()
   "Show the Banjo panel."
-  (let ((buf (banjo--get-output-buffer))
-        (side (if (eq banjo-panel-position 'left) 'left 'right)))
-    (unless (get-buffer-window buf)
-      (display-buffer-in-side-window
-       buf
-       `((side . ,side)
-         (window-width . ,banjo-panel-width)
-         (preserve-size . (t . nil)))))))
+  (let* ((buf (banjo--get-output-buffer))
+         (input-buf (banjo--get-input-buffer))
+         (side (if (eq banjo-panel-position 'left) 'left 'right))
+         (selected (selected-window))
+         (out-win (display-buffer-in-side-window
+                   buf
+                   `((side . ,side)
+                     (slot . 0)
+                     (window-width . ,banjo-panel-width)
+                     (preserve-size . (t . nil)))))
+         (input-win (display-buffer-in-side-window
+                     input-buf
+                     `((side . ,side)
+                       (slot . 1)
+                       (window-width . ,banjo-panel-width)
+                       (window-height . ,banjo-input-height)
+                       (preserve-size . (nil . t))))))
+    (when (window-live-p out-win)
+      (set-window-parameter out-win 'no-other-window t)
+      (set-window-dedicated-p out-win t))
+    (when (window-live-p input-win)
+      (set-window-parameter input-win 'no-other-window t)
+      (set-window-parameter input-win 'window-size-fixed 'height)
+      (set-window-dedicated-p input-win t))
+    (when (window-live-p selected)
+      (select-window selected))))
 
 (defun banjo--hide-panel ()
   "Hide the Banjo panel."
-  (let ((win (get-buffer-window banjo--output-buffer)))
-    (when win
-      (delete-window win))))
+  (let ((input-win (get-buffer-window banjo--input-buffer))
+        (out-win (get-buffer-window banjo--output-buffer)))
+    (when (window-live-p input-win)
+      (delete-window input-win))
+    (when (window-live-p out-win)
+      (delete-window out-win))))
 
 ;;;###autoload
 (defun banjo-toggle ()
@@ -405,7 +466,16 @@
   (interactive)
   (if (get-buffer-window banjo--output-buffer)
       (banjo--hide-panel)
-    (banjo--show-panel)))
+    (banjo-focus-input)))
+
+;;;###autoload
+(defun banjo-focus-input ()
+  "Show the Banjo panel and focus the input buffer."
+  (interactive)
+  (banjo--show-panel)
+  (let ((input-win (get-buffer-window banjo--input-buffer)))
+    (when (window-live-p input-win)
+      (select-window input-win))))
 
 ;; WebSocket
 
@@ -576,14 +646,36 @@
            :filter #'banjo--process-filter
            :sentinel #'banjo--process-sentinel))))
 
-(defun banjo--process-filter (proc output)
-  "Process filter for daemon PROC, handling OUTPUT."
-  ;; Look for "ready:" line with port
-  (when (string-match "ready:\\([0-9]+\\)" output)
-    (let ((port (string-to-number (match-string 1 output))))
-      (setq banjo--port port)
-      (banjo--connect port))))
-
+(defun banjo--process-filter (_proc output)
+  "Process filter for daemon OUTPUT."
+  (setq banjo--process-output (concat banjo--process-output output))
+  (let* ((buf banjo--process-output)
+         (lines (split-string buf "\n"))
+         (complete (if (string-suffix-p "\n" buf) lines (butlast lines)))
+         (rest (if (string-suffix-p "\n" buf) "" (car (last lines)))))
+    (setq banjo--process-output rest)
+    (dolist (line complete)
+      (let ((trimmed (string-trim line)))
+        (when (and trimmed (not (string-empty-p trimmed)))
+          (cond
+           ((string-match "ready:\\([0-9]+\\)" trimmed)
+            (let ((port (string-to-number (match-string 1 trimmed))))
+              (setq banjo--port port)
+              (banjo--connect port)))
+           (t
+            (let ((msg (condition-case nil
+                           (json-read-from-string trimmed)
+                         (error nil))))
+              (when msg
+                (let ((method (alist-get 'method msg))
+                      (params (alist-get 'params msg)))
+                  (when (and (stringp method) (string= method "ready"))
+                    (let* ((port (or (alist-get 'mcp_port params)
+                                     (alist-get 'port params)))
+                           (num (and port (if (numberp port) port (string-to-number port)))))
+                      (when (and num (> num 0))
+                        (setq banjo--port num)
+                        (banjo--connect num))))))))))))))
 (defun banjo--process-sentinel (proc event)
   "Process sentinel for daemon PROC, handling EVENT."
   (when (string-match-p "\\(finished\\|exited\\|killed\\)" event)
@@ -616,7 +708,7 @@
        ;; Create session
        (banjo--send-request
         "session/new"
-        `((cwd . ,default-directory))
+        `((cwd . ,(expand-file-name default-directory)))
         (lambda (sess-result _sess-err)
           (when sess-result
             (setq banjo--session-id (alist-get 'sessionId sess-result))
@@ -633,6 +725,30 @@
   (message "Banjo disconnected"))
 
 ;; Commands
+
+(defun banjo--send-text (prompt)
+  "Send PROMPT to the agent and append to output."
+  (unless banjo--session-id
+    (user-error "Banjo not connected. Run M-x banjo-start"))
+  (banjo--show-panel)
+  (banjo--append-output (format "> %s\n\n" prompt) 'banjo-face-user)
+  (setq banjo--streaming nil)
+  (banjo--send-notification
+   "session/prompt"
+   `((sessionId . ,banjo--session-id)
+     (prompt . [((type . "text") (text . ,prompt))]))))
+
+;;;###autoload
+(defun banjo-input-send ()
+  "Send the current input buffer contents."
+  (interactive)
+  (let ((text (string-trim-right
+               (buffer-substring-no-properties (point-min) (point-max)))))
+    (when (string-blank-p text)
+      (user-error "Prompt is empty"))
+    (banjo--send-text text)
+    (let ((inhibit-read-only t))
+      (erase-buffer))))
 
 ;;;###autoload
 (defun banjo-start ()
@@ -665,15 +781,7 @@
 (defun banjo-send (prompt)
   "Send PROMPT to Claude/Codex."
   (interactive "sPrompt: ")
-  (unless banjo--session-id
-    (user-error "Banjo not connected. Run M-x banjo-start"))
-  (banjo--clear-output)
-  (banjo--append-output (format "> %s\n\n" prompt) 'banjo-face-user)
-  (setq banjo--streaming nil)
-  (banjo--send-notification
-   "session/prompt"
-   `((sessionId . ,banjo--session-id)
-     (prompt . ((content . [((type . "text") (text . ,prompt))]))))))
+  (banjo--send-text prompt))
 
 ;;;###autoload
 (defun banjo-send-region (start end prompt)
@@ -681,7 +789,7 @@
   (interactive "r\nsPrompt: ")
   (let ((content (buffer-substring-no-properties start end))
         (file (or (buffer-file-name) "untitled")))
-    (banjo-send (format "%s\n\nFile: %s\n```\n%s\n```" prompt file content))))
+    (banjo--send-text (format "%s\n\nFile: %s\n```\n%s\n```" prompt file content))))
 
 ;;;###autoload
 (defun banjo-cancel ()
@@ -729,7 +837,7 @@
     (banjo--send-notification
      "session/set_config_option"
      `((sessionId . ,banjo--session-id)
-       (optionId . "engine")
+       (configId . "route")
        (value . ,engine)))
     (plist-put banjo--state :engine engine)
     (banjo--update-mode-line)))
@@ -743,6 +851,7 @@
     (define-key map "p" #'banjo-send)
     (define-key map "r" #'banjo-send-region)
     (define-key map "c" #'banjo-cancel)
+    (define-key map "i" #'banjo-focus-input)
     (define-key map "t" #'banjo-toggle)
     (define-key map "m" #'banjo-set-mode)
     (define-key map "M" #'banjo-set-model)
@@ -750,50 +859,72 @@
     map)
   "Keymap for Banjo commands.")
 
+(defvar banjo--doom-prefix-map nil
+  "Keymap for Banjo Doom leader prefix.")
+
 (defun banjo--doom-p ()
   "Return non-nil if running in Doom Emacs."
   (boundp 'doom-version))
 
-(defun banjo--doom-prefix-available-p (prefix)
-  "Return non-nil if PREFIX is a keymap in `doom-leader-map`."
+(defun banjo--ensure-doom-prefix-map (prefix)
+  "Ensure PREFIX is a keymap in `doom-leader-map` and return non-nil on success."
   (when (boundp 'doom-leader-map)
     (let* ((key (kbd prefix))
-           (binding (lookup-key doom-leader-map key)))
-      (keymapp binding))))
+           (binding (lookup-key doom-leader-map key))
+           (orig binding))
+      (when (or (null binding) (eq binding 'undefined) (not (keymapp binding)))
+        (setq binding (make-sparse-keymap))
+        (define-key doom-leader-map key binding)
+        (when (and orig (not (keymapp orig)))
+          (message "Banjo: rebound leader %s to a keymap" prefix)))
+      (when (keymapp binding)
+        (setq banjo--doom-prefix-map binding)
+        binding))))
+
+(defun banjo--define-doom-leader-keys (prefix)
+  "Define Doom leader bindings under PREFIX."
+  (let ((map (banjo--ensure-doom-prefix-map prefix)))
+    (when map
+      (define-key map (kbd "b") #'banjo-toggle)
+      (define-key map (kbd "s") #'banjo-send)
+      (define-key map (kbd "v") #'banjo-send-region)
+      (define-key map (kbd "c") #'banjo-cancel)
+      (define-key map (kbd "i") #'banjo-focus-input)
+      (define-key map (kbd "m") #'banjo-set-mode)
+      (define-key map (kbd "M") #'banjo-set-model)
+      (define-key map (kbd "e") #'banjo-set-engine)
+      (define-key map (kbd "S") #'banjo-start)
+      (define-key map (kbd "q") #'banjo-stop)
+      (when (fboundp 'which-key-add-key-based-replacements)
+        (let ((leader (if (boundp 'doom-leader-key) doom-leader-key "SPC")))
+          (which-key-add-key-based-replacements
+           (concat leader " " prefix) "ai agent")))
+      t)))
 
 (defun banjo--setup-doom-keybindings ()
   "Set up Doom Emacs keybindings using SPC a prefix."
   (with-eval-after-load 'doom-keybinds
     ;; Leader keybindings: SPC <prefix> ...
-    (when (fboundp 'map!)
-      (let ((prefix banjo-doom-leader-prefix))
-        (if (banjo--doom-prefix-available-p prefix)
-            (eval `(map! :leader
-                         (:prefix (,prefix . "ai agent")
-                          :desc "Toggle panel"      "b" #'banjo-toggle
-                          :desc "Send prompt"       "s" #'banjo-send
-                          :desc "Send region"       "v" #'banjo-send-region
-                          :desc "Cancel"            "c" #'banjo-cancel
-                          :desc "Set mode"          "m" #'banjo-set-mode
-                          :desc "Set model"         "M" #'banjo-set-model
-                          :desc "Set engine"        "e" #'banjo-set-engine
-                          :desc "Start"             "S" #'banjo-start
-                          :desc "Stop"              "q" #'banjo-stop)))
-          (message "Banjo: leader prefix %s is not a keymap; set `banjo-doom-leader-prefix`" prefix)))))
+    (let ((prefix banjo-doom-leader-prefix))
+      (if (banjo--define-doom-leader-keys prefix)
+          t
+        (message "Banjo: leader prefix %s unavailable; set `banjo-doom-leader-prefix`" prefix))))
   (with-eval-after-load 'evil
     ;; Panel buffer keybindings
-    (evil-define-key 'normal banjo-mode-map
-      "q" #'banjo--hide-panel
-      "gr" #'banjo-toggle
-      (kbd "C-c") #'banjo-cancel)))
+    (when (fboundp 'evil-define-key)
+      (evil-define-key 'normal banjo-mode-map
+        "q" #'banjo--hide-panel
+        "gr" #'banjo-toggle
+        (kbd "C-c") #'banjo-cancel))))
 
 (defun banjo--setup-evil-panel-bindings ()
   "Set up evil-mode bindings for the panel buffer."
   (eval-after-load 'evil
-    '(evil-define-key 'normal banjo-mode-map
-       "q" #'banjo--hide-panel
-       "gr" #'banjo-toggle
-       (kbd "C-c") #'banjo-cancel)))
+    '(when (fboundp 'evil-define-key)
+       (evil-define-key 'normal banjo-mode-map
+         "q" #'banjo--hide-panel
+         "gr" #'banjo-toggle
+         (kbd "C-c") #'banjo-cancel))))
 
 ;;;###autoload
 (defun banjo-setup-keybindings ()
