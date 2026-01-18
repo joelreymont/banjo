@@ -211,6 +211,41 @@ pub const ToolProxy = struct {
 const testing = std.testing;
 const ohsnap = @import("ohsnap");
 
+const ProxyCapture = struct {
+    proxy: ToolProxy,
+    output: *std.ArrayList(u8),
+    list_writer: *std.ArrayList(u8).Writer,
+    allocator: Allocator,
+
+    fn init(allocator: Allocator) !ProxyCapture {
+        const output = try allocator.create(std.ArrayList(u8));
+        errdefer allocator.destroy(output);
+        output.* = .empty;
+
+        const list_writer = try allocator.create(std.ArrayList(u8).Writer);
+        errdefer allocator.destroy(list_writer);
+        list_writer.* = output.writer(allocator);
+
+        return .{
+            .proxy = ToolProxy.init(allocator, jsonrpc.Writer.init(allocator, list_writer.any())),
+            .output = output,
+            .list_writer = list_writer,
+            .allocator = allocator,
+        };
+    }
+
+    fn deinit(self: *ProxyCapture) void {
+        self.output.deinit(self.allocator);
+        self.allocator.destroy(self.output);
+        self.allocator.destroy(self.list_writer);
+        self.proxy.deinit();
+    }
+
+    fn toOwnedSlice(self: *ProxyCapture) ![]u8 {
+        return self.output.toOwnedSlice(self.allocator);
+    }
+};
+
 test "ToolProxy init/deinit" {
     const writer = jsonrpc.Writer.init(testing.allocator, std.io.null_writer.any());
     var proxy = ToolProxy.init(testing.allocator, writer);
@@ -335,4 +370,50 @@ test "ToolProxy multiple concurrent requests" {
         \\  .pending_3: bool = true
         \\  .count: u32 = 2
     ).expectEqual(after);
+}
+
+test "ToolProxy readFile request" {
+    var cap = try ProxyCapture.init(testing.allocator);
+    defer cap.deinit();
+
+    const id = try cap.proxy.readFile("sess", "/tmp/file.txt", 12, 5);
+    try testing.expectEqual(@as(i64, 1), id);
+
+    const snapshot = try cap.toOwnedSlice();
+    defer testing.allocator.free(snapshot);
+    try (ohsnap{}).snap(@src(),
+        \\{"jsonrpc":"2.0","method":"fs/read_text_file","params":{"sessionId":"sess","path":"/tmp/file.txt","line":12,"limit":5},"id":1}
+        \\
+    ).diff(snapshot, true);
+}
+
+test "ToolProxy writeFile request" {
+    var cap = try ProxyCapture.init(testing.allocator);
+    defer cap.deinit();
+
+    const id = try cap.proxy.writeFile("sess", "/tmp/out.txt", "hello");
+    try testing.expectEqual(@as(i64, 1), id);
+
+    const snapshot = try cap.toOwnedSlice();
+    defer testing.allocator.free(snapshot);
+    try (ohsnap{}).snap(@src(),
+        \\{"jsonrpc":"2.0","method":"fs/write_text_file","params":{"sessionId":"sess","path":"/tmp/out.txt","content":"hello"},"id":1}
+        \\
+    ).diff(snapshot, true);
+}
+
+test "ToolProxy bash request" {
+    var cap = try ProxyCapture.init(testing.allocator);
+    defer cap.deinit();
+
+    const args = &[_][]const u8{ "-lc", "echo hi" };
+    const id = try cap.proxy.createTerminal("sess", "bash", args, null, "/tmp", 1024);
+    try testing.expectEqual(@as(i64, 1), id);
+
+    const snapshot = try cap.toOwnedSlice();
+    defer testing.allocator.free(snapshot);
+    try (ohsnap{}).snap(@src(),
+        \\{"jsonrpc":"2.0","method":"terminal/create","params":{"sessionId":"sess","command":"bash","args":["-lc","echo hi"],"cwd":"/tmp","outputByteLimit":1024},"id":1}
+        \\
+    ).diff(snapshot, true);
 }

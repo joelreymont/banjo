@@ -90,3 +90,47 @@ pub fn writeAll(fd: std.posix.fd_t, buf: []const u8) !void {
         offset += n;
     }
 }
+
+const testing = std.testing;
+
+const ChunkReader = struct {
+    chunks: []const []const u8,
+    idx: usize = 0,
+
+    fn read(self: *ChunkReader, buf: []u8) !usize {
+        if (self.idx >= self.chunks.len) return 0;
+        const chunk = self.chunks[self.idx];
+        self.idx += 1;
+        const n = @min(buf.len, chunk.len);
+        @memcpy(buf[0..n], chunk[0..n]);
+        return n;
+    }
+};
+
+test "readLine assembles partial reads" {
+    var reader = ChunkReader{
+        .chunks = &.{ "hello", " world", "\nrest" },
+    };
+    var queue: byte_queue.ByteQueue = .{};
+    defer queue.deinit(testing.allocator);
+
+    const line = try readLine(
+        testing.allocator,
+        &queue,
+        reader,
+        null,
+        null,
+        1024,
+    );
+    try testing.expectEqualStrings("hello world", line.?);
+
+    const tail = try readLine(
+        testing.allocator,
+        &queue,
+        reader,
+        null,
+        null,
+        1024,
+    );
+    try testing.expectEqualStrings("rest", tail.?);
+}

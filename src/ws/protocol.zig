@@ -267,6 +267,142 @@ test "PermissionRequest serialization" {
     ).expectEqual(summary);
 }
 
+test "JsonRpcRequest prompt serialization" {
+    const params = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\{"text":"Hello","files":[],"cwd":"/tmp"}
+    , .{});
+    defer params.deinit();
+
+    const id = try std.json.parseFromSlice(std.json.Value, testing.allocator, "1", .{});
+    defer id.deinit();
+
+    const req = JsonRpcRequest{
+        .method = "prompt",
+        .params = params.value,
+        .id = id.value,
+    };
+    const json = try jsonAlloc(testing.allocator, req);
+    defer testing.allocator.free(json);
+    try (ohsnap{}).snap(@src(),
+        \\{"jsonrpc":"2.0","method":"prompt","params":{"text":"Hello","files":[],"cwd":"/tmp"},"id":1}
+        \\
+    ).diff(json, true);
+}
+
+test "JsonRpcRequest cancel serialization" {
+    const id = try std.json.parseFromSlice(std.json.Value, testing.allocator, "2", .{});
+    defer id.deinit();
+
+    const req = JsonRpcRequest{
+        .method = "cancel",
+        .id = id.value,
+    };
+    const json = try jsonAlloc(testing.allocator, req);
+    defer testing.allocator.free(json);
+    try (ohsnap{}).snap(@src(),
+        \\{"jsonrpc":"2.0","method":"cancel","id":2}
+        \\
+    ).diff(json, true);
+}
+
+test "JsonRpcRequest set_engine serialization" {
+    const params = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\{"engine":"claude"}
+    , .{});
+    defer params.deinit();
+
+    const id = try std.json.parseFromSlice(std.json.Value, testing.allocator, "3", .{});
+    defer id.deinit();
+
+    const req = JsonRpcRequest{
+        .method = "set_engine",
+        .params = params.value,
+        .id = id.value,
+    };
+    const json = try jsonAlloc(testing.allocator, req);
+    defer testing.allocator.free(json);
+    try (ohsnap{}).snap(@src(),
+        \\{"jsonrpc":"2.0","method":"set_engine","params":{"engine":"claude"},"id":3}
+        \\
+    ).diff(json, true);
+}
+
+test "JsonRpcRequest set_model serialization" {
+    const params = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\{"model":"sonnet"}
+    , .{});
+    defer params.deinit();
+
+    const id = try std.json.parseFromSlice(std.json.Value, testing.allocator, "4", .{});
+    defer id.deinit();
+
+    const req = JsonRpcRequest{
+        .method = "set_model",
+        .params = params.value,
+        .id = id.value,
+    };
+    const json = try jsonAlloc(testing.allocator, req);
+    defer testing.allocator.free(json);
+    try (ohsnap{}).snap(@src(),
+        \\{"jsonrpc":"2.0","method":"set_model","params":{"model":"sonnet"},"id":4}
+        \\
+    ).diff(json, true);
+}
+
+test "JsonRpcNotification stream_chunk serialization" {
+    const params = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\{"text":"chunk","is_thought":false}
+    , .{});
+    defer params.deinit();
+
+    const notif = JsonRpcNotification{
+        .method = "stream_chunk",
+        .params = params.value,
+    };
+    const json = try jsonAlloc(testing.allocator, notif);
+    defer testing.allocator.free(json);
+    try (ohsnap{}).snap(@src(),
+        \\{"jsonrpc":"2.0","method":"stream_chunk","params":{"text":"chunk","is_thought":false}}
+        \\
+    ).diff(json, true);
+}
+
+test "JsonRpcNotification tool_call serialization" {
+    const params = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\{"id":"t1","name":"Read","status":"running","input":{"path":"/tmp/a"}}
+    , .{});
+    defer params.deinit();
+
+    const notif = JsonRpcNotification{
+        .method = "tool_call",
+        .params = params.value,
+    };
+    const json = try jsonAlloc(testing.allocator, notif);
+    defer testing.allocator.free(json);
+    try (ohsnap{}).snap(@src(),
+        \\{"jsonrpc":"2.0","method":"tool_call","params":{"id":"t1","name":"Read","status":"running","input":{"path":"/tmp/a"}}}
+        \\
+    ).diff(json, true);
+}
+
+test "JsonRpcNotification status serialization" {
+    const params = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\{"text":"Ready"}
+    , .{});
+    defer params.deinit();
+
+    const notif = JsonRpcNotification{
+        .method = "status",
+        .params = params.value,
+    };
+    const json = try jsonAlloc(testing.allocator, notif);
+    defer testing.allocator.free(json);
+    try (ohsnap{}).snap(@src(),
+        \\{"jsonrpc":"2.0","method":"status","params":{"text":"Ready"}}
+        \\
+    ).diff(json, true);
+}
+
 test "StateResponse serialization" {
     const state = StateResponse{
         .engine = "claude",

@@ -322,11 +322,18 @@ fn parseHeader(line: []const u8, prefix: []const u8) ?[]const u8 {
 const testing = std.testing;
 const ohsnap = @import("ohsnap");
 
-fn makeMaskedFrame(allocator: Allocator, opcode: u8, payload: []const u8, mask: [4]u8) ![]u8 {
+fn makeMaskedFrameWithFin(
+    allocator: Allocator,
+    fin: bool,
+    opcode: u8,
+    payload: []const u8,
+    mask: [4]u8,
+) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
 
-    try buf.append(allocator, 0x80 | opcode);
+    const fin_bit: u8 = if (fin) 0x80 else 0x00;
+    try buf.append(allocator, fin_bit | opcode);
     if (payload.len < 126) {
         try buf.append(allocator, 0x80 | @as(u8, @intCast(payload.len)));
     } else if (payload.len < 65536) {
@@ -344,6 +351,10 @@ fn makeMaskedFrame(allocator: Allocator, opcode: u8, payload: []const u8, mask: 
     }
 
     return buf.toOwnedSlice(allocator);
+}
+
+fn makeMaskedFrame(allocator: Allocator, opcode: u8, payload: []const u8, mask: [4]u8) ![]u8 {
+    return makeMaskedFrameWithFin(allocator, true, opcode, payload, mask);
 }
 
 test "encodeFrame small payload" {
@@ -423,6 +434,48 @@ test "parseFrame masked" {
     ).expectEqual(summary);
 }
 
+test "parseFrame fragmented text" {
+    const allocator = testing.allocator;
+    const mask = [4]u8{ 0x10, 0x20, 0x30, 0x40 };
+    const data = try makeMaskedFrameWithFin(allocator, false, @intFromEnum(Opcode.text), "hi", mask);
+    defer allocator.free(data);
+
+    const result = try parseFrame(data);
+    const summary = .{
+        .fin = result.frame.fin,
+        .opcode = @tagName(result.frame.opcode),
+        .payload = result.frame.payload,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\ws.websocket.test.parseFrame fragmented text__struct_<^\d+$>
+        \\  .fin: bool = false
+        \\  .opcode: [:0]const u8
+        \\    "text"
+        \\  .payload: []const u8
+        \\    "hi"
+    ).expectEqual(summary);
+}
+
+test "parseFrame fragmented control frame" {
+    const allocator = testing.allocator;
+    const mask = [4]u8{ 0x01, 0x02, 0x03, 0x04 };
+    const data = try makeMaskedFrameWithFin(allocator, false, @intFromEnum(Opcode.ping), "", mask);
+    defer allocator.free(data);
+
+    try testing.expectError(error.FragmentedControlFrame, parseFrame(data));
+}
+
+test "parseFrame control frame too large" {
+    const allocator = testing.allocator;
+    var payload: [126]u8 = undefined;
+    @memset(payload[0..], 'x');
+    const mask = [4]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+    const data = try makeMaskedFrame(allocator, @intFromEnum(Opcode.ping), &payload, mask);
+    defer allocator.free(data);
+
+    try testing.expectError(error.ControlFrameTooLarge, parseFrame(data));
+}
+
 test "parseFrame incomplete" {
     var data = [_]u8{0x81}; // Only first byte
     try testing.expectError(error.NeedMoreData, parseFrame(&data));
@@ -473,6 +526,73 @@ test "parseFrame reserved opcode" {
     const data = try makeMaskedFrame(allocator, 0x3, "", mask);
     defer allocator.free(data);
     try testing.expectError(error.ReservedOpcode, parseFrame(data));
+}
+
+test "encodeFrame 126 boundary" {
+    const allocator = testing.allocator;
+    const payload = "x" ** 126;
+    const frame = try encodeFrame(allocator, .text, payload);
+    defer allocator.free(frame);
+
+    const summary = .{
+        .first = frame[0],
+        .len = frame[1],
+        .extended_len = std.mem.readInt(u16, frame[2..4], .big),
+        .payload_len = frame[4..].len,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\ws.websocket.test.encodeFrame 126 boundary__struct_<^\d+$>
+        \\  .first: u8 = 129
+        \\  .len: u8 = 126
+        \\  .extended_len: u16 = 126
+        \\  .payload_len: usize = 126
+    ).expectEqual(summary);
+}
+
+test "encodeFrame 65536 boundary" {
+    const allocator = testing.allocator;
+    const payload = try allocator.alloc(u8, 65536);
+    defer allocator.free(payload);
+    @memset(payload, 'x');
+
+    const frame = try encodeFrame(allocator, .text, payload);
+    defer allocator.free(frame);
+
+    const summary = .{
+        .first = frame[0],
+        .len = frame[1],
+        .extended_len = std.mem.readInt(u64, frame[2..10], .big),
+        .payload_len = frame[10..].len,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\ws.websocket.test.encodeFrame 65536 boundary__struct_<^\d+$>
+        \\  .first: u8 = 129
+        \\  .len: u8 = 127
+        \\  .extended_len: u64 = 65536
+        \\  .payload_len: usize = 65536
+    ).expectEqual(summary);
+}
+
+test "perf: parseFrame throughput" {
+    const allocator = testing.allocator;
+    const mask = [4]u8{ 0xde, 0xad, 0xbe, 0xef };
+    const frame = try makeMaskedFrame(allocator, @intFromEnum(Opcode.text), "hello", mask);
+    defer allocator.free(frame);
+
+    const buf = try allocator.alloc(u8, frame.len);
+    defer allocator.free(buf);
+
+    const iterations: usize = 1000;
+    var timer = std.time.Timer.start() catch return;
+    for (0..iterations) |_| {
+        @memcpy(buf, frame);
+        _ = try parseFrame(buf);
+    }
+    const elapsed = timer.read();
+    const ops_per_sec = @as(f64, @floatFromInt(iterations)) /
+        (@as(f64, @floatFromInt(elapsed)) / 1e9);
+
+    try testing.expect(ops_per_sec > 10_000);
 }
 
 test "tryParseHandshake returns null for partial headers" {

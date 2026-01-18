@@ -220,6 +220,7 @@ pub fn generateUuidV4(out: *[36]u8) void {
 // Tests
 const testing = std.testing;
 const ohsnap = @import("ohsnap");
+const test_env = @import("../util/test_env.zig");
 
 test "generateUuidV4 format" {
     var uuid: [36]u8 = undefined;
@@ -273,4 +274,23 @@ test "isPidAlive invalid" {
         \\  .alive: bool = <^(true|false)$>
     ).expectEqual(summary);
     try std.testing.expectEqual(expected, summary.alive);
+}
+
+test "create returns permission error when home unwritable" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try tmp.dir.realpath(".", &path_buf);
+
+    var guard_home = try test_env.EnvVarGuard.set(testing.allocator, "HOME", home);
+    defer guard_home.deinit();
+
+    // Create ~/.claude and make it unreadable to block lockfile creation
+    try tmp.dir.makeDir(".claude");
+    const claude_path = try std.fs.path.join(testing.allocator, &.{ home, ".claude" });
+    defer testing.allocator.free(claude_path);
+    try std.posix.chmod(claude_path, 0);
+
+    try testing.expectError(error.AccessDenied, create(testing.allocator, 12345, home));
 }

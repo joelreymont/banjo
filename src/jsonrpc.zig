@@ -591,6 +591,26 @@ test "parse request with number id" {
     ).expectEqual(summary);
 }
 
+test "parse request with null id" {
+    const json =
+        \\{"jsonrpc":"2.0","method":"test","id":null}
+    ;
+    var parsed = try parseRequest(testing.allocator, json);
+    defer parsed.deinit();
+    const summary = .{
+        .method = parsed.request.method,
+        .notification = parsed.request.isNotification(),
+        .has_null_id = parsed.request.id == .null,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\jsonrpc.test.parse request with null id__struct_<^\d+$>
+        \\  .method: []const u8
+        \\    "test"
+        \\  .notification: bool = false
+        \\  .has_null_id: bool = true
+    ).expectEqual(summary);
+}
+
 test "parse notification (no id)" {
     const json =
         \\{"jsonrpc":"2.0","method":"notify"}
@@ -607,6 +627,22 @@ test "parse notification (no id)" {
         \\    "notify"
         \\  .notification: bool = true
     ).expectEqual(summary);
+}
+
+test "parse request with unicode params" {
+    const json =
+        \\{"jsonrpc":"2.0","method":"test","params":{"text":"naïve café ☕"}}
+    ;
+    var parsed = try parseRequest(testing.allocator, json);
+    defer parsed.deinit();
+    const params = parsed.request.params orelse return error.TestUnexpectedResult;
+    const text = params.object.get("text") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("naïve café ☕", text.string);
+}
+
+test "parse request rejects invalid JSON" {
+    const json = "{";
+    try testing.expectError(error.UnexpectedEndOfInput, parseRequest(testing.allocator, json));
 }
 
 const ChunkedReader = struct {
@@ -663,6 +699,32 @@ test "Reader reads chunked messages" {
     ).expectEqual(summary);
 }
 
+test "Reader handles large payload" {
+    const payload_len: usize = 200_000;
+    const payload = try testing.allocator.alloc(u8, payload_len);
+    defer testing.allocator.free(payload);
+    @memset(payload, 'a');
+
+    var out: std.io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"test\",\"params\":{\"text\":\"");
+    try out.writer.writeAll(payload);
+    try out.writer.writeAll("\"}}\n");
+    const input = try out.toOwnedSlice();
+    defer testing.allocator.free(input);
+
+    var chunked = ChunkedReader{ .data = input, .chunk = 1024 };
+    var reader = Reader.init(testing.allocator, chunked.reader());
+    defer reader.deinit();
+
+    var parsed = (try reader.nextMessage()) orelse return error.TestUnexpectedResult;
+    defer parsed.deinit();
+    const req = parsed.message.request;
+    const params = req.params orelse return error.TestUnexpectedResult;
+    const text = params.object.get("text") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, payload_len), text.string.len);
+}
+
 test "Reader nextMessageWithTimeout returns timeout" {
     const fds = try std.posix.pipe();
     defer std.posix.close(fds[0]);
@@ -674,6 +736,20 @@ test "Reader nextMessageWithTimeout returns timeout" {
 
     const deadline_ms = std.time.milliTimestamp() - 1;
     try testing.expectError(error.Timeout, reader.nextMessageWithTimeout(deadline_ms));
+}
+
+test "perf: parseMessage throughput" {
+    const json = "{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":1}";
+    const iterations: usize = 10000;
+    var timer = std.time.Timer.start() catch return;
+    for (0..iterations) |_| {
+        var parsed = try parseMessage(testing.allocator, json);
+        parsed.deinit();
+    }
+    const elapsed = timer.read();
+    const ops_per_sec = @as(f64, @floatFromInt(iterations)) /
+        (@as(f64, @floatFromInt(elapsed)) / 1e9);
+    try testing.expect(ops_per_sec > 5000);
 }
 
 test "serialize success response" {
