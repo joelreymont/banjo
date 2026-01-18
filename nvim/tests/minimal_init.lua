@@ -7,6 +7,7 @@ vim.opt.rtp:prepend(plugin_root)
 
 -- Add tests directory to Lua package path
 local tests_dir = plugin_root .. "/tests"
+package.path = plugin_root .. "/?.lua;" .. package.path
 package.path = tests_dir .. "/?.lua;" .. package.path
 
 -- Find dependencies (plenary for test framework, nui.nvim for UI)

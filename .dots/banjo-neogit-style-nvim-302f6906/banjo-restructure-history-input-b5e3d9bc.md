@@ -1,9 +1,11 @@
 ---
 title: Restructure history/input layout
-status: open
+status: closed
 priority: 1
 issue-type: task
-created-at: "2026-01-18T17:03:00.669077+02:00"
+created-at: "\"2026-01-18T17:03:00.669077+02:00\""
+closed-at: "2026-01-19T05:33:44.276279+02:00"
+close-reason: completed
 blocks:
   - banjo-define-neogit-layout-335eb23d
 ---

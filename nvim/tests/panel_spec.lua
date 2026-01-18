@@ -67,6 +67,216 @@ describe("banjo panel", function()
     end)
   end)
 
+  describe("layout", function()
+    it("defines section order and scroll rules", function()
+      local sections = require("banjo.ui.sections")
+      local order = sections.order()
+      assert.same({ "header", "actions", "history", "input" }, order)
+
+      local defs = sections.defs()
+      assert.equals("fixed", defs.header.scroll)
+      assert.equals("scroll", defs.history.scroll)
+      assert.equals("fixed", defs.input.scroll)
+      assert.equals("fixed", defs.actions.scroll)
+    end)
+
+    it("computes ranges from total and fixed counts", function()
+      local sections = require("banjo.ui.sections")
+      local ranges, counts = sections.compute_ranges(10, { header = 2, actions = 1, input = 0 })
+      assert.equals(2, ranges.header.stop)
+      assert.equals(3, ranges.history.start)
+      assert.equals(10, ranges.history.stop)
+      assert.equals(7, counts.history)
+      assert.equals(2, ranges.actions.start)
+      assert.equals(3, ranges.actions.stop)
+    end)
+
+    it("keeps history above input padding", function()
+      panel.open()
+      helpers.wait(50)
+
+      panel.append("Hello layout")
+      helpers.wait(50)
+
+      local state = panel._get_state()
+      local ranges = state.sections.ranges
+      local buf = helpers.get_banjo_buffer()
+      local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+      local hello_idx = nil
+      for i, line in ipairs(lines) do
+        if line:find("Hello layout", 1, true) then
+          hello_idx = i - 1
+          break
+        end
+      end
+
+      assert.truthy(hello_idx, "Expected history line")
+      assert.is_true(hello_idx < (ranges.input and ranges.input.start or 0), "History should be above input")
+
+      local input_lines = vim.api.nvim_buf_get_lines(buf, ranges.input.start, ranges.input.stop, false)
+      assert.equals(state.sections.counts.input or 0, #input_lines)
+    end)
+  end)
+
+  describe("header", function()
+    it("renders auth menu and highlights active mode", function()
+      panel.open()
+      helpers.wait(50)
+
+      local buf = helpers.get_banjo_buffer()
+      local lines = vim.api.nvim_buf_get_lines(buf, 0, 2, false)
+      local line1 = lines[1] or ""
+      local line2 = lines[2] or ""
+
+      assert.truthy(line1:find("Banjo", 1, true), "Expected header title")
+      assert.truthy(line2:find("[D] Default", 1, true), "Expected default option")
+      assert.truthy(line2:find("[E] Accept Edits", 1, true), "Expected accept edits option")
+      assert.truthy(line2:find("[A] Auto-approve", 1, true), "Expected auto-approve option")
+      assert.truthy(line2:find("[P] Plan", 1, true), "Expected plan option")
+
+      local ns_header = vim.api.nvim_create_namespace("banjo_header")
+      local extmarks = vim.api.nvim_buf_get_extmarks(buf, ns_header, 0, -1, { details = true })
+      local has_active = false
+      local has_inactive = false
+      for _, mark in ipairs(extmarks) do
+        local details = mark[4] or {}
+        if details.hl_group == "BanjoAuthActive" then
+          has_active = true
+        elseif details.hl_group == "BanjoAuthInactive" then
+          has_inactive = true
+        end
+      end
+
+      assert.is_true(has_active, "Expected active mode highlight")
+      assert.is_true(has_inactive, "Expected inactive mode highlight")
+    end)
+
+    it("calls bridge.set_permission_mode from keymaps", function()
+      panel.open()
+      helpers.wait(100)
+
+      local called = nil
+      local bridge = {
+        get_state = function()
+          return { mode = "default" }
+        end,
+        is_running = function()
+          return true
+        end,
+        set_permission_mode = function(mode)
+          called = mode
+        end,
+      }
+
+      panel.set_bridge(bridge)
+      panel._update_status()
+      helpers.wait(50)
+
+      local buf = helpers.get_banjo_buffer()
+      vim.api.nvim_exec_autocmds("BufEnter", { buffer = buf })
+      helpers.wait(50)
+
+      local maps = vim.api.nvim_buf_get_keymap(buf, "n")
+      local has_a = false
+      for _, m in ipairs(maps) do
+        if m.lhs == "A" then
+          has_a = true
+          break
+        end
+      end
+      assert.is_true(has_a, "Expected A keymap")
+
+      panel._set_permission_mode("auto_approve")
+      assert.equals("auto_approve", called)
+    end)
+  end)
+
+  describe("actions", function()
+    it("renders action row with hints and highlights", function()
+      panel.open()
+      helpers.wait(50)
+
+      local buf = helpers.get_banjo_buffer()
+      local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+      local action_line = nil
+      for _, line in ipairs(lines) do
+        if line:find("%[p%]%s+Prompt") then
+          action_line = line
+          break
+        end
+      end
+
+      assert.truthy(action_line, "Expected action row")
+      assert.truthy(action_line:find("Mode:", 1, true), "Expected mode entry")
+      assert.truthy(action_line:find("Agent:", 1, true), "Expected agent entry")
+      assert.truthy(action_line:find("Model:", 1, true), "Expected model entry")
+
+      local ns_actions = vim.api.nvim_create_namespace("banjo_actions")
+      local extmarks = vim.api.nvim_buf_get_extmarks(buf, ns_actions, 0, -1, { details = true })
+      local has_key = false
+      local has_label = false
+      local has_value = false
+      for _, mark in ipairs(extmarks) do
+        local details = mark[4] or {}
+        if details.hl_group == "BanjoActionKey" then
+          has_key = true
+        elseif details.hl_group == "BanjoActionLabel" then
+          has_label = true
+        elseif details.hl_group == "BanjoActionValue" then
+          has_value = true
+        end
+      end
+
+      assert.is_true(has_key, "Expected action key highlight")
+      assert.is_true(has_label, "Expected action label highlight")
+      assert.is_true(has_value, "Expected action value highlight")
+    end)
+
+    it("dispatches mode/agent/model actions", function()
+      panel.open()
+      helpers.wait(50)
+
+      local bridge = {
+        get_state = function()
+          return {
+            mode = "default",
+            engine = "claude",
+            model = "m1",
+            models = { { id = "m1" }, { id = "m2" } },
+          }
+        end,
+      }
+      panel.set_bridge(bridge)
+
+      local commands = require("banjo.commands")
+      local calls = {}
+      local original = commands.dispatch
+
+      local ok, err = pcall(function()
+        commands.dispatch = function(cmd, args, context)
+          table.insert(calls, { cmd = cmd, args = args })
+          return true
+        end
+
+        panel._action_cycle_mode()
+        panel._action_toggle_agent()
+        panel._action_cycle_model()
+      end)
+
+      commands.dispatch = original
+      if not ok then
+        error(err)
+      end
+
+      assert.equals("mode", calls[1].cmd)
+      assert.equals("accept_edits", calls[1].args)
+      assert.equals("codex", calls[2].cmd)
+      assert.equals("", calls[2].args)
+      assert.equals("model", calls[3].cmd)
+      assert.equals("m2", calls[3].args)
+    end)
+  end)
+
   describe("append", function()
     it("adds text to buffer", function()
       panel.open()
@@ -199,9 +409,10 @@ describe("banjo panel", function()
 
       local buf = helpers.get_banjo_buffer()
       local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-      local content = table.concat(lines, "")
+      local content = table.concat(lines, "\n")
 
-      assert.equals("", content)
+      assert.is_nil(content:find("Some text", 1, true), "History should be cleared")
+      assert.truthy(content:find("Banjo", 1, true), "Header should remain")
     end)
   end)
 

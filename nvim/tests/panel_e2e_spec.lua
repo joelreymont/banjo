@@ -209,7 +209,11 @@ describe("Banjo Panel", function()
         helpers.assert_truthy(panel_win, "Panel should exist")
 
         local state = helpers.capture_buffer_state(panel_win.buffer)
-        helpers.assert_eq(1, state.line_count, "Panel should have one empty line after clear")
+        local panel_state = panel._get_state()
+        local counts = panel_state.sections.counts or {}
+        local expected = (counts.header or 0) + (counts.actions or 0) + (counts.input or 0) + 1
+        helpers.assert_eq(expected, state.line_count, "Panel should keep header, actions, input padding, and one empty line after clear")
+        helpers.assert_contains(state.lines[1] or "", "Banjo", "Header should remain after clear")
     end)
 end)
 

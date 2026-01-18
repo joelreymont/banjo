@@ -1,9 +1,10 @@
 ---
 title: Add action row + hints
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-01-18T17:03:08.959823+02:00"
+created-at: "\"2026-01-18T17:03:08.959823+02:00\""
+closed-at: "2026-01-18T21:30:27.478095+02:00"
 blocks:
   - banjo-define-neogit-layout-335eb23d
 ---

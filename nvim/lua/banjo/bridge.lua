@@ -845,13 +845,18 @@ end
 function M.set_permission_mode(mode)
     local b = get_bridge()
     b.preserved.permission_mode = mode
-    if not b.state.session_id then return end
+    if not b.state.session_id then
+        b.state.mode = mode
+        panel._update_status()
+        return
+    end
     -- ACP uses session/set_mode
     M._send_notification("session/set_mode", {
         sessionId = b.state.session_id,
         modeId = mode,
     })
     b.state.mode = mode
+    panel._update_status()
 end
 
 function M.request_state()

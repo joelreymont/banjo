@@ -1,9 +1,11 @@
 ---
 title: Wire auth menu actions
-status: open
+status: closed
 priority: 1
 issue-type: task
-created-at: "2026-01-18T17:02:52.194314+02:00"
+created-at: "\"2026-01-18T17:02:52.194314+02:00\""
+closed-at: "2026-01-18T21:46:24.298133+02:00"
+close-reason: completed
 blocks:
   - banjo-render-auth-menu-1a6a08b4
 ---
