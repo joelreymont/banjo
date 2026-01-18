@@ -1275,10 +1275,10 @@ function M.show_tool_result(id, status)
         return
     end
 
-    local icon = "v"
+    local icon = "✓"
     local hl = "BanjoToolOk"
     if status == "failed" then
-        icon = "x"
+        icon = "✗"
         hl = "BanjoToolErr"
     elseif status == "running" then
         icon = ">"
@@ -1357,12 +1357,13 @@ function M._build_status(panel_state)
     local mode_display = {
         default = "Default",
         accept_edits = "Accept Edits",
-        auto_approve = "Auto Approve",
+        auto_approve = "Auto-approve",
         plan_only = "Plan",
         -- Handle capitalized versions from backend
         Default = "Default",
         ["Accept Edits"] = "Accept Edits",
-        ["Auto Approve"] = "Auto Approve",
+        ["Auto Approve"] = "Auto-approve",
+        ["Auto-approve"] = "Auto-approve",
         Plan = "Plan",
     }
     table.insert(parts, string.format("(%s)", mode_display[mode] or mode))
