@@ -837,6 +837,18 @@
 
 ;; WebSocket
 
+(defun banjo--make-request (method params &optional id)
+  "Build a JSON-RPC message for METHOD and PARAMS.
+Include ID when provided."
+  (if id
+      `((jsonrpc . "2.0")
+        (id . ,id)
+        (method . ,method)
+        (params . ,params))
+    `((jsonrpc . "2.0")
+      (method . ,method)
+      (params . ,params))))
+
 (defun banjo--send-request (method params &optional callback)
   "Send a JSON-RPC request with METHOD and PARAMS. Call CALLBACK with result."
   (when (and banjo--websocket (websocket-openp banjo--websocket))
@@ -846,19 +858,14 @@
         (puthash id callback banjo--pending-requests))
       (websocket-send-text
        banjo--websocket
-       (json-encode `((jsonrpc . "2.0")
-                      (id . ,id)
-                      (method . ,method)
-                      (params . ,params)))))))
+       (json-encode (banjo--make-request method params id))))))
 
 (defun banjo--send-notification (method params)
   "Send a JSON-RPC notification with METHOD and PARAMS."
   (when (and banjo--websocket (websocket-openp banjo--websocket))
     (websocket-send-text
      banjo--websocket
-     (json-encode `((jsonrpc . "2.0")
-                    (method . ,method)
-                    (params . ,params))))))
+     (json-encode (banjo--make-request method params)))))
 
 (defun banjo--send-response (id result &optional err)
   "Send a JSON-RPC response for request ID with RESULT or ERR."

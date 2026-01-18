@@ -166,6 +166,21 @@ pub fn commentBlockHasNote(line_index: *const LineIndex, content: []const u8, st
 // Tests
 const testing = std.testing;
 const ohsnap = @import("ohsnap");
+const zcheck = @import("zcheck");
+const zcheck_seed_base: u64 = 0x6c4c_2fb1_8d79_5e1b;
+
+const LineBytes = zcheck.BoundedSlice(u8, 64);
+const InsertBytes = zcheck.BoundedSlice(u8, 24);
+
+fn scrubNoNewline(buf: []u8, src: []const u8) []const u8 {
+    var len: usize = 0;
+    for (src) |c| {
+        if (c == '\n') continue;
+        buf[len] = c;
+        len += 1;
+    }
+    return buf[0..len];
+}
 
 test "LineIndex init and lineSlice" {
     const content = "line1\nline2\nline3";
@@ -229,4 +244,59 @@ test "findCommentBlockEnd finds block end" {
     // Line 0 is start of comment block, should find end at line 2
     const end = findCommentBlockEnd(&idx, content, 0);
     try testing.expectEqual(@as(u32, 2), end);
+}
+
+test "comment edit preserves line structure" {
+    try zcheck.check(struct {
+        fn prop(args: struct { line_a: LineBytes, line_b: LineBytes, insert: InsertBytes }) !bool {
+            var line_a_buf: [LineBytes.MAX_LEN]u8 = undefined;
+            var line_b_buf: [LineBytes.MAX_LEN]u8 = undefined;
+            var insert_buf: [InsertBytes.MAX_LEN]u8 = undefined;
+            const line_a = scrubNoNewline(&line_a_buf, args.line_a.slice());
+            var line_b = scrubNoNewline(&line_b_buf, args.line_b.slice());
+            const insert = scrubNoNewline(&insert_buf, args.insert.slice());
+            const alloc = testing.allocator;
+
+            if (line_b.len == 0) {
+                line_b_buf[0] = 'x';
+                line_b = line_b_buf[0..1];
+            }
+
+            var content = std.ArrayListUnmanaged(u8){};
+            defer content.deinit(alloc);
+            try content.appendSlice(alloc, line_a);
+            try content.append(alloc, '\n');
+            try content.appendSlice(alloc, line_b);
+
+            var idx = try LineIndex.init(alloc, content.items);
+            defer idx.deinit(alloc);
+
+            const pos = if (line_a.len == 0) 0 else insert.len % (line_a.len + 1);
+
+            var edited = std.ArrayListUnmanaged(u8){};
+            defer edited.deinit(alloc);
+            try edited.appendSlice(alloc, line_a[0..pos]);
+            try edited.appendSlice(alloc, insert);
+            try edited.appendSlice(alloc, line_a[pos..]);
+            try edited.append(alloc, '\n');
+            try edited.appendSlice(alloc, line_b);
+
+            var edited_idx = try LineIndex.init(alloc, edited.items);
+            defer edited_idx.deinit(alloc);
+
+            if (edited_idx.starts.items.len != 2) return false;
+
+            const edited_line_a = edited_idx.lineSlice(edited.items, 0) orelse return false;
+            const edited_line_b = edited_idx.lineSlice(edited.items, 1) orelse return false;
+
+            if (edited_line_a.len != line_a.len + insert.len) return false;
+            if (!mem.eql(u8, edited_line_a[0..pos], line_a[0..pos])) return false;
+            if (!mem.eql(u8, edited_line_a[pos .. pos + insert.len], insert)) return false;
+            if (!mem.eql(u8, edited_line_a[pos + insert.len ..], line_a[pos..])) return false;
+            if (!mem.eql(u8, edited_line_b, line_b)) return false;
+            if (idx.starts.items.len != edited_idx.starts.items.len) return false;
+
+            return true;
+        }
+    }.prop, .{ .iterations = 400, .seed = zcheck_seed_base + 1 });
 }

@@ -290,7 +290,7 @@ test "create returns permission error when home unwritable" {
     try tmp.dir.makeDir(".claude");
     const claude_path = try std.fs.path.join(testing.allocator, &.{ home, ".claude" });
     defer testing.allocator.free(claude_path);
-    try std.posix.chmod(claude_path, 0);
+    try std.posix.fchmodat(std.posix.AT.FDCWD, claude_path, 0, 0);
 
     try testing.expectError(error.AccessDenied, create(testing.allocator, 12345, home));
 }

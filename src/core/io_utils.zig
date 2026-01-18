@@ -117,7 +117,7 @@ test "readLine assembles partial reads" {
     const line = try readLine(
         testing.allocator,
         &queue,
-        reader,
+        &reader,
         null,
         null,
         1024,
@@ -127,7 +127,7 @@ test "readLine assembles partial reads" {
     const tail = try readLine(
         testing.allocator,
         &queue,
-        reader,
+        &reader,
         null,
         null,
         1024,

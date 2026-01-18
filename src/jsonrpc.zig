@@ -89,11 +89,35 @@ pub const Message = union(enum) {
     response: Response,
 };
 
+const IdField = struct {
+    value: ?Request.Id = null,
+    present: bool = false,
+
+    pub fn jsonParse(
+        allocator: Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) std.json.ParseError(@TypeOf(source.*))!IdField {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(
+        allocator: Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) std.json.ParseFromValueError!IdField {
+        var result = IdField{ .present = true };
+        result.value = try Request.Id.jsonParseFromValue(allocator, source, options);
+        return result;
+    }
+};
+
 const Envelope = struct {
     jsonrpc: []const u8 = "2.0",
     method: ?[]const u8 = null,
     params: ?std.json.Value = null,
-    id: ?Request.Id = null,
+    id: IdField = .{},
     result: ?std.json.Value = null,
     @"error": ?Error = null,
 };
@@ -135,7 +159,7 @@ pub fn parseRequest(allocator: Allocator, json_str: []const u8) !ParsedRequest {
     const request = Request{
         .method = method,
         .params = env.params,
-        .id = env.id,
+        .id = env.id.value,
     };
     return .{ .request = request, .arena = arena };
 }
@@ -157,12 +181,12 @@ fn parseMessageFromEnvelope(env: Envelope) !Message {
     if (!std.mem.eql(u8, env.jsonrpc, "2.0")) return error.InvalidRequest;
 
     if (env.method) |method| {
-        if (env.id != null) {
+        if (env.id.present) {
             return .{
                 .request = .{
                     .method = method,
                     .params = env.params,
-                    .id = env.id,
+                    .id = env.id.value,
                 },
             };
         }
@@ -175,11 +199,11 @@ fn parseMessageFromEnvelope(env: Envelope) !Message {
     }
 
     if (env.result == null and env.@"error" == null) return error.InvalidRequest;
-    if (env.id == null) return error.InvalidRequest;
+    if (!env.id.present) return error.InvalidRequest;
 
     return .{
         .response = .{
-            .id = env.id,
+            .id = env.id.value,
             .result = env.result,
             .@"error" = env.@"error",
         },
@@ -597,10 +621,17 @@ test "parse request with null id" {
     ;
     var parsed = try parseRequest(testing.allocator, json);
     defer parsed.deinit();
+    const has_null_id = if (parsed.request.id) |id|
+        switch (id) {
+            .null => true,
+            else => false,
+        }
+    else
+        false;
     const summary = .{
         .method = parsed.request.method,
         .notification = parsed.request.isNotification(),
-        .has_null_id = parsed.request.id == .null,
+        .has_null_id = has_null_id,
     };
     try (ohsnap{}).snap(@src(),
         \\jsonrpc.test.parse request with null id__struct_<^\d+$>
@@ -709,7 +740,7 @@ test "Reader handles large payload" {
     defer out.deinit();
     try out.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"test\",\"params\":{\"text\":\"");
     try out.writer.writeAll(payload);
-    try out.writer.writeAll("\"}}\n");
+    try out.writer.writeAll("\"},\"id\":1}\n");
     const input = try out.toOwnedSlice();
     defer testing.allocator.free(input);
 

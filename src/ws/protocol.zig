@@ -285,7 +285,6 @@ test "JsonRpcRequest prompt serialization" {
     defer testing.allocator.free(json);
     try (ohsnap{}).snap(@src(),
         \\{"jsonrpc":"2.0","method":"prompt","params":{"text":"Hello","files":[],"cwd":"/tmp"},"id":1}
-        \\
     ).diff(json, true);
 }
 
@@ -301,7 +300,6 @@ test "JsonRpcRequest cancel serialization" {
     defer testing.allocator.free(json);
     try (ohsnap{}).snap(@src(),
         \\{"jsonrpc":"2.0","method":"cancel","id":2}
-        \\
     ).diff(json, true);
 }
 
@@ -323,7 +321,6 @@ test "JsonRpcRequest set_engine serialization" {
     defer testing.allocator.free(json);
     try (ohsnap{}).snap(@src(),
         \\{"jsonrpc":"2.0","method":"set_engine","params":{"engine":"claude"},"id":3}
-        \\
     ).diff(json, true);
 }
 
@@ -345,7 +342,6 @@ test "JsonRpcRequest set_model serialization" {
     defer testing.allocator.free(json);
     try (ohsnap{}).snap(@src(),
         \\{"jsonrpc":"2.0","method":"set_model","params":{"model":"sonnet"},"id":4}
-        \\
     ).diff(json, true);
 }
 
@@ -363,7 +359,6 @@ test "JsonRpcNotification stream_chunk serialization" {
     defer testing.allocator.free(json);
     try (ohsnap{}).snap(@src(),
         \\{"jsonrpc":"2.0","method":"stream_chunk","params":{"text":"chunk","is_thought":false}}
-        \\
     ).diff(json, true);
 }
 
@@ -381,7 +376,6 @@ test "JsonRpcNotification tool_call serialization" {
     defer testing.allocator.free(json);
     try (ohsnap{}).snap(@src(),
         \\{"jsonrpc":"2.0","method":"tool_call","params":{"id":"t1","name":"Read","status":"running","input":{"path":"/tmp/a"}}}
-        \\
     ).diff(json, true);
 }
 
@@ -399,7 +393,6 @@ test "JsonRpcNotification status serialization" {
     defer testing.allocator.free(json);
     try (ohsnap{}).snap(@src(),
         \\{"jsonrpc":"2.0","method":"status","params":{"text":"Ready"}}
-        \\
     ).diff(json, true);
 }
 

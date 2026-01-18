@@ -222,3 +222,19 @@ test "StopReason enum values" {
         \\  .context_reloaded: u3 = 5
     ).expectEqual(summary);
 }
+
+test "EditorCallbacks layout" {
+    const summary = .{
+        .size = @as(usize, @sizeOf(EditorCallbacks)),
+        .alignment = @as(usize, @alignOf(EditorCallbacks)),
+        .ctx_off = @as(usize, @offsetOf(EditorCallbacks, "ctx")),
+        .vtable_off = @as(usize, @offsetOf(EditorCallbacks, "vtable")),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.callbacks.test.EditorCallbacks layout__struct_<^\d+$>
+        \\  .size: usize = 16
+        \\  .alignment: usize = 8
+        \\  .ctx_off: usize = 0
+        \\  .vtable_off: usize = 8
+    ).expectEqual(summary);
+}
