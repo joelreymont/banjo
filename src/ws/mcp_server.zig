@@ -66,7 +66,7 @@ pub const McpServer = struct {
                 .agent = undefined,
             };
             conn.jsonrpc_reader = jsonrpc.Reader.init(allocator, conn.ws_reader.reader());
-            conn.agent = Agent.init(allocator, conn.ws_writer.writer(), &conn.jsonrpc_reader);
+            conn.agent = Agent.init(allocator, conn.ws_writer.writer(), null);
             return conn;
         }
 
@@ -658,10 +658,8 @@ pub const McpServer = struct {
         debugLog("handleAcpJsonRpcMessage: payload={d} bytes", .{payload.len});
         const conn = self.acp_client orelse return;
 
-        var parsed = try jsonrpc.parseMessage(self.allocator, payload);
-        defer parsed.deinit();
-
-        try conn.agent.handleMessage(parsed.message);
+        const parsed = try jsonrpc.parseMessage(self.allocator, payload);
+        try conn.agent.handleParsedMessage(parsed);
     }
 };
 

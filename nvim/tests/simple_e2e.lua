@@ -454,11 +454,11 @@ log("Test 18: set_permission_mode...")
 bridge.set_permission_mode("auto_approve")
 wait_for(function()
     local st = bridge.get_state()
-    return st and st.mode == "Auto-approve"
+    return st and st.mode == "auto_approve"
 end, 2000)
 local state_after_mode = bridge.get_state()
-if state_after_mode and state_after_mode.mode == "Auto-approve" then
-    pass("set_permission_mode changed mode to Auto-approve")
+if state_after_mode and state_after_mode.mode == "auto_approve" then
+    pass("set_permission_mode changed mode to auto_approve")
 else
     fail("set_permission_mode did not change mode", "got: " .. tostring(state_after_mode and state_after_mode.mode))
 end
@@ -467,7 +467,7 @@ end
 bridge.set_permission_mode("default")
 wait_for(function()
     local st = bridge.get_state()
-    return st and st.mode == "Default"
+    return st and st.mode == "default"
 end, 2000)
 
 log("")
@@ -569,11 +569,11 @@ log("Test 26: /mode command...")
 commands.dispatch("mode", "accept_edits", { panel = panel, bridge = bridge })
 wait_for(function()
     local st = bridge.get_state()
-    return st and st.mode == "Accept Edits"
+    return st and st.mode == "accept_edits"
 end, 2000)
 state = bridge.get_state()
-if state and state.mode == "Accept Edits" then
-    pass("/mode sets mode to Accept Edits")
+if state and state.mode == "accept_edits" then
+    pass("/mode sets mode to accept_edits")
 else
     fail("/mode failed", "mode: " .. tostring(state and state.mode))
 end
@@ -581,7 +581,7 @@ end
 commands.dispatch("mode", "default", { panel = panel, bridge = bridge })
 wait_for(function()
     local st = bridge.get_state()
-    return st and st.mode == "Default"
+    return st and st.mode == "default"
 end, 2000)
 
 -- Test 27: /codex command

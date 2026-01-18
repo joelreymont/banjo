@@ -91,11 +91,18 @@ pub const NewSessionResponse = struct {
         try jw.beginObject();
         try jw.objectField("sessionId");
         try jw.write(self.sessionId);
+        if (self.configOptions) |config_options| {
+            try jw.objectField("configOptions");
+            try jw.write(config_options);
+        }
+        if (self.models) |models| {
+            try jw.objectField("models");
+            try jw.write(models);
+        }
         if (self.modes) |modes| {
             try jw.objectField("modes");
             try jw.write(modes);
         }
-        // Note: configOptions and models not yet supported by Zed ACP
         try jw.endObject();
     }
 };

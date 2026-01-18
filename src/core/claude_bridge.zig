@@ -599,13 +599,13 @@ pub const Bridge = struct {
                 _ = proc.wait() catch |err| {
                     log.warn("Failed to wait for Claude process: {}", .{err});
                 };
-                self.process = null;
-                self.stdout_reader = null;
             }
             if (self.reader_thread) |thread| {
                 thread.join();
                 self.reader_thread = null;
             }
+            self.process = null;
+            self.stdout_reader = null;
         }
 
         var args: std.ArrayList([]const u8) = .empty;
@@ -728,14 +728,14 @@ pub const Bridge = struct {
                 error.FileNotFound => {},
                 else => log.warn("Failed to wait for Claude process: {}", .{err}),
             };
-            self.process = null;
-            self.stdout_reader = null;
         }
         // Join reader thread
         if (self.reader_thread) |thread| {
             thread.join();
             self.reader_thread = null;
         }
+        self.process = null;
+        self.stdout_reader = null;
         self.queue_mutex.lock();
         self.reader_closed = true;
         self.queue_mutex.unlock();
@@ -756,13 +756,13 @@ pub const Bridge = struct {
                 error.FileNotFound => {},
                 else => log.warn("Failed to wait for Claude process: {}", .{err}),
             };
-            self.process = null;
-            self.stdout_reader = null;
         }
         if (self.reader_thread) |thread| {
             thread.join();
             self.reader_thread = null;
         }
+        self.process = null;
+        self.stdout_reader = null;
         self.queue_mutex.lock();
         self.reader_closed = true;
         self.queue_mutex.unlock();
@@ -825,8 +825,7 @@ pub const Bridge = struct {
                         .Stopped => |sig| log.err("Claude CLI stopped by signal {d}", .{sig}),
                         .Unknown => |val| log.err("Claude CLI terminated (unknown: {d})", .{val}),
                     }
-                    self.process = null;
-                    self.stdout_reader = null;
+                    self.stop();
                 }
             }
             return err;
@@ -838,44 +837,46 @@ pub const Bridge = struct {
         _ = self.process orelse return error.NotStarted;
         const reader = if (self.stdout_reader) |*stdout_reader| &stdout_reader.interface else return error.NoStdout;
 
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        var keep_arena = false;
-        defer if (!keep_arena) arena.deinit();
+        while (true) {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            var keep_arena = false;
+            defer if (!keep_arena) arena.deinit();
 
-        var line_writer: std.io.Writer.Allocating = .init(arena.allocator());
-        defer line_writer.deinit();
+            var line_writer: std.io.Writer.Allocating = .init(arena.allocator());
+            defer line_writer.deinit();
 
-        _ = reader.streamDelimiterLimit(&line_writer.writer, '\n', .limited(max_json_line_bytes)) catch |e| switch (e) {
-            error.ReadFailed => {
-                bridgeDebugLog("readMessageRaw: streamDelimiter ReadFailed", .{});
-                return null;
-            },
-            error.WriteFailed => return error.OutOfMemory,
-            error.StreamTooLong => return error.LineTooLong,
-        };
+            _ = reader.streamDelimiterLimit(&line_writer.writer, '\n', .limited(max_json_line_bytes)) catch |e| switch (e) {
+                error.ReadFailed => {
+                    bridgeDebugLog("readMessageRaw: streamDelimiter ReadFailed", .{});
+                    return null;
+                },
+                error.WriteFailed => return error.OutOfMemory,
+                error.StreamTooLong => return error.LineTooLong,
+            };
 
-        if (reader.peekGreedy(1)) |peek| {
-            if (peek.len > 0 and peek[0] == '\n') {
-                reader.toss(1);
+            if (reader.peekGreedy(1)) |peek| {
+                if (peek.len > 0 and peek[0] == '\n') {
+                    reader.toss(1);
+                }
+            } else |err| switch (err) {
+                error.ReadFailed => {
+                    bridgeDebugLog("readMessageRaw: peekGreedy ReadFailed", .{});
+                    return null;
+                },
+                error.EndOfStream => {},
             }
-        } else |err| switch (err) {
-            error.ReadFailed => {
-                bridgeDebugLog("readMessageRaw: peekGreedy ReadFailed", .{});
-                return null;
-            },
-            error.EndOfStream => {},
+
+            const line = line_writer.written();
+
+            if (line.len == 0) {
+                bridgeDebugLog("readMessageRaw: empty line (len=0)", .{});
+                continue;
+            }
+
+            const msg = try parseStreamMessageLine(&arena, line);
+            keep_arena = true;
+            return msg;
         }
-
-        const line = line_writer.written();
-
-        if (line.len == 0) {
-            bridgeDebugLog("readMessageRaw: empty line (len=0)", .{});
-            return null;
-        }
-
-        const msg = try parseStreamMessageLine(&arena, line);
-        keep_arena = true;
-        return msg;
     }
 
     fn parseStreamMessageLine(arena: *std.heap.ArenaAllocator, line: []const u8) !StreamMessage {
