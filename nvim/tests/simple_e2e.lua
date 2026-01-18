@@ -530,11 +530,23 @@ log("Test 23: /clear command...")
 panel.append("Test content")
 local commands = require("banjo.commands")
 commands.dispatch("clear", "", { panel = panel, bridge = bridge })
-lines = vim.api.nvim_buf_get_lines(output_buf, 0, -1, false)
-if #lines <= 1 or (lines[1] == "" and #lines == 1) then
+local sec = require("banjo.ui.sections")
+local state = panel._get_state()
+local total = vim.api.nvim_buf_line_count(output_buf)
+local ranges = sec.compute_ranges(total, state.sections and state.sections.counts or {})
+local hist = ranges.history or { start = 0, stop = 0 }
+lines = vim.api.nvim_buf_get_lines(output_buf, hist.start, hist.stop, false)
+local non_empty = false
+for _, line in ipairs(lines) do
+    if line ~= "" then
+        non_empty = true
+        break
+    end
+end
+if not non_empty then
     pass("/clear clears output")
 else
-    fail("/clear failed", "buffer has " .. #lines .. " lines")
+    fail("/clear failed", "history has " .. #lines .. " lines")
 end
 
 -- Test 24: /help command
