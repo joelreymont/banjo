@@ -81,7 +81,7 @@ Approval requests: `item/commandExecution/requestApproval`, `item/fileChange/req
 
 Daemon mode server for Neovim/Emacs. Listens on random port, writes lockfile.
 
-- **Lockfile**: `.banjo.lock` in project root, contains `{"port": N}`
+- **Lockfile**: `~/.claude/ide/<port>.lock` (port is the filename). JSON contains `pid`, `workspaceFolders`, `ideName`, `transport`.
 - **Protocol**: JSON-RPC 2.0 over WebSocket frames
 - **ACP transport**: Wraps Agent with WebSocket reader/writer (`src/acp/ws_transport.zig`)
 
@@ -154,7 +154,7 @@ Routes tool requests from CLI to editor:
 
 ### ACP (Agent Client Protocol)
 
-JSON-RPC 2.0 over stdio/WebSocket. See `docs/acp-protocol.md`.
+JSON-RPC 2.0 over stdio/WebSocket. See `docs/acp-protocol.md` and `docs/acp-websocket.md`.
 
 Key methods:
 - `initialize` - Capability negotiation
