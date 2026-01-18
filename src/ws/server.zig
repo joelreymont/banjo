@@ -721,7 +721,7 @@ test "expirePendingHandshakes closes timed out handshake" {
         .closed = !still_pending,
     };
     try (ohsnap{}).snap(@src(),
-        \\ws.mcp_server.test.expirePendingHandshakes closes timed out handshake__struct_<^\d+$>
+        \\ws.server.test.expirePendingHandshakes closes timed out handshake__struct_<^\d+$>
         \\  .pending: u32 = 0
         \\  .still_pending: bool = false
         \\  .closed: bool = true
@@ -761,7 +761,7 @@ test "McpServer init and deinit" {
         .nvim_socket = server.nvim_client_socket,
     };
     try (ohsnap{}).snap(@src(),
-        \\ws.mcp_server.test.McpServer init and deinit__struct_<^\d+$>
+        \\ws.server.test.McpServer init and deinit__struct_<^\d+$>
         \\  .port: u16 = <^\d+$>
         \\  .nvim_socket: ?i32
         \\    null
@@ -781,7 +781,7 @@ test "McpServer port binding" {
         .different = server1.port != server2.port,
     };
     try (ohsnap{}).snap(@src(),
-        \\ws.mcp_server.test.McpServer port binding__struct_<^\d+$>
+        \\ws.server.test.McpServer port binding__struct_<^\d+$>
         \\  .port1: u16 = <^\d+$>
         \\  .port2: u16 = <^\d+$>
         \\  .different: bool = true
@@ -810,7 +810,7 @@ test "setNonBlocking and setBlocking toggle O_NONBLOCK" {
         .after_blocking = after_blocking,
     };
     try (ohsnap{}).snap(@src(),
-        \\ws.mcp_server.test.setNonBlocking and setBlocking toggle O_NONBLOCK__struct_<^\d+$>
+        \\ws.server.test.setNonBlocking and setBlocking toggle O_NONBLOCK__struct_<^\d+$>
         \\  .initial_nonblock: bool = false
         \\  .after_nonblock: bool = true
         \\  .after_blocking: bool = false

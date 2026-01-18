@@ -2,7 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const protocol = @import("protocol.zig");
-const mcp_server_mod = @import("mcp_server.zig");
+const mcp_mod = @import("server.zig");
 const core_types = @import("../core/types.zig");
 const Engine = core_types.Engine;
 const callbacks_mod = @import("../core/callbacks.zig");
@@ -118,7 +118,7 @@ pub const Handler = struct {
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     claude_session_id: ?[]const u8 = null,
     codex_session_id: ?[]const u8 = null,
-    mcp_server: ?*mcp_server_mod.McpServer = null,
+    mcp_server: ?*mcp_mod.McpServer = null,
     should_exit: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     poll_thread: ?std.Thread = null,
 
@@ -245,7 +245,7 @@ pub const Handler = struct {
         };
 
         // Start MCP server for Claude CLI discovery and nvim WebSocket
-        self.mcp_server = mcp_server_mod.McpServer.init(self.allocator, self.cwd) catch |err| {
+        self.mcp_server = mcp_mod.McpServer.init(self.allocator, self.cwd) catch |err| {
             log.err("Failed to init MCP server: {}", .{err});
             return err;
         };

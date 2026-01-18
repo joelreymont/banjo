@@ -73,7 +73,7 @@ Banjo is written in Zig and implements the [Agent Client Protocol (ACP)](https:/
 | `src/acp/agent.zig` | ACP agent implementation |
 | `src/core/claude_bridge.zig` | Claude Code subprocess |
 | `src/core/codex_bridge.zig` | Codex app-server subprocess |
-| `src/ws/mcp_server.zig` | WebSocket server for Neovim |
+| `src/ws/server.zig` | WebSocket server for Neovim |
 | `src/lsp/` | LSP server for code notes |
 | `nvim/lua/banjo/` | Neovim Lua plugin |
 

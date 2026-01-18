@@ -77,7 +77,7 @@ Flow:
 
 Approval requests: `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`
 
-### WebSocket Server (`src/ws/mcp_server.zig`)
+### WebSocket Server (`src/ws/server.zig`)
 
 Daemon mode server for Neovim/Emacs. Listens on random port, writes lockfile.
 
@@ -211,7 +211,7 @@ If pending tasks exist, Banjo sends a nudge prompt to continue working.
 | `src/acp/protocol.zig` | ACP type definitions |
 | `src/core/claude_bridge.zig` | Claude Code subprocess |
 | `src/core/codex_bridge.zig` | Codex app-server subprocess |
-| `src/ws/mcp_server.zig` | WebSocket server for nvim/emacs |
+| `src/ws/server.zig` | WebSocket server for nvim/emacs |
 | `src/ws/handler.zig` | Daemon message routing |
 | `src/tools/proxy.zig` | Editor tool forwarding |
 | `src/jsonrpc.zig` | JSON-RPC 2.0 parser/writer |
