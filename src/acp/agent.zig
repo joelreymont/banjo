@@ -4863,6 +4863,35 @@ test "replaceFirst returns copy when needle not found" {
     ).expectEqual(summary);
 }
 
+test "truncateUtf8 handles 2-byte sequence" {
+    const input = "caf\xC3\xA9";
+    const out_4 = truncateUtf8(input, 4);
+    const out_5 = truncateUtf8(input, 5);
+    const exp_4 = [_]u8{ 'c', 'a', 'f' };
+    const exp_5 = [_]u8{ 'c', 'a', 'f', 0xC3, 0xA9 };
+    const checks = [_]struct { out: []const u8, exp: []const u8 }{
+        .{ .out = out_4, .exp = &exp_4 },
+        .{ .out = out_5, .exp = &exp_5 },
+    };
+    var ok = [_]bool{ false, false };
+    for (checks, 0..) |check, i| {
+        ok[i] = std.mem.eql(u8, check.out, check.exp);
+    }
+    const summary = .{
+        .out_4_len = out_4.len,
+        .out_5_len = out_5.len,
+        .out_4_ok = ok[0],
+        .out_5_ok = ok[1],
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.truncateUtf8 handles 2-byte sequence__struct_<^\d+$>
+        \\  .out_4_len: usize = 3
+        \\  .out_5_len: usize = 5
+        \\  .out_4_ok: bool = true
+        \\  .out_5_ok: bool = true
+    ).expectEqual(summary);
+}
+
 test "TurnError.isMaxTurnError detects max turn errors" {
     const TurnError = codex_cli.TurnError;
     const summary = .{
