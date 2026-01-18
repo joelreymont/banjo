@@ -6,6 +6,7 @@ SESSION.md
 dist/
 extension/banjo
 /target/
+.dots/archive/
 
 # WASM build artifacts
 extension.wasm
