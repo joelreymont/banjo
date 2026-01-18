@@ -427,6 +427,16 @@
 (define-key banjo-mode-map (kbd "i") #'banjo-focus-input)
 (define-key banjo-mode-map (kbd "RET") #'banjo-focus-input)
 
+(defun banjo--maybe-evil-insert ()
+  (when (fboundp 'evil-insert-state)
+    (evil-insert-state)))
+
+(defun banjo-input-slash ()
+  "Focus input and insert a slash."
+  (interactive)
+  (banjo-focus-input)
+  (insert "/"))
+
 (defun banjo--get-output-buffer ()
   "Get or create the output buffer."
   (banjo--ensure-buffer-vars)
@@ -557,7 +567,8 @@
   (banjo--show-panel)
   (let ((input-win (get-buffer-window banjo--input-buffer)))
     (when (window-live-p input-win)
-      (select-window input-win))))
+      (select-window input-win)
+      (banjo--maybe-evil-insert))))
 
 ;; WebSocket
 
