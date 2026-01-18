@@ -31,7 +31,7 @@
   :type 'string
   :group 'banjo)
 
-(defcustom banjo-panel-width 80
+(defcustom banjo-panel-width 50
   "Width of the Banjo panel."
   :type 'integer
   :group 'banjo)
@@ -46,8 +46,8 @@
   :type 'integer
   :group 'banjo)
 
-(defcustom banjo-input-header "Message Banjo Duet (Local) - RET send, C-j newline, / for commands"
-  "Header line for the Banjo input buffer."
+(defcustom banjo-input-hints "RET send, C-j newline, / commands"
+  "Hints shown in the Banjo input header line."
   :type 'string
   :group 'banjo)
 
@@ -319,8 +319,42 @@
 
 ;; Buffer names
 
-(defconst banjo--output-buffer "*banjo*" "Output buffer name.")
-(defconst banjo--input-buffer "*banjo-input*" "Input buffer name.")
+(defvar banjo--output-buffer "*banjo*" "Output buffer name.")
+(defvar banjo--input-buffer "*banjo-input*" "Input buffer name.")
+
+(defvar banjo--source-checked nil
+  "Non-nil when banjo source refresh check has run.")
+
+(defun banjo--ensure-buffer-vars ()
+  "Ensure internal buffer name variables are initialized."
+  (unless (boundp 'banjo--output-buffer)
+    (setq banjo--output-buffer "*banjo*"))
+  (unless (boundp 'banjo--input-buffer)
+    (setq banjo--input-buffer "*banjo-input*"))
+  (unless (boundp 'banjo-input-mode-map)
+    (setq banjo-input-mode-map (make-sparse-keymap))
+    (define-key banjo-input-mode-map (kbd "RET") #'banjo-input-send)
+    (define-key banjo-input-mode-map (kbd "C-c C-c") #'banjo-input-send)
+    (define-key banjo-input-mode-map (kbd "C-c C-k") #'banjo-cancel)
+    (define-key banjo-input-mode-map (kbd "C-j") #'newline)))
+
+(defun banjo--refresh-elc-if-needed ()
+  "Reload and recompile when source is newer than the loaded .elc."
+  (unless banjo--source-checked
+    (setq banjo--source-checked t)
+    (let* ((loaded (or load-file-name (buffer-file-name)))
+           (elc (and loaded (string-match-p "\\.elc\\'" loaded) loaded))
+           (el (and elc (concat (file-name-sans-extension elc) ".el"))))
+      (when (and el (file-exists-p el) (file-newer-than-file-p el elc))
+        (condition-case err
+            (progn
+              (load el nil t)
+              (byte-compile-file el)
+              (message "Banjo: refreshed byte-compiled file"))
+          (error
+           (message "Banjo: failed to refresh byte-compiled file: %s" err)))))))
+
+(banjo--refresh-elc-if-needed)
 
 ;; Mode line
 
@@ -339,7 +373,25 @@
                       engine
                       (if (string= model "") "" (concat "/" model))
                       mode)
-            " [disconnected]"))))
+            " [disconnected]"))
+    (force-mode-line-update t)))
+
+(defun banjo--input-header ()
+  "Build the input header line."
+  (let ((engine (or (plist-get banjo--state :engine) "claude"))
+        (mode (banjo--display-mode (or (plist-get banjo--state :mode) "default")))
+        (hints (or banjo-input-hints "")))
+    (if (string= hints "")
+        (format "Agent: %s  Auth: %s" engine mode)
+      (format "Agent: %s  Auth: %s  %s" engine mode hints))))
+
+(defun banjo--display-mode (mode)
+  "Return user-facing MODE name."
+  (cond
+   ((string= mode "acceptEdits") "accept_edits")
+   ((string= mode "bypassPermissions") "auto_approve")
+   ((string= mode "plan") "plan_only")
+   (t mode)))
 
 ;; Output buffer
 
@@ -365,7 +417,10 @@
 
 (define-derived-mode banjo-input-mode text-mode "BanjoInput"
   "Major mode for Banjo input."
-  (setq-local header-line-format banjo-input-header)
+  (setq-local header-line-format '(:eval (banjo--input-header)))
+  (setq-local display-line-numbers nil)
+  (when (fboundp 'display-line-numbers-mode)
+    (display-line-numbers-mode -1))
   (setq-local truncate-lines nil)
   (setq-local word-wrap t))
 
@@ -374,6 +429,7 @@
 
 (defun banjo--get-output-buffer ()
   "Get or create the output buffer."
+  (banjo--ensure-buffer-vars)
   (let ((buf (get-buffer-create banjo--output-buffer)))
     (with-current-buffer buf
       (unless (eq major-mode 'banjo-mode)
@@ -382,6 +438,7 @@
 
 (defun banjo--get-input-buffer ()
   "Get or create the input buffer."
+  (banjo--ensure-buffer-vars)
   (let ((buf (get-buffer-create banjo--input-buffer)))
     (with-current-buffer buf
       (unless (eq major-mode 'banjo-input-mode)
@@ -411,6 +468,30 @@
         (goto-char (point-max))
         (recenter -1)))))
 
+(defun banjo--append-user-message (text)
+  "Append user TEXT to the output buffer with clear separation."
+  (let ((buf (banjo--get-output-buffer)))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (goto-char (point-max))
+        (when (> (point-max) (point-min))
+          (unless (bolp)
+            (insert "\n"))
+          (insert "\n"))
+        (let ((beg (point)))
+          (insert text)
+          (let ((end (point)))
+            (add-face-text-property beg end 'banjo-face-user t)
+            (banjo--apply-buttons beg end)
+            (font-lock-ensure beg end)))
+        (unless (bolp)
+          (insert "\n"))
+        (insert "\n")))))
+
+(defun banjo--append-status (text)
+  "Append status TEXT to the output buffer."
+  (banjo--append-output (concat text "\n") 'banjo-face-tool))
+
 (defun banjo--clear-output ()
   "Clear the output buffer."
   (let ((buf (banjo--get-output-buffer)))
@@ -424,6 +505,7 @@
 
 (defun banjo--show-panel ()
   "Show the Banjo panel."
+  (banjo--ensure-buffer-vars)
   (let* ((buf (banjo--get-output-buffer))
          (input-buf (banjo--get-input-buffer))
          (side (if (eq banjo-panel-position 'left) 'left 'right))
@@ -541,22 +623,45 @@
      ((string= method "session/request_permission")
       (banjo--handle-permission-request id params))
      (t
-      (banjo--send-response id nil `((code . -32601) (message . "Method not found")))))))
+     (banjo--send-response id nil `((code . -32601) (message . "Method not found")))))))
+
+(defconst banjo--default-permission-options
+  '(((kind . "allow_once") (name . "Allow once") (optionId . "allow_once"))
+    ((kind . "allow_always") (name . "Allow for session") (optionId . "allow_always"))
+    ((kind . "reject_once") (name . "Deny") (optionId . "reject_once"))
+    ((kind . "reject_always") (name . "Deny for session") (optionId . "reject_always")))
+  "Fallback permission options.")
+
+(defun banjo--permission-option-choices (options)
+  "Build display choices from permission OPTIONS."
+  (let ((i 0)
+        (choices nil))
+    (dolist (opt options (nreverse choices))
+      (setq i (1+ i))
+      (let* ((name (or (alist-get 'name opt) (alist-get 'optionId opt) "Option"))
+             (kind (alist-get 'kind opt))
+             (label (if kind
+                        (format "%d) %s (%s)" i name kind)
+                      (format "%d) %s" i name))))
+        (push (cons label opt) choices)))))
+
+(defun banjo--permission-outcome (option-id)
+  "Build response outcome for OPTION-ID."
+  (if option-id
+      `((outcome . ((outcome . "selected") (optionId . ,option-id))))
+    '((outcome . ((outcome . "cancelled"))))))
 
 (defun banjo--handle-permission-request (id params)
   "Handle permission request with ID and PARAMS."
   (let* ((tool-call (alist-get 'toolCall params))
          (title (or (alist-get 'title tool-call) "Unknown tool"))
-         (options (alist-get 'options params))
-         (prompt (format "Allow %s? (y=yes, a=always, n=no): " title)))
-    (let ((response (read-char prompt)))
-      (cond
-       ((or (eq response ?y) (eq response ?Y))
-        (banjo--send-response id `((outcome . ((outcome . "selected") (optionId . "allow_once"))))))
-       ((or (eq response ?a) (eq response ?A))
-        (banjo--send-response id `((outcome . ((outcome . "selected") (optionId . "allow_always"))))))
-       (t
-        (banjo--send-response id `((outcome . ((outcome . "cancelled"))))))))))
+         (options (or (alist-get 'options params) banjo--default-permission-options))
+         (choices (banjo--permission-option-choices options))
+         (prompt (format "Allow %s: " title))
+         (choice (completing-read prompt (mapcar #'car choices) nil t))
+         (option (cdr (assoc choice choices)))
+         (option-id (or (alist-get 'optionId option) (alist-get 'id option))))
+    (banjo--send-response id (banjo--permission-outcome option-id))))
 
 (defun banjo--handle-notification (msg)
   "Handle a JSON-RPC notification MSG."
@@ -676,7 +781,7 @@
                       (when (and num (> num 0))
                         (setq banjo--port num)
                         (banjo--connect num))))))))))))))
-(defun banjo--process-sentinel (proc event)
+(defun banjo--process-sentinel (_proc event)
   "Process sentinel for daemon PROC, handling EVENT."
   (when (string-match-p "\\(finished\\|exited\\|killed\\)" event)
     (setq banjo--process nil)
@@ -731,12 +836,132 @@
   (unless banjo--session-id
     (user-error "Banjo not connected. Run M-x banjo-start"))
   (banjo--show-panel)
-  (banjo--append-output (format "> %s\n\n" prompt) 'banjo-face-user)
+  (banjo--append-user-message prompt)
   (setq banjo--streaming nil)
   (banjo--send-notification
    "session/prompt"
    `((sessionId . ,banjo--session-id)
      (prompt . [((type . "text") (text . ,prompt))]))))
+
+(defvar banjo--command-table (make-hash-table :test 'equal)
+  "Slash command handlers.")
+
+(defun banjo--register-command (name fn)
+  "Register slash command NAME with handler FN."
+  (puthash name fn banjo--command-table))
+
+(defun banjo--parse-command (text)
+  "Parse TEXT as a slash command.
+Return (cmd . args) or nil."
+  (let ((trimmed (string-trim text)))
+    (when (string-prefix-p "/" trimmed)
+      (let ((rest (string-trim (substring trimmed 1))))
+        (if (string-empty-p rest)
+            (cons "" "")
+          (if (string-match "\\`\\([^ ]+\\)\\(?:\\s-+\\(.*\\)\\)?\\'" rest)
+              (cons (match-string 1 rest) (or (match-string 2 rest) ""))
+            (cons rest "")))))))
+
+(defun banjo--dispatch-command (cmd args)
+  "Dispatch slash command CMD with ARGS.
+Return non-nil if handled locally."
+  (let ((handler (gethash cmd banjo--command-table)))
+    (when handler
+      (funcall handler args)
+      t)))
+
+(defun banjo--normalize-mode (mode)
+  "Normalize MODE to ACP ids."
+  (cond
+   ((or (string= mode "accept_edits") (string= mode "acceptEdits")) "acceptEdits")
+   ((or (string= mode "auto_approve") (string= mode "bypassPermissions")) "bypassPermissions")
+   ((or (string= mode "plan_only") (string= mode "plan")) "plan")
+   (t mode)))
+
+(defun banjo--command-help (_args)
+  "Show slash command help."
+  (dolist (line '("Available commands:"
+                  "  /help - Show this help"
+                  "  /version - Show banjo version"
+                  "  /clear - Clear output buffer"
+                  "  /new - Start new session"
+                  "  /cancel - Cancel current request"
+                  "  /model <name> - Set model"
+                  "  /mode <name> - Set permission mode (default, accept_edits, auto_approve, plan_only)"
+                  "  /claude - Switch to Claude"
+                  "  /codex - Switch to Codex"))
+    (banjo--append-status line)))
+
+(defun banjo--command-version (_args)
+  "Show banjo version."
+  (let ((version (plist-get banjo--state :version)))
+    (if (and version (not (string-empty-p version)))
+        (banjo--append-status (format "Banjo %s" version))
+      (banjo--append-status "Banjo version unknown (not connected)"))))
+
+(defun banjo--command-clear (_args)
+  "Clear output buffer."
+  (banjo--clear-output))
+
+(defun banjo--command-new (_args)
+  "Start a new session."
+  (if (not (and banjo--websocket (websocket-openp banjo--websocket)))
+      (banjo--append-status "Not connected")
+    (banjo--clear-output)
+    (banjo--append-status "Starting new session...")
+    (banjo--send-request
+     "session/new"
+     `((cwd . ,(expand-file-name default-directory)))
+     (lambda (sess-result _sess-err)
+       (when sess-result
+         (setq banjo--session-id (alist-get 'sessionId sess-result))
+         (when-let ((modes (alist-get 'modes sess-result)))
+           (plist-put banjo--state :mode (alist-get 'currentModeId modes)))
+         (banjo--update-mode-line)
+         (banjo--append-status "New session ready"))))))
+
+(defun banjo--command-cancel (_args)
+  "Cancel current request."
+  (if banjo--session-id
+      (progn
+        (banjo-cancel)
+        (banjo--append-status "Cancelled"))
+    (banjo--append-status "Not connected")))
+
+(defun banjo--command-model (args)
+  "Set model."
+  (if (string-empty-p args)
+      (banjo--append-status "Usage: /model <name>")
+    (banjo-set-model args)
+    (banjo--append-status (format "Model: %s" args))))
+
+(defun banjo--command-mode (args)
+  "Set permission mode."
+  (if (string-empty-p args)
+      (banjo--append-status "Usage: /mode <default|accept_edits|auto_approve|plan_only>")
+    (let ((mode (banjo--normalize-mode args)))
+      (banjo-set-mode mode)
+      (banjo--append-status (format "Mode: %s" (banjo--display-mode mode))))))
+
+(defun banjo--command-claude (_args)
+  "Switch to Claude."
+  (banjo-set-engine "claude")
+  (banjo--append-status "Agent: claude"))
+
+(defun banjo--command-codex (_args)
+  "Switch to Codex."
+  (banjo-set-engine "codex")
+  (banjo--append-status "Agent: codex"))
+
+(banjo--register-command "help" #'banjo--command-help)
+(banjo--register-command "version" #'banjo--command-version)
+(banjo--register-command "clear" #'banjo--command-clear)
+(banjo--register-command "new" #'banjo--command-new)
+(banjo--register-command "cancel" #'banjo--command-cancel)
+(banjo--register-command "model" #'banjo--command-model)
+(banjo--register-command "mode" #'banjo--command-mode)
+(banjo--register-command "claude" #'banjo--command-claude)
+(banjo--register-command "codex" #'banjo--command-codex)
 
 ;;;###autoload
 (defun banjo-input-send ()
@@ -746,7 +971,10 @@
                (buffer-substring-no-properties (point-min) (point-max)))))
     (when (string-blank-p text)
       (user-error "Prompt is empty"))
-    (banjo--send-text text)
+    (let ((cmd (banjo--parse-command text)))
+      (if (and cmd (banjo--dispatch-command (car cmd) (cdr cmd)))
+          nil
+        (banjo--send-text text)))
     (let ((inhibit-read-only t))
       (erase-buffer))))
 
@@ -760,7 +988,8 @@
     (let ((port (banjo--read-lockfile)))
       (if port
           (banjo--connect port)
-        (banjo--start-daemon)))))
+        (banjo--start-daemon))))
+  (banjo-focus-input))
 
 ;;;###autoload
 (defun banjo-stop ()
@@ -911,20 +1140,27 @@
         (message "Banjo: leader prefix %s unavailable; set `banjo-doom-leader-prefix`" prefix))))
   (with-eval-after-load 'evil
     ;; Panel buffer keybindings
-    (when (fboundp 'evil-define-key)
-      (evil-define-key 'normal banjo-mode-map
-        "q" #'banjo--hide-panel
-        "gr" #'banjo-toggle
-        (kbd "C-c") #'banjo-cancel))))
+    (banjo--evil-define-key 'normal banjo-mode-map
+      "q" #'banjo--hide-panel
+      "gr" #'banjo-toggle
+      (kbd "C-c") #'banjo-cancel)))
 
 (defun banjo--setup-evil-panel-bindings ()
   "Set up evil-mode bindings for the panel buffer."
   (eval-after-load 'evil
-    '(when (fboundp 'evil-define-key)
-       (evil-define-key 'normal banjo-mode-map
-         "q" #'banjo--hide-panel
-         "gr" #'banjo-toggle
-         (kbd "C-c") #'banjo-cancel))))
+    '(banjo--evil-define-key 'normal banjo-mode-map
+       "q" #'banjo--hide-panel
+       "gr" #'banjo-toggle
+       (kbd "C-c") #'banjo-cancel)))
+
+(defun banjo--evil-define-key (state keymap &rest bindings)
+  "Define Evil bindings without macro/function load hazards."
+  (cond
+   ((fboundp 'evil-define-key*)
+    (apply #'evil-define-key* state keymap bindings))
+   ((fboundp 'evil-define-key)
+    (eval (cons 'evil-define-key (cons state (cons keymap bindings)))))
+   (t nil)))
 
 ;;;###autoload
 (defun banjo-setup-keybindings ()
