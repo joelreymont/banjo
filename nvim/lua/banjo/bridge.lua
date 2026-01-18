@@ -94,7 +94,7 @@ function M.start(binary_path, cwd)
     b.autocmd_group = vim.api.nvim_create_augroup("BanjoEvents_" .. my_tabid, { clear = true })
 
     -- Spawn the binary to get the WebSocket port
-    b.job_id = vim.fn.jobstart({ binary_path, "--nvim" }, {
+    b.job_id = vim.fn.jobstart({ binary_path, "--daemon" }, {
         cwd = cwd,
         stdout_buffered = false,
         on_stdout = vim.schedule_wrap(function(_, data)

@@ -1025,7 +1025,7 @@ Include ID when provided."
 
 (defun banjo--start-daemon ()
   "Start the Banjo daemon."
-  (let ((cmd (list banjo-binary "--nvim")))
+  (let ((cmd (list banjo-binary "--daemon")))
     (setq banjo--process
           (make-process
            :name "banjo"

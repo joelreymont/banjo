@@ -80,7 +80,6 @@ const arg_map = std.StaticStringMap(ArgAction).initComptime(.{
     .{ "--agent", .mode_agent },
     .{ "--lsp", .mode_lsp },
     .{ "--daemon", .mode_daemon },
-    .{ "--nvim", .mode_daemon }, // Keep for backward compat
     .{ "--verbose", .verbose },
     .{ "-v", .verbose },
     .{ "--session-id", .session_id },
