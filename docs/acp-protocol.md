@@ -2,7 +2,8 @@
 
 Reference: https://agentclientprotocol.com / https://github.com/zed-industries/agent-client-protocol
 
-ACP is a JSON-RPC 2.0 protocol over stdio for communication between code editors (clients) and AI coding agents.
+ACP is a JSON-RPC 2.0 protocol over stdio or WebSocket for communication between code editors (clients) and AI coding agents.
+WebSocket transport details are in [docs/acp-websocket.md](acp-websocket.md).
 
 ## Message Flow
 

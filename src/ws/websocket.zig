@@ -520,6 +520,31 @@ test "parseFrame close" {
     ).expectEqual(summary);
 }
 
+test "parseFrame close preserves reason" {
+    const allocator = testing.allocator;
+    const mask = [4]u8{ 0x05, 0x06, 0x07, 0x08 };
+    const payload = [_]u8{ 0x03, 0xe8, 'b', 'y', 'e' };
+    const data = try makeMaskedFrame(allocator, @intFromEnum(Opcode.close), &payload, mask);
+    defer allocator.free(data);
+
+    const result = try parseFrame(data);
+    const payload_hex = try bytesToHexLower(allocator, result.frame.payload);
+    defer allocator.free(payload_hex);
+    const summary = .{
+        .opcode = @tagName(result.frame.opcode),
+        .payload_len = result.frame.payload.len,
+        .payload_hex = payload_hex,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\ws.websocket.test.parseFrame close preserves reason__struct_<^\d+$>
+        \\  .opcode: [:0]const u8
+        \\    "close"
+        \\  .payload_len: usize = 5
+        \\  .payload_hex: []u8
+        \\    "03e8627965"
+    ).expectEqual(summary);
+}
+
 test "parseFrame reserved opcode" {
     const allocator = testing.allocator;
     const mask = [4]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
@@ -600,6 +625,27 @@ test "tryParseHandshake returns null for partial headers" {
     const partial = "GET /nvim HTTP/1.1\r\nHost: localhost\r\n";
     const parsed = try tryParseHandshake(allocator, partial);
     try testing.expect(parsed == null);
+}
+
+test "tryParseHandshake rejects missing headers" {
+    const allocator = testing.allocator;
+    const missing_key =
+        "GET /nvim HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n" ++
+        "\r\n";
+    try testing.expectError(error.MissingWebSocketKey, tryParseHandshake(allocator, missing_key));
+
+    const missing_version =
+        "GET /nvim HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "\r\n";
+    try testing.expectError(error.UnsupportedWebSocketVersion, tryParseHandshake(allocator, missing_version));
 }
 
 test "tryParseHandshake parses complete headers" {

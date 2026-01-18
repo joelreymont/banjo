@@ -92,6 +92,7 @@ pub fn writeAll(fd: std.posix.fd_t, buf: []const u8) !void {
 }
 
 const testing = std.testing;
+const ohsnap = @import("ohsnap");
 
 const ChunkReader = struct {
     chunks: []const []const u8,
@@ -133,4 +134,71 @@ test "readLine assembles partial reads" {
         1024,
     );
     try testing.expectEqualStrings("rest", tail.?);
+}
+
+test "writeAll returns WouldBlock on send timeout" {
+    var pair: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair) != 0) {
+        return error.SocketPairFailed;
+    }
+    defer std.posix.close(pair[0]);
+    defer std.posix.close(pair[1]);
+
+    var sndbuf: i32 = 4096;
+    try std.posix.setsockopt(pair[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&sndbuf));
+
+    const timeout = std.posix.timeval{ .sec = 0, .usec = 10_000 };
+    try std.posix.setsockopt(pair[0], std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout));
+
+    const payload_len: usize = 1024 * 1024;
+    const payload = try testing.allocator.alloc(u8, payload_len);
+    defer testing.allocator.free(payload);
+    @memset(payload, 'x');
+
+    const WriteState = struct {
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        err: ?anyerror = null,
+    };
+
+    var state = WriteState{
+        .done = std.atomic.Value(bool).init(false),
+        .err = null,
+    };
+
+    const WriteThread = struct {
+        fn run(s: *WriteState, fd: std.posix.fd_t, buf: []const u8) void {
+            var err: ?anyerror = null;
+            writeAll(fd, buf) catch |e| {
+                err = e;
+            };
+            s.err = err;
+            s.done.store(true, .release);
+        }
+    };
+
+    var thread = try std.Thread.spawn(.{}, WriteThread.run, .{ &state, pair[0], payload });
+
+    const deadline_ms = std.time.milliTimestamp() + 200;
+    while (!state.done.load(.acquire) and std.time.milliTimestamp() < deadline_ms) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    const forced = !state.done.load(.acquire);
+    if (forced) {
+        try std.posix.shutdown(pair[0], .send);
+        try std.posix.shutdown(pair[1], .recv);
+    }
+
+    thread.join();
+
+    const err_name = if (state.err) |e| @errorName(e) else "none";
+    const summary = .{
+        .err = err_name,
+        .forced = forced,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.io_utils.test.writeAll returns WouldBlock on send timeout__struct_<^\d+$>
+        \\  .err: [:0]const u8
+        \\    "WouldBlock"
+        \\  .forced: bool = false
+    ).expectEqual(summary);
 }

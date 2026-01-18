@@ -82,6 +82,7 @@ Banjo is written in Zig and implements the [Agent Client Protocol (ACP)](https:/
 | Doc | Contents |
 |-----|----------|
 | [docs/acp-protocol.md](docs/acp-protocol.md) | ACP specification |
+| [docs/acp-websocket.md](docs/acp-websocket.md) | ACP WebSocket transport |
 | [docs/wire-formats.md](docs/wire-formats.md) | JSON-RPC message schemas |
 | [docs/claude-code.md](docs/claude-code.md) | Claude Code CLI integration |
 | [docs/codex.md](docs/codex.md) | Codex app-server protocol |

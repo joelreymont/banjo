@@ -4863,6 +4863,116 @@ test "replaceFirst returns copy when needle not found" {
     ).expectEqual(summary);
 }
 
+test "truncateUtf8 handles 2-byte sequence" {
+    const input = "caf\xC3\xA9";
+    const out_4 = Agent.truncateUtf8(input, 4);
+    const out_5 = Agent.truncateUtf8(input, 5);
+    const exp_4 = [_]u8{ 'c', 'a', 'f' };
+    const exp_5 = [_]u8{ 'c', 'a', 'f', 0xC3, 0xA9 };
+    const checks = [_]struct { out: []const u8, exp: []const u8 }{
+        .{ .out = out_4, .exp = &exp_4 },
+        .{ .out = out_5, .exp = &exp_5 },
+    };
+    var ok = [_]bool{ false, false };
+    for (checks, 0..) |check, i| {
+        ok[i] = std.mem.eql(u8, check.out, check.exp);
+    }
+    const summary = .{
+        .out_4_len = out_4.len,
+        .out_5_len = out_5.len,
+        .out_4_ok = ok[0],
+        .out_5_ok = ok[1],
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.truncateUtf8 handles 2-byte sequence__struct_<^\d+$>
+        \\  .out_4_len: usize = 3
+        \\  .out_5_len: usize = 5
+        \\  .out_4_ok: bool = true
+        \\  .out_5_ok: bool = true
+    ).expectEqual(summary);
+}
+
+test "truncateUtf8 handles 4-byte sequence" {
+    const input = "a\xF0\x9F\x98\x80b";
+    const out_4 = Agent.truncateUtf8(input, 4);
+    const out_5 = Agent.truncateUtf8(input, 5);
+    const out_6 = Agent.truncateUtf8(input, 6);
+    const exp_4 = [_]u8{'a'};
+    const exp_5 = [_]u8{ 'a', 0xF0, 0x9F, 0x98, 0x80 };
+    const exp_6 = [_]u8{ 'a', 0xF0, 0x9F, 0x98, 0x80, 'b' };
+    const checks = [_]struct { out: []const u8, exp: []const u8 }{
+        .{ .out = out_4, .exp = &exp_4 },
+        .{ .out = out_5, .exp = &exp_5 },
+        .{ .out = out_6, .exp = &exp_6 },
+    };
+    var ok = [_]bool{ false, false, false };
+    for (checks, 0..) |check, i| {
+        ok[i] = std.mem.eql(u8, check.out, check.exp);
+    }
+    const summary = .{
+        .out_4_len = out_4.len,
+        .out_5_len = out_5.len,
+        .out_6_len = out_6.len,
+        .out_4_ok = ok[0],
+        .out_5_ok = ok[1],
+        .out_6_ok = ok[2],
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.truncateUtf8 handles 4-byte sequence__struct_<^\d+$>
+        \\  .out_4_len: usize = 1
+        \\  .out_5_len: usize = 5
+        \\  .out_6_len: usize = 6
+        \\  .out_4_ok: bool = true
+        \\  .out_5_ok: bool = true
+        \\  .out_6_ok: bool = true
+    ).expectEqual(summary);
+}
+
+test "truncateUtf8 handles overlong sequence" {
+    const input = "a\xC0\xAFb";
+    const out = Agent.truncateUtf8(input, 3);
+    const exp = [_]u8{'a'};
+    const summary = .{
+        .out_len = out.len,
+        .out_ok = std.mem.eql(u8, out, &exp),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.truncateUtf8 handles overlong sequence__struct_<^\d+$>
+        \\  .out_len: usize = 1
+        \\  .out_ok: bool = true
+    ).expectEqual(summary);
+}
+
+test "truncateUtf8 handles truncated sequence" {
+    const input = "a\xE2\x82";
+    const out = Agent.truncateUtf8(input, 2);
+    const exp = [_]u8{'a'};
+    const summary = .{
+        .out_len = out.len,
+        .out_ok = std.mem.eql(u8, out, &exp),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.truncateUtf8 handles truncated sequence__struct_<^\d+$>
+        \\  .out_len: usize = 1
+        \\  .out_ok: bool = true
+    ).expectEqual(summary);
+}
+
+test "truncateUtf8 handles surrogate halves" {
+    const input = "a\xED\xA0\x80b";
+    const out = Agent.truncateUtf8(input, 4);
+    const exp = [_]u8{'a'};
+    const summary = .{
+        .out_len = out.len,
+        .out_ok = std.mem.eql(u8, out, &exp),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\acp.agent.test.truncateUtf8 handles surrogate halves__struct_<^\d+$>
+        \\  .out_len: usize = 1
+        \\  .out_ok: bool = true
+    ).expectEqual(summary);
+}
+
 test "TurnError.isMaxTurnError detects max turn errors" {
     const TurnError = codex_cli.TurnError;
     const summary = .{
@@ -5801,6 +5911,9 @@ test "Agent handleRequest - resumeSession existing" {
     const session_id = "session-test";
     const session = agent.sessions.get(session_id).?;
 
+    session.bridge = Bridge.init(testing.allocator, ".");
+    session.codex_bridge = CodexBridge.init(testing.allocator, ".");
+
     const exec_tool = try testing.allocator.dupe(u8, "exec-tool");
     try session.pending_execute_tools.put(exec_tool, {});
 
@@ -6174,6 +6287,8 @@ test "Agent handleRequest - cancel" {
         .pending_edit = session.pending_edit_tools.count(),
         .quiet_tools = session.quiet_tool_ids.count(),
         .prompt_queue = session.prompt_queue.items.len,
+        .bridge_nil = session.bridge == null,
+        .codex_bridge_nil = session.codex_bridge == null,
     };
     try (ohsnap{}).snap(@src(),
         \\acp.agent.test.Agent handleRequest - cancel__struct_<^\d+$>
@@ -6183,6 +6298,8 @@ test "Agent handleRequest - cancel" {
         \\  .pending_edit: u32 = 0
         \\  .quiet_tools: u32 = 0
         \\  .prompt_queue: usize = 0
+        \\  .bridge_nil: bool = true
+        \\  .codex_bridge_nil: bool = true
     ).expectEqual(summary);
 }
 

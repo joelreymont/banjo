@@ -1582,6 +1582,63 @@ fn createTestCallbacks(comptime T: type) EditorCallbacks.VTable {
     };
 }
 
+const TimeoutCtx = struct {
+    cancelled: *std.atomic.Value(bool),
+    timeouts: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+};
+
+fn createTimeoutCallbacks() EditorCallbacks.VTable {
+    const Callbacks = struct {
+        fn sendText(_: *anyopaque, _: []const u8, _: Engine, _: []const u8) anyerror!void {}
+        fn sendTextRaw(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {}
+        fn sendTextPrefix(_: *anyopaque, _: []const u8, _: Engine) anyerror!void {}
+        fn sendThought(_: *anyopaque, _: []const u8, _: Engine, _: []const u8) anyerror!void {}
+        fn sendThoughtRaw(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {}
+        fn sendThoughtPrefix(_: *anyopaque, _: []const u8, _: Engine) anyerror!void {}
+        fn sendToolCall(_: *anyopaque, _: []const u8, _: Engine, _: []const u8, _: []const u8, _: []const u8, _: ToolKind, _: ?std.json.Value) anyerror!void {}
+        fn sendToolResult(_: *anyopaque, _: []const u8, _: Engine, _: []const u8, _: ?[]const u8, _: ToolStatus, _: ?std.json.Value) anyerror!void {}
+        fn sendUserMessage(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {}
+        fn onTimeout(ctx: *anyopaque) void {
+            const tctx: *TimeoutCtx = @ptrCast(@alignCast(ctx));
+            _ = tctx.timeouts.fetchAdd(1, .acq_rel);
+            tctx.cancelled.store(true, .release);
+        }
+        fn onSessionId(_: *anyopaque, _: Engine, _: []const u8) void {}
+        fn onSlashCommands(_: *anyopaque, _: []const u8, _: []const []const u8) anyerror!void {}
+        fn checkAuthRequired(_: *anyopaque, _: []const u8, _: Engine, _: []const u8) anyerror!?StopReason {
+            return null;
+        }
+        fn sendContinuePrompt(_: *anyopaque, _: Engine, _: []const u8) anyerror!bool {
+            return false;
+        }
+        fn restartEngine(_: *anyopaque, _: Engine) bool {
+            return true;
+        }
+        fn onApprovalRequest(_: *anyopaque, _: std.json.Value, _: ApprovalKind, _: ?std.json.Value) anyerror!?[]const u8 {
+            return null;
+        }
+    };
+
+    return .{
+        .sendText = Callbacks.sendText,
+        .sendTextRaw = Callbacks.sendTextRaw,
+        .sendTextPrefix = Callbacks.sendTextPrefix,
+        .sendThought = Callbacks.sendThought,
+        .sendThoughtRaw = Callbacks.sendThoughtRaw,
+        .sendThoughtPrefix = Callbacks.sendThoughtPrefix,
+        .sendToolCall = Callbacks.sendToolCall,
+        .sendToolResult = Callbacks.sendToolResult,
+        .sendUserMessage = Callbacks.sendUserMessage,
+        .onTimeout = Callbacks.onTimeout,
+        .onSessionId = Callbacks.onSessionId,
+        .onSlashCommands = Callbacks.onSlashCommands,
+        .checkAuthRequired = Callbacks.checkAuthRequired,
+        .sendContinuePrompt = Callbacks.sendContinuePrompt,
+        .restartEngine = Callbacks.restartEngine,
+        .onApprovalRequest = Callbacks.onApprovalRequest,
+    };
+}
+
 test "integration: dot off triggers context reload" {
     // Test that a Bash tool_use with "dot off" followed by tool_result triggers context reload
     var tracker = ContextReloadTracker.init(testing.allocator);
@@ -1703,6 +1760,70 @@ test "integration: dot off failure skips context reload" {
 
     // Verify context reload was NOT triggered (no prompts sent)
     try testing.expect(!tracker.hasContextReload());
+}
+
+test "processClaudeMessages cancels after timeout" {
+    const vtable = createTimeoutCallbacks();
+    var cancelled = std.atomic.Value(bool).init(false);
+    var timeout_ctx = TimeoutCtx{ .cancelled = &cancelled };
+    const cbs = EditorCallbacks{ .ctx = @ptrCast(&timeout_ctx), .vtable = &vtable };
+
+    var last_nudge: i64 = 0;
+    var ctx = PromptContext{
+        .allocator = testing.allocator,
+        .session_id = "test-timeout-claude",
+        .cwd = "/tmp",
+        .cancelled = &cancelled,
+        .nudge = .{ .enabled = false, .cooldown_ms = 0, .last_nudge_ms = &last_nudge },
+        .cb = cbs,
+    };
+
+    var bridge = Bridge.init(testing.allocator, "/tmp");
+    defer bridge.deinit();
+
+    const stop_reason = try processClaudeMessages(&ctx, &bridge);
+    const summary = .{
+        .stop = @tagName(stop_reason),
+        .timeouts = timeout_ctx.timeouts.load(.acquire),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.engine.test.processClaudeMessages cancels after timeout__struct_<^\d+$>
+        \\  .stop: [:0]const u8
+        \\    "cancelled"
+        \\  .timeouts: u32 = 1
+    ).expectEqual(summary);
+}
+
+test "processCodexMessages cancels after timeout" {
+    const vtable = createTimeoutCallbacks();
+    var cancelled = std.atomic.Value(bool).init(false);
+    var timeout_ctx = TimeoutCtx{ .cancelled = &cancelled };
+    const cbs = EditorCallbacks{ .ctx = @ptrCast(&timeout_ctx), .vtable = &vtable };
+
+    var last_nudge: i64 = 0;
+    var ctx = PromptContext{
+        .allocator = testing.allocator,
+        .session_id = "test-timeout-codex",
+        .cwd = "/tmp",
+        .cancelled = &cancelled,
+        .nudge = .{ .enabled = false, .cooldown_ms = 0, .last_nudge_ms = &last_nudge },
+        .cb = cbs,
+    };
+
+    var bridge = CodexBridge.init(testing.allocator, "/tmp");
+    defer bridge.deinit();
+
+    const stop_reason = try processCodexMessages(&ctx, &bridge);
+    const summary = .{
+        .stop = @tagName(stop_reason),
+        .timeouts = timeout_ctx.timeouts.load(.acquire),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.engine.test.processCodexMessages cancels after timeout__struct_<^\d+$>
+        \\  .stop: [:0]const u8
+        \\    "cancelled"
+        \\  .timeouts: u32 = 1
+    ).expectEqual(summary);
 }
 
 test "integration: dot off skips subsequent nudge" {

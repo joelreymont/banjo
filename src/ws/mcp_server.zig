@@ -698,6 +698,36 @@ test "queueHandshake returns error at capacity without closing socket" {
     server.closePendingHandshakes();
 }
 
+test "expirePendingHandshakes closes timed out handshake" {
+    const server = try McpServer.init(testing.allocator, "/tmp");
+    defer server.deinit();
+
+    const client = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    var owns_client = true;
+    defer if (owns_client) posix.close(client);
+
+    try server.queueHandshake(client);
+    const pending = server.pending_handshakes.getPtr(client) orelse return error.TestUnexpectedResult;
+    const deadline = pending.deadline_ms;
+
+    server.expirePendingHandshakes(deadline);
+
+    const still_pending = server.pending_handshakes.contains(client);
+    if (!still_pending) owns_client = false;
+
+    const summary = .{
+        .pending = @as(u32, @intCast(server.pending_handshakes.count())),
+        .still_pending = still_pending,
+        .closed = !still_pending,
+    };
+    try (ohsnap{}).snap(@src(),
+        \\ws.mcp_server.test.expirePendingHandshakes closes timed out handshake__struct_<^\d+$>
+        \\  .pending: u32 = 0
+        \\  .still_pending: bool = false
+        \\  .closed: bool = true
+    ).expectEqual(summary);
+}
+
 test "finishHandshake releases socket lock before nvim callback" {
     const server = try McpServer.init(testing.allocator, "/tmp");
     defer server.deinit();
