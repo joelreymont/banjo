@@ -164,6 +164,18 @@
       (goto-char (point-min))
       (should (search-forward "Available commands:" nil t)))))
 
+(ert-deftest banjo-test-input-face-remap ()
+  (let ((banjo--input-buffer "*banjo-test-input*"))
+    (banjo--get-input-buffer)
+    (with-current-buffer (banjo--get-input-buffer)
+      (should (assq 'default face-remapping-alist)))))
+
+(ert-deftest banjo-test-evil-slash-binding-setup ()
+  (let ((features (cons 'evil features)))
+    (eval '(defmacro evil-define-key (&rest _args) nil))
+    (banjo--setup-evil-panel-bindings)
+    (should (keymapp banjo-input-mode-map))))
+
 (ert-deftest banjo-test-doom-prefix-availability ()
   (let ((orig-bound (boundp 'doom-leader-map))
         (orig (and (boundp 'doom-leader-map) doom-leader-map)))

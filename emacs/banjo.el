@@ -68,6 +68,11 @@
   "Face for user prompts."
   :group 'banjo)
 
+(defface banjo-face-input
+  '((t :inherit font-lock-string-face :slant italic))
+  "Face for input buffer text."
+  :group 'banjo)
+
 (defface banjo-face-assistant
   '((t :inherit default))
   "Face for assistant output."
@@ -418,14 +423,14 @@
 (define-derived-mode banjo-input-mode text-mode "BanjoInput"
   "Major mode for Banjo input."
   (setq-local header-line-format '(:eval (banjo--input-header)))
-  (setq-local display-line-numbers nil)
-  (when (fboundp 'display-line-numbers-mode)
-    (display-line-numbers-mode -1))
+  (banjo--disable-line-numbers)
+  (banjo--apply-input-style)
   (setq-local truncate-lines nil)
   (setq-local word-wrap t))
 
 (define-key banjo-mode-map (kbd "i") #'banjo-focus-input)
 (define-key banjo-mode-map (kbd "RET") #'banjo-focus-input)
+(define-key banjo-mode-map (kbd "/") #'banjo-input-slash)
 
 (defun banjo--maybe-evil-insert ()
   (when (fboundp 'evil-insert-state)
@@ -436,6 +441,18 @@
   (interactive)
   (banjo-focus-input)
   (insert "/"))
+
+(defun banjo--disable-line-numbers ()
+  "Disable line numbers in the current buffer."
+  (setq-local display-line-numbers nil)
+  (when (fboundp 'display-line-numbers-mode)
+    (display-line-numbers-mode -1)))
+
+(defun banjo--apply-input-style ()
+  "Apply input buffer styling."
+  (setq-local font-lock-defaults nil)
+  (setq-local face-remapping-alist '((default banjo-face-input)))
+  (font-lock-mode -1))
 
 (defun banjo--get-output-buffer ()
   "Get or create the output buffer."
@@ -453,6 +470,9 @@
     (with-current-buffer buf
       (unless (eq major-mode 'banjo-input-mode)
         (banjo-input-mode)))
+    (with-current-buffer buf
+      (banjo--disable-line-numbers)
+      (banjo--apply-input-style))
     buf))
 
 (defun banjo--append-output (text &optional face)
@@ -1154,15 +1174,22 @@ Return non-nil if handled locally."
     (banjo--evil-define-key 'normal banjo-mode-map
       "q" #'banjo--hide-panel
       "gr" #'banjo-toggle
-      (kbd "C-c") #'banjo-cancel)))
+      "/" #'banjo-input-slash
+      (kbd "C-c") #'banjo-cancel)
+    (banjo--evil-define-key 'normal banjo-input-mode-map
+      "/" #'banjo-input-slash)))
 
 (defun banjo--setup-evil-panel-bindings ()
   "Set up evil-mode bindings for the panel buffer."
   (eval-after-load 'evil
-    '(banjo--evil-define-key 'normal banjo-mode-map
-       "q" #'banjo--hide-panel
-       "gr" #'banjo-toggle
-       (kbd "C-c") #'banjo-cancel)))
+    '(progn
+       (banjo--evil-define-key 'normal banjo-mode-map
+         "q" #'banjo--hide-panel
+         "gr" #'banjo-toggle
+         "/" #'banjo-input-slash
+         (kbd "C-c") #'banjo-cancel)
+       (banjo--evil-define-key 'normal banjo-input-mode-map
+         "/" #'banjo-input-slash))))
 
 (defun banjo--evil-define-key (state keymap &rest bindings)
   "Define Evil bindings without macro/function load hazards."
