@@ -81,16 +81,25 @@
        (setenv "BANJO_ROUTE" "claude")
        (setenv "BANJO_PRIMARY_AGENT" "claude")))
     (setenv "BANJO_AUTO_RESUME" "false")
-    (unwind-protect
-        (progn
+    ;; Mock interactive prompts to auto-approve in batch mode
+    (let ((orig-completing-read (symbol-function 'completing-read)))
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (prompt choices &rest args)
+                   (if (string-match-p "\\`Allow " prompt)
+                       (car choices)
+                     (apply orig-completing-read prompt choices args))))
+                ((symbol-function 'yes-or-no-p) (lambda (_prompt) t))
+                ((symbol-function 'y-or-n-p) (lambda (_prompt) t)))
+        (unwind-protect
+            (progn
+              (banjo-test--exec-command "banjo-stop")
+              (setq banjo--process-output "")
+              (banjo-test--exec-command "banjo-start")
+              (should (banjo-test--wait-until (lambda () banjo--session-id) 15.0))
+              (banjo-test--send-from-input prompt)
+              (should (banjo-test--wait-until #'banjo-test--assistant-output-p 20.0)))
           (banjo-test--exec-command "banjo-stop")
-          (setq banjo--process-output "")
-          (banjo-test--exec-command "banjo-start")
-          (should (banjo-test--wait-until (lambda () banjo--session-id) 15.0))
-          (banjo-test--send-from-input prompt)
-          (should (banjo-test--wait-until #'banjo-test--assistant-output-p 20.0)))
-      (banjo-test--exec-command "banjo-stop")
-      (delete-directory temp-dir t))))
+          (delete-directory temp-dir t))))))
 
 (ert-deftest banjo-test-split-fence-chunks ()
   (let ((banjo--output-buffer "*banjo-test*"))
@@ -384,7 +393,28 @@
                     (error nil))))
       (delete-directory tmp-dir t))))
 
+(ert-deftest banjo-test-permission-options-vector ()
+  "Verify permission options work with JSON vector input."
+  (let* ((vec-options [((kind . "allow_once") (name . "Allow") (optionId . "allow_once"))
+                       ((kind . "reject_once") (name . "Deny") (optionId . "reject_once"))])
+         (list-options '(((kind . "allow_once") (name . "Allow") (optionId . "allow_once"))
+                         ((kind . "reject_once") (name . "Deny") (optionId . "reject_once"))))
+         (vec-choices (banjo--permission-option-choices vec-options))
+         (list-choices (banjo--permission-option-choices list-options)))
+    (should (= (length vec-choices) 2))
+    (should (= (length list-choices) 2))
+    (should (string-match-p "Allow" (caar vec-choices)))
+    (should (string-match-p "Allow" (caar list-choices)))))
+
+(ert-deftest banjo-test-handle-message-invalid-json ()
+  "Verify invalid JSON doesn't crash message handler."
+  (let ((frame (make-websocket-frame :opcode 'text :payload "not valid json")))
+    (should (condition-case nil
+                (progn (banjo--handle-message frame) t)
+              (error nil)))))
+
 (ert-deftest banjo-test-emacs-end-to-end ()
+  :tags '(:e2e)
   (banjo-test--e2e-run 'codex "Reply with a short greeting.")
   (banjo-test--e2e-run 'claude "Reply with a short greeting."))
 
