@@ -418,5 +418,168 @@
   (banjo-test--e2e-run 'codex "Reply with a short greeting.")
   (banjo-test--e2e-run 'claude "Reply with a short greeting."))
 
+;; WebSocket message simulation helpers
+
+(defun banjo-test--simulate-notification (method params)
+  "Simulate receiving a JSON-RPC notification."
+  (let ((frame (make-websocket-frame
+                :opcode 'text
+                :payload (json-encode `((method . ,method) (params . ,params))))))
+    (banjo--handle-message frame)))
+
+(defun banjo-test--simulate-request (id method params)
+  "Simulate receiving a JSON-RPC request with ID."
+  (let ((frame (make-websocket-frame
+                :opcode 'text
+                :payload (json-encode `((id . ,id) (method . ,method) (params . ,params))))))
+    (banjo--handle-message frame)))
+
+;; Tool call output tests
+
+(ert-deftest banjo-test-tool-call-update-shows-output ()
+  "Tool call updates with content should display in output buffer."
+  (let ((banjo--output-buffer "*banjo-test-output*")
+        (banjo--tool-calls (make-hash-table :test 'equal)))
+    (banjo--clear-output)
+    (puthash "tool-123" "Bash: ls" banjo--tool-calls)
+    (banjo-test--simulate-notification
+     "session/update"
+     '((update . ((sessionUpdate . "tool_call_update")
+                  (toolCallId . "tool-123")
+                  (content . [((type . "content")
+                               (content . ((type . "text") (text . "file1.txt\nfile2.txt"))))])))))
+    (with-current-buffer (banjo--get-output-buffer)
+      (goto-char (point-min))
+      (should (search-forward "file1.txt" nil t))
+      (should (search-forward "file2.txt" nil t)))))
+
+(ert-deftest banjo-test-tool-output-has-face ()
+  "Tool output should have banjo-face-tool-output applied."
+  (let ((banjo--output-buffer "*banjo-test-output*")
+        (banjo--tool-calls (make-hash-table :test 'equal)))
+    (banjo--clear-output)
+    (puthash "tool-123" "Bash: ls" banjo--tool-calls)
+    (banjo-test--simulate-notification
+     "session/update"
+     '((update . ((sessionUpdate . "tool_call_update")
+                  (toolCallId . "tool-123")
+                  (content . [((type . "content")
+                               (content . ((type . "text") (text . "output"))))])))))
+    (with-current-buffer (banjo--get-output-buffer)
+      (goto-char (point-min))
+      (search-forward "output")
+      (should (eq (get-text-property (1- (point)) 'face) 'banjo-face-tool-output)))))
+
+;; Agent message coloring tests
+
+(ert-deftest banjo-test-agent-message-has-face ()
+  "Agent message chunks should have banjo-face-assistant applied."
+  (let ((banjo--output-buffer "*banjo-test-output*"))
+    (banjo--clear-output)
+    (banjo-test--simulate-notification
+     "session/update"
+     '((update . ((sessionUpdate . "agent_message_chunk")
+                  (content . ((type . "text") (text . "Hello there")))))))
+    (with-current-buffer (banjo--get-output-buffer)
+      (goto-char (point-min))
+      (search-forward "Hello")
+      (should (eq (get-text-property (1- (point)) 'face) 'banjo-face-assistant)))))
+
+;; Slash completion tests
+
+(ert-deftest banjo-test-slash-triggers-completion ()
+  "Pressing / in input buffer should trigger completion."
+  (let ((banjo--input-buffer "*banjo-test-input*")
+        (completion-triggered nil))
+    (with-current-buffer (banjo--get-input-buffer)
+      (erase-buffer)
+      (cl-letf (((symbol-function 'completion-at-point)
+                 (lambda () (setq completion-triggered t))))
+        (call-interactively 'banjo-input-maybe-complete))
+      (should (string= (buffer-string) "/"))
+      (should completion-triggered))))
+
+(ert-deftest banjo-test-slash-completion-returns-commands ()
+  "Slash completion should return registered commands."
+  (let ((banjo--input-buffer "*banjo-test-input*"))
+    (with-current-buffer (banjo--get-input-buffer)
+      (erase-buffer)
+      (insert "/he")
+      (goto-char (point-max))
+      (let ((capf (banjo--completion-at-point)))
+        (should capf)
+        (should (member "help" (nth 2 capf)))
+        ;; Should have exit function for auto-send
+        (should (plist-get (nthcdr 3 capf) :exit-function))))))
+
+(ert-deftest banjo-test-slash-completion-auto-sends ()
+  "Completing a slash command should auto-send it."
+  (let ((banjo--input-buffer "*banjo-test-input*")
+        (banjo--output-buffer "*banjo-test-output*")
+        (send-called nil))
+    (banjo--clear-output)
+    (with-current-buffer (banjo--get-input-buffer)
+      (erase-buffer)
+      (insert "/help")
+      (cl-letf (((symbol-function 'banjo-input-send)
+                 (lambda () (interactive) (setq send-called t))))
+        ;; Simulate completion finishing
+        (banjo--completion-exit "help" 'finished)
+        ;; Allow the timer to run
+        (sleep-for 0.05))
+      (should send-called))))
+
+;; Permission request tests
+
+(ert-deftest banjo-test-permission-request-flow ()
+  "Permission requests should show prompt and send response."
+  (let ((banjo--output-buffer "*banjo-test-output*")
+        (banjo--websocket t)
+        (sent-response nil))
+    ;; Mock websocket-openp BEFORE clear-output (which calls update-mode-line)
+    (cl-letf (((symbol-function 'websocket-openp) (lambda (_) t))
+              ((symbol-function 'websocket-send-text)
+               (lambda (_ws text) (setq sent-response text)))
+              ((symbol-function 'completing-read)
+               (lambda (_prompt choices &rest _) (car choices)))
+              ((symbol-function 'raise-frame) #'ignore))
+      (banjo--clear-output)
+      (banjo-test--simulate-request
+       42
+       "session/request_permission"
+       '((toolCall . ((title . "Bash: rm -rf")
+                      (toolCallId . "tc-1")))
+         (options . [((kind . "allow_once") (name . "Allow") (optionId . "allow"))])))
+      (with-current-buffer (banjo--get-output-buffer)
+        (goto-char (point-min))
+        (should (search-forward "[?] Bash: rm -rf" nil t)))
+      (should sent-response)
+      (should (string-match-p "\"id\":42" sent-response)))))
+
+;; Error handling tests
+
+(ert-deftest banjo-test-malformed-session-update ()
+  "Malformed session/update should not crash."
+  (let ((banjo--output-buffer "*banjo-test-output*"))
+    (banjo--clear-output)
+    (should-not (condition-case nil
+                    (progn
+                      (banjo-test--simulate-notification
+                       "session/update"
+                       '((update . ((toolCallId . "bad")))))
+                      nil)
+                  (error t)))))
+
+(ert-deftest banjo-test-disconnect-during-stream ()
+  "Disconnect during streaming should clean up state."
+  (let ((banjo--streaming t)
+        (banjo--websocket t)
+        (banjo--session-id "test"))
+    (banjo--on-disconnect)
+    (should-not banjo--streaming)
+    (should-not banjo--websocket)
+    (should-not banjo--session-id)))
+
+
 (provide 'banjo-test)
 ;;; banjo-test.el ends here
