@@ -81,16 +81,25 @@
        (setenv "BANJO_ROUTE" "claude")
        (setenv "BANJO_PRIMARY_AGENT" "claude")))
     (setenv "BANJO_AUTO_RESUME" "false")
-    (unwind-protect
-        (progn
+    ;; Mock interactive prompts to auto-approve in batch mode
+    (let ((orig-completing-read (symbol-function 'completing-read)))
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (prompt choices &rest args)
+                   (if (string-match-p "\\`Allow " prompt)
+                       (car choices)
+                     (apply orig-completing-read prompt choices args))))
+                ((symbol-function 'yes-or-no-p) (lambda (_prompt) t))
+                ((symbol-function 'y-or-n-p) (lambda (_prompt) t)))
+        (unwind-protect
+            (progn
+              (banjo-test--exec-command "banjo-stop")
+              (setq banjo--process-output "")
+              (banjo-test--exec-command "banjo-start")
+              (should (banjo-test--wait-until (lambda () banjo--session-id) 15.0))
+              (banjo-test--send-from-input prompt)
+              (should (banjo-test--wait-until #'banjo-test--assistant-output-p 20.0)))
           (banjo-test--exec-command "banjo-stop")
-          (setq banjo--process-output "")
-          (banjo-test--exec-command "banjo-start")
-          (should (banjo-test--wait-until (lambda () banjo--session-id) 15.0))
-          (banjo-test--send-from-input prompt)
-          (should (banjo-test--wait-until #'banjo-test--assistant-output-p 20.0)))
-      (banjo-test--exec-command "banjo-stop")
-      (delete-directory temp-dir t))))
+          (delete-directory temp-dir t))))))
 
 (ert-deftest banjo-test-split-fence-chunks ()
   (let ((banjo--output-buffer "*banjo-test*"))
@@ -265,6 +274,40 @@
       (should (string-match-p "Banjo\\[codex/x" banjo--mode-line-string))
       (should (string-match-p "hold" banjo--mode-line-string)))))
 
+(ert-deftest banjo-test-faces-defined ()
+  "Verify all banjo faces are defined with proper inheritance."
+  (dolist (face '(banjo-face-user
+                  banjo-face-input
+                  banjo-face-assistant
+                  banjo-face-thought
+                  banjo-face-tool
+                  banjo-face-tool-success
+                  banjo-face-tool-fail
+                  banjo-face-tool-pending
+                  banjo-face-link
+                  banjo-face-code
+                  banjo-face-code-block
+                  banjo-face-inline-code
+                  banjo-face-header
+                  banjo-face-blockquote
+                  banjo-face-list-bullet
+                  banjo-face-hr))
+    (should (facep face))))
+
+(ert-deftest banjo-test-face-applied ()
+  "Verify faces are actually applied to output text."
+  (let ((banjo--output-buffer "*banjo-test-faces*"))
+    (banjo--clear-output)
+    (banjo--append-output "tool line\n" 'banjo-face-tool)
+    (with-current-buffer (banjo--get-output-buffer)
+      (goto-char (point-min))
+      (should (eq major-mode 'banjo-mode))
+      ;; font-lock-mode may be nil in batch mode, but faces should still apply
+      (let ((face-at (get-text-property (point) 'face)))
+        (should face-at)
+        (should (or (eq face-at 'banjo-face-tool)
+                    (memq 'banjo-face-tool (if (listp face-at) face-at nil))))))))
+
 (ert-deftest banjo-test-doom-prefix-availability ()
   (let ((orig-bound (boundp 'doom-leader-map))
         (orig (and (boundp 'doom-leader-map) doom-leader-map)))
@@ -328,20 +371,50 @@
          (tmp-dir (make-temp-file "banjo-compile-" t))
          (tmp-src (expand-file-name "banjo.el" tmp-dir))
          (tmp-elc (expand-file-name "banjo.elc" tmp-dir))
-         (features (cons 'evil features)))
+         (features (cons 'evil features))
+         (byte-compile-dest-file-function
+          (lambda (_src) tmp-elc)))
     (unwind-protect
         (progn
           (should src)
           (copy-file src tmp-src t)
-          (let ((byte-compile-warnings nil))
-            (byte-compile-file tmp-src))
+          ;; Compile with warnings enabled and capture them
+          (let ((byte-compile-warnings t)
+                (warning-minimum-level :warning)
+                (warnings nil))
+            (cl-letf (((symbol-function 'byte-compile-warn)
+                       (lambda (fmt &rest args)
+                         (push (apply #'format fmt args) warnings))))
+              (should (byte-compile-file tmp-src)))
+            (should-not warnings))
           (eval '(defmacro evil-define-key (&rest _args) nil))
           (should (condition-case nil
                       (load tmp-elc nil t)
                     (error nil))))
       (delete-directory tmp-dir t))))
 
+(ert-deftest banjo-test-permission-options-vector ()
+  "Verify permission options work with JSON vector input."
+  (let* ((vec-options [((kind . "allow_once") (name . "Allow") (optionId . "allow_once"))
+                       ((kind . "reject_once") (name . "Deny") (optionId . "reject_once"))])
+         (list-options '(((kind . "allow_once") (name . "Allow") (optionId . "allow_once"))
+                         ((kind . "reject_once") (name . "Deny") (optionId . "reject_once"))))
+         (vec-choices (banjo--permission-option-choices vec-options))
+         (list-choices (banjo--permission-option-choices list-options)))
+    (should (= (length vec-choices) 2))
+    (should (= (length list-choices) 2))
+    (should (string-match-p "Allow" (caar vec-choices)))
+    (should (string-match-p "Allow" (caar list-choices)))))
+
+(ert-deftest banjo-test-handle-message-invalid-json ()
+  "Verify invalid JSON doesn't crash message handler."
+  (let ((frame (make-websocket-frame :opcode 'text :payload "not valid json")))
+    (should (condition-case nil
+                (progn (banjo--handle-message frame) t)
+              (error nil)))))
+
 (ert-deftest banjo-test-emacs-end-to-end ()
+  :tags '(:e2e)
   (banjo-test--e2e-run 'codex "Reply with a short greeting.")
   (banjo-test--e2e-run 'claude "Reply with a short greeting."))
 

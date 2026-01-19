@@ -17,6 +17,7 @@
 
 (require 'websocket)
 (require 'json)
+(require 'seq)
 (require 'subr-x)
 
 ;; Customization
@@ -89,7 +90,7 @@
   :group 'banjo)
 
 (defface banjo-face-assistant
-  '((t :inherit default))
+  '((t :inherit font-lock-doc-face))
   "Face for assistant output."
   :group 'banjo)
 
@@ -331,7 +332,8 @@
 (defvar banjo--next-id 1 "Next JSON-RPC request ID.")
 (defvar banjo--pending-requests (make-hash-table :test 'equal) "Pending requests.")
 (defvar banjo--port nil "Daemon port.")
-(defvar banjo--state nil "Current state (engine, model, mode).")
+(defvar banjo--state '(:engine nil :model nil :mode nil)
+  "Current state (engine, model, mode).")
 (defvar banjo--streaming nil "Whether we're currently streaming output.")
 (defvar banjo--tool-calls (make-hash-table :test 'equal) "Active tool calls.")
 (defvar banjo--process-output ""
@@ -398,7 +400,7 @@
                        (format "%ds" (floor (- (float-time) banjo--stream-start-time))))))
     (setq banjo--mode-line-string
           (if connected
-              (format " Banjo[%s%s %s %s%s]"
+              (format " Banjo[%s%s %s %s%s%s]"
                       engine
                       (if (string= model "") "" (concat "/" model))
                       (banjo--display-mode mode)
@@ -465,7 +467,7 @@
           (with-temp-buffer
             (insert-file-contents file)
             (let ((data (read (current-buffer))))
-              (when (listp data)
+              (when (and (listp data) (cl-every #'stringp data))
                 (setq banjo--history data))))
         (error nil)))))
 
@@ -729,11 +731,12 @@
             (let ((end (point))
                   (prev-open banjo--code-block-open))
               (banjo--update-code-blocks text)
-              (when face
-                (add-face-text-property beg end face t))
               (banjo--apply-code-blocks beg end prev-open)
               (banjo--apply-buttons beg end)
-              (font-lock-ensure beg end)))
+              ;; font-lock first, then manual face on top
+              (font-lock-ensure beg end)
+              (when face
+                (add-face-text-property beg end face t))))
           (goto-char (point-max))))
       (banjo--scroll-windows-to-bottom scroll-wins))))
 
@@ -877,25 +880,27 @@ Include ID when provided."
 
 (defun banjo--handle-message (frame)
   "Handle incoming WebSocket FRAME."
-  (let* ((payload (websocket-frame-text frame))
-         (msg (json-read-from-string payload))
-         (id (alist-get 'id msg))
-         (method (alist-get 'method msg))
-         (result (alist-get 'result msg))
-         (err (alist-get 'error msg)))
-    (cond
-     ;; Response to our request
-     ((or result err)
-      (let ((callback (gethash id banjo--pending-requests)))
-        (when callback
-          (remhash id banjo--pending-requests)
-          (funcall callback result err))))
-     ;; Request from server
-     ((and method id)
-      (banjo--handle-request msg))
-     ;; Notification from server
-     (method
-      (banjo--handle-notification msg)))))
+  (condition-case parse-err
+      (let* ((payload (websocket-frame-text frame))
+             (msg (json-read-from-string payload))
+             (id (alist-get 'id msg))
+             (method (alist-get 'method msg))
+             (result (alist-get 'result msg))
+             (err (alist-get 'error msg)))
+        (cond
+         ;; Response to our request
+         ((or result err)
+          (let ((callback (gethash id banjo--pending-requests)))
+            (when callback
+              (remhash id banjo--pending-requests)
+              (funcall callback result err))))
+         ;; Request from server
+         ((and method id)
+          (banjo--handle-request msg))
+         ;; Notification from server
+         (method
+          (banjo--handle-notification msg))))
+    (error (message "Banjo: message parse error: %s" parse-err))))
 
 (defun banjo--handle-request (msg)
   "Handle a JSON-RPC request MSG from the server."
@@ -916,17 +921,18 @@ Include ID when provided."
   "Fallback permission options.")
 
 (defun banjo--permission-option-choices (options)
-  "Build display choices from permission OPTIONS."
+  "Build display choices from permission OPTIONS (list or vector)."
   (let ((i 0)
         (choices nil))
-    (dolist (opt options (nreverse choices))
+    (seq-doseq (opt options)
       (setq i (1+ i))
       (let* ((name (or (alist-get 'name opt) (alist-get 'optionId opt) "Option"))
              (kind (alist-get 'kind opt))
              (label (if kind
                         (format "%d) %s (%s)" i name kind)
                       (format "%d) %s" i name))))
-        (push (cons label opt) choices)))))
+        (push (cons label opt) choices)))
+    (nreverse choices)))
 
 (defun banjo--permission-outcome (option-id)
   "Build response outcome for OPTION-ID."
@@ -1000,10 +1006,10 @@ Include ID when provided."
                         (t 'banjo-face-tool-pending))))
             (banjo--append-output (format " -> %s\n" icon) face)))))
      ((string= update-type "current_mode_update")
-      (plist-put banjo--state :mode (alist-get 'currentModeId update))
+      (setq banjo--state (plist-put banjo--state :mode (alist-get 'currentModeId update)))
       (banjo--update-mode-line))
      ((string= update-type "current_model_update")
-      (plist-put banjo--state :model (alist-get 'currentModelId update))
+      (setq banjo--state (plist-put banjo--state :model (alist-get 'currentModelId update)))
       (banjo--update-mode-line)))))
 
 ;; Daemon management
@@ -1088,27 +1094,32 @@ Include ID when provided."
    '((protocolVersion . 1)
      (clientCapabilities . nil)
      (clientInfo . ((name . "banjo-emacs") (version . "0.1.0"))))
-   (lambda (result _err)
-     (when result
-       ;; Store agent info
-       (when-let ((agent-info (alist-get 'agentInfo result)))
-         (plist-put banjo--state :version (alist-get 'version agent-info)))
-       ;; Create session
-       (banjo--send-request
+   (lambda (result err)
+     (if err
+         (message "Banjo: init error: %s" (alist-get 'message err))
+       (when result
+         (when-let ((agent-info (alist-get 'agentInfo result)))
+           (setq banjo--state (plist-put banjo--state :version (alist-get 'version agent-info))))
+         (banjo--send-request
         "session/new"
         `((cwd . ,(expand-file-name default-directory)))
-        (lambda (sess-result _sess-err)
-          (when sess-result
-            (setq banjo--session-id (alist-get 'sessionId sess-result))
-            (when-let ((modes (alist-get 'modes sess-result)))
-              (plist-put banjo--state :mode (alist-get 'currentModeId modes)))
-            (banjo--update-mode-line)
-            (message "Banjo connected"))))))))
+        (lambda (sess-result sess-err)
+          (if sess-err
+              (message "Banjo: session error: %s" (alist-get 'message sess-err))
+            (when sess-result
+              (setq banjo--session-id (alist-get 'sessionId sess-result))
+              (when-let ((modes (alist-get 'modes sess-result)))
+                (setq banjo--state (plist-put banjo--state :mode (alist-get 'currentModeId modes))))
+              (banjo--update-mode-line)
+              (message "Banjo connected"))))))))))
 
 (defun banjo--on-disconnect ()
   "Handle WebSocket disconnection."
   (setq banjo--websocket nil)
   (setq banjo--session-id nil)
+  (clrhash banjo--pending-requests)
+  (clrhash banjo--tool-calls)
+  (banjo--stop-streaming)
   (banjo--update-mode-line)
   (message "Banjo disconnected"))
 
@@ -1191,18 +1202,21 @@ Return non-nil if handled locally."
   "Start a new session."
   (if (not (and banjo--websocket (websocket-openp banjo--websocket)))
       (banjo--append-status "Not connected")
+    (clrhash banjo--tool-calls)
     (banjo--clear-output)
     (banjo--append-status "Starting new session...")
     (banjo--send-request
      "session/new"
      `((cwd . ,(expand-file-name default-directory)))
-     (lambda (sess-result _sess-err)
-       (when sess-result
-         (setq banjo--session-id (alist-get 'sessionId sess-result))
-         (when-let ((modes (alist-get 'modes sess-result)))
-           (plist-put banjo--state :mode (alist-get 'currentModeId modes)))
-         (banjo--update-mode-line)
-         (banjo--append-status "New session ready"))))))
+     (lambda (sess-result sess-err)
+       (if sess-err
+           (banjo--append-status (format "Error: %s" (alist-get 'message sess-err)))
+         (when sess-result
+           (setq banjo--session-id (alist-get 'sessionId sess-result))
+           (when-let ((modes (alist-get 'modes sess-result)))
+             (setq banjo--state (plist-put banjo--state :mode (alist-get 'currentModeId modes))))
+           (banjo--update-mode-line)
+           (banjo--append-status "New session ready")))))))
 
 (defun banjo--command-cancel (_args)
   "Cancel current request."
@@ -1302,11 +1316,17 @@ Return non-nil if handled locally."
   "Stop Banjo daemon and disconnect."
   (interactive)
   (when banjo--websocket
-    (websocket-close banjo--websocket)
+    (condition-case nil
+        (websocket-close banjo--websocket)
+      (error nil))
     (setq banjo--websocket nil))
   (when banjo--process
     (kill-process banjo--process)
     (setq banjo--process nil))
+  (when-let ((buf (get-buffer "*banjo-daemon*")))
+    (kill-buffer buf))
+  (clrhash banjo--pending-requests)
+  (clrhash banjo--tool-calls)
   (banjo--stop-streaming)
   (setq banjo--session-id nil)
   (setq banjo--port nil)
@@ -1348,7 +1368,7 @@ Return non-nil if handled locally."
      "session/set_mode"
      `((sessionId . ,banjo--session-id)
        (modeId . ,mode)))
-    (plist-put banjo--state :mode mode)
+    (setq banjo--state (plist-put banjo--state :mode mode))
     (banjo--update-mode-line)))
 
 ;;;###autoload
@@ -1361,7 +1381,7 @@ Return non-nil if handled locally."
      "session/set_model"
      `((sessionId . ,banjo--session-id)
        (modelId . ,model)))
-    (plist-put banjo--state :model model)
+    (setq banjo--state (plist-put banjo--state :model model))
     (banjo--update-mode-line)))
 
 ;;;###autoload
@@ -1375,7 +1395,7 @@ Return non-nil if handled locally."
      `((sessionId . ,banjo--session-id)
        (configId . "route")
        (value . ,engine)))
-    (plist-put banjo--state :engine engine)
+    (setq banjo--state (plist-put banjo--state :engine engine))
     (banjo--update-mode-line)))
 
 ;; Keybindings

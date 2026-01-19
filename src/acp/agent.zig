@@ -39,11 +39,11 @@ const log = std.log.scoped(.agent);
 /// Banjo version with git hash
 pub const version = "0.6.6 (" ++ config.git_hash ++ ")";
 const no_engine_warning = "Banjo Duet could not find Claude Code or Codex. Install one (or set CLAUDE_CODE_EXECUTABLE/CODEX_EXECUTABLE) and restart the agent.";
-const max_context_bytes = 64 * 1024; // cap embedded resource text to keep prompts bounded
-const max_media_preview_bytes = 2048; // small preview for binary media captions
-const max_codex_image_bytes: usize = 8 * 1024 * 1024; // guard against massive base64 images
-const resource_line_limit: u32 = 200; // limit resource excerpt lines to reduce UI spam
-const max_tool_preview_bytes: usize = 1024; // keep tool call previews readable in the panel
+const max_context_bytes = constants.max_context_bytes;
+const max_media_preview_bytes = constants.max_media_preview_bytes;
+const max_codex_image_bytes = constants.max_codex_image_bytes;
+const resource_line_limit = constants.resource_line_limit;
+const max_tool_preview_bytes = constants.max_tool_preview_bytes;
 const default_model_id = "sonnet";
 const prompt_poll_ms: i64 = 250;
 const nudge_prompt = "work on the next dot";
@@ -173,14 +173,7 @@ fn generateSessionIdWithAllocator(allocator: Allocator) ![]const u8 {
 }
 
 fn mapToolKind(tool_name: []const u8) protocol.SessionUpdate.ToolKind {
-    const map = std.StaticStringMap(protocol.SessionUpdate.ToolKind).initComptime(.{
-        .{ "Read", .read },
-        .{ "Write", .write },
-        .{ "Edit", .edit },
-        .{ "Bash", .execute },
-        .{ "Command", .execute },
-    });
-    return map.get(tool_name) orelse .other;
+    return tool_categories.getToolKind(tool_name).toProtocol();
 }
 
 fn routeLabel(route: Route) []const u8 {

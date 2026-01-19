@@ -1,4 +1,46 @@
 const std = @import("std");
+const protocol = @import("../acp/protocol.zig");
+
+/// Unified tool kind for engine/callback layers
+pub const ToolKind = enum {
+    read,
+    edit,
+    execute,
+    browser,
+    other,
+
+    /// Convert to protocol ToolKind for ACP SessionUpdate
+    pub fn toProtocol(self: ToolKind) protocol.SessionUpdate.ToolKind {
+        return switch (self) {
+            .read => .read,
+            .edit => .edit,
+            .execute => .execute,
+            .browser => .fetch,
+            .other => .other,
+        };
+    }
+};
+
+/// Map tool name to ToolKind
+const tool_kind_map = std.StaticStringMap(ToolKind).initComptime(.{
+    .{ "Read", .read },
+    .{ "Glob", .read },
+    .{ "Grep", .read },
+    .{ "LS", .read },
+    .{ "Edit", .edit },
+    .{ "Write", .edit },
+    .{ "MultiEdit", .edit },
+    .{ "NotebookEdit", .edit },
+    .{ "Bash", .execute },
+    .{ "Command", .execute },
+    .{ "Task", .execute },
+    .{ "WebFetch", .browser },
+    .{ "WebSearch", .browser },
+});
+
+pub fn getToolKind(tool_name: []const u8) ToolKind {
+    return tool_kind_map.get(tool_name) orelse .other;
+}
 
 /// Tool category flags
 pub const ToolFlags = struct {
@@ -57,6 +99,61 @@ pub fn isQuiet(tool_name: []const u8) bool {
 }
 
 const ohsnap = @import("ohsnap");
+
+test "tool kind mapping" {
+    const summary = .{
+        .read = getToolKind("Read"),
+        .glob = getToolKind("Glob"),
+        .edit = getToolKind("Edit"),
+        .write = getToolKind("Write"),
+        .bash = getToolKind("Bash"),
+        .task = getToolKind("Task"),
+        .webfetch = getToolKind("WebFetch"),
+        .unknown = getToolKind("Unknown"),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.tool_categories.test.tool kind mapping__struct_<^\d+$>
+        \\  .read: core.tool_categories.ToolKind
+        \\    .read
+        \\  .glob: core.tool_categories.ToolKind
+        \\    .read
+        \\  .edit: core.tool_categories.ToolKind
+        \\    .edit
+        \\  .write: core.tool_categories.ToolKind
+        \\    .edit
+        \\  .bash: core.tool_categories.ToolKind
+        \\    .execute
+        \\  .task: core.tool_categories.ToolKind
+        \\    .execute
+        \\  .webfetch: core.tool_categories.ToolKind
+        \\    .browser
+        \\  .unknown: core.tool_categories.ToolKind
+        \\    .other
+    ).expectEqual(summary);
+}
+
+test "tool kind to protocol" {
+    const summary = .{
+        .read = ToolKind.read.toProtocol(),
+        .edit = ToolKind.edit.toProtocol(),
+        .execute = ToolKind.execute.toProtocol(),
+        .browser = ToolKind.browser.toProtocol(),
+        .other = ToolKind.other.toProtocol(),
+    };
+    try (ohsnap{}).snap(@src(),
+        \\core.tool_categories.test.tool kind to protocol__struct_<^\d+$>
+        \\  .read: acp.protocol.SessionUpdate.ToolKind
+        \\    .read
+        \\  .edit: acp.protocol.SessionUpdate.ToolKind
+        \\    .edit
+        \\  .execute: acp.protocol.SessionUpdate.ToolKind
+        \\    .execute
+        \\  .browser: acp.protocol.SessionUpdate.ToolKind
+        \\    .fetch
+        \\  .other: acp.protocol.SessionUpdate.ToolKind
+        \\    .other
+    ).expectEqual(summary);
+}
 
 test "tool categories" {
     const summary = .{

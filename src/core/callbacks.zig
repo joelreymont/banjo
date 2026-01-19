@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("types.zig");
+const tool_categories = @import("tool_categories.zig");
 const Engine = types.Engine;
 
 pub const ToolStatus = enum {
@@ -11,13 +12,7 @@ pub const ToolStatus = enum {
     failed,
 };
 
-pub const ToolKind = enum {
-    read,
-    edit,
-    execute,
-    browser,
-    other,
-};
+pub const ToolKind = tool_categories.ToolKind;
 
 /// Codex approval request kind
 pub const ApprovalKind = enum {
