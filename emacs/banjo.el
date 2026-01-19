@@ -398,7 +398,7 @@
                        (format "%ds" (floor (- (float-time) banjo--stream-start-time))))))
     (setq banjo--mode-line-string
           (if connected
-              (format " Banjo[%s%s %s %s%s]"
+              (format " Banjo[%s%s %s %s%s%s]"
                       engine
                       (if (string= model "") "" (concat "/" model))
                       (banjo--display-mode mode)
@@ -729,11 +729,12 @@
             (let ((end (point))
                   (prev-open banjo--code-block-open))
               (banjo--update-code-blocks text)
-              (when face
-                (add-face-text-property beg end face t))
               (banjo--apply-code-blocks beg end prev-open)
               (banjo--apply-buttons beg end)
-              (font-lock-ensure beg end)))
+              ;; font-lock first, then manual face on top
+              (font-lock-ensure beg end)
+              (when face
+                (add-face-text-property beg end face t))))
           (goto-char (point-max))))
       (banjo--scroll-windows-to-bottom scroll-wins))))
 

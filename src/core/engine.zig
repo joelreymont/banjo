@@ -6,8 +6,9 @@ const Engine = types.Engine;
 const Route = types.Route;
 const callbacks = @import("callbacks.zig");
 const EditorCallbacks = callbacks.EditorCallbacks;
-const ToolKind = callbacks.ToolKind;
 const ToolStatus = callbacks.ToolStatus;
+const tool_categories = @import("tool_categories.zig");
+const ToolKind = tool_categories.ToolKind;
 const ApprovalKind = callbacks.ApprovalKind;
 pub const StopReason = callbacks.EditorCallbacks.StopReason;
 const claude_bridge = @import("claude_bridge.zig");
@@ -84,21 +85,7 @@ pub const PromptContext = struct {
     }
 };
 
-fn mapToolKind(tool_name: []const u8) ToolKind {
-    const map = std.StaticStringMap(ToolKind).initComptime(.{
-        .{ "Read", .read },
-        .{ "Glob", .read },
-        .{ "Grep", .read },
-        .{ "LS", .read },
-        .{ "Edit", .edit },
-        .{ "Write", .edit },
-        .{ "MultiEdit", .edit },
-        .{ "NotebookEdit", .edit },
-        .{ "Bash", .execute },
-        .{ "Task", .execute },
-    });
-    return map.get(tool_name) orelse .other;
-}
+const mapToolKind = tool_categories.getToolKind;
 
 fn elapsedMs(start_ms: i64) u64 {
     const now = std.time.milliTimestamp();

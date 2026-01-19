@@ -265,6 +265,40 @@
       (should (string-match-p "Banjo\\[codex/x" banjo--mode-line-string))
       (should (string-match-p "hold" banjo--mode-line-string)))))
 
+(ert-deftest banjo-test-faces-defined ()
+  "Verify all banjo faces are defined with proper inheritance."
+  (dolist (face '(banjo-face-user
+                  banjo-face-input
+                  banjo-face-assistant
+                  banjo-face-thought
+                  banjo-face-tool
+                  banjo-face-tool-success
+                  banjo-face-tool-fail
+                  banjo-face-tool-pending
+                  banjo-face-link
+                  banjo-face-code
+                  banjo-face-code-block
+                  banjo-face-inline-code
+                  banjo-face-header
+                  banjo-face-blockquote
+                  banjo-face-list-bullet
+                  banjo-face-hr))
+    (should (facep face))))
+
+(ert-deftest banjo-test-face-applied ()
+  "Verify faces are actually applied to output text."
+  (let ((banjo--output-buffer "*banjo-test-faces*"))
+    (banjo--clear-output)
+    (banjo--append-output "tool line\n" 'banjo-face-tool)
+    (with-current-buffer (banjo--get-output-buffer)
+      (goto-char (point-min))
+      (should (eq major-mode 'banjo-mode))
+      ;; font-lock-mode may be nil in batch mode, but faces should still apply
+      (let ((face-at (get-text-property (point) 'face)))
+        (should face-at)
+        (should (or (eq face-at 'banjo-face-tool)
+                    (memq 'banjo-face-tool (if (listp face-at) face-at nil))))))))
+
 (ert-deftest banjo-test-doom-prefix-availability ()
   (let ((orig-bound (boundp 'doom-leader-map))
         (orig (and (boundp 'doom-leader-map) doom-leader-map)))
@@ -328,13 +362,22 @@
          (tmp-dir (make-temp-file "banjo-compile-" t))
          (tmp-src (expand-file-name "banjo.el" tmp-dir))
          (tmp-elc (expand-file-name "banjo.elc" tmp-dir))
-         (features (cons 'evil features)))
+         (features (cons 'evil features))
+         (byte-compile-dest-file-function
+          (lambda (_src) tmp-elc)))
     (unwind-protect
         (progn
           (should src)
           (copy-file src tmp-src t)
-          (let ((byte-compile-warnings nil))
-            (byte-compile-file tmp-src))
+          ;; Compile with warnings enabled and capture them
+          (let ((byte-compile-warnings t)
+                (warning-minimum-level :warning)
+                (warnings nil))
+            (cl-letf (((symbol-function 'byte-compile-warn)
+                       (lambda (fmt &rest args)
+                         (push (apply #'format fmt args) warnings))))
+              (should (byte-compile-file tmp-src)))
+            (should-not warnings))
           (eval '(defmacro evil-define-key (&rest _args) nil))
           (should (condition-case nil
                       (load tmp-elc nil t)

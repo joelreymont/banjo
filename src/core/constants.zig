@@ -48,3 +48,20 @@ pub const stdout_buffer_size: usize = 64 * 1024;
 
 /// Max queued bridge messages before applying backpressure/drop policy
 pub const bridge_queue_max_messages: usize = 1024;
+
+// Agent content limits
+
+/// Cap embedded resource text to keep prompts bounded
+pub const max_context_bytes: usize = 64 * 1024;
+
+/// Small preview for binary media captions
+pub const max_media_preview_bytes: usize = 2048;
+
+/// Guard against massive base64 images (Codex)
+pub const max_codex_image_bytes: usize = 8 * 1024 * 1024;
+
+/// Limit resource excerpt lines to reduce UI spam
+pub const resource_line_limit: u32 = 200;
+
+/// Keep tool call previews readable in the panel
+pub const max_tool_preview_bytes: usize = 1024;
