@@ -3,6 +3,8 @@
 (require 'ert)
 (require 'cl-lib)
 
+(setq load-prefer-newer t)
+
 (defun banjo-test--ensure-websocket ()
   (unless (require 'websocket nil t)
     (let ((candidates (list
@@ -25,6 +27,10 @@
       (accept-process-output nil 0.05)
       (setq done (funcall pred)))
     done))
+
+(defun banjo-test--flush-render ()
+  (let ((buf (banjo--get-output-buffer)))
+    (banjo--flush-render buf)))
 
 (defun banjo-test--assistant-output-p ()
   (with-current-buffer (banjo--get-output-buffer)
@@ -88,6 +94,9 @@
                    (if (string-match-p "\\`Allow " prompt)
                        (car choices)
                      (apply orig-completing-read prompt choices args))))
+                ((symbol-function 'read-char-choice)
+                 (lambda (prompt _choices)
+                   (if (string-match-p "\\`Allow " prompt) ?y ?y)))
                 ((symbol-function 'yes-or-no-p) (lambda (_prompt) t))
                 ((symbol-function 'y-or-n-p) (lambda (_prompt) t)))
         (unwind-protect
@@ -107,6 +116,7 @@
     (banjo--append-output "``")
     (banjo--append-output "`\ncode\n")
     (banjo--append-output "```\nplain\n")
+    (banjo-test--flush-render)
     (with-current-buffer (banjo--get-output-buffer)
       (goto-char (point-min))
       (search-forward "code")
@@ -121,6 +131,7 @@
         (progn
           (banjo--clear-output)
           (banjo--append-output (format "```\n%s\n```\n" tmp))
+          (banjo-test--flush-render)
           (with-current-buffer (banjo--get-output-buffer)
             (goto-char (point-min))
             (search-forward tmp)
@@ -248,9 +259,180 @@
         (should capf)
         (should (member "help" (nth 2 capf)))))))
 
+(ert-deftest banjo-test-normalize-mode-variants ()
+  (should (string= (banjo--normalize-mode "accept-edits") "acceptEdits"))
+  (should (string= (banjo--normalize-mode "accept edits") "acceptEdits"))
+  (should (string= (banjo--normalize-mode "auto-approve") "bypassPermissions"))
+  (should (string= (banjo--normalize-mode "plan-only") "plan"))
+  (should (string= (banjo--normalize-mode "default") "default")))
+
+(ert-deftest banjo-test-command-mode-sends-notification ()
+  (let ((banjo--session-id "sess-1")
+        (banjo--websocket t)
+        (sent nil))
+    (cl-letf (((symbol-function 'websocket-openp) (lambda (_) t))
+              ((symbol-function 'websocket-send-text)
+               (lambda (_ws text) (setq sent text))))
+      (banjo--command-mode "accept-edits")
+      (should sent)
+      (should (string-match-p "\"session/set_mode\"" sent))
+      (should (string-match-p "\"modeId\":\"acceptEdits\"" sent)))))
+
+(ert-deftest banjo-test-command-mode-not-connected ()
+  (let ((banjo--output-buffer "*banjo-test-output*")
+        (banjo--session-id nil)
+        (banjo--websocket nil))
+    (banjo--clear-output)
+    (banjo--command-mode "accept-edits")
+    (with-current-buffer (banjo--get-output-buffer)
+      (should (string-match-p "Not connected" (buffer-string))))))
+
+(ert-deftest banjo-test-command-model-sends-notification ()
+  (let ((banjo--output-buffer "*banjo-test-output*")
+        (banjo--session-id "sess-1")
+        (banjo--websocket t)
+        (sent nil))
+    (cl-letf (((symbol-function 'websocket-openp) (lambda (_) t))
+              ((symbol-function 'websocket-send-text)
+               (lambda (_ws text) (setq sent text))))
+      (banjo--clear-output)
+      (banjo--command-model "sonnet")
+      (should sent)
+      (should (string-match-p "\"session/set_model\"" sent))
+      (should (string-match-p "\"modelId\":\"sonnet\"" sent))
+      (with-current-buffer (banjo--get-output-buffer)
+        (should (string-match-p "Model: sonnet" (buffer-string)))))))
+
+(ert-deftest banjo-test-command-model-not-connected ()
+  (let ((banjo--output-buffer "*banjo-test-output*")
+        (banjo--session-id nil)
+        (banjo--websocket nil))
+    (banjo--clear-output)
+    (banjo--command-model "sonnet")
+    (with-current-buffer (banjo--get-output-buffer)
+      (should (string-match-p "Model: sonnet" (buffer-string))))))
+
+(ert-deftest banjo-test-command-version-known ()
+  (let ((banjo--output-buffer "*banjo-test-output*")
+        (banjo--state (list :version "1.2.3")))
+    (banjo--clear-output)
+    (banjo--command-version "")
+    (with-current-buffer (banjo--get-output-buffer)
+      (should (string-match-p "Banjo 1.2.3" (buffer-string))))))
+
+(ert-deftest banjo-test-command-version-unknown ()
+  (let ((banjo--output-buffer "*banjo-test-output*")
+        (banjo--state (list :version nil)))
+    (banjo--clear-output)
+    (banjo--command-version "")
+    (with-current-buffer (banjo--get-output-buffer)
+      (should (string-match-p "Banjo version unknown" (buffer-string))))))
+
+(ert-deftest banjo-test-command-clear ()
+  (let ((banjo--output-buffer "*banjo-test-output*"))
+    (banjo--clear-output)
+    (banjo--append-output "hello\n")
+    (banjo--command-clear "")
+    (with-current-buffer (banjo--get-output-buffer)
+      (should (string= "" (buffer-string))))))
+
+(ert-deftest banjo-test-command-new-not-connected ()
+  (let ((banjo--output-buffer "*banjo-test-output*")
+        (banjo--websocket nil))
+    (banjo--clear-output)
+    (banjo--command-new "")
+    (with-current-buffer (banjo--get-output-buffer)
+      (should (string-match-p "Not connected" (buffer-string))))))
+
+(ert-deftest banjo-test-command-new-sends-request ()
+  (let ((banjo--output-buffer "*banjo-test-output*")
+        (banjo--websocket t)
+        (banjo--session-id "sess-old")
+        (banjo--state (list :mode "default"))
+        (default-directory "/tmp/banjo-test/"))
+    (let (sent-method sent-params sent-callback)
+      (cl-letf (((symbol-function 'websocket-openp) (lambda (_) t))
+                ((symbol-function 'banjo--send-request)
+                 (lambda (method params callback)
+                   (setq sent-method method
+                         sent-params params
+                         sent-callback callback))))
+        (banjo--clear-output)
+        (banjo--command-new "")
+        (should (string= sent-method "session/new"))
+        (should (equal sent-params `((cwd . ,(expand-file-name default-directory)))))
+        (should sent-callback)
+        (funcall sent-callback
+                 '((sessionId . "sess-new")
+                   (modes . ((currentModeId . "plan"))))
+                 nil)
+        (should (string= banjo--session-id "sess-new"))
+        (should (string= (plist-get banjo--state :mode) "plan"))
+        (with-current-buffer (banjo--get-output-buffer)
+          (should (string-match-p "Starting new session" (buffer-string)))
+          (should (string-match-p "New session ready" (buffer-string))))))))
+
+(ert-deftest banjo-test-command-cancel-connected ()
+  (let ((banjo--output-buffer "*banjo-test-output*")
+        (banjo--session-id "sess-1")
+        (called nil))
+    (cl-letf (((symbol-function 'banjo-cancel)
+               (lambda () (setq called t))))
+      (banjo--clear-output)
+      (banjo--command-cancel "")
+      (should called)
+      (with-current-buffer (banjo--get-output-buffer)
+        (should (string-match-p "Cancelled" (buffer-string)))))))
+
+(ert-deftest banjo-test-command-cancel-not-connected ()
+  (let ((banjo--output-buffer "*banjo-test-output*")
+        (banjo--session-id nil))
+    (banjo--clear-output)
+    (banjo--command-cancel "")
+    (with-current-buffer (banjo--get-output-buffer)
+      (should (string-match-p "Not connected" (buffer-string))))))
+
+(ert-deftest banjo-test-command-claude-sends-notification ()
+  (let ((banjo--output-buffer "*banjo-test-output*")
+        (banjo--session-id "sess-1")
+        (banjo--websocket t)
+        (banjo--state (list :engine "codex"))
+        (sent nil))
+    (cl-letf (((symbol-function 'websocket-openp) (lambda (_) t))
+              ((symbol-function 'websocket-send-text)
+               (lambda (_ws text) (setq sent text))))
+      (banjo--clear-output)
+      (banjo--command-claude "")
+      (should sent)
+      (should (string-match-p "\"session/set_config_option\"" sent))
+      (should (string-match-p "\"configId\":\"route\"" sent))
+      (should (string-match-p "\"value\":\"claude\"" sent))
+      (should (string= (plist-get banjo--state :engine) "claude"))
+      (with-current-buffer (banjo--get-output-buffer)
+        (should (string-match-p "Agent: claude" (buffer-string)))))))
+
+(ert-deftest banjo-test-command-codex-sends-notification ()
+  (let ((banjo--output-buffer "*banjo-test-output*")
+        (banjo--session-id "sess-1")
+        (banjo--websocket t)
+        (banjo--state (list :engine "claude"))
+        (sent nil))
+    (cl-letf (((symbol-function 'websocket-openp) (lambda (_) t))
+              ((symbol-function 'websocket-send-text)
+               (lambda (_ws text) (setq sent text))))
+      (banjo--clear-output)
+      (banjo--command-codex "")
+      (should sent)
+      (should (string-match-p "\"session/set_config_option\"" sent))
+      (should (string-match-p "\"configId\":\"route\"" sent))
+      (should (string-match-p "\"value\":\"codex\"" sent))
+      (should (string= (plist-get banjo--state :engine) "codex"))
+      (with-current-buffer (banjo--get-output-buffer)
+        (should (string-match-p "Agent: codex" (buffer-string)))))))
+
 (ert-deftest banjo-test-autoscroll-toggle ()
   (let ((banjo-autoscroll t))
-    (banjo-toggle-autoscroll)
+    (banjo--toggle-autoscroll)
     (should (not banjo-autoscroll))))
 
 (ert-deftest banjo-test-code-fold ()
@@ -266,13 +448,14 @@
       (should-not (banjo--find-fold-overlay (point))))))
 
 (ert-deftest banjo-test-mode-line-status ()
-  (let ((banjo-autoscroll nil)
-        (banjo--state (list :engine "codex" :model "x" :mode "acceptEdits"))
-        (banjo--websocket 'test))
+  (let ((banjo--state (list :engine "codex" :model "x" :mode "acceptEdits"))
+        (banjo--websocket 'test)
+        (banjo--stream-start-time (- (float-time) 5)))
     (cl-letf (((symbol-function 'websocket-openp) (lambda (_ws) t)))
       (banjo--update-mode-line)
-      (should (string-match-p "Banjo\\[codex/x" banjo--mode-line-string))
-      (should (string-match-p "hold" banjo--mode-line-string)))))
+      (should (string-match-p "codex/x" banjo--mode-line-string))
+      (should (string-match-p "(accept_edits)" banjo--mode-line-string))
+      (should (string-match-p "5s" banjo--mode-line-string)))))
 
 (ert-deftest banjo-test-faces-defined ()
   "Verify all banjo faces are defined with proper inheritance."
@@ -441,7 +624,13 @@
   (let ((banjo--output-buffer "*banjo-test-output*")
         (banjo--tool-calls (make-hash-table :test 'equal)))
     (banjo--clear-output)
-    (puthash "tool-123" "Bash: ls" banjo--tool-calls)
+    ;; First simulate tool_call to set up markers
+    (banjo-test--simulate-notification
+     "session/update"
+     '((update . ((sessionUpdate . "tool_call")
+                  (toolCallId . "tool-123")
+                  (title . "Bash: ls")))))
+    ;; Then simulate tool_call_update with content
     (banjo-test--simulate-notification
      "session/update"
      '((update . ((sessionUpdate . "tool_call_update")
@@ -458,7 +647,13 @@
   (let ((banjo--output-buffer "*banjo-test-output*")
         (banjo--tool-calls (make-hash-table :test 'equal)))
     (banjo--clear-output)
-    (puthash "tool-123" "Bash: ls" banjo--tool-calls)
+    ;; First simulate tool_call to set up markers
+    (banjo-test--simulate-notification
+     "session/update"
+     '((update . ((sessionUpdate . "tool_call")
+                  (toolCallId . "tool-123")
+                  (title . "Bash: ls")))))
+    ;; Then simulate tool_call_update with content
     (banjo-test--simulate-notification
      "session/update"
      '((update . ((sessionUpdate . "tool_call_update")
@@ -469,6 +664,48 @@
       (goto-char (point-min))
       (search-forward "output")
       (should (eq (get-text-property (1- (point)) 'font-lock-face) 'banjo-face-tool-output)))))
+
+(ert-deftest banjo-test-tool-completion-updates-header ()
+  "Tool completion should update header to ✓/✗."
+  (let ((banjo--output-buffer "*banjo-test-output*")
+        (banjo--tool-calls (make-hash-table :test 'equal))
+        (errors nil))
+    (banjo--clear-output)
+    ;; Override message to catch errors
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest args)
+                 (when (string-match-p "parse error" fmt)
+                   (push (apply #'format fmt args) errors)))))
+      ;; 1. tool_call
+      (banjo-test--simulate-notification
+       "session/update"
+       '((update . ((sessionUpdate . "tool_call")
+                    (toolCallId . "tool-fold-test")
+                    (title . "Bash: echo test")))))
+      ;; 2. tool_call_update with content
+      (banjo-test--simulate-notification
+       "session/update"
+       '((update . ((sessionUpdate . "tool_call_update")
+                    (toolCallId . "tool-fold-test")
+                    (content . [((type . "content")
+                                 (content . ((type . "text") (text . "line1\nline2\nline3"))))])))))
+      ;; 3. tool_call_update with status=completed
+      (banjo-test--simulate-notification
+       "session/update"
+       '((update . ((sessionUpdate . "tool_call_update")
+                    (toolCallId . "tool-fold-test")
+                    (status . "completed"))))))
+    ;; Fail if any parse errors occurred
+    (should-not errors)
+    ;; Verify header updated to completed
+    (with-current-buffer (banjo--get-output-buffer)
+      (goto-char (point-min))
+      (should (search-forward "○ Bash: echo test → ✓" nil t))
+      ;; Fold overlay created and invisible
+      (let ((ov (car (seq-filter (lambda (o) (overlay-get o 'banjo-tool-fold))
+                                 (overlays-in (point-min) (point-max))))))
+        (should ov)
+        (should (overlay-get ov 'invisible))))))
 
 ;; Agent message coloring tests
 
@@ -540,8 +777,8 @@
     (cl-letf (((symbol-function 'websocket-openp) (lambda (_) t))
               ((symbol-function 'websocket-send-text)
                (lambda (_ws text) (setq sent-response text)))
-              ((symbol-function 'completing-read)
-               (lambda (_prompt choices &rest _) (car choices)))
+              ((symbol-function 'read-char-choice)
+               (lambda (_prompt _choices) ?y))
               ((symbol-function 'raise-frame) #'ignore))
       (banjo--clear-output)
       (banjo-test--simulate-request
@@ -579,6 +816,50 @@
     (should-not banjo--streaming)
     (should-not banjo--websocket)
     (should-not banjo--session-id)))
+
+;; History navigation edge case tests
+
+(ert-deftest banjo-test-history-empty ()
+  "History navigation with empty history should not error."
+  (let ((banjo-history-dir (make-temp-file "banjo-hist-" t))
+        (banjo--history nil)
+        (banjo--history-index 0)
+        (banjo--history-temp nil)
+        (banjo--history-key nil)
+        (banjo--input-buffer "*banjo-test-input*"))
+    (unwind-protect
+        (with-current-buffer (banjo--get-input-buffer)
+          (erase-buffer)
+          (insert "current")
+          ;; With empty history, should signal user-error
+          (should (condition-case nil
+                      (progn (banjo-history-prev) nil)
+                    (user-error t)))
+          ;; Should preserve current text
+          (should (string= (buffer-string) "current")))
+      (delete-directory banjo-history-dir t))))
+
+(ert-deftest banjo-test-history-boundary ()
+  "History navigation at boundaries should stop gracefully."
+  (let ((banjo-history-dir (make-temp-file "banjo-hist-" t))
+        (banjo--history nil)
+        (banjo--history-index 0)
+        (banjo--history-temp nil)
+        (banjo--history-key nil)
+        (banjo--input-buffer "*banjo-test-input*"))
+    (unwind-protect
+        (progn
+          (banjo--history-ensure default-directory)
+          (banjo--history-add "first")
+          (with-current-buffer (banjo--get-input-buffer)
+            (erase-buffer)
+            (banjo-history-prev)
+            (should (string= (buffer-string) "first"))
+            ;; Going prev again should signal user-error (oldest entry)
+            (should (condition-case nil
+                        (progn (banjo-history-prev) nil)
+                      (user-error t)))))
+      (delete-directory banjo-history-dir t))))
 
 
 (provide 'banjo-test)

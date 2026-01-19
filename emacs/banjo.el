@@ -47,9 +47,9 @@
   :type 'integer
   :group 'banjo)
 
-(defcustom banjo-input-hints "RET send, C-j newline, / commands"
-  "Hints shown in the Banjo input header line."
-  :type 'string
+(defcustom banjo-render-idle-delay 0.05
+  "Delay in seconds before rendering new output."
+  :type 'number
   :group 'banjo)
 
 (defcustom banjo-history-max 100
@@ -70,6 +70,21 @@
 (defcustom banjo-enable-links t
   "Whether to detect and activate file/URL links in output."
   :type 'boolean
+  :group 'banjo)
+
+(defcustom banjo-tool-call-max nil
+  "Maximum number of tool calls to retain, or nil for unlimited."
+  :type '(choice (const nil) integer)
+  :group 'banjo)
+
+(defcustom banjo-link-check-exists t
+  "Whether to check file existence before creating file links."
+  :type 'boolean
+  :group 'banjo)
+
+(defcustom banjo-link-cache-ttl nil
+  "Seconds to cache file-exists results, or nil for no expiry."
+  :type '(choice (const nil) number)
   :group 'banjo)
 
 (defcustom banjo-doom-leader-prefix "a"
@@ -115,6 +130,19 @@
                          (let ((r (format "%S" result)))
                            (if (> (length r) 200) (substring r 0 200) r))))
      (err (banjo--log "<<< error id=%s %S" id err)))))
+
+;; Forward declarations (defined later, used by banjo-dump-state)
+(defvar banjo--websocket)
+(defvar banjo--session-id)
+(defvar banjo--streaming)
+(defvar banjo--stream-start-time)
+(defvar banjo--state)
+(defvar banjo--pending-requests)
+(defvar banjo--tool-calls)
+(defvar banjo--process)
+(defvar banjo--port)
+(defvar banjo--command-table)
+(defvar banjo-input-mode-map)
 
 (defun banjo-dump-state ()
   "Dump current banjo state to log file for debugging."
@@ -173,6 +201,11 @@
   "Face for pending tool calls."
   :group 'banjo)
 
+(defface banjo-face-timer
+  '((t :inherit warning :weight bold))
+  "Face for streaming timer in mode line."
+  :group 'banjo)
+
 (defface banjo-face-tool-output
   '((t :inherit font-lock-string-face))
   "Face for tool output content."
@@ -229,10 +262,9 @@
     ("^\\s-*\\([0-9]+\\.\\)\\s-+" (1 'banjo-face-list-bullet))
     ("^\\s-*\\([-*+]\\)\\s-+" (1 'banjo-face-list-bullet))
     ("^\\s-*[-_*]\\{3,\\}\\s-*$" . 'banjo-face-hr)
-    ("^\\s-*\\([.vx>]\\)\\s-+.*$" . 'banjo-face-tool)
-    ("^\\s-*\\(v\\)\\s-+" (1 'banjo-face-tool-success))
-    ("^\\s-*\\(x\\)\\s-+" (1 'banjo-face-tool-fail))
-    ("^\\s-*\\([.>]\\)\\s-+" (1 'banjo-face-tool-pending))
+    ("^\\s-*○\\s-+.*→\\s-*\\(✓\\)\\s-*$" (1 'banjo-face-tool-success))
+    ("^\\s-*○\\s-+.*→\\s-*\\(✗\\)\\s-*$" (1 'banjo-face-tool-fail))
+    ("^\\s-*○\\s-+.*$" . 'banjo-face-tool)
     ("\\*\\*[^*\n]+\\*\\*" . 'bold)))
 
 ;; Link detection
@@ -249,14 +281,17 @@
 (defconst banjo--file-path-regexp
   "\\b\\([~./][[:alnum:]_./~+-]+\\|[[:alnum:]_./~+-]+/[[:alnum:]_./~+-]+\\)\\b")
 
-(defconst banjo--code-line-buffer-max 2048
-  "Maximum buffered characters for incremental fence detection.")
-
 (defvar-local banjo--code-block-open nil
   "Non-nil when inside a fenced code block.")
 
-(defvar-local banjo--code-line-buffer ""
-  "Accumulated partial line for fenced code parsing.")
+(defvar-local banjo--render-pos nil
+  "Last rendered position in the output buffer.")
+
+(defvar-local banjo--render-timer nil
+  "Idle timer for deferred rendering.")
+
+(defvar-local banjo--path-exists-cache (make-hash-table :test 'equal)
+  "Cache of file existence checks.")
 
 (defun banjo--resolve-path (path)
   "Resolve PATH against the current buffer default directory."
@@ -284,6 +319,29 @@
    'face 'banjo-face-link
    'banjo-link t))
 
+(defun banjo--file-exists-cached (path)
+  "Return cached file existence for PATH."
+  (let* ((cache banjo--path-exists-cache)
+         (entry (gethash path cache)))
+    (if entry
+        (let ((ts (car entry))
+              (val (cdr entry)))
+          (if (and banjo-link-cache-ttl ts
+                   (> (- (float-time) ts) banjo-link-cache-ttl))
+              (progn
+                (remhash path cache)
+                (banjo--file-exists-cached path))
+            val))
+      (let ((val (file-exists-p path)))
+        (puthash path (cons (float-time) val) cache)
+        val))))
+
+(defun banjo--check-exists-p (path)
+  "Return non-nil if PATH should be checked for existence."
+  (and banjo-link-check-exists
+       (not (file-remote-p default-directory))
+       (not (file-remote-p path))))
+
 (defun banjo--apply-buttons (beg end)
   "Create link buttons in region BEG..END."
   (when banjo-enable-links
@@ -308,7 +366,8 @@
                  (b (match-beginning 1))
                  (e (match-end 0))
                  (abs (banjo--resolve-path path)))
-            (when (and (file-exists-p abs)
+            (when (and (or (not (banjo--check-exists-p abs))
+                           (banjo--file-exists-cached abs))
                        (not (get-text-property b 'banjo-link))
                        (not (get-text-property b 'banjo-code-block)))
               (banjo--make-link-button
@@ -324,7 +383,8 @@
                  (b (match-beginning 1))
                  (e (match-end 0))
                  (abs (banjo--resolve-path path)))
-            (when (and (file-exists-p abs)
+            (when (and (or (not (banjo--check-exists-p abs))
+                           (banjo--file-exists-cached abs))
                        (not (get-text-property b 'banjo-link))
                        (not (get-text-property b 'banjo-code-block)))
               (banjo--make-link-button
@@ -338,7 +398,8 @@
                  (b (match-beginning 1))
                  (e (match-end 1))
                  (abs (banjo--resolve-path path)))
-            (when (and (file-exists-p abs)
+            (when (and (or (not (banjo--check-exists-p abs))
+                           (banjo--file-exists-cached abs))
                        (not (get-text-property b 'banjo-link))
                        (not (get-text-property b 'banjo-code-block)))
               (banjo--make-link-button
@@ -347,7 +408,8 @@
                (format "Open %s" path)))))))))
 
 (defun banjo--apply-code-blocks (beg end start-open)
-  "Apply code block faces between BEG and END."
+  "Apply code block faces between BEG and END.
+Return final open state."
   (let ((open start-open))
     (save-excursion
       (goto-char beg)
@@ -364,24 +426,43 @@
             (when open
               (add-face-text-property line-beg line-end 'banjo-face-code-block t)
               (add-text-properties line-beg line-end '(banjo-code-block t)))))
-        (forward-line 1)))))
+        (forward-line 1)))
+    open))
 
-(defun banjo--update-code-blocks (text)
-  "Update code block state from streamed TEXT."
-  (let* ((data (concat banjo--code-line-buffer text)))
-    (when (> (length data) banjo--code-line-buffer-max)
-      (if (string-match-p "\n" data)
-          (setq data (substring data (- (length data) banjo--code-line-buffer-max)))
-        (setq data (substring data 0 banjo--code-line-buffer-max))))
-    (let* ((parts (split-string data "\n"))
-           (line-count (length parts))
-           (i 0))
-      (while (< i (1- line-count))
-        (let ((line (nth i parts)))
-          (when (string-match-p "^\\s-*```" line)
-            (setq banjo--code-block-open (not banjo--code-block-open))))
-        (setq i (1+ i)))
-      (setq banjo--code-line-buffer (nth (1- line-count) parts)))))
+(defun banjo--cancel-render-timer ()
+  "Cancel deferred render timer for current buffer."
+  (when banjo--render-timer
+    (cancel-timer banjo--render-timer)
+    (setq banjo--render-timer nil)))
+
+(defun banjo--flush-render (buf)
+  "Apply deferred rendering for BUF."
+  (when (buffer-live-p buf)
+    (with-current-buffer buf
+      (setq banjo--render-timer nil)
+      (let ((beg (or banjo--render-pos (point-min)))
+            (end (point-max)))
+        (when (< beg end)
+          (let ((inhibit-read-only t))
+            (let ((open (banjo--apply-code-blocks beg end banjo--code-block-open)))
+              (setq banjo--code-block-open open))
+            (banjo--apply-buttons beg end)
+            (font-lock-ensure beg end)
+            (setq banjo--render-pos end)))))))
+
+(defun banjo--queue-render ()
+  "Queue deferred rendering for the output buffer."
+  (let ((buf (banjo--get-output-buffer)))
+    (with-current-buffer buf
+      (unless banjo--render-pos
+        (setq banjo--render-pos (point-min)))
+      (unless banjo--render-timer
+        (setq banjo--render-timer
+              (if banjo--streaming
+                  (run-with-timer banjo-render-idle-delay nil
+                                  #'banjo--flush-render buf)
+                (run-with-idle-timer banjo-render-idle-delay nil
+                                     #'banjo--flush-render buf)))))))
 
 ;; State
 
@@ -394,7 +475,10 @@
 (defvar banjo--state '(:engine nil :model nil :mode nil)
   "Current state (engine, model, mode).")
 (defvar banjo--streaming nil "Whether we're currently streaming output.")
-(defvar banjo--tool-calls (make-hash-table :test 'equal) "Active tool calls.")
+(defvar banjo--tool-calls (make-hash-table :test 'equal)
+  "Active tool calls. Maps tool-id to plist with markers and status.")
+(defvar banjo--tool-call-order nil
+  "Tool call IDs in creation order (oldest first).")
 (defvar banjo--process-output ""
   "Accumulated output from the Banjo daemon process.")
 (defvar banjo--last-cwd nil "Last working directory for input/history.")
@@ -404,9 +488,6 @@
 (defvar banjo--output-buffer "*banjo*" "Output buffer name.")
 (defvar banjo--input-buffer "*banjo-input*" "Input buffer name.")
 
-(defvar banjo--source-checked nil
-  "Non-nil when banjo source refresh check has run.")
-
 (defun banjo--ensure-buffer-vars ()
   "Ensure internal buffer name variables are initialized."
   (unless (boundp 'banjo--output-buffer)
@@ -414,34 +495,7 @@
   (unless (boundp 'banjo--input-buffer)
     (setq banjo--input-buffer "*banjo-input*"))
   (unless (boundp 'banjo-input-mode-map)
-    (setq banjo-input-mode-map (make-sparse-keymap))
-    (define-key banjo-input-mode-map (kbd "RET") #'banjo-input-send)
-    (define-key banjo-input-mode-map (kbd "C-c C-c") #'banjo-input-send)
-    (define-key banjo-input-mode-map (kbd "C-c C-k") #'banjo-cancel)
-    (define-key banjo-input-mode-map (kbd "C-j") #'newline)
-    (define-key banjo-input-mode-map (kbd "M-p") #'banjo-history-prev)
-    (define-key banjo-input-mode-map (kbd "M-n") #'banjo-history-next)
-    (define-key banjo-input-mode-map (kbd "<up>") #'banjo-history-prev)
-    (define-key banjo-input-mode-map (kbd "<down>") #'banjo-history-next)
-    (define-key banjo-input-mode-map (kbd "TAB") #'completion-at-point)))
-
-(defun banjo--refresh-elc-if-needed ()
-  "Reload and recompile when source is newer than the loaded .elc."
-  (unless banjo--source-checked
-    (setq banjo--source-checked t)
-    (let* ((loaded (or load-file-name (buffer-file-name)))
-           (elc (and loaded (string-match-p "\\.elc\\'" loaded) loaded))
-           (el (and elc (concat (file-name-sans-extension elc) ".el"))))
-      (when (and el (file-exists-p el) (file-newer-than-file-p el elc))
-        (condition-case err
-            (progn
-              (load el nil t)
-              (byte-compile-file el)
-              (message "Banjo: refreshed byte-compiled file"))
-          (error
-           (message "Banjo: failed to refresh byte-compiled file: %s" err)))))))
-
-(banjo--refresh-elc-if-needed)
+    (setq banjo-input-mode-map (banjo--make-input-keymap))))
 
 ;; Mode line
 
@@ -454,19 +508,17 @@
          (model (or (plist-get banjo--state :model) ""))
          (mode (or (plist-get banjo--state :mode) "default"))
          (connected (and banjo--websocket (websocket-openp banjo--websocket)))
-         (scroll (if banjo-autoscroll "auto" "hold"))
          (elapsed (and banjo--stream-start-time
-                       (format "%ds" (floor (- (float-time) banjo--stream-start-time))))))
+                       (floor (- (float-time) banjo--stream-start-time)))))
     (setq banjo--mode-line-string
           (if connected
-              (format " Banjo[%s%s %s %s%s%s]"
-                      engine
-                      (if (string= model "") "" (concat "/" model))
-                      (banjo--display-mode mode)
-                      scroll
-                      (if elapsed " " "")
-                      (or elapsed ""))
-            " Banjo[disconnected]"))
+              (concat
+               (format " [%s%s (%s)]"
+                       engine
+                       (if (string= model "") "" (concat "/" model))
+                       (banjo--display-mode mode))
+               (if elapsed (format " %ds" elapsed) ""))
+            " [disconnected]"))
     (force-mode-line-update t)))
 
 (defvar banjo--stream-start-time nil
@@ -587,10 +639,6 @@
         (banjo--set-input-text banjo--history-temp)
       (banjo--set-input-text (nth (1- banjo--history-index) banjo--history)))))
 
-(defun banjo--input-header ()
-  "Build the input header line."
-  "RET send, / cmds")
-
 (defun banjo--display-mode (mode)
   "Return user-facing MODE name."
   (cond
@@ -601,16 +649,26 @@
 
 ;; Output buffer
 
+(defvar banjo-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map "z" #'banjo-toggle-fold)
+    (define-key map (kbd "TAB") #'banjo-toggle-fold)
+    map)
+  "Keymap for `banjo-mode'.")
+
 (define-derived-mode banjo-mode special-mode "Banjo"
   "Major mode for Banjo output."
+  :keymap banjo-mode-map
   (setq-local buffer-read-only t)
   (setq-local mode-line-format '(:eval banjo--mode-line-string))
   (setq-local truncate-lines nil)
   (setq-local word-wrap t)
   (setq-local banjo--code-block-open nil)
-  (setq-local banjo--code-line-buffer "")
+  (setq-local banjo--render-pos nil)
+  (setq-local banjo--path-exists-cache (make-hash-table :test 'equal))
   (setq-local font-lock-defaults '(banjo--font-lock-keywords))
   (setq-local font-lock-multiline t)
+  (add-to-invisibility-spec '(banjo-fold . t))
   (font-lock-mode 1))
 
 (defun banjo-input-maybe-complete ()
@@ -621,7 +679,8 @@
                                (line-beginning-position) (point)))
     (completion-at-point)))
 
-(defvar banjo-input-mode-map
+(defun banjo--make-input-keymap ()
+  "Create keymap for `banjo-input-mode'."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "RET") #'banjo-input-send)
     (define-key map (kbd "C-c C-c") #'banjo-input-send)
@@ -633,12 +692,14 @@
     (define-key map (kbd "<down>") #'banjo-history-next)
     (define-key map (kbd "TAB") #'completion-at-point)
     (define-key map (kbd "/") #'banjo-input-maybe-complete)
-    map)
+    map))
+
+(defvar banjo-input-mode-map
+  (banjo--make-input-keymap)
   "Keymap for Banjo input.")
 
 (define-derived-mode banjo-input-mode text-mode "BanjoInput"
   "Major mode for Banjo input."
-  (setq-local header-line-format '(:eval (banjo--input-header)))
   (banjo--disable-line-numbers)
   (banjo--apply-input-style)
   (setq-local completion-at-point-functions '(banjo--completion-at-point))
@@ -648,7 +709,6 @@
 (define-key banjo-mode-map (kbd "i") #'banjo-focus-input)
 (define-key banjo-mode-map (kbd "RET") #'banjo-focus-input)
 (define-key banjo-mode-map (kbd "/") #'banjo-input-slash)
-(define-key banjo-mode-map (kbd "z") #'banjo-toggle-code-fold)
 
 (defun banjo--maybe-evil-insert ()
   (when (fboundp 'evil-insert-state)
@@ -739,8 +799,149 @@
           (user-error "No code block at point"))
         (let ((fold (make-overlay (car range) (cdr range))))
           (overlay-put fold 'banjo-fold t)
-          (overlay-put fold 'invisible t)
+          (overlay-put fold 'invisible 'banjo-fold)
           (overlay-put fold 'isearch-open-invisible #'delete-overlay))))))
+
+(defun banjo-toggle-fold ()
+  "Toggle fold for code block or tool section at point."
+  (interactive)
+  (save-excursion
+    (beginning-of-line)
+    (cond
+     ;; Tool section header
+     ((banjo--tool-section-at-point)
+      (banjo-toggle-tool-fold))
+     ;; Inside tool output - find overlay and toggle
+     ((banjo--find-tool-overlay (point))
+      (banjo-toggle-tool-fold))
+     ;; Code block
+     ((banjo--code-block-range)
+      (banjo-toggle-code-fold))
+     ;; Existing code fold overlay
+     ((banjo--find-fold-overlay (point))
+      (banjo-toggle-code-fold))
+     (t
+      (user-error "No foldable content at point")))))
+
+;; Tool output folding
+
+(defun banjo--find-tool-overlay (pos)
+  "Find tool fold overlay at POS."
+  (let ((found nil))
+    (dolist (ov (overlays-at pos) found)
+      (when (overlay-get ov 'banjo-tool-fold)
+        (setq found ov)))))
+
+(defun banjo--tool-section-at-point ()
+  "Find tool section at point. Returns (header-start . tool-id) or nil."
+  (save-excursion
+    (beginning-of-line)
+    (when (looking-at "^○ ")
+      (let ((header-start (point)))
+        (catch 'found
+          (maphash (lambda (id info)
+                     (let ((marker (plist-get info :header-marker)))
+                       (when (and marker
+                                  (marker-buffer marker)
+                                  (= (marker-position marker) header-start))
+                         (throw 'found (cons header-start id)))))
+                   banjo--tool-calls)
+          nil)))))
+
+(defun banjo--tool-header-text (title status)
+  "Build tool header line from TITLE and STATUS."
+  (cond
+   ((and status (string= status "completed"))
+    (format "○ %s → ✓" title))
+   ((and status (string= status "failed"))
+    (format "○ %s → ✗" title))
+   (t
+    (format "○ %s" title))))
+
+(defun banjo--update-tool-header (tool-id)
+  "Update tool header line for TOOL-ID."
+  (let* ((info (gethash tool-id banjo--tool-calls))
+         (header-marker (plist-get info :header-marker))
+         (title (plist-get info :title))
+         (status (plist-get info :status)))
+    (when (and header-marker (marker-buffer header-marker))
+      (with-current-buffer (marker-buffer header-marker)
+        (let ((pos (marker-position header-marker)))
+          (when (<= pos (point-max))
+            (let ((inhibit-read-only t))
+              (save-excursion
+                (goto-char pos)
+                (let ((line-end (line-end-position)))
+                  (delete-region (point) line-end)
+                  (insert (banjo--tool-header-text title status)))))))))))
+
+(defun banjo--create-tool-fold (tool-id &optional hidden)
+  "Create fold overlay for TOOL-ID output."
+  (let* ((info (gethash tool-id banjo--tool-calls))
+         (header-marker (plist-get info :header-marker))
+         (output-marker (plist-get info :output-marker)))
+    (when (and header-marker output-marker
+               (marker-buffer header-marker)
+               (marker-buffer output-marker)
+               (eq (marker-buffer header-marker) (marker-buffer output-marker)))
+      (with-current-buffer (marker-buffer output-marker)
+        (when-let ((existing (banjo--find-tool-overlay-by-id tool-id)))
+          (delete-overlay existing))
+        (let ((header-pos (marker-position header-marker))
+              (output-pos (marker-position output-marker)))
+          ;; Validate positions are within buffer
+          (when (and (<= header-pos (point-max))
+                     (<= output-pos (point-max)))
+            ;; Output starts after header line, ends at output-marker
+            (let* ((output-start (save-excursion
+                                   (goto-char header-pos)
+                                   (forward-line 1)
+                                   (point)))
+                   (output-end output-pos))
+              (when (< output-start output-end)
+                (let ((fold (make-overlay output-start output-end)))
+                  (overlay-put fold 'banjo-tool-fold t)
+                  (overlay-put fold 'banjo-tool-id tool-id)
+                  (overlay-put fold 'evaporate t)
+                  (overlay-put fold 'rear-advance t)
+                  (overlay-put fold 'isearch-open-invisible #'delete-overlay)
+                  (when hidden
+                    (overlay-put fold 'invisible 'banjo-fold))
+                  fold)))))))))
+
+(defun banjo-toggle-tool-fold ()
+  "Toggle fold for tool output at point."
+  (interactive)
+  (let ((ov (banjo--find-tool-overlay (point))))
+    (if ov
+        ;; Toggle existing overlay
+        (let ((currently-hidden (overlay-get ov 'invisible)))
+          (if currently-hidden
+              (overlay-put ov 'invisible nil)
+            (overlay-put ov 'invisible 'banjo-fold)))
+      (let ((section (banjo--tool-section-at-point)))
+        (when section
+          (let* ((tool-id (cdr section))
+                 (existing-ov (banjo--find-tool-overlay-by-id tool-id)))
+            (if existing-ov
+                (banjo-toggle-tool-fold-overlay existing-ov)
+              (banjo--create-tool-fold tool-id t))))))))
+
+(defun banjo--find-tool-overlay-by-id (tool-id)
+  "Find tool fold overlay by TOOL-ID."
+  (with-current-buffer (banjo--get-output-buffer)
+    (let ((found nil))
+      (dolist (ov (overlays-in (point-min) (point-max)) found)
+        (when (and (overlay-get ov 'banjo-tool-fold)
+                   (string= (overlay-get ov 'banjo-tool-id) tool-id))
+          (setq found ov))))))
+
+(defun banjo-toggle-tool-fold-overlay (ov)
+  "Toggle visibility of tool fold overlay OV."
+  (let ((currently-hidden (overlay-get ov 'invisible)))
+    (if currently-hidden
+        (overlay-put ov 'invisible nil)
+      (overlay-put ov 'invisible 'banjo-fold))))
 
 (defun banjo--get-output-buffer ()
   "Get or create the output buffer."
@@ -765,15 +966,36 @@
       (banjo--history-ensure default-directory))
     buf))
 
+(defvar banjo--scroll-win-cache nil
+  "Cached windows displaying the output buffer.")
+
+(defvar banjo--scroll-win-cache-dirty t
+  "Non-nil when scroll window cache needs refresh.")
+
+(defvar banjo--scroll-win-cache-buf nil
+  "Buffer associated with `banjo--scroll-win-cache'.")
+
+(defun banjo--mark-scroll-win-cache-dirty (&rest _)
+  (setq banjo--scroll-win-cache-dirty t))
+
+(add-hook 'window-configuration-change-hook #'banjo--mark-scroll-win-cache-dirty)
+(add-hook 'window-size-change-functions #'banjo--mark-scroll-win-cache-dirty)
+
 (defun banjo--window-at-bottom-p (win)
   (with-selected-window win
     (>= (window-end win t) (point-max))))
 
 (defun banjo--collect-scroll-windows (buf)
   (when banjo-autoscroll
-    (let (wins)
-      (dolist (win (get-buffer-window-list buf nil t) wins)
-        (when (banjo--window-at-bottom-p win)
+    (let ((wins nil))
+      (when (or banjo--scroll-win-cache-dirty
+                (not (eq banjo--scroll-win-cache-buf buf)))
+        (setq banjo--scroll-win-cache (get-buffer-window-list buf nil t))
+        (setq banjo--scroll-win-cache-buf buf)
+        (setq banjo--scroll-win-cache-dirty nil))
+      (dolist (win banjo--scroll-win-cache wins)
+        (when (and (window-live-p win)
+                   (banjo--window-at-bottom-p win))
           (push win wins))))))
 
 (defun banjo--scroll-windows-to-bottom (wins)
@@ -783,9 +1005,8 @@
         (goto-char (point-max))
         (recenter -1)))))
 
-(defun banjo-toggle-autoscroll ()
+(defun banjo--toggle-autoscroll ()
   "Toggle autoscroll in the output buffer."
-  (interactive)
   (setq banjo-autoscroll (not banjo-autoscroll))
   (banjo--update-mode-line)
   (message "Banjo autoscroll: %s" (if banjo-autoscroll "on" "off")))
@@ -799,15 +1020,10 @@
           (goto-char (point-max))
           (let ((beg (point)))
             (insert text)
-            (let ((end (point))
-                  (prev-open banjo--code-block-open))
-              (banjo--update-code-blocks text)
-              (banjo--apply-code-blocks beg end prev-open)
-              (banjo--apply-buttons beg end)
-              ;; Apply markdown font-lock, then our face via font-lock-face property
-              (font-lock-ensure beg end)
+            (let ((end (point)))
               (when face
-                (put-text-property beg end 'font-lock-face face))))
+                (put-text-property beg end 'font-lock-face face))
+              (banjo--queue-render)))
           (goto-char (point-max))))
       (banjo--scroll-windows-to-bottom scroll-wins))))
 
@@ -822,12 +1038,8 @@
             (unless (bolp)
               (insert "\n"))
             (insert "\n"))
-          (let ((beg (point)))
-            (insert text)
-            (let ((end (point)))
-              (banjo--apply-buttons beg end)
-              (font-lock-ensure beg end)
-              (put-text-property beg end 'font-lock-face 'banjo-face-user)))
+          (insert text)
+          (banjo--queue-render)
           (unless (bolp)
             (insert "\n"))
           (insert "\n")))
@@ -848,14 +1060,71 @@
           (unless (bolp) (insert "\n"))
           (insert "\n"))))))
 
+(defun banjo--cleanup-tool-calls ()
+  "Free all markers in tool-calls hash table."
+  (maphash (lambda (_id info)
+             (let ((header-marker (plist-get info :header-marker))
+                   (output-marker (plist-get info :output-marker)))
+               (when header-marker (set-marker header-marker nil))
+               (when output-marker (set-marker output-marker nil))))
+           banjo--tool-calls)
+  (clrhash banjo--tool-calls)
+  (setq banjo--tool-call-order nil))
+
+(defun banjo--drop-tool-call (tool-id info)
+  "Remove TOOL-ID from tracking and free markers."
+  (let ((header-marker (plist-get info :header-marker))
+        (output-marker (plist-get info :output-marker)))
+    (when header-marker (set-marker header-marker nil))
+    (when output-marker (set-marker output-marker nil)))
+  (remhash tool-id banjo--tool-calls))
+
+(defun banjo--maybe-prune-tool-calls ()
+  "Prune completed tool calls if above `banjo-tool-call-max`."
+  (when (and banjo-tool-call-max
+             (> (hash-table-count banjo--tool-calls) banjo-tool-call-max))
+    (let ((max banjo-tool-call-max)
+          (count (hash-table-count banjo--tool-calls))
+          (pruned t))
+      (while (and (> count max) pruned)
+        (setq pruned nil)
+        (let ((prev nil)
+              (cur banjo--tool-call-order))
+          (while cur
+            (let* ((tool-id (car cur))
+                   (info (gethash tool-id banjo--tool-calls))
+                   (status (and info (plist-get info :status))))
+              (cond
+               ((null info)
+                (if prev
+                    (setcdr prev (cdr cur))
+                  (setq banjo--tool-call-order (cdr cur)))
+                (setq cur (if prev (cdr prev) banjo--tool-call-order)))
+               ((or (string= status "completed")
+                    (string= status "failed"))
+                (banjo--drop-tool-call tool-id info)
+                (setq count (1- count))
+                (if prev
+                    (setcdr prev (cdr cur))
+                  (setq banjo--tool-call-order (cdr cur)))
+                (setq pruned t)
+                (setq cur nil))
+               (t
+                (setq prev cur)
+                (setq cur (cdr cur)))))))))))
+
 (defun banjo--clear-output ()
   "Clear the output buffer."
+  (banjo--cleanup-tool-calls)
   (let ((buf (banjo--get-output-buffer)))
     (with-current-buffer buf
       (let ((inhibit-read-only t))
         (setq banjo--code-block-open nil)
-        (setq banjo--code-line-buffer "")
+        (setq banjo--render-pos nil)
+        (clrhash banjo--path-exists-cache)
+        (banjo--cancel-render-timer)
         (remove-overlays (point-min) (point-max) 'banjo-fold t)
+        (remove-overlays (point-min) (point-max) 'banjo-tool-fold t)
         (erase-buffer)))))
 
 ;; Panel
@@ -966,15 +1235,20 @@ Include ID when provided."
   "Handle incoming WebSocket FRAME."
   (condition-case parse-err
       (let* ((payload (websocket-frame-text frame))
+             (json-object-type 'alist)
+             (json-array-type 'vector)
+             (json-key-type 'symbol)
              (msg (json-read-from-string payload))
              (id (alist-get 'id msg))
              (method (alist-get 'method msg))
-             (result (alist-get 'result msg))
-             (err (alist-get 'error msg)))
+             (has-result (assoc 'result msg))
+             (has-error (assoc 'error msg))
+             (result (cdr has-result))
+             (err (cdr has-error)))
         (banjo--log-recv msg)
         (cond
-         ;; Response to our request
-         ((or result err)
+         ;; Response to our request (check key presence, not truthiness)
+         ((or has-result has-error)
           (let ((callback (gethash id banjo--pending-requests)))
             (when callback
               (remhash id banjo--pending-requests)
@@ -1021,6 +1295,18 @@ Include ID when provided."
         (push (cons label opt) choices)))
     (nreverse choices)))
 
+(defun banjo--find-permission-option (options kinds)
+  "Return first option whose kind or optionId is in KINDS."
+  (seq-find
+   (lambda (opt)
+     (let* ((kind (alist-get 'kind opt))
+            (opt-id (alist-get 'optionId opt))
+            (kind-str (and kind (if (symbolp kind) (symbol-name kind) kind)))
+            (id-str (and opt-id (if (symbolp opt-id) (symbol-name opt-id) opt-id))))
+       (or (and kind-str (member kind-str kinds))
+           (and id-str (member id-str kinds)))))
+   options))
+
 (defun banjo--permission-outcome (option-id)
   "Build response outcome for OPTION-ID."
   (if option-id
@@ -1032,16 +1318,25 @@ Include ID when provided."
   (let* ((tool-call (alist-get 'toolCall params))
          (title (or (alist-get 'title tool-call) "Unknown tool"))
          (options (or (alist-get 'options params) banjo--default-permission-options))
-         (choices (banjo--permission-option-choices options))
-         (prompt (format "Allow %s? " title)))
+         (prompt (format "Allow %s? (y=yes, a=always, n=no): " title)))
     ;; Show in output buffer
-    (banjo--append-output (format "\n[?] %s" title) 'banjo-face-tool-pending)
+    (banjo--append-output (format "\n[?] %s\n" title) 'banjo-face-tool-pending)
     ;; Focus Emacs frame and prompt
     (raise-frame)
-    (let* ((choice (completing-read prompt (mapcar #'car choices) nil t))
-           (option (cdr (assoc choice choices)))
-           (option-id (or (alist-get 'optionId option) (alist-get 'id option))))
-      (banjo--send-response id (banjo--permission-outcome option-id)))))
+    (condition-case nil
+        (let* ((key (read-char-choice prompt '(?y ?a ?n)))
+               (opt (pcase key
+                      (?y (banjo--find-permission-option options '("allow_once")))
+                      (?a (or (banjo--find-permission-option options '("allow_always"))
+                              (banjo--find-permission-option options '("allow_once"))))
+                      (?n (or (banjo--find-permission-option options '("reject_once"))
+                              (banjo--find-permission-option options '("reject_always"))))))
+               (option-id (and opt (or (alist-get 'optionId opt) (alist-get 'id opt)))))
+          (banjo--send-response id (banjo--permission-outcome option-id)))
+      (quit
+       ;; User cancelled - send explicit cancelled outcome
+       (banjo--send-response id (banjo--permission-outcome nil))
+       (banjo--append-output "[cancelled]\n" 'banjo-face-tool)))))
 
 (defun banjo--handle-notification (msg)
   "Handle a JSON-RPC notification MSG."
@@ -1052,7 +1347,8 @@ Include ID when provided."
       (banjo--handle-session-update params))
      ((string= method "session/end")
       (banjo--stop-streaming)
-      (banjo--append-output "\n\n" 'shadow)))))
+      (banjo--append-output "\n\n" 'shadow))))
+)
 
 (defun banjo--handle-session-update (params)
   "Handle session/update notification with PARAMS."
@@ -1079,38 +1375,68 @@ Include ID when provided."
      ((string= update-type "tool_call")
       (let ((tool-id (alist-get 'toolCallId update))
             (title (alist-get 'title update)))
-        (puthash tool-id title banjo--tool-calls)
-        (banjo--append-output (format "\n%s %s" "." title) 'banjo-face-tool)))
+        (unless banjo--streaming
+          (banjo--start-streaming))
+        (with-current-buffer (banjo--get-output-buffer)
+          (let ((inhibit-read-only t)
+                (header-marker (make-marker))
+                (output-marker (make-marker)))
+            (goto-char (point-max))
+            (insert "\n")
+            (set-marker header-marker (point))
+            (insert (format "%s\n" (banjo--tool-header-text title "running")))
+            (set-marker output-marker (point))
+            ;; Make output-marker advance when text is inserted at it
+            (set-marker-insertion-type output-marker t)
+            (puthash tool-id
+                     (list :title title
+                           :header-marker header-marker
+                           :output-marker output-marker
+                           :status "running")
+                     banjo--tool-calls)
+            (setq banjo--tool-call-order
+                  (nconc banjo--tool-call-order (list tool-id)))))))
      ((string= update-type "tool_call_update")
       (let* ((tool-id (alist-get 'toolCallId update))
              (status (alist-get 'status update))
              (content-arr (alist-get 'content update))
-             (title (gethash tool-id banjo--tool-calls)))
+             (info (gethash tool-id banjo--tool-calls)))
         ;; Show tool output content if present
-        (when content-arr
-          (seq-doseq (item content-arr)
-            (when-let* ((inner (alist-get 'content item))
-                        (text (alist-get 'text inner)))
-              (banjo--append-output text 'banjo-face-tool-output))))
-        ;; Show status change
-        (when (and title status)
-          (let* ((icon (cond
-                        ((string= status "completed") "v")
-                        ((string= status "failed") "x")
-                        ((string= status "running") ">")
-                        ((string= status "pending") ".")
-                        (t ".")))
-                 (face (cond
-                        ((string= status "completed") 'banjo-face-tool-success)
-                        ((string= status "failed") 'banjo-face-tool-fail)
-                        (t 'banjo-face-tool-pending))))
-            (banjo--append-output (format " -> %s\n" icon) face)))))
+        (when (and content-arr info)
+          (let ((output-marker (plist-get info :output-marker)))
+            (when (and output-marker (marker-buffer output-marker))
+              (with-current-buffer (marker-buffer output-marker)
+                (let ((inhibit-read-only t)
+                      (pos (marker-position output-marker)))
+                  ;; Validate marker position is within buffer
+                  (when (<= pos (point-max))
+                    (goto-char pos)
+                    (let ((did-insert nil))
+                      (seq-doseq (item content-arr)
+                        (when-let* ((inner (alist-get 'content item))
+                                    (text (alist-get 'text inner)))
+                          (let ((beg (point)))
+                            (insert text)
+                            (unless (string-suffix-p "\n" text)
+                              (insert "\n"))
+                            (put-text-property beg (point) 'font-lock-face 'banjo-face-tool-output)
+                            (setq did-insert t))))
+                      (when did-insert
+                        (banjo--queue-render)))))))))
+        ;; Handle status change
+        (when (and info status)
+          (puthash tool-id (plist-put info :status status) banjo--tool-calls)
+          (banjo--update-tool-header tool-id)
+          (when (or (string= status "completed") (string= status "failed"))
+            (banjo--create-tool-fold tool-id t)))
+        (banjo--maybe-prune-tool-calls)))
      ((string= update-type "current_mode_update")
       (setq banjo--state (plist-put banjo--state :mode (alist-get 'currentModeId update)))
       (banjo--update-mode-line))
      ((string= update-type "current_model_update")
       (setq banjo--state (plist-put banjo--state :model (alist-get 'currentModelId update)))
-      (banjo--update-mode-line)))))
+      (banjo--update-mode-line)))
+  ))
 
 ;; Daemon management
 
@@ -1124,10 +1450,14 @@ Include ID when provided."
   "Read port from lockfile if it exists."
   (let ((lockfile (banjo--find-lockfile)))
     (when (file-exists-p lockfile)
-      (with-temp-buffer
-        (insert-file-contents lockfile)
-        (let ((data (json-read)))
-          (alist-get 'port data))))))
+      (condition-case nil
+          (with-temp-buffer
+            (insert-file-contents lockfile)
+            (let* ((json-object-type 'alist)
+                   (json-key-type 'symbol)
+                   (data (json-read)))
+              (alist-get 'port data)))
+        (error nil)))))
 
 (defun banjo--start-daemon ()
   "Start the Banjo daemon."
@@ -1157,9 +1487,12 @@ Include ID when provided."
               (setq banjo--port port)
               (banjo--connect port)))
            (t
-            (let ((msg (condition-case nil
-                           (json-read-from-string trimmed)
-                         (error nil))))
+            (let* ((json-object-type 'alist)
+                   (json-array-type 'vector)
+                   (json-key-type 'symbol)
+                   (msg (condition-case nil
+                            (json-read-from-string trimmed)
+                          (error nil))))
               (when msg
                 (let ((method (alist-get 'method msg))
                       (params (alist-get 'params msg)))
@@ -1219,8 +1552,9 @@ Include ID when provided."
   (banjo--log "=== DISCONNECTED ===")
   (setq banjo--websocket nil)
   (setq banjo--session-id nil)
+  (setq banjo--next-id 1)
   (clrhash banjo--pending-requests)
-  (clrhash banjo--tool-calls)
+  (banjo--cleanup-tool-calls)
   (banjo--stop-streaming)
   (banjo--update-mode-line)
   (message "Banjo disconnected"))
@@ -1273,11 +1607,15 @@ Return non-nil if handled locally."
 
 (defun banjo--normalize-mode (mode)
   "Normalize MODE to ACP ids."
-  (cond
-   ((or (string= mode "accept_edits") (string= mode "acceptEdits")) "acceptEdits")
-   ((or (string= mode "auto_approve") (string= mode "bypassPermissions")) "bypassPermissions")
-   ((or (string= mode "plan_only") (string= mode "plan")) "plan")
-   (t mode)))
+  (let* ((raw (string-trim (downcase (or mode ""))))
+         (norm (replace-regexp-in-string "[- ]" "_" raw)))
+    (cond
+     ((or (string= norm "accept_edits") (string= norm "acceptedits")) "acceptEdits")
+     ((or (string= norm "auto_approve") (string= norm "bypasspermissions")
+          (string= norm "bypass_permissions")) "bypassPermissions")
+     ((or (string= norm "plan_only") (string= norm "plan")) "plan")
+     ((string= norm "default") "default")
+     (t mode))))
 
 (defun banjo--command-help (_args)
   "Show slash command help."
@@ -1289,7 +1627,6 @@ Return non-nil if handled locally."
                   "  /cancel - Cancel current request"
                   "  /model <name> - Set model"
                   "  /mode <name> - Set permission mode (default, accept_edits, auto_approve, plan_only)"
-                  "  /autoscroll <on|off|toggle> - Toggle autoscroll"
                   "  /claude - Switch to Claude"
                   "  /codex - Switch to Codex"))
     (banjo--append-status line)))
@@ -1309,8 +1646,9 @@ Return non-nil if handled locally."
   "Start a new session."
   (if (not (and banjo--websocket (websocket-openp banjo--websocket)))
       (banjo--append-status "Not connected")
-    (clrhash banjo--tool-calls)
     (banjo--clear-output)
+    (setq banjo--history-index 0)
+    (setq banjo--history-temp nil)
     (banjo--append-status "Starting new session...")
     (banjo--send-request
      "session/new"
@@ -1344,9 +1682,11 @@ Return non-nil if handled locally."
   "Set permission mode."
   (if (string-empty-p args)
       (banjo--append-status "Usage: /mode <default|accept_edits|auto_approve|plan_only>")
-    (let ((mode (banjo--normalize-mode args)))
-      (banjo-set-mode mode)
-      (banjo--append-status (format "Mode: %s" (banjo--display-mode mode))))))
+    (if (not (and banjo--session-id banjo--websocket (websocket-openp banjo--websocket)))
+        (banjo--append-status "Not connected")
+      (let ((mode (banjo--normalize-mode args)))
+        (banjo-set-mode mode)
+        (banjo--append-status (format "Mode: %s" (banjo--display-mode mode)))))))
 
 (defun banjo--command-claude (_args)
   "Switch to Claude."
@@ -1358,24 +1698,6 @@ Return non-nil if handled locally."
   (banjo-set-engine "codex")
   (banjo--append-status "Agent: codex"))
 
-(defun banjo--command-autoscroll (args)
-  "Toggle autoscroll."
-  (let ((arg (string-trim (or args ""))))
-    (cond
-     ((or (string-empty-p arg) (string= arg "toggle"))
-      (banjo-toggle-autoscroll)
-      (banjo--append-status (format "Autoscroll: %s" (if banjo-autoscroll "on" "off"))))
-     ((string= arg "on")
-      (setq banjo-autoscroll t)
-      (banjo--update-mode-line)
-      (banjo--append-status "Autoscroll: on"))
-     ((string= arg "off")
-      (setq banjo-autoscroll nil)
-      (banjo--update-mode-line)
-      (banjo--append-status "Autoscroll: off"))
-     (t
-      (banjo--append-status "Usage: /autoscroll <on|off|toggle>")))))
-
 (banjo--register-command "help" #'banjo--command-help)
 (banjo--register-command "version" #'banjo--command-version)
 (banjo--register-command "clear" #'banjo--command-clear)
@@ -1383,7 +1705,6 @@ Return non-nil if handled locally."
 (banjo--register-command "cancel" #'banjo--command-cancel)
 (banjo--register-command "model" #'banjo--command-model)
 (banjo--register-command "mode" #'banjo--command-mode)
-(banjo--register-command "autoscroll" #'banjo--command-autoscroll)
 (banjo--register-command "claude" #'banjo--command-claude)
 (banjo--register-command "codex" #'banjo--command-codex)
 
@@ -1433,12 +1754,28 @@ Return non-nil if handled locally."
   (when-let ((buf (get-buffer "*banjo-daemon*")))
     (kill-buffer buf))
   (clrhash banjo--pending-requests)
-  (clrhash banjo--tool-calls)
+  (banjo--cleanup-tool-calls)
   (banjo--stop-streaming)
   (setq banjo--session-id nil)
   (setq banjo--port nil)
   (banjo--update-mode-line)
   (message "Banjo stopped"))
+
+;;;###autoload
+(defun banjo-recompile ()
+  "Byte-compile banjo.el."
+  (interactive)
+  (let* ((lib (locate-library "banjo"))
+         (src (cond
+               ((and lib (string-match-p "\\.el\\'" lib)) lib)
+               ((and lib (string-match-p "\\.elc\\'" lib))
+                (let ((el (concat (file-name-sans-extension lib) ".el")))
+                  (and (file-exists-p el) el)))
+               (t nil))))
+    (unless src
+      (user-error "banjo.el not found"))
+    (byte-compile-file src)
+    (message "Banjo: recompiled %s" src)))
 
 ;;;###autoload
 (defun banjo-send (prompt)
@@ -1470,13 +1807,14 @@ Return non-nil if handled locally."
   "Set permission MODE."
   (interactive
    (list (completing-read "Mode: " '("default" "acceptEdits" "bypassPermissions" "plan") nil t)))
-  (when banjo--session-id
-    (banjo--send-notification
-     "session/set_mode"
-     `((sessionId . ,banjo--session-id)
-       (modeId . ,mode)))
-    (setq banjo--state (plist-put banjo--state :mode mode))
-    (banjo--update-mode-line)))
+  (unless banjo--session-id
+    (user-error "Banjo not connected. Run M-x banjo-start"))
+  (banjo--send-notification
+   "session/set_mode"
+   `((sessionId . ,banjo--session-id)
+     (modeId . ,mode)))
+  (setq banjo--state (plist-put banjo--state :mode mode))
+  (banjo--update-mode-line))
 
 ;;;###autoload
 (defun banjo-set-model (model)
@@ -1516,7 +1854,6 @@ Return non-nil if handled locally."
     (define-key map "c" #'banjo-cancel)
     (define-key map "i" #'banjo-focus-input)
     (define-key map "t" #'banjo-toggle)
-    (define-key map "A" #'banjo-toggle-autoscroll)
     (define-key map "m" #'banjo-set-mode)
     (define-key map "M" #'banjo-set-model)
     (define-key map "e" #'banjo-set-engine)

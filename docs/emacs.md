@@ -77,6 +77,7 @@ Tool calls appear inline:
 ○ Read src/main.zig → ✓
 ○ Bash npm test → ✗
 ```
+In the `*banjo*` buffer, use `z` or `TAB` on a tool line to collapse/expand its output.
 
 ## Keybindings
 
@@ -132,6 +133,7 @@ In the `*banjo*` buffer: `q` closes panel, `C-c` cancels request.
 | `banjo-set-mode` | Set permission mode (default/acceptEdits/bypassPermissions/plan) |
 | `banjo-set-model` | Set model (sonnet/opus/haiku) |
 | `banjo-set-engine` | Set engine (claude/codex) |
+| `banjo-recompile` | Recompile banjo.el |
 
 ## Configuration
 
@@ -142,6 +144,17 @@ In the `*banjo*` buffer: `q` closes panel, `C-c` cancels request.
 
 ;; Binary path (auto-detected if on PATH)
 (setq banjo-binary "banjo")
+
+;; Render batching (seconds)
+(setq banjo-render-idle-delay 0.05)
+
+;; Link detection
+(setq banjo-enable-links t)
+(setq banjo-link-check-exists t)
+(setq banjo-link-cache-ttl nil)
+
+;; Tool call retention (nil = unlimited)
+(setq banjo-tool-call-max nil)
 ```
 
 ## Mode Line
