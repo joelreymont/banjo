@@ -144,9 +144,7 @@
   :group 'banjo)
 
 (defface banjo-face-assistant
-  '((((class color) (background dark)) :foreground "#b8c0e0")
-    (((class color) (background light)) :foreground "#4a5568")
-    (t :inherit default))
+  '((t :inherit font-lock-doc-face :slant italic))
   "Face for assistant output."
   :group 'banjo)
 
@@ -173,6 +171,11 @@
 (defface banjo-face-tool-pending
   '((t :inherit warning))
   "Face for pending tool calls."
+  :group 'banjo)
+
+(defface banjo-face-tool-output
+  '((t :inherit font-lock-string-face))
+  "Face for tool output content."
   :group 'banjo)
 
 (defface banjo-face-link
@@ -586,12 +589,8 @@
 
 (defun banjo--input-header ()
   "Build the input header line."
-  (let ((engine (or (plist-get banjo--state :engine) "claude"))
-        (mode (banjo--display-mode (or (plist-get banjo--state :mode) "default")))
-        (hints (or banjo-input-hints "")))
-    (if (string= hints "")
-        (format "Agent: %s  Auth: %s" engine mode)
-      (format "Agent: %s  Auth: %s  %s" engine mode hints))))
+  (let ((mode (banjo--display-mode (or (plist-get banjo--state :mode) "default"))))
+    (format "[%s] RET send, / cmds" mode)))
 
 (defun banjo--display-mode (mode)
   "Return user-facing MODE name."
@@ -615,6 +614,14 @@
   (setq-local font-lock-multiline t)
   (font-lock-mode 1))
 
+(defun banjo-input-maybe-complete ()
+  "Insert / and trigger completion if at start of line."
+  (interactive)
+  (insert "/")
+  (when (string-prefix-p "/" (buffer-substring-no-properties
+                               (line-beginning-position) (point)))
+    (completion-at-point)))
+
 (defvar banjo-input-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "RET") #'banjo-input-send)
@@ -626,6 +633,7 @@
     (define-key map (kbd "<up>") #'banjo-history-prev)
     (define-key map (kbd "<down>") #'banjo-history-next)
     (define-key map (kbd "TAB") #'completion-at-point)
+    (define-key map (kbd "/") #'banjo-input-maybe-complete)
     map)
   "Keymap for Banjo input.")
 
@@ -648,10 +656,11 @@
     (evil-insert-state)))
 
 (defun banjo-input-slash ()
-  "Focus input and insert a slash."
+  "Focus input and insert a slash, then show completions."
   (interactive)
   (banjo-focus-input)
-  (insert "/"))
+  (insert "/")
+  (completion-at-point))
 
 (defun banjo--current-cwd ()
   (let ((buf (window-buffer (selected-window))))
@@ -690,7 +699,14 @@
       (let ((start (+ bol 1))
             (end (point))
             (cmds (banjo--command-names)))
-        (list start end cmds)))))
+        (list start end cmds
+              :exit-function #'banjo--completion-exit)))))
+
+(defun banjo--completion-exit (_candidate status)
+  "Handle completion with STATUS. Auto-send if finished."
+  (when (eq status 'finished)
+    ;; Small delay to let completion UI close, then send
+    (run-at-time 0.01 nil #'banjo-input-send)))
 
 (defun banjo--code-block-range ()
   (save-excursion
@@ -1007,11 +1023,15 @@ Include ID when provided."
          (title (or (alist-get 'title tool-call) "Unknown tool"))
          (options (or (alist-get 'options params) banjo--default-permission-options))
          (choices (banjo--permission-option-choices options))
-         (prompt (format "Allow %s: " title))
-         (choice (completing-read prompt (mapcar #'car choices) nil t))
-         (option (cdr (assoc choice choices)))
-         (option-id (or (alist-get 'optionId option) (alist-get 'id option))))
-    (banjo--send-response id (banjo--permission-outcome option-id))))
+         (prompt (format "Allow %s? " title)))
+    ;; Show in output buffer
+    (banjo--append-output (format "\n[?] %s" title) 'banjo-face-tool-pending)
+    ;; Focus Emacs frame and prompt
+    (raise-frame)
+    (let* ((choice (completing-read prompt (mapcar #'car choices) nil t))
+           (option (cdr (assoc choice choices)))
+           (option-id (or (alist-get 'optionId option) (alist-get 'id option))))
+      (banjo--send-response id (banjo--permission-outcome option-id)))))
 
 (defun banjo--handle-notification (msg)
   "Handle a JSON-RPC notification MSG."
@@ -1053,8 +1073,16 @@ Include ID when provided."
      ((string= update-type "tool_call_update")
       (let* ((tool-id (alist-get 'toolCallId update))
              (status (alist-get 'status update))
+             (content-arr (alist-get 'content update))
              (title (gethash tool-id banjo--tool-calls)))
-        (when title
+        ;; Show tool output content if present
+        (when content-arr
+          (seq-doseq (item content-arr)
+            (when-let* ((inner (alist-get 'content item))
+                        (text (alist-get 'text inner)))
+              (banjo--append-output text 'banjo-face-tool-output))))
+        ;; Show status change
+        (when (and title status)
           (let* ((icon (cond
                         ((string= status "completed") "v")
                         ((string= status "failed") "x")
