@@ -302,8 +302,8 @@
     (with-current-buffer (banjo--get-output-buffer)
       (goto-char (point-min))
       (should (eq major-mode 'banjo-mode))
-      ;; font-lock-mode may be nil in batch mode, but faces should still apply
-      (let ((face-at (get-text-property (point) 'face)))
+      ;; font-lock-face property should be applied
+      (let ((face-at (get-text-property (point) 'font-lock-face)))
         (should face-at)
         (should (or (eq face-at 'banjo-face-tool)
                     (memq 'banjo-face-tool (if (listp face-at) face-at nil))))))))
@@ -468,7 +468,7 @@
     (with-current-buffer (banjo--get-output-buffer)
       (goto-char (point-min))
       (search-forward "output")
-      (should (eq (get-text-property (1- (point)) 'face) 'banjo-face-tool-output)))))
+      (should (eq (get-text-property (1- (point)) 'font-lock-face) 'banjo-face-tool-output)))))
 
 ;; Agent message coloring tests
 
@@ -483,7 +483,7 @@
     (with-current-buffer (banjo--get-output-buffer)
       (goto-char (point-min))
       (search-forward "Hello")
-      (should (eq (get-text-property (1- (point)) 'face) 'banjo-face-assistant)))))
+      (should (eq (get-text-property (1- (point)) 'font-lock-face) 'banjo-face-assistant)))))
 
 ;; Slash completion tests
 

@@ -35,13 +35,23 @@
 
 - For complex state machines, use a labeled switch with `continue :state`.
 
-## Testing
+## Testing (Zig)
 
 - Primary: snapshots (ohsnap) + property tests (zcheck) with a real oracle.
 - `std.testing` only for trivial cases, error paths, or when no structured output exists.
 - **NEVER use `testing.expect` to decompose structures field-by-field** - use ohsnap snapshots instead.
 - Always run `zig build test` after major changes or adding tests.
 - Always run `zig build` after tests pass to ensure binary is current.
+
+## Testing (Elisp)
+
+- Use `ert-deftest` for all tests in `emacs/banjo-test.el`
+- **Simulate websocket messages** with `banjo-test--simulate-notification` helper
+- **Test face application** with `get-text-property` after text insertion
+- **Mock blocking functions** with `cl-letf` (completing-read, yes-or-no-p)
+- Tag slow/live tests with `:e2e` to run separately
+- Run tests: `emacs --batch -L emacs -l emacs/banjo-test.el -f ert-run-tests-batch-and-exit`
+- **Every UI behavior needs a test** - if user can trigger it, test it
 
 ## Zed Logs (macOS)
 

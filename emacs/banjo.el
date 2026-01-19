@@ -589,8 +589,7 @@
 
 (defun banjo--input-header ()
   "Build the input header line."
-  (let ((mode (banjo--display-mode (or (plist-get banjo--state :mode) "default"))))
-    (format "[%s] RET send, / cmds" mode)))
+  "RET send, / cmds")
 
 (defun banjo--display-mode (mode)
   "Return user-facing MODE name."
@@ -805,10 +804,10 @@
               (banjo--update-code-blocks text)
               (banjo--apply-code-blocks beg end prev-open)
               (banjo--apply-buttons beg end)
-              ;; font-lock first, then manual face on top (nil = prepend for priority)
+              ;; Apply markdown font-lock, then our face via font-lock-face property
               (font-lock-ensure beg end)
               (when face
-                (add-face-text-property beg end face nil))))
+                (put-text-property beg end 'font-lock-face face))))
           (goto-char (point-max))))
       (banjo--scroll-windows-to-bottom scroll-wins))))
 
@@ -826,9 +825,9 @@
           (let ((beg (point)))
             (insert text)
             (let ((end (point)))
-              (add-face-text-property beg end 'banjo-face-user t)
               (banjo--apply-buttons beg end)
-              (font-lock-ensure beg end)))
+              (font-lock-ensure beg end)
+              (put-text-property beg end 'font-lock-face 'banjo-face-user)))
           (unless (bolp)
             (insert "\n"))
           (insert "\n")))
@@ -837,6 +836,17 @@
 (defun banjo--append-status (text)
   "Append status TEXT to the output buffer."
   (banjo--append-output (concat text "\n") 'banjo-face-tool))
+
+(defun banjo--ensure-blank-line ()
+  "Ensure output buffer ends with a blank line for separation."
+  (let ((buf (banjo--get-output-buffer)))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (goto-char (point-max))
+        (unless (or (= (point) (point-min))
+                    (looking-back "\n\n" (max (point-min) (- (point) 2))))
+          (unless (bolp) (insert "\n"))
+          (insert "\n"))))))
 
 (defun banjo--clear-output ()
   "Clear the output buffer."
@@ -1053,9 +1063,10 @@ Include ID when provided."
       (let* ((content (alist-get 'content update))
              (text (alist-get 'text content)))
         (when text
-          (unless banjo--streaming
+          (when (not banjo--streaming)
             (banjo--start-streaming)
-            (banjo--show-panel))
+            (banjo--show-panel)
+            (banjo--ensure-blank-line))
           (banjo--append-output text 'banjo-face-assistant))))
      ((string= update-type "agent_thought_chunk")
       (let* ((content (alist-get 'content update))
