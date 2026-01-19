@@ -77,6 +77,60 @@
   :type 'string
   :group 'banjo)
 
+(defcustom banjo-debug-log-file "/tmp/banjo-emacs.log"
+  "File for debug logging. Set to nil to disable."
+  :type '(choice (const nil) string)
+  :group 'banjo)
+
+;; Debug logging
+
+(defvar banjo--debug-log-buffer nil
+  "Ring buffer for recent log entries.")
+
+(defun banjo--log (fmt &rest args)
+  "Log FMT with ARGS to debug file if enabled."
+  (when banjo-debug-log-file
+    (let ((msg (format "[%s] %s\n"
+                       (format-time-string "%H:%M:%S")
+                       (apply #'format fmt args))))
+      (append-to-file msg nil banjo-debug-log-file))))
+
+(defun banjo--log-send (method params)
+  "Log outgoing METHOD with PARAMS."
+  (banjo--log ">>> %s %S" method (if (> (length (format "%S" params)) 200)
+                                     (substring (format "%S" params) 0 200)
+                                   params)))
+
+(defun banjo--log-recv (msg)
+  "Log incoming MSG."
+  (let* ((method (alist-get 'method msg))
+         (id (alist-get 'id msg))
+         (result (alist-get 'result msg))
+         (err (alist-get 'error msg)))
+    (cond
+     (method (banjo--log "<<< %s %S" method
+                         (let ((p (format "%S" (alist-get 'params msg))))
+                           (if (> (length p) 200) (substring p 0 200) p))))
+     (result (banjo--log "<<< response id=%s result=%S" id
+                         (let ((r (format "%S" result)))
+                           (if (> (length r) 200) (substring r 0 200) r))))
+     (err (banjo--log "<<< error id=%s %S" id err)))))
+
+(defun banjo-dump-state ()
+  "Dump current banjo state to log file for debugging."
+  (interactive)
+  (let ((state `((connected . ,(not (null banjo--websocket)))
+                 (session-id . ,banjo--session-id)
+                 (streaming . ,banjo--streaming)
+                 (stream-start . ,banjo--stream-start-time)
+                 (state . ,banjo--state)
+                 (pending-requests . ,(hash-table-count banjo--pending-requests))
+                 (tool-calls . ,(hash-table-count banjo--tool-calls))
+                 (process . ,(and banjo--process (process-status banjo--process)))
+                 (port . ,banjo--port))))
+    (banjo--log "=== STATE DUMP ===\n%s" (pp-to-string state))
+    (message "State dumped to %s" banjo-debug-log-file)))
+
 ;; Faces
 
 (defface banjo-face-user
@@ -90,7 +144,9 @@
   :group 'banjo)
 
 (defface banjo-face-assistant
-  '((t :inherit font-lock-doc-face))
+  '((((class color) (background dark)) :foreground "#b8c0e0")
+    (((class color) (background light)) :foreground "#4a5568")
+    (t :inherit default))
   "Face for assistant output."
   :group 'banjo)
 
@@ -733,10 +789,10 @@
               (banjo--update-code-blocks text)
               (banjo--apply-code-blocks beg end prev-open)
               (banjo--apply-buttons beg end)
-              ;; font-lock first, then manual face on top
+              ;; font-lock first, then manual face on top (nil = prepend for priority)
               (font-lock-ensure beg end)
               (when face
-                (add-face-text-property beg end face t))))
+                (add-face-text-property beg end face nil))))
           (goto-char (point-max))))
       (banjo--scroll-windows-to-bottom scroll-wins))))
 
@@ -859,6 +915,7 @@ Include ID when provided."
       (setq banjo--next-id (1+ banjo--next-id))
       (when callback
         (puthash id callback banjo--pending-requests))
+      (banjo--log-send method params)
       (websocket-send-text
        banjo--websocket
        (json-encode (banjo--make-request method params id))))))
@@ -866,6 +923,7 @@ Include ID when provided."
 (defun banjo--send-notification (method params)
   "Send a JSON-RPC notification with METHOD and PARAMS."
   (when (and banjo--websocket (websocket-openp banjo--websocket))
+    (banjo--log-send method params)
     (websocket-send-text
      banjo--websocket
      (json-encode (banjo--make-request method params)))))
@@ -887,6 +945,7 @@ Include ID when provided."
              (method (alist-get 'method msg))
              (result (alist-get 'result msg))
              (err (alist-get 'error msg)))
+        (banjo--log-recv msg)
         (cond
          ;; Response to our request
          ((or result err)
@@ -900,7 +959,9 @@ Include ID when provided."
          ;; Notification from server
          (method
           (banjo--handle-notification msg))))
-    (error (message "Banjo: message parse error: %s" parse-err))))
+    (error
+     (banjo--log "!!! parse error: %s" parse-err)
+     (message "Banjo: message parse error: %s" parse-err))))
 
 (defun banjo--handle-request (msg)
   "Handle a JSON-RPC request MSG from the server."
@@ -1088,6 +1149,7 @@ Include ID when provided."
 
 (defun banjo--on-connect ()
   "Handle WebSocket connection."
+  (banjo--log "=== CONNECTED to port %s ===" banjo--port)
   ;; Send initialize request
   (banjo--send-request
    "initialize"
@@ -1115,6 +1177,7 @@ Include ID when provided."
 
 (defun banjo--on-disconnect ()
   "Handle WebSocket disconnection."
+  (banjo--log "=== DISCONNECTED ===")
   (setq banjo--websocket nil)
   (setq banjo--session-id nil)
   (clrhash banjo--pending-requests)
@@ -1132,10 +1195,15 @@ Include ID when provided."
   (banjo--show-panel)
   (banjo--append-user-message prompt)
   (setq banjo--streaming nil)
-  (banjo--send-notification
+  (banjo--send-request
    "session/prompt"
    `((sessionId . ,banjo--session-id)
-     (prompt . [((type . "text") (text . ,prompt))]))))
+     (prompt . [((type . "text") (text . ,prompt))]))
+   (lambda (result _err)
+     (banjo--stop-streaming)
+     (when-let ((reason (alist-get 'stopReason result)))
+       (unless (string= reason "end_turn")
+         (banjo--append-output (format "\n[%s]\n" reason) 'shadow))))))
 
 (defvar banjo--command-table (make-hash-table :test 'equal)
   "Slash command handlers.")

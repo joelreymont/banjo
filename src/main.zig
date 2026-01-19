@@ -42,6 +42,7 @@ const Mode = enum {
     lsp, // LSP server mode
     daemon, // WebSocket daemon mode
     hook_permission, // Permission hook for Claude Code
+    inspect, // Connect to daemon and dump state
 };
 
 /// CLI options matching Claude Code interface
@@ -62,6 +63,7 @@ const ArgAction = enum {
     mode_agent,
     mode_lsp,
     mode_daemon,
+    mode_inspect,
     verbose,
     session_id,
     permission_mode,
@@ -80,6 +82,7 @@ const arg_map = std.StaticStringMap(ArgAction).initComptime(.{
     .{ "--agent", .mode_agent },
     .{ "--lsp", .mode_lsp },
     .{ "--daemon", .mode_daemon },
+    .{ "--inspect", .mode_inspect },
     .{ "--verbose", .verbose },
     .{ "-v", .verbose },
     .{ "--session-id", .session_id },
@@ -130,6 +133,7 @@ fn parseArgs(allocator: std.mem.Allocator) !CliOptions {
                 .mode_agent => opts.mode = .agent,
                 .mode_lsp => opts.mode = .lsp,
                 .mode_daemon => opts.mode = .daemon,
+                .mode_inspect => opts.mode = .inspect,
                 .verbose => opts.verbose = true,
                 .session_id => {
                     if (args.next()) |sid| {
@@ -156,6 +160,7 @@ fn parseArgs(allocator: std.mem.Allocator) !CliOptions {
             .mode_agent => opts.mode = .agent,
             .mode_lsp => opts.mode = .lsp,
             .mode_daemon => opts.mode = .daemon,
+            .mode_inspect => opts.mode = .inspect,
             .verbose => opts.verbose = true,
             .session_id => {
                 if (opts.session_id) |sid| allocator.free(sid);
@@ -418,6 +423,87 @@ fn runPermissionHook(allocator: std.mem.Allocator) !void {
     // For "ask" or unknown, output nothing - defer to default permission flow
 }
 
+/// Inspect running banjo daemon and emacs state
+fn runInspect(allocator: std.mem.Allocator) !void {
+    const stdout = std.fs.File.stdout();
+
+    // Read banjo log
+    try stdout.writeAll("=== BANJO LOG (last 50 lines) ===\n");
+    {
+        const result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "tail", "-50", "/tmp/banjo.log" },
+        });
+        if (result) |r| {
+            defer allocator.free(r.stdout);
+            defer allocator.free(r.stderr);
+            try stdout.writeAll(r.stdout);
+        } else |_| {
+            try stdout.writeAll("(no banjo log)\n");
+        }
+    }
+
+    // Read emacs log
+    try stdout.writeAll("\n=== EMACS LOG (last 50 lines) ===\n");
+    {
+        const result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "tail", "-50", "/tmp/banjo-emacs.log" },
+        });
+        if (result) |r| {
+            defer allocator.free(r.stdout);
+            defer allocator.free(r.stderr);
+            try stdout.writeAll(r.stdout);
+        } else |_| {
+            try stdout.writeAll("(no emacs log)\n");
+        }
+    }
+
+    // Query emacs state via emacsclient
+    try stdout.writeAll("\n=== EMACS STATE ===\n");
+    {
+        const result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{
+                "emacsclient", "--eval",
+                \\(progn
+                \\  (require 'banjo nil t)
+                \\  (when (fboundp 'banjo-dump-state)
+                \\    (banjo-dump-state))
+                \\  (format "connected=%s session=%s streaming=%s pending=%d"
+                \\    (if (and (boundp 'banjo--websocket) banjo--websocket) "yes" "no")
+                \\    (if (boundp 'banjo--session-id) banjo--session-id "nil")
+                \\    (if (and (boundp 'banjo--streaming) banjo--streaming) "yes" "no")
+                \\    (if (boundp 'banjo--pending-requests) (hash-table-count banjo--pending-requests) 0)))
+            },
+        });
+        if (result) |r| {
+            defer allocator.free(r.stdout);
+            defer allocator.free(r.stderr);
+            try stdout.writeAll(r.stdout);
+            try stdout.writeAll("\n");
+        } else |_| {
+            try stdout.writeAll("(emacsclient not available)\n");
+        }
+    }
+
+    // Find lockfile
+    try stdout.writeAll("\n=== LOCKFILE ===\n");
+    const lockfile_path = ".banjo.lock";
+    const lockfile = std.fs.cwd().openFile(lockfile_path, .{}) catch {
+        try stdout.writeAll("(no lockfile found)\n");
+        return;
+    };
+    defer lockfile.close();
+    var buf: [1024]u8 = undefined;
+    const n = lockfile.readAll(&buf) catch {
+        try stdout.writeAll("(failed to read lockfile)\n");
+        return;
+    };
+    try stdout.writeAll(buf[0..n]);
+    try stdout.writeAll("\n");
+}
+
 pub fn main() !void {
     // Initialize file-based logging (writes to /tmp/banjo.log by default)
     const log_path = std.posix.getenv("BANJO_LOG_FILE") orelse "/tmp/banjo.log";
@@ -492,6 +578,9 @@ pub fn main() !void {
         },
         .hook_permission => {
             try runPermissionHook(allocator);
+        },
+        .inspect => {
+            try runInspect(allocator);
         },
     }
 }
