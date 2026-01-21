@@ -556,6 +556,9 @@ Return final open state."
 (defconst banjo--mode-line-hints "RET send, C-j newline, / cmds"
   "Input hints shown in the Banjo input mode line.")
 
+(defconst banjo--mode-choices '("default" "accept_edits" "auto_approve" "plan_only")
+  "Mode names for /mode completion.")
+
 (defun banjo--mode-line-align-right (left right)
   "Return a mode line with LEFT text and RIGHT text aligned right."
   (if (string-empty-p right)
@@ -1619,7 +1622,8 @@ Include ID when provided."
           (puthash tool-id (plist-put info :status status) banjo--tool-calls)
           (banjo--update-tool-header tool-id)
           (when (or (string= status "completed") (string= status "failed"))
-            (banjo--create-tool-fold tool-id t)))
+            (banjo--create-tool-fold tool-id t)
+            (banjo--ensure-blank-line)))
         (banjo--maybe-prune-tool-calls)))
      ((string= update-type "current_mode_update")
       (setq banjo--state (plist-put banjo--state :mode (alist-get 'currentModeId update)))
@@ -1884,13 +1888,18 @@ Return non-nil if handled locally."
 
 (defun banjo--command-mode (args)
   "Set permission mode."
-  (if (string-empty-p args)
-      (banjo--append-status "Usage: /mode <default|accept_edits|auto_approve|plan_only>")
-    (if (not (and banjo--session-id banjo--websocket (websocket-openp banjo--websocket)))
-        (banjo--append-status "Not connected")
-      (let ((mode (banjo--normalize-mode args)))
-        (banjo-set-mode mode)
-        (banjo--append-status (format "Mode: %s" (banjo--display-mode mode)))))))
+  (let* ((choice (if (string-empty-p args)
+                     (completing-read "Mode: " banjo--mode-choices nil t)
+                   args))
+         (mode (and (not (string-empty-p choice)) (banjo--normalize-mode choice))))
+    (cond
+     ((not mode)
+      (banjo--append-status "Mode: cancelled"))
+     ((not (and banjo--session-id banjo--websocket (websocket-openp banjo--websocket)))
+      (banjo--append-status "Not connected"))
+     (t
+      (banjo-set-mode mode)
+      (banjo--append-status (format "Mode: %s" (banjo--display-mode mode)))))))
 
 (defun banjo--command-claude (_args)
   "Switch to Claude."
