@@ -550,22 +550,15 @@ Return final open state."
 
 (defun banjo--output-mode-line ()
   "Return mode line for the output buffer."
-  (let* ((status banjo--mode-line-left)
-         (timer banjo--mode-line-timer)
-         (hints banjo--mode-line-hints)
-         (sep "  ")
+  (let* ((hints banjo--mode-line-hints)
          (win (or (and (boundp 'mode-line-window) mode-line-window)
                   (get-buffer-window (current-buffer) t)))
-         (width (if win (window-total-width win) 0))
-         (timer-w (string-width timer))
-         (avail (- width (string-width status) (string-width sep)
-                   (if (string-empty-p timer) 0 (1+ timer-w))))
-         (hint (if (> avail 0)
-                   (truncate-string-to-width hints avail nil nil "...")
-                 "")))
-    (banjo--mode-line-align-right
-     (if (string-empty-p hint) status (concat status sep hint))
-     timer)))
+         (width (if win (window-total-width win) 0)))
+    (truncate-string-to-width hints width nil nil "...")))
+
+(defun banjo--input-mode-line ()
+  "Return mode line for the input buffer."
+  (banjo--mode-line-align-right banjo--mode-line-left banjo--mode-line-timer))
 
 (defun banjo--update-mode-line ()
   "Update the mode line with current state."
@@ -765,7 +758,7 @@ Return final open state."
 (define-derived-mode banjo-input-mode text-mode "BanjoInput"
   "Major mode for Banjo input."
   (setq-local header-line-format nil)
-  (setq-local mode-line-format nil)
+  (setq-local mode-line-format '(:eval (banjo--input-mode-line)))
   (banjo--disable-line-numbers)
   (banjo--apply-input-style)
   (setq-local completion-at-point-functions '(banjo--completion-at-point))
@@ -1020,6 +1013,7 @@ Return final open state."
     (with-current-buffer buf
       (unless (eq major-mode 'banjo-mode)
         (banjo-mode))
+      (setq-local mode-line-format '(:eval (banjo--output-mode-line)))
       (banjo--update-mode-line))
     buf))
 
@@ -1032,6 +1026,7 @@ Return final open state."
         (banjo-input-mode)))
     (with-current-buffer buf
       (setq-local header-line-format nil)
+      (setq-local mode-line-format '(:eval (banjo--input-mode-line)))
       (banjo--disable-line-numbers)
       (banjo--apply-input-style)
       (banjo--history-ensure default-directory))
