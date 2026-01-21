@@ -525,27 +525,46 @@ Return final open state."
 
 ;; Mode line
 
-(defvar banjo--mode-line-string ""
-  "Mode line string for Banjo status.")
+(defvar banjo--mode-line-left ""
+  "Left-side mode line string for Banjo status.")
+
+(defvar banjo--mode-line-timer ""
+  "Right-side mode line timer string.")
 
 (defconst banjo--mode-line-hints "RET send, C-j newline, / cmds"
   "Input hints shown in the Banjo input mode line.")
 
+(defun banjo--mode-line-align-right (left right)
+  "Return a mode line with LEFT text and RIGHT text aligned right."
+  (if (string-empty-p right)
+      left
+    (list left
+          (propertize " " 'display
+                      `(space :align-to (- right ,(string-width right))))
+          right)))
+
+(defun banjo--mode-line-render ()
+  "Return mode line for the output buffer."
+  (banjo--mode-line-align-right banjo--mode-line-left banjo--mode-line-timer))
+
 (defun banjo--input-mode-line ()
-  "Return mode line string for the input buffer."
-  (let* ((status banjo--mode-line-string)
+  "Return mode line for the input buffer."
+  (let* ((status banjo--mode-line-left)
+         (timer banjo--mode-line-timer)
          (hints banjo--mode-line-hints)
          (sep "  ")
          (win (or (and (boundp 'mode-line-window) mode-line-window)
                   (get-buffer-window (current-buffer) t)))
          (width (if win (window-total-width win) 0))
-         (avail (- width (string-width status) (string-width sep)))
+         (timer-w (string-width timer))
+         (avail (- width (string-width status) (string-width sep)
+                   (if (string-empty-p timer) 0 (1+ timer-w))))
          (hint (if (> avail 0)
                    (truncate-string-to-width hints avail nil nil "...")
                  "")))
-    (if (string-empty-p hint)
-        status
-      (concat status sep hint))))
+    (banjo--mode-line-align-right
+     (if (string-empty-p hint) status (concat status sep hint))
+     timer)))
 
 (defun banjo--update-mode-line ()
   "Update the mode line with current state."
@@ -555,15 +574,14 @@ Return final open state."
          (connected (and banjo--websocket (websocket-openp banjo--websocket)))
          (elapsed (and banjo--stream-start-time
                        (floor (- (float-time) banjo--stream-start-time)))))
-    (setq banjo--mode-line-string
+    (setq banjo--mode-line-left
           (if connected
-              (concat
-               (format " [%s%s (%s)]"
-                       engine
-                       (if (string= model "") "" (concat "/" model))
-                       (banjo--display-mode mode))
-               (if elapsed (format " %ds" elapsed) ""))
+              (format " [%s%s (%s)]"
+                      engine
+                      (if (string= model "") "" (concat "/" model))
+                      (banjo--display-mode mode))
             " [disconnected]"))
+    (setq banjo--mode-line-timer (if elapsed (format "%ds" elapsed) ""))
     (force-mode-line-update t)))
 
 (defvar banjo--stream-start-time nil
@@ -705,7 +723,7 @@ Return final open state."
   "Major mode for Banjo output."
   :keymap banjo-mode-map
   (setq-local buffer-read-only t)
-  (setq-local mode-line-format '(:eval banjo--mode-line-string))
+  (setq-local mode-line-format '(:eval (banjo--mode-line-render)))
   (setq-local truncate-lines nil)
   (setq-local word-wrap t)
   (setq-local banjo--code-block-open nil)
@@ -855,8 +873,8 @@ Return final open state."
   (save-excursion
     (beginning-of-line)
     (cond
-     ;; Tool section header
-     ((banjo--tool-section-at-point)
+     ;; Tool section header or output
+     ((banjo--tool-id-at-point)
       (banjo-toggle-tool-fold))
      ;; Inside tool output - find overlay and toggle
      ((banjo--find-tool-overlay (point))
@@ -879,21 +897,26 @@ Return final open state."
       (when (overlay-get ov 'banjo-tool-fold)
         (setq found ov)))))
 
-(defun banjo--tool-section-at-point ()
-  "Find tool section at point. Returns (header-start . tool-id) or nil."
-  (save-excursion
-    (beginning-of-line)
-    (when (looking-at "^○ ")
-      (let ((header-start (point)))
+(defun banjo--tool-id-at-point ()
+  "Return tool-id for the tool section at point, or nil."
+  (or (when-let ((ov (banjo--find-tool-overlay (point))))
+        (overlay-get ov 'banjo-tool-id))
+      (let ((pos (point))
+            (buf (current-buffer)))
         (catch 'found
-          (maphash (lambda (id info)
-                     (let ((marker (plist-get info :header-marker)))
-                       (when (and marker
-                                  (marker-buffer marker)
-                                  (= (marker-position marker) header-start))
-                         (throw 'found (cons header-start id)))))
-                   banjo--tool-calls)
-          nil)))))
+          (maphash
+           (lambda (id info)
+             (let ((header-marker (plist-get info :header-marker))
+                   (output-marker (plist-get info :output-marker)))
+               (when (and header-marker output-marker
+                          (eq (marker-buffer header-marker) buf)
+                          (eq (marker-buffer output-marker) buf))
+                 (let ((header-pos (marker-position header-marker))
+                       (output-pos (marker-position output-marker)))
+                   (when (and (<= header-pos pos) (<= pos output-pos))
+                     (throw 'found id))))))
+           banjo--tool-calls)
+          nil))))
 
 (defun banjo--tool-header-text (title status)
   "Build tool header line from TITLE and STATUS."
@@ -966,10 +989,9 @@ Return final open state."
           (if currently-hidden
               (overlay-put ov 'invisible nil)
             (overlay-put ov 'invisible 'banjo-fold)))
-      (let ((section (banjo--tool-section-at-point)))
-        (when section
-          (let* ((tool-id (cdr section))
-                 (existing-ov (banjo--find-tool-overlay-by-id tool-id)))
+      (let ((tool-id (banjo--tool-id-at-point)))
+        (when tool-id
+          (let ((existing-ov (banjo--find-tool-overlay-by-id tool-id)))
             (if existing-ov
                 (banjo-toggle-tool-fold-overlay existing-ov)
               (banjo--create-tool-fold tool-id t))))))))

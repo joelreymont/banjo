@@ -453,9 +453,9 @@
         (banjo--stream-start-time (- (float-time) 5)))
     (cl-letf (((symbol-function 'websocket-openp) (lambda (_ws) t)))
       (banjo--update-mode-line)
-      (should (string-match-p "codex/x" banjo--mode-line-string))
-      (should (string-match-p "(accept_edits)" banjo--mode-line-string))
-      (should (string-match-p "5s" banjo--mode-line-string)))))
+      (should (string-match-p "codex/x" banjo--mode-line-left))
+      (should (string-match-p "(accept_edits)" banjo--mode-line-left))
+      (should (string= "5s" banjo--mode-line-timer)))))
 
 (ert-deftest banjo-test-faces-defined ()
   "Verify all banjo faces are defined with proper inheritance."
@@ -704,6 +704,38 @@
       ;; Fold overlay created and invisible
       (let ((ov (car (seq-filter (lambda (o) (overlay-get o 'banjo-tool-fold))
                                  (overlays-in (point-min) (point-max))))))
+        (should ov)
+        (should (overlay-get ov 'invisible)))))
+
+(ert-deftest banjo-test-tool-fold-toggle-from-output ()
+  "Tool folding should toggle when point is on output."
+  (let ((banjo--output-buffer "*banjo-test-output*")
+        (banjo--tool-calls (make-hash-table :test 'equal)))
+    (banjo--clear-output)
+    (banjo-test--simulate-notification
+     "session/update"
+     '((update . ((sessionUpdate . "tool_call")
+                  (toolCallId . "tool-fold-test")
+                  (title . "Bash: echo test")))))
+    (banjo-test--simulate-notification
+     "session/update"
+     '((update . ((sessionUpdate . "tool_call_update")
+                  (toolCallId . "tool-fold-test")
+                  (content . [((type . "content")
+                               (content . ((type . "text") (text . "line1\nline2"))))])
+                  (status . "completed"))))))
+    (with-current-buffer (banjo--get-output-buffer)
+      (let ((ov (banjo--find-tool-overlay-by-id "tool-fold-test")))
+        (should ov)
+        (should (overlay-get ov 'invisible)))
+      (goto-char (point-min))
+      (search-forward "line1")
+      (banjo-toggle-fold)
+      (let ((ov (banjo--find-tool-overlay-by-id "tool-fold-test")))
+        (should ov)
+        (should-not (overlay-get ov 'invisible)))
+      (banjo-toggle-fold)
+      (let ((ov (banjo--find-tool-overlay-by-id "tool-fold-test")))
         (should ov)
         (should (overlay-get ov 'invisible))))))
 
