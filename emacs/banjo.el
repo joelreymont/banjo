@@ -392,9 +392,10 @@ When set to \\='auto, only auto-approve in batch/noninteractive mode."
         (while (re-search-forward banjo--url-regexp end t)
           (let* ((url (match-string 1))
                  (b (match-beginning 1))
-                 (e (match-end 1)))
-            (unless (or (get-text-property b 'banjo-link)
-                        (get-text-property b 'banjo-code-block))
+                 (e (match-end 1))
+                 (has-link (text-property-any b e 'banjo-link t))
+                 (in-code (text-property-any b e 'banjo-code-block t)))
+            (unless (or has-link in-code)
               (banjo--make-link-button
                b e
                (lambda (_btn) (browse-url url))
@@ -406,11 +407,13 @@ When set to \\='auto, only auto-approve in batch/noninteractive mode."
                  (col (match-string 3))
                  (b (match-beginning 1))
                  (e (match-end 0))
-                 (abs (banjo--resolve-path path)))
+                 (abs (banjo--resolve-path path))
+                 (has-link (text-property-any b e 'banjo-link t))
+                 (in-code (text-property-any b e 'banjo-code-block t)))
             (when (and (or (not (banjo--check-exists-p abs))
                            (banjo--file-exists-cached abs))
-                       (not (get-text-property b 'banjo-link))
-                       (not (get-text-property b 'banjo-code-block)))
+                       (not has-link)
+                       (not in-code))
               (banjo--make-link-button
                b e
                (lambda (_btn)
@@ -423,11 +426,13 @@ When set to \\='auto, only auto-approve in batch/noninteractive mode."
                  (col (match-string 3))
                  (b (match-beginning 1))
                  (e (match-end 0))
-                 (abs (banjo--resolve-path path)))
+                 (abs (banjo--resolve-path path))
+                 (has-link (text-property-any b e 'banjo-link t))
+                 (in-code (text-property-any b e 'banjo-code-block t)))
             (when (and (or (not (banjo--check-exists-p abs))
                            (banjo--file-exists-cached abs))
-                       (not (get-text-property b 'banjo-link))
-                       (not (get-text-property b 'banjo-code-block)))
+                       (not has-link)
+                       (not in-code))
               (banjo--make-link-button
                b e
                (lambda (_btn)
@@ -438,11 +443,13 @@ When set to \\='auto, only auto-approve in batch/noninteractive mode."
           (let* ((path (match-string 1))
                  (b (match-beginning 1))
                  (e (match-end 1))
-                 (abs (banjo--resolve-path path)))
+                 (abs (banjo--resolve-path path))
+                 (has-link (text-property-any b e 'banjo-link t))
+                 (in-code (text-property-any b e 'banjo-code-block t)))
             (when (and (or (not (banjo--check-exists-p abs))
                            (banjo--file-exists-cached abs))
-                       (not (get-text-property b 'banjo-link))
-                       (not (get-text-property b 'banjo-code-block)))
+                       (not has-link)
+                       (not in-code))
               (banjo--make-link-button
                b e
                (lambda (_btn) (banjo--open-file-link path 1 nil))
@@ -1092,8 +1099,12 @@ Return final open state."
   (dolist (win wins)
     (when (window-live-p win)
       (with-selected-window win
-        (goto-char (point-max))
-        (recenter -1)))))
+        (let* ((end (point-max))
+               (lines (max 0 (1- (window-body-height win)))))
+          (goto-char end)
+          (forward-line (- lines))
+          (set-window-start win (point))
+          (set-window-point win end))))))
 
 (defun banjo--toggle-autoscroll ()
   "Toggle autoscroll in the output buffer."
@@ -1990,7 +2001,7 @@ Return non-nil if handled locally."
   "Set permission MODE."
   (interactive
    (list (completing-read "Mode: " '("default" "acceptEdits" "bypassPermissions" "plan") nil t)))
-  (unless banjo--session-id
+  (unless (and banjo--session-id banjo--websocket (websocket-openp banjo--websocket))
     (user-error "Banjo not connected. Run M-x banjo-start"))
   (banjo--send-notification
    "session/set_mode"
@@ -2004,13 +2015,14 @@ Return non-nil if handled locally."
   "Set AI MODEL."
   (interactive
    (list (completing-read "Model: " '("sonnet" "opus" "haiku") nil t)))
-  (when banjo--session-id
-    (banjo--send-notification
-     "session/set_model"
-     `((sessionId . ,banjo--session-id)
-       (modelId . ,model)))
-    (setq banjo--state (plist-put banjo--state :model model))
-    (banjo--update-mode-line)))
+  (unless (and banjo--session-id banjo--websocket (websocket-openp banjo--websocket))
+    (user-error "Banjo not connected. Run M-x banjo-start"))
+  (banjo--send-notification
+   "session/set_model"
+   `((sessionId . ,banjo--session-id)
+     (modelId . ,model)))
+  (setq banjo--state (plist-put banjo--state :model model))
+  (banjo--update-mode-line))
 
 ;;;###autoload
 (defun banjo-set-engine (engine)

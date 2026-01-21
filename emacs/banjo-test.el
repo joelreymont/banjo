@@ -312,9 +312,7 @@
         (banjo--session-id nil)
         (banjo--websocket nil))
     (banjo--clear-output)
-    (banjo--command-model "sonnet")
-    (with-current-buffer (banjo--get-output-buffer)
-      (should (string-match-p "Model: sonnet" (buffer-string))))))
+    (should-error (banjo--command-model "sonnet") :type 'user-error)))
 
 (ert-deftest banjo-test-command-version-known ()
   (let ((banjo--output-buffer "*banjo-test-output*")
