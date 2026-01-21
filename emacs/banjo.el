@@ -687,6 +687,8 @@ Return final open state."
 (defun banjo-history-prev ()
   "Replace input with previous history item."
   (interactive)
+  (unless (eq major-mode 'banjo-input-mode)
+    (user-error "Not in Banjo input buffer"))
   (banjo--history-ensure default-directory)
   (when (null banjo--history)
     (user-error "No history"))
@@ -701,6 +703,8 @@ Return final open state."
 (defun banjo-history-next ()
   "Replace input with next history item."
   (interactive)
+  (unless (eq major-mode 'banjo-input-mode)
+    (user-error "Not in Banjo input buffer"))
   (banjo--history-ensure default-directory)
   (when (= banjo--history-index 0)
     (user-error "Newest history entry"))
@@ -977,7 +981,9 @@ Return final open state."
         (let ((header-pos (marker-position header-marker))
               (output-pos (marker-position output-marker)))
           ;; Validate positions are within buffer
-          (when (and (<= header-pos (point-max))
+          (when (and header-pos
+                     output-pos
+                     (<= header-pos (point-max))
                      (<= output-pos (point-max)))
             ;; Output starts after header line, ends at output-marker
             (let* ((output-start (save-excursion
@@ -1072,6 +1078,7 @@ Return final open state."
   (when banjo-autoscroll
     (let ((wins nil))
       (when (or banjo--scroll-win-cache-dirty
+                (not (buffer-live-p banjo--scroll-win-cache-buf))
                 (not (eq banjo--scroll-win-cache-buf buf)))
         (setq banjo--scroll-win-cache (get-buffer-window-list buf nil t))
         (setq banjo--scroll-win-cache-buf buf)
@@ -1451,18 +1458,15 @@ Include ID when provided."
         (setq banjo--permission-prompt-timer
               (run-at-time 0.2 nil #'banjo--permission-prompt))
       (with-local-quit
-        (if (> (minibuffer-depth) 0)
-            (setq banjo--permission-prompt-timer
-                  (run-at-time 0.2 nil #'banjo--permission-prompt))
-          (condition-case nil
-              (let ((choice (read-char-choice
-                             (format "Allow %s? (y=yes, a=always, n=no): " title)
-                             '(?y ?a ?n ?\r ?\n))))
-                (pcase choice
-                  ((or ?y ?\r ?\n) (banjo--permission-choose 'allow_once))
-                  (?a (banjo--permission-choose 'allow_always))
-                  (?n (banjo--permission-choose 'reject_once))))
-            (quit (banjo--permission-cancel))))))))
+        (condition-case nil
+            (let ((choice (read-char-choice
+                           (format "Allow %s? (y=yes, a=always, n=no): " title)
+                           '(?y ?a ?n ?\r ?\n))))
+              (pcase choice
+                ((or ?y ?\r ?\n) (banjo--permission-choose 'allow_once))
+                (?a (banjo--permission-choose 'allow_always))
+                (?n (banjo--permission-choose 'reject_once))))
+          (quit (banjo--permission-cancel)))))))
 
 (defun banjo--permission-schedule-prompt ()
   "Schedule a permission prompt outside the websocket handler."
@@ -1534,29 +1538,30 @@ Include ID when provided."
           (banjo--append-output text 'banjo-face-thought))))
      ((string= update-type "tool_call")
       (let ((tool-id (alist-get 'toolCallId update))
-            (title (alist-get 'title update)))
-        (unless banjo--streaming
-          (banjo--start-streaming))
-        (with-current-buffer (banjo--get-output-buffer)
-          (let ((inhibit-read-only t)
-                (header-marker (make-marker))
-                (output-marker (make-marker)))
-            (goto-char (point-max))
-            (insert "\n")
-            (set-marker header-marker (point))
-            (insert (format "%s\n" (banjo--tool-header-text title "running")))
-            (put-text-property (marker-position header-marker) (1- (point)) 'banjo-tool-id tool-id)
-            (set-marker output-marker (point))
-            ;; Make output-marker advance when text is inserted at it
-            (set-marker-insertion-type output-marker t)
-            (puthash tool-id
-                     (list :title title
-                           :header-marker header-marker
-                           :output-marker output-marker
-                           :status "running")
-                     banjo--tool-calls)
-            (setq banjo--tool-call-order
-                  (nconc banjo--tool-call-order (list tool-id)))))))
+            (title (or (alist-get 'title update) "Tool")))
+        (when tool-id
+          (unless banjo--streaming
+            (banjo--start-streaming))
+          (with-current-buffer (banjo--get-output-buffer)
+            (let ((inhibit-read-only t)
+                  (header-marker (make-marker))
+                  (output-marker (make-marker)))
+              (goto-char (point-max))
+              (insert "\n")
+              (set-marker header-marker (point))
+              (insert (format "%s\n" (banjo--tool-header-text title "running")))
+              (put-text-property (marker-position header-marker) (1- (point)) 'banjo-tool-id tool-id)
+              (set-marker output-marker (point))
+              ;; Make output-marker advance when text is inserted at it
+              (set-marker-insertion-type output-marker t)
+              (puthash tool-id
+                       (list :title title
+                             :header-marker header-marker
+                             :output-marker output-marker
+                             :status "running")
+                       banjo--tool-calls)
+              (setq banjo--tool-call-order
+                    (nconc banjo--tool-call-order (list tool-id))))))))
      ((string= update-type "tool_call_update")
       (let* ((tool-id (alist-get 'toolCallId update))
              (status (alist-get 'status update))
@@ -1716,6 +1721,8 @@ Include ID when provided."
 (defun banjo--on-disconnect ()
   "Handle WebSocket disconnection."
   (banjo--log "=== DISCONNECTED ===")
+  (when banjo--pending-permission
+    (banjo--permission-cancel))
   (setq banjo--websocket nil)
   (setq banjo--session-id nil)
   (setq banjo--next-id 1)
@@ -1723,7 +1730,6 @@ Include ID when provided."
   (when banjo--permission-prompt-timer
     (cancel-timer banjo--permission-prompt-timer)
     (setq banjo--permission-prompt-timer nil))
-  (setq banjo--pending-permission nil)
   (when-let ((buf (get-buffer banjo--output-buffer)))
     (with-current-buffer buf
       (banjo--cancel-render-timer)))
@@ -1886,7 +1892,9 @@ Return non-nil if handled locally."
   "Send the current input buffer contents."
   (interactive)
   (if banjo--pending-permission
-      (message "Banjo: permission prompt active")
+      (progn
+        (message "Banjo: permission prompt active")
+        (banjo--append-status "Permission prompt active"))
     (let ((text (string-trim-right
                  (buffer-substring-no-properties (point-min) (point-max)))))
       (when (string-blank-p text)
