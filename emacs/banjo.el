@@ -556,8 +556,16 @@ Return final open state."
 (defconst banjo--mode-line-hints "RET send, C-j newline, / cmds"
   "Input hints shown in the Banjo input mode line.")
 
-(defconst banjo--mode-choices '("default" "accept_edits" "auto_approve" "plan_only")
-  "Mode names for /mode completion.")
+(defconst banjo--mode-choices
+  '(("Default" . "default")
+    ("Plan Only" . "plan_only")
+    ("Accept Edits" . "accept_edits")
+    ("Auto Approve" . "auto_approve"))
+  "Mode choices for /mode completion.")
+
+(defun banjo--mode-choice-id (choice)
+  "Return mode id for CHOICE string."
+  (or (cdr (assoc choice banjo--mode-choices)) choice))
 
 (defun banjo--mode-line-align-right (left right)
   "Return a mode line with LEFT text and RIGHT text aligned right."
@@ -851,19 +859,21 @@ Return final open state."
         (list start end cmds
               :exit-function #'banjo--completion-exit)))))
 
-(defun banjo--completion-exit (_candidate status)
+(defun banjo--completion-exit (candidate status)
   "Handle completion with STATUS. Auto-send if finished."
   (when (eq status 'finished)
     (let ((buf (current-buffer))
-          (snapshot (buffer-substring-no-properties (point-min) (point-max))))
-      ;; Small delay to let completion UI close, then send if unchanged.
+          (cmd candidate))
+      ;; Small delay to let completion UI close, then send if command is complete.
       (run-at-time
        0.01 nil
        (lambda ()
          (when (buffer-live-p buf)
            (with-current-buffer buf
-             (when (string= (buffer-substring-no-properties (point-min) (point-max)) snapshot)
-               (banjo-input-send)))))))))
+             (let ((text (string-trim-right
+                          (buffer-substring-no-properties (point-min) (point-max)))))
+               (when (string= text (concat "/" cmd))
+                 (banjo-input-send))))))))))
 
 (defun banjo--code-block-range ()
   (save-excursion
@@ -1889,9 +1899,10 @@ Return non-nil if handled locally."
 (defun banjo--command-mode (args)
   "Set permission mode."
   (let* ((choice (if (string-empty-p args)
-                     (completing-read "Mode: " banjo--mode-choices nil t)
+                     (completing-read "Mode: " (mapcar #'car banjo--mode-choices) nil t)
                    args))
-         (mode (and (not (string-empty-p choice)) (banjo--normalize-mode choice))))
+         (mode (and (not (string-empty-p choice))
+                    (banjo--normalize-mode (banjo--mode-choice-id choice)))))
     (cond
      ((not mode)
       (banjo--append-status "Mode: cancelled"))
@@ -2023,7 +2034,8 @@ Return non-nil if handled locally."
 (defun banjo-set-mode (mode)
   "Set permission MODE."
   (interactive
-   (list (completing-read "Mode: " '("default" "acceptEdits" "bypassPermissions" "plan") nil t)))
+   (list (banjo--mode-choice-id
+          (completing-read "Mode: " (mapcar #'car banjo--mode-choices) nil t))))
   (unless (and banjo--session-id banjo--websocket (websocket-openp banjo--websocket))
     (user-error "Banjo not connected. Run M-x banjo-start"))
   (banjo--send-notification
