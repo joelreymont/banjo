@@ -628,6 +628,9 @@ Return final open state."
 (defvar banjo--history-key nil
   "Current history key for the active project.")
 
+(defvar banjo--history-dir nil
+  "Directory used for the current history key.")
+
 (defun banjo--history-key-for-dir (dir)
   (secure-hash 'sha1 (expand-file-name dir)))
 
@@ -659,6 +662,7 @@ Return final open state."
   (let ((key (banjo--history-key-for-dir dir)))
     (unless (and banjo--history-key (string= banjo--history-key key))
       (setq banjo--history-key key)
+      (setq banjo--history-dir dir)
       (banjo--history-load dir))))
 
 (defun banjo--history-add (text)
@@ -672,7 +676,7 @@ Return final open state."
       (setq banjo--history-index 0
             banjo--history-temp nil)
       (when banjo--history-key
-        (banjo--history-save default-directory)))))
+        (banjo--history-save (or banjo--history-dir default-directory))))))
 
 (defun banjo--set-input-text (text)
   (let ((inhibit-read-only t))
@@ -1443,18 +1447,22 @@ Include ID when provided."
   (when-let* ((pending banjo--pending-permission)
               (tool-call (plist-get pending :tool-call))
               (title (or (alist-get 'title tool-call) "Unknown tool")))
-    (if (active-minibuffer-window)
+    (if (> (minibuffer-depth) 0)
         (setq banjo--permission-prompt-timer
               (run-at-time 0.2 nil #'banjo--permission-prompt))
-      (condition-case nil
-          (let ((choice (read-char-choice
-                         (format "Allow %s? (y=yes, a=always, n=no): " title)
-                         '(?y ?a ?n ?\r ?\n))))
-            (pcase choice
-              ((or ?y ?\r ?\n) (banjo--permission-choose 'allow_once))
-              (?a (banjo--permission-choose 'allow_always))
-              (?n (banjo--permission-choose 'reject_once))))
-        (quit (banjo--permission-cancel))))))
+      (with-local-quit
+        (if (> (minibuffer-depth) 0)
+            (setq banjo--permission-prompt-timer
+                  (run-at-time 0.2 nil #'banjo--permission-prompt))
+          (condition-case nil
+              (let ((choice (read-char-choice
+                             (format "Allow %s? (y=yes, a=always, n=no): " title)
+                             '(?y ?a ?n ?\r ?\n))))
+                (pcase choice
+                  ((or ?y ?\r ?\n) (banjo--permission-choose 'allow_once))
+                  (?a (banjo--permission-choose 'allow_always))
+                  (?n (banjo--permission-choose 'reject_once))))
+            (quit (banjo--permission-cancel))))))))
 
 (defun banjo--permission-schedule-prompt ()
   "Schedule a permission prompt outside the websocket handler."
@@ -1712,6 +1720,13 @@ Include ID when provided."
   (setq banjo--session-id nil)
   (setq banjo--next-id 1)
   (clrhash banjo--pending-requests)
+  (when banjo--permission-prompt-timer
+    (cancel-timer banjo--permission-prompt-timer)
+    (setq banjo--permission-prompt-timer nil))
+  (setq banjo--pending-permission nil)
+  (when-let ((buf (get-buffer banjo--output-buffer)))
+    (with-current-buffer buf
+      (banjo--cancel-render-timer)))
   (banjo--cleanup-tool-calls)
   (banjo--stop-streaming)
   (banjo--update-mode-line)
