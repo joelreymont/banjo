@@ -1400,29 +1400,17 @@ Include ID when provided."
 (defvar banjo--pending-permission nil
   "Pending permission request plist (:id :tool-call :options).")
 
+(defvar banjo--permission-prompt-timer nil
+  "Timer used to prompt for permissions.")
+
 (defun banjo--permission-active-p ()
   (and banjo--pending-permission t))
 
-(defvar banjo--permission-prev-map nil
-  "Saved overriding map while permission prompt is active.")
-(defvar banjo--permission-override-active nil
-  "Non-nil when permission prompt overrides keymaps.")
-
-(defun banjo--permission-activate-map ()
-  (unless banjo--permission-override-active
-    (setq banjo--permission-prev-map overriding-terminal-local-map)
-    (setq banjo--permission-override-active t))
-  (setq overriding-terminal-local-map banjo--permission-map))
-
-(defun banjo--permission-deactivate-map ()
-  (when banjo--permission-override-active
-    (setq overriding-terminal-local-map banjo--permission-prev-map)
-    (setq banjo--permission-prev-map nil)
-    (setq banjo--permission-override-active nil)))
-
 (defun banjo--permission-clear ()
   (setq banjo--pending-permission nil)
-  (banjo--permission-deactivate-map)
+  (when banjo--permission-prompt-timer
+    (cancel-timer banjo--permission-prompt-timer)
+    (setq banjo--permission-prompt-timer nil))
   (message nil))
 
 (defun banjo--permission-choose (kind)
@@ -1437,9 +1425,12 @@ Include ID when provided."
                      ('reject_once (or (banjo--find-permission-option options '("reject_once"))
                                        (banjo--find-permission-option options '("reject_always"))))
                      (_ nil))))
-    (banjo--permission-clear)
-    (banjo--send-response id (banjo--permission-outcome (and opt (or (alist-get 'optionId opt)
-                                                                     (alist-get 'id opt)))))))
+    (if opt
+        (banjo--send-response id (banjo--permission-outcome (or (alist-get 'optionId opt)
+                                                                (alist-get 'id opt))))
+      (banjo--send-response id nil `((code . -32602)
+                                     (message . ,(format "Missing permission option for %s" kind)))))
+    (banjo--permission-clear)))
 
 (defun banjo--permission-cancel ()
   (interactive)
@@ -1449,16 +1440,32 @@ Include ID when provided."
       (banjo--send-response id (banjo--permission-outcome nil))
       (banjo--append-output "[cancelled]\n" 'banjo-face-tool))))
 
-(defvar banjo--permission-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "y") (lambda () (interactive) (banjo--permission-choose 'allow_once)))
-    (define-key map (kbd "a") (lambda () (interactive) (banjo--permission-choose 'allow_always)))
-    (define-key map (kbd "n") (lambda () (interactive) (banjo--permission-choose 'reject_once)))
-    (define-key map (kbd "RET") (lambda () (interactive) (banjo--permission-choose 'allow_once)))
-    (define-key map (kbd "C-g") #'banjo--permission-cancel)
-    (define-key map [t] #'ignore)
-    map)
-  "Keymap for permission prompts.")
+(defun banjo--permission-prompt ()
+  "Prompt user to decide on a pending permission request."
+  (setq banjo--permission-prompt-timer nil)
+  (when-let* ((pending banjo--pending-permission)
+              (tool-call (plist-get pending :tool-call))
+              (title (or (alist-get 'title tool-call) "Unknown tool")))
+    (if (active-minibuffer-window)
+        (setq banjo--permission-prompt-timer
+              (run-at-time 0.2 nil #'banjo--permission-prompt))
+      (condition-case nil
+          (let ((choice (read-char-choice
+                         (format "Allow %s? (y=yes, a=always, n=no): " title)
+                         '(?y ?a ?n ?\r ?\n))))
+            (pcase choice
+              ((or ?y ?\r ?\n) (banjo--permission-choose 'allow_once))
+              (?a (banjo--permission-choose 'allow_always))
+              (?n (banjo--permission-choose 'reject_once))))
+        (quit (banjo--permission-cancel))))))
+
+(defun banjo--permission-schedule-prompt ()
+  "Schedule a permission prompt outside the websocket handler."
+  (unless noninteractive
+    (when banjo--permission-prompt-timer
+      (cancel-timer banjo--permission-prompt-timer))
+    (setq banjo--permission-prompt-timer
+          (run-at-time 0 nil #'banjo--permission-prompt))))
 
 (defun banjo--permission-auto-approve-p ()
   (pcase banjo-permission-auto-approve
@@ -1473,19 +1480,17 @@ Include ID when provided."
          (options (or (alist-get 'options params) banjo--default-permission-options)))
     ;; Show in output buffer
     (banjo--append-output (format "\n[?] %s\n" title) 'banjo-face-tool-pending)
-    (when (banjo--permission-auto-approve-p)
-      (let ((opt (banjo--find-permission-option options '("allow_once"))))
-        (banjo--send-response id (banjo--permission-outcome (and opt (or (alist-get 'optionId opt)
-                                                                         (alist-get 'id opt))))))
-      (cl-return-from banjo--handle-permission-request))
-    (when banjo--pending-permission
-      (banjo--permission-cancel))
-    (setq banjo--pending-permission (list :id id :tool-call tool-call :options options))
-    (raise-frame)
-    (when (fboundp 'select-frame-set-input-focus)
-      (select-frame-set-input-focus (selected-frame)))
-    (message "Allow %s? (y=yes, a=always, n=no): " title)
-    (banjo--permission-activate-map)))
+    (if (banjo--permission-auto-approve-p)
+        (let ((opt (banjo--find-permission-option options '("allow_once"))))
+          (banjo--send-response id (banjo--permission-outcome (and opt (or (alist-get 'optionId opt)
+                                                                           (alist-get 'id opt))))))
+      (when banjo--pending-permission
+        (banjo--permission-cancel))
+      (setq banjo--pending-permission (list :id id :tool-call tool-call :options options))
+      (raise-frame)
+      (when (fboundp 'select-frame-set-input-focus)
+        (select-frame-set-input-focus (selected-frame)))
+      (banjo--permission-schedule-prompt))))
 
 (defun banjo--handle-notification (msg)
   "Handle a JSON-RPC notification MSG."
