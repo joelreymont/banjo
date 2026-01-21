@@ -992,19 +992,13 @@ Return final open state."
 (defun banjo-toggle-tool-fold ()
   "Toggle fold for tool output at point."
   (interactive)
-  (let ((ov (banjo--find-tool-overlay (point))))
-    (if ov
-        ;; Toggle existing overlay
-        (let ((currently-hidden (overlay-get ov 'invisible)))
-          (if currently-hidden
-              (overlay-put ov 'invisible nil)
-            (overlay-put ov 'invisible 'banjo-fold)))
-      (let ((tool-id (banjo--tool-id-at-point)))
-        (when tool-id
-          (let ((existing-ov (banjo--find-tool-overlay-by-id tool-id)))
-            (if existing-ov
-                (banjo-toggle-tool-fold-overlay existing-ov)
-              (banjo--create-tool-fold tool-id t))))))))
+  (let ((tool-id (banjo--tool-id-at-point)))
+    (if tool-id
+        (when-let ((ov (or (banjo--find-tool-overlay-by-id tool-id)
+                           (banjo--create-tool-fold tool-id t))))
+          (banjo-toggle-tool-fold-overlay ov))
+      (when-let ((ov (banjo--find-tool-overlay (point))))
+        (banjo-toggle-tool-fold-overlay ov)))))
 
 (defun banjo--find-tool-overlay-by-id (tool-id)
   "Find tool fold overlay by TOOL-ID."
@@ -1463,9 +1457,9 @@ Include ID when provided."
   "Schedule a permission prompt outside the websocket handler."
   (unless noninteractive
     (when banjo--permission-prompt-timer
-      (cancel-timer banjo--permission-prompt-timer))
-    (setq banjo--permission-prompt-timer
-          (run-at-time 0 nil #'banjo--permission-prompt))))
+      (cancel-timer banjo--permission-prompt-timer)
+      (setq banjo--permission-prompt-timer nil))
+    (banjo--permission-prompt)))
 
 (defun banjo--permission-auto-approve-p ()
   (pcase banjo-permission-auto-approve
