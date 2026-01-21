@@ -339,13 +339,16 @@ When set to \\='auto, only auto-approve in batch/noninteractive mode."
 
 (defun banjo--open-file-link (path line col)
   "Open PATH at LINE and optional COL."
-  (let ((file (banjo--resolve-path path)))
+  (let ((file (banjo--resolve-path path))
+        (line-num (and (numberp line) line))
+        (col-num (and (numberp col) col)))
     (when (file-exists-p file)
       (find-file-other-window file)
       (goto-char (point-min))
-      (forward-line (max 0 (1- line)))
-      (when col
-        (move-to-column (max 0 (1- col)))))))
+      (when line-num
+        (forward-line (max 0 (1- line-num))))
+      (when col-num
+        (move-to-column (max 0 (1- col-num)))))))
 
 (defun banjo--make-link-button (beg end action help)
   "Create a link button from BEG to END."
@@ -366,9 +369,9 @@ When set to \\='auto, only auto-approve in batch/noninteractive mode."
               (val (cdr entry)))
           (if (and banjo-link-cache-ttl ts
                    (> (- (float-time) ts) banjo-link-cache-ttl))
-              (progn
-                (remhash path cache)
-                (banjo--file-exists-cached path))
+              (let ((fresh (file-exists-p path)))
+                (puthash path (cons (float-time) fresh) cache)
+                fresh)
             val))
       (let ((val (file-exists-p path)))
         (puthash path (cons (float-time) val) cache)
@@ -1459,7 +1462,8 @@ Include ID when provided."
     (when banjo--permission-prompt-timer
       (cancel-timer banjo--permission-prompt-timer)
       (setq banjo--permission-prompt-timer nil))
-    (banjo--permission-prompt)))
+    (setq banjo--permission-prompt-timer
+          (run-with-idle-timer 0 nil #'banjo--permission-prompt))))
 
 (defun banjo--permission-auto-approve-p ()
   (pcase banjo-permission-auto-approve
@@ -1656,6 +1660,7 @@ Include ID when provided."
                       (when (and num (> num 0))
                         (setq banjo--port num)
                         (banjo--connect num))))))))))))))
+
 (defun banjo--process-sentinel (_proc event)
   "Process sentinel for daemon PROC, handling EVENT."
   (when (string-match-p "\\(finished\\|exited\\|killed\\)" event)
@@ -1865,21 +1870,20 @@ Return non-nil if handled locally."
 (defun banjo-input-send ()
   "Send the current input buffer contents."
   (interactive)
-  (when banjo--pending-permission
-    (message "Banjo: permission prompt active")
-    (cl-return-from banjo-input-send))
-  (let ((text (string-trim-right
-               (buffer-substring-no-properties (point-min) (point-max)))))
-    (when (string-blank-p text)
-      (user-error "Prompt is empty"))
-    (banjo--history-ensure default-directory)
-    (banjo--history-add text)
-    (let ((cmd (banjo--parse-command text)))
-      (if (and cmd (banjo--dispatch-command (car cmd) (cdr cmd)))
-          nil
-        (banjo--send-text text)))
-    (let ((inhibit-read-only t))
-      (erase-buffer))))
+  (if banjo--pending-permission
+      (message "Banjo: permission prompt active")
+    (let ((text (string-trim-right
+                 (buffer-substring-no-properties (point-min) (point-max)))))
+      (when (string-blank-p text)
+        (user-error "Prompt is empty"))
+      (banjo--history-ensure default-directory)
+      (banjo--history-add text)
+      (let ((cmd (banjo--parse-command text)))
+        (if (and cmd (banjo--dispatch-command (car cmd) (cdr cmd)))
+            nil
+          (banjo--send-text text)))
+      (let ((inhibit-read-only t))
+        (erase-buffer)))))
 
 ;;;###autoload
 (defun banjo-start ()
