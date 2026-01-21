@@ -1381,15 +1381,10 @@ Include ID when provided."
       `((outcome . ((outcome . "selected") (optionId . ,option-id))))
     '((outcome . ((outcome . "cancelled"))))))
 
-(defun banjo--handle-permission-request (id params)
-  "Handle permission request with ID and PARAMS."
-  (let* ((tool-call (alist-get 'toolCall params))
-         (title (or (alist-get 'title tool-call) "Unknown tool"))
-         (options (or (alist-get 'options params) banjo--default-permission-options))
+(defun banjo--prompt-permission (id tool-call options)
+  "Prompt for permission for TOOL-CALL and respond to request ID."
+  (let* ((title (or (alist-get 'title tool-call) "Unknown tool"))
          (prompt (format "Allow %s? (y=yes, a=always, n=no): " title)))
-    ;; Show in output buffer
-    (banjo--append-output (format "\n[?] %s\n" title) 'banjo-face-tool-pending)
-    ;; Focus Emacs frame and prompt
     (raise-frame)
     (condition-case nil
         (let* ((key (read-char-choice prompt '(?y ?a ?n)))
@@ -1404,11 +1399,19 @@ Include ID when provided."
             (discard-input))
           (banjo--send-response id (banjo--permission-outcome option-id)))
       (quit
-       ;; User cancelled - send explicit cancelled outcome
        (when (input-pending-p)
          (discard-input))
        (banjo--send-response id (banjo--permission-outcome nil))
        (banjo--append-output "[cancelled]\n" 'banjo-face-tool)))))
+
+(defun banjo--handle-permission-request (id params)
+  "Handle permission request with ID and PARAMS."
+  (let* ((tool-call (alist-get 'toolCall params))
+         (title (or (alist-get 'title tool-call) "Unknown tool"))
+         (options (or (alist-get 'options params) banjo--default-permission-options)))
+    ;; Show in output buffer
+    (banjo--append-output (format "\n[?] %s\n" title) 'banjo-face-tool-pending)
+    (run-at-time 0 nil #'banjo--prompt-permission id tool-call options)))
 
 (defun banjo--handle-notification (msg)
   "Handle a JSON-RPC notification MSG."
@@ -1987,6 +1990,8 @@ Return non-nil if handled locally."
     (banjo--evil-define-key 'normal banjo-mode-map
       "q" #'banjo--hide-panel
       "gr" #'banjo-toggle
+      "z" #'banjo-toggle-fold
+      (kbd "TAB") #'banjo-toggle-fold
       "/" #'banjo-input-slash
       (kbd "C-c") #'banjo-cancel)
     (banjo--evil-define-key 'normal banjo-input-mode-map
@@ -1999,6 +2004,8 @@ Return non-nil if handled locally."
        (banjo--evil-define-key 'normal banjo-mode-map
          "q" #'banjo--hide-panel
          "gr" #'banjo-toggle
+         "z" #'banjo-toggle-fold
+         (kbd "TAB") #'banjo-toggle-fold
          "/" #'banjo-input-slash
          (kbd "C-c") #'banjo-cancel)
        (banjo--evil-define-key 'normal banjo-input-mode-map

@@ -826,6 +826,7 @@
       (with-current-buffer (banjo--get-output-buffer)
         (goto-char (point-min))
         (should (search-forward "[?] Bash: rm -rf" nil t)))
+      (banjo-test--wait-until (lambda () sent-response) 1.0)
       (should sent-response)
       (should (string-match-p "\"id\":42" sent-response)))))
 
