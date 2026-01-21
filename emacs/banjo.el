@@ -19,6 +19,7 @@
 (require 'json)
 (require 'seq)
 (require 'subr-x)
+(require 'cl-lib)
 
 ;; Customization
 
@@ -95,6 +96,12 @@
 (defcustom banjo-debug-log-file "/tmp/banjo-emacs.log"
   "File for debug logging. Set to nil to disable."
   :type '(choice (const nil) string)
+  :group 'banjo)
+
+(defcustom banjo-permission-auto-approve 'auto
+  "Whether to auto-approve permission prompts.
+When set to \\='auto, only auto-approve in batch/noninteractive mode."
+  :type '(choice (const auto) (const t) (const nil))
   :group 'banjo)
 
 (defcustom banjo-auto-recompile t
@@ -710,6 +717,7 @@ Return final open state."
   (let ((map (make-sparse-keymap)))
     (define-key map "z" #'banjo-toggle-fold)
     (define-key map (kbd "TAB") #'banjo-toggle-fold)
+    (define-key map [double-mouse-1] #'banjo-toggle-fold-at-event)
     map)
   "Keymap for `banjo-mode'.")
 
@@ -884,6 +892,12 @@ Return final open state."
 
 ;; Tool output folding
 
+(defun banjo-toggle-fold-at-event (event)
+  "Toggle fold at mouse EVENT."
+  (interactive "e")
+  (mouse-set-point event)
+  (banjo-toggle-fold))
+
 (defun banjo--find-tool-overlay (pos)
   "Find tool fold overlay at POS."
   (let ((found nil))
@@ -893,7 +907,8 @@ Return final open state."
 
 (defun banjo--tool-id-at-point ()
   "Return tool-id for the tool section at point, or nil."
-  (or (when-let ((ov (banjo--find-tool-overlay (point))))
+  (or (get-text-property (point) 'banjo-tool-id)
+      (when-let ((ov (banjo--find-tool-overlay (point))))
         (overlay-get ov 'banjo-tool-id))
       (let ((pos (point))
             (buf (current-buffer)))
@@ -937,7 +952,8 @@ Return final open state."
                 (goto-char pos)
                 (let ((line-end (line-end-position)))
                   (delete-region (point) line-end)
-                  (insert (banjo--tool-header-text title status)))))))))))
+                  (insert (banjo--tool-header-text title status))
+                  (put-text-property pos (point) 'banjo-tool-id tool-id))))))))))
 
 (defun banjo--create-tool-fold (tool-id &optional hidden)
   "Create fold overlay for TOOL-ID output."
@@ -1381,28 +1397,74 @@ Include ID when provided."
       `((outcome . ((outcome . "selected") (optionId . ,option-id))))
     '((outcome . ((outcome . "cancelled"))))))
 
-(defun banjo--prompt-permission (id tool-call options)
-  "Prompt for permission for TOOL-CALL and respond to request ID."
-  (let* ((title (or (alist-get 'title tool-call) "Unknown tool"))
-         (prompt (format "Allow %s? (y=yes, a=always, n=no): " title)))
-    (raise-frame)
-    (condition-case nil
-        (let* ((key (read-char-choice prompt '(?y ?a ?n)))
-               (opt (pcase key
-                      (?y (banjo--find-permission-option options '("allow_once")))
-                      (?a (or (banjo--find-permission-option options '("allow_always"))
-                              (banjo--find-permission-option options '("allow_once"))))
-                      (?n (or (banjo--find-permission-option options '("reject_once"))
-                              (banjo--find-permission-option options '("reject_always"))))))
-               (option-id (and opt (or (alist-get 'optionId opt) (alist-get 'id opt)))))
-          (when (input-pending-p)
-            (discard-input))
-          (banjo--send-response id (banjo--permission-outcome option-id)))
-      (quit
-       (when (input-pending-p)
-         (discard-input))
-       (banjo--send-response id (banjo--permission-outcome nil))
-       (banjo--append-output "[cancelled]\n" 'banjo-face-tool)))))
+(defvar banjo--pending-permission nil
+  "Pending permission request plist (:id :tool-call :options).")
+
+(defun banjo--permission-active-p ()
+  (and banjo--pending-permission t))
+
+(defvar banjo--permission-prev-map nil
+  "Saved overriding map while permission prompt is active.")
+(defvar banjo--permission-override-active nil
+  "Non-nil when permission prompt overrides keymaps.")
+
+(defun banjo--permission-activate-map ()
+  (unless banjo--permission-override-active
+    (setq banjo--permission-prev-map overriding-terminal-local-map)
+    (setq banjo--permission-override-active t))
+  (setq overriding-terminal-local-map banjo--permission-map))
+
+(defun banjo--permission-deactivate-map ()
+  (when banjo--permission-override-active
+    (setq overriding-terminal-local-map banjo--permission-prev-map)
+    (setq banjo--permission-prev-map nil)
+    (setq banjo--permission-override-active nil)))
+
+(defun banjo--permission-clear ()
+  (setq banjo--pending-permission nil)
+  (banjo--permission-deactivate-map)
+  (message nil))
+
+(defun banjo--permission-choose (kind)
+  (interactive)
+  (when-let* ((pending banjo--pending-permission)
+              (id (plist-get pending :id))
+              (options (plist-get pending :options))
+              (opt (pcase kind
+                     ('allow_once (banjo--find-permission-option options '("allow_once")))
+                     ('allow_always (or (banjo--find-permission-option options '("allow_always"))
+                                        (banjo--find-permission-option options '("allow_once"))))
+                     ('reject_once (or (banjo--find-permission-option options '("reject_once"))
+                                       (banjo--find-permission-option options '("reject_always"))))
+                     (_ nil))))
+    (banjo--permission-clear)
+    (banjo--send-response id (banjo--permission-outcome (and opt (or (alist-get 'optionId opt)
+                                                                     (alist-get 'id opt)))))))
+
+(defun banjo--permission-cancel ()
+  (interactive)
+  (when-let ((pending banjo--pending-permission))
+    (let ((id (plist-get pending :id)))
+      (banjo--permission-clear)
+      (banjo--send-response id (banjo--permission-outcome nil))
+      (banjo--append-output "[cancelled]\n" 'banjo-face-tool))))
+
+(defvar banjo--permission-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "y") (lambda () (interactive) (banjo--permission-choose 'allow_once)))
+    (define-key map (kbd "a") (lambda () (interactive) (banjo--permission-choose 'allow_always)))
+    (define-key map (kbd "n") (lambda () (interactive) (banjo--permission-choose 'reject_once)))
+    (define-key map (kbd "RET") (lambda () (interactive) (banjo--permission-choose 'allow_once)))
+    (define-key map (kbd "C-g") #'banjo--permission-cancel)
+    (define-key map [t] #'ignore)
+    map)
+  "Keymap for permission prompts.")
+
+(defun banjo--permission-auto-approve-p ()
+  (pcase banjo-permission-auto-approve
+    ('auto noninteractive)
+    ('t t)
+    (_ nil)))
 
 (defun banjo--handle-permission-request (id params)
   "Handle permission request with ID and PARAMS."
@@ -1411,7 +1473,19 @@ Include ID when provided."
          (options (or (alist-get 'options params) banjo--default-permission-options)))
     ;; Show in output buffer
     (banjo--append-output (format "\n[?] %s\n" title) 'banjo-face-tool-pending)
-    (run-at-time 0 nil #'banjo--prompt-permission id tool-call options)))
+    (when (banjo--permission-auto-approve-p)
+      (let ((opt (banjo--find-permission-option options '("allow_once"))))
+        (banjo--send-response id (banjo--permission-outcome (and opt (or (alist-get 'optionId opt)
+                                                                         (alist-get 'id opt))))))
+      (cl-return-from banjo--handle-permission-request))
+    (when banjo--pending-permission
+      (banjo--permission-cancel))
+    (setq banjo--pending-permission (list :id id :tool-call tool-call :options options))
+    (raise-frame)
+    (when (fboundp 'select-frame-set-input-focus)
+      (select-frame-set-input-focus (selected-frame)))
+    (message "Allow %s? (y=yes, a=always, n=no): " title)
+    (banjo--permission-activate-map)))
 
 (defun banjo--handle-notification (msg)
   "Handle a JSON-RPC notification MSG."
@@ -1460,6 +1534,7 @@ Include ID when provided."
             (insert "\n")
             (set-marker header-marker (point))
             (insert (format "%s\n" (banjo--tool-header-text title "running")))
+            (put-text-property (marker-position header-marker) (1- (point)) 'banjo-tool-id tool-id)
             (set-marker output-marker (point))
             ;; Make output-marker advance when text is inserted at it
             (set-marker-insertion-type output-marker t)
@@ -1495,8 +1570,12 @@ Include ID when provided."
                             (unless (string-suffix-p "\n" text)
                               (insert "\n"))
                             (put-text-property beg (point) 'font-lock-face 'banjo-face-tool-output)
+                            (put-text-property beg (point) 'banjo-tool-id tool-id)
                             (setq did-insert t))))
                       (when did-insert
+                        (when (and (member (plist-get info :status) '("completed" "failed"))
+                                   (not (banjo--find-tool-overlay-by-id tool-id)))
+                          (banjo--create-tool-fold tool-id t))
                         (banjo--queue-render)))))))))
         ;; Handle status change
         (when (and info status)
@@ -1787,6 +1866,9 @@ Return non-nil if handled locally."
 (defun banjo-input-send ()
   "Send the current input buffer contents."
   (interactive)
+  (when banjo--pending-permission
+    (message "Banjo: permission prompt active")
+    (cl-return-from banjo-input-send))
   (let ((text (string-trim-right
                (buffer-substring-no-properties (point-min) (point-max)))))
     (when (string-blank-p text)

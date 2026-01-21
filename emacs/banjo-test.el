@@ -743,6 +743,32 @@
         (should ov)
         (should (overlay-get ov 'invisible))))))
 
+(ert-deftest banjo-test-tool-fold-after-status-then-output ()
+  "Tool folding should apply when output arrives after completion."
+  (let ((banjo--output-buffer "*banjo-test-output*")
+        (banjo--tool-calls (make-hash-table :test 'equal)))
+    (banjo--clear-output)
+    (banjo-test--simulate-notification
+     "session/update"
+     '((update . ((sessionUpdate . "tool_call")
+                  (toolCallId . "tool-fold-late")
+                  (title . "Bash: echo test")))))
+    (banjo-test--simulate-notification
+     "session/update"
+     '((update . ((sessionUpdate . "tool_call_update")
+                  (toolCallId . "tool-fold-late")
+                  (status . "completed")))))
+    (banjo-test--simulate-notification
+     "session/update"
+     '((update . ((sessionUpdate . "tool_call_update")
+                  (toolCallId . "tool-fold-late")
+                  (content . [((type . "content")
+                               (content . ((type . "text") (text . "late output"))))])))))
+    (with-current-buffer (banjo--get-output-buffer)
+      (let ((ov (banjo--find-tool-overlay-by-id "tool-fold-late")))
+        (should ov)
+        (should (overlay-get ov 'invisible))))))
+
 ;; Agent message coloring tests
 
 (ert-deftest banjo-test-agent-message-has-face ()
@@ -808,13 +834,12 @@
   "Permission requests should show prompt and send response."
   (let ((banjo--output-buffer "*banjo-test-output*")
         (banjo--websocket t)
+        (banjo-permission-auto-approve nil)
         (sent-response nil))
     ;; Mock websocket-openp BEFORE clear-output (which calls update-mode-line)
     (cl-letf (((symbol-function 'websocket-openp) (lambda (_) t))
               ((symbol-function 'websocket-send-text)
                (lambda (_ws text) (setq sent-response text)))
-              ((symbol-function 'read-char-choice)
-               (lambda (_prompt _choices) ?y))
               ((symbol-function 'raise-frame) #'ignore))
       (banjo--clear-output)
       (banjo-test--simulate-request
@@ -826,6 +851,7 @@
       (with-current-buffer (banjo--get-output-buffer)
         (goto-char (point-min))
         (should (search-forward "[?] Bash: rm -rf" nil t)))
+      (banjo--permission-choose 'allow_once)
       (banjo-test--wait-until (lambda () sent-response) 1.0)
       (should sent-response)
       (should (string-match-p "\"id\":42" sent-response)))))
