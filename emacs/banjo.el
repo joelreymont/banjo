@@ -97,10 +97,36 @@
   :type '(choice (const nil) string)
   :group 'banjo)
 
+(defcustom banjo-auto-recompile t
+  "Auto-recompile banjo.el when the .el is newer than the loaded .elc."
+  :type 'boolean
+  :group 'banjo)
+
 ;; Debug logging
 
 (defvar banjo--debug-log-buffer nil
   "Ring buffer for recent log entries.")
+
+(defvar banjo--source-checked nil
+  "Non-nil if source/bytecode freshness has been checked.")
+
+(defun banjo--refresh-elc-if-needed ()
+  "Reload and recompile if the .el is newer than the loaded .elc."
+  (when (and banjo-auto-recompile (not banjo--source-checked))
+    (setq banjo--source-checked t)
+    (let* ((loaded (or load-file-name (buffer-file-name)))
+           (elc (and loaded (string-match-p "\\.elc\\'" loaded) loaded))
+           (el (and elc (concat (file-name-sans-extension elc) ".el"))))
+      (when (and el (file-exists-p el) (file-newer-than-file-p el elc))
+        (condition-case err
+            (progn
+              (load el nil t)
+              (byte-compile-file el)
+              (message "Banjo: refreshed byte-compiled file"))
+          (error
+           (message "Banjo: failed to refresh byte-compiled file: %s" err)))))))
+
+(banjo--refresh-elc-if-needed)
 
 (defun banjo--log (fmt &rest args)
   "Log FMT with ARGS to debug file if enabled."
@@ -502,6 +528,25 @@ Return final open state."
 (defvar banjo--mode-line-string ""
   "Mode line string for Banjo status.")
 
+(defconst banjo--mode-line-hints "RET send, C-j newline, / cmds"
+  "Input hints shown in the Banjo input mode line.")
+
+(defun banjo--input-mode-line ()
+  "Return mode line string for the input buffer."
+  (let* ((status banjo--mode-line-string)
+         (hints banjo--mode-line-hints)
+         (sep "  ")
+         (win (or (and (boundp 'mode-line-window) mode-line-window)
+                  (get-buffer-window (current-buffer) t)))
+         (width (if win (window-total-width win) 0))
+         (avail (- width (string-width status) (string-width sep)))
+         (hint (if (> avail 0)
+                   (truncate-string-to-width hints avail nil nil "...")
+                 "")))
+    (if (string-empty-p hint)
+        status
+      (concat status sep hint))))
+
 (defun banjo--update-mode-line ()
   "Update the mode line with current state."
   (let* ((engine (or (plist-get banjo--state :engine) "claude"))
@@ -700,6 +745,8 @@ Return final open state."
 
 (define-derived-mode banjo-input-mode text-mode "BanjoInput"
   "Major mode for Banjo input."
+  (setq-local header-line-format nil)
+  (setq-local mode-line-format '(:eval (banjo--input-mode-line)))
   (banjo--disable-line-numbers)
   (banjo--apply-input-style)
   (setq-local completion-at-point-functions '(banjo--completion-at-point))
@@ -961,6 +1008,7 @@ Return final open state."
       (unless (eq major-mode 'banjo-input-mode)
         (banjo-input-mode)))
     (with-current-buffer buf
+      (setq-local header-line-format nil)
       (banjo--disable-line-numbers)
       (banjo--apply-input-style)
       (banjo--history-ensure default-directory))
