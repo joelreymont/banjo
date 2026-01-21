@@ -662,8 +662,10 @@ Return final open state."
 (defun banjo--history-save (dir)
   (let ((file (banjo--history-file dir)))
     (make-directory banjo-history-dir t)
-    (with-temp-file file
-      (prin1 banjo--history (current-buffer)))))
+    (let ((tmp (make-temp-file (expand-file-name "history-" banjo-history-dir) nil ".el")))
+      (with-temp-file tmp
+        (prin1 banjo--history (current-buffer)))
+      (rename-file tmp file t))))
 
 (defun banjo--history-ensure (dir)
   (let ((key (banjo--history-key-for-dir dir)))
@@ -849,8 +851,16 @@ Return final open state."
 (defun banjo--completion-exit (_candidate status)
   "Handle completion with STATUS. Auto-send if finished."
   (when (eq status 'finished)
-    ;; Small delay to let completion UI close, then send
-    (run-at-time 0.01 nil #'banjo-input-send)))
+    (let ((buf (current-buffer))
+          (snapshot (buffer-substring-no-properties (point-min) (point-max))))
+      ;; Small delay to let completion UI close, then send if unchanged.
+      (run-at-time
+       0.01 nil
+       (lambda ()
+         (when (buffer-live-p buf)
+           (with-current-buffer buf
+             (when (string= (buffer-substring-no-properties (point-min) (point-max)) snapshot)
+               (banjo-input-send)))))))))
 
 (defun banjo--code-block-range ()
   (save-excursion
@@ -1694,12 +1704,16 @@ Include ID when provided."
 
 (defun banjo--connect (port)
   "Connect to daemon at PORT via WebSocket."
-  (setq banjo--websocket
-        (websocket-open
-         (format "ws://127.0.0.1:%d/acp" port)
-         :on-message (lambda (_ws frame) (banjo--handle-message frame))
-         :on-open (lambda (_ws) (banjo--on-connect))
-         :on-close (lambda (_ws) (banjo--on-disconnect)))))
+  (condition-case err
+      (setq banjo--websocket
+            (websocket-open
+             (format "ws://127.0.0.1:%d/acp" port)
+             :on-message (lambda (_ws frame) (banjo--handle-message frame))
+             :on-open (lambda (_ws) (banjo--on-connect))
+             :on-close (lambda (_ws) (banjo--on-disconnect))))
+    (error
+     (setq banjo--websocket nil)
+     (message "Banjo connect failed: %s" err))))
 
 (defun banjo--on-connect ()
   "Handle WebSocket connection."
