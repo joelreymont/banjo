@@ -543,12 +543,8 @@ Return final open state."
                       `(space :align-to (- right ,(string-width right))))
           right)))
 
-(defun banjo--mode-line-render ()
+(defun banjo--output-mode-line ()
   "Return mode line for the output buffer."
-  (banjo--mode-line-align-right banjo--mode-line-left banjo--mode-line-timer))
-
-(defun banjo--input-mode-line ()
-  "Return mode line for the input buffer."
   (let* ((status banjo--mode-line-left)
          (timer banjo--mode-line-timer)
          (hints banjo--mode-line-hints)
@@ -723,7 +719,7 @@ Return final open state."
   "Major mode for Banjo output."
   :keymap banjo-mode-map
   (setq-local buffer-read-only t)
-  (setq-local mode-line-format '(:eval (banjo--mode-line-render)))
+  (setq-local mode-line-format '(:eval (banjo--output-mode-line)))
   (setq-local truncate-lines nil)
   (setq-local word-wrap t)
   (setq-local banjo--code-block-open nil)
@@ -764,7 +760,7 @@ Return final open state."
 (define-derived-mode banjo-input-mode text-mode "BanjoInput"
   "Major mode for Banjo input."
   (setq-local header-line-format nil)
-  (setq-local mode-line-format '(:eval (banjo--input-mode-line)))
+  (setq-local mode-line-format nil)
   (banjo--disable-line-numbers)
   (banjo--apply-input-style)
   (setq-local completion-at-point-functions '(banjo--completion-at-point))
@@ -1402,9 +1398,13 @@ Include ID when provided."
                       (?n (or (banjo--find-permission-option options '("reject_once"))
                               (banjo--find-permission-option options '("reject_always"))))))
                (option-id (and opt (or (alist-get 'optionId opt) (alist-get 'id opt)))))
+          (when (input-pending-p)
+            (discard-input))
           (banjo--send-response id (banjo--permission-outcome option-id)))
       (quit
        ;; User cancelled - send explicit cancelled outcome
+       (when (input-pending-p)
+         (discard-input))
        (banjo--send-response id (banjo--permission-outcome nil))
        (banjo--append-output "[cancelled]\n" 'banjo-face-tool)))))
 
