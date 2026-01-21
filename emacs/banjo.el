@@ -115,16 +115,21 @@
   (when (and banjo-auto-recompile (not banjo--source-checked))
     (setq banjo--source-checked t)
     (let* ((loaded (or load-file-name (buffer-file-name)))
-           (elc (and loaded (string-match-p "\\.elc\\'" loaded) loaded))
-           (el (and elc (concat (file-name-sans-extension elc) ".el"))))
-      (when (and el (file-exists-p el) (file-newer-than-file-p el elc))
-        (condition-case err
-            (progn
-              (load el nil t)
-              (byte-compile-file el)
-              (message "Banjo: refreshed byte-compiled file"))
-          (error
-           (message "Banjo: failed to refresh byte-compiled file: %s" err)))))))
+           (el (cond
+                ((and loaded (string-match-p "\\.elc\\'" loaded))
+                 (concat (file-name-sans-extension loaded) ".el"))
+                (loaded)))
+           (elc (and el (concat (file-name-sans-extension el) ".elc"))))
+      (when (and el (file-exists-p el) elc)
+        (when (or (not (file-exists-p elc))
+                  (file-newer-than-file-p el elc))
+          (condition-case err
+              (progn
+                (load el nil t)
+                (byte-compile-file el)
+                (message "Banjo: refreshed byte-compiled file"))
+            (error
+             (message "Banjo: failed to refresh byte-compiled file: %s" err))))))))
 
 (banjo--refresh-elc-if-needed)
 
