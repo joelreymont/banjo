@@ -993,7 +993,6 @@ pub const Handler = struct {
                     .permission_mode = self.permission.mode.toCliArg(),
                     .model = model_copy,
                     .permission_socket_path = self.permission.socket_path,
-                    .continue_last = true,
                 };
             };
             defer if (model_copy) |m| self.allocator.free(m);
@@ -1035,7 +1034,6 @@ pub const Handler = struct {
             };
             try bridge.start(.{
                 .approval_policy = approval_policy,
-                .resume_last = self.codex_session_id == null, // Resume last if no explicit session
             });
         }
 

@@ -623,13 +623,6 @@ pub const Bridge = struct {
             "stream-json",
         });
 
-        if (opts.resume_session_id) |sid| {
-            try args.append(self.allocator, "--resume");
-            try args.append(self.allocator, sid);
-        } else if (opts.continue_last) {
-            try args.append(self.allocator, "--continue");
-        }
-
         if (opts.skip_permissions) {
             try args.append(self.allocator, "--dangerously-skip-permissions");
         }
@@ -704,8 +697,6 @@ pub const Bridge = struct {
     }
 
     pub const StartOptions = struct {
-        resume_session_id: ?[]const u8 = null,
-        continue_last: bool = false, // Use --continue to resume last session
         skip_permissions: bool = false,
         permission_mode: ?[]const u8 = null,
         model: ?[]const u8 = null,
@@ -713,7 +704,6 @@ pub const Bridge = struct {
     };
 
     /// Interrupt the current request (SIGINT to Claude CLI)
-    /// Claude exits on SIGINT - next prompt will restart with --continue.
     pub fn interrupt(self: *Bridge) void {
         self.interrupted = true;
         self.stop_requested.store(true, .release);
@@ -1304,8 +1294,6 @@ fn collectClaudeSnapshot(allocator: Allocator, prompt: []const u8) ![]u8 {
     defer bridge.deinit();
 
     try bridge.start(.{
-        .resume_session_id = null,
-        .continue_last = false,
         .permission_mode = "default",
         .model = null,
     });
@@ -1483,8 +1471,6 @@ test "live: Claude Code /clear does not reset context" {
     defer bridge.deinit();
 
     try bridge.start(.{
-        .resume_session_id = null,
-        .continue_last = false,
         .permission_mode = "default",
         .model = null,
     });
@@ -1529,8 +1515,6 @@ test "Claude Code SIGINT interrupt stops streaming" {
     defer bridge.deinit();
 
     try bridge.start(.{
-        .resume_session_id = null,
-        .continue_last = false,
         .permission_mode = "default",
         .model = null,
     });
@@ -1604,21 +1588,20 @@ test "Bridge restarts after SIGINT and processes new prompt" {
     try testing.expect(got_response);
 }
 
-test "interrupt and continue preserves session context" {
+test "interrupt and restart works" {
     // Regression: Before fix, isAlive() could return true during race window
     // after interrupt but before process fully exited, causing sendPrompt to fail.
-    // Also verifies session continuity via --continue.
     if (!config.live_cli_tests) return error.SkipZigTest;
     if (!Bridge.isAvailable()) return error.SkipZigTest;
 
     var bridge = Bridge.init(testing.allocator, ".");
     defer bridge.deinit();
 
-    // Start session and establish context
+    // Start session
     try bridge.start(.{ .permission_mode = "default" });
-    try bridge.sendPrompt("Remember the secret word: BANANA. Acknowledge with OK.");
+    try bridge.sendPrompt("Say OK.");
 
-    // Wait for acknowledgment
+    // Wait for response
     const deadline1 = std.time.milliTimestamp() + constants.live_snapshot_timeout_ms;
     while (std.time.milliTimestamp() < deadline1) {
         var msg = bridge.readMessageWithTimeout(deadline1) catch break orelse break;
@@ -1626,17 +1609,14 @@ test "interrupt and continue preserves session context" {
         if (msg.type == .result) break;
     }
 
-    // Interrupt then IMMEDIATELY restart with --continue
+    // Interrupt then restart fresh
     bridge.interrupt();
     try testing.expect(!bridge.isAlive());
-    try bridge.start(.{
-        .permission_mode = "default",
-        .continue_last = true,
-    });
+    try bridge.start(.{ .permission_mode = "default" });
     try testing.expect(bridge.isAlive());
 
-    // Ask about the secret - verify we can send/receive after restart
-    try bridge.sendPrompt("What was the secret word I told you? Reply with just the word.");
+    // Verify we can send/receive after restart
+    try bridge.sendPrompt("Say hello.");
     var got_response = false;
     const deadline2 = std.time.milliTimestamp() + constants.live_snapshot_timeout_ms;
     while (std.time.milliTimestamp() < deadline2) {
@@ -1649,7 +1629,6 @@ test "interrupt and continue preserves session context" {
     }
 
     bridge.stop();
-    // Core test: restart + prompt flow works (context memory is best-effort)
     try testing.expect(got_response);
 }
 

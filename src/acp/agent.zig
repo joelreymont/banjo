@@ -37,7 +37,7 @@ const ws_protocol = @import("../ws/protocol.zig");
 const log = std.log.scoped(.agent);
 
 /// Banjo version with git hash
-pub const version = "0.6.6 (" ++ config.git_hash ++ ")";
+pub const version = config.version ++ " (" ++ config.git_hash ++ ")";
 const no_engine_warning = "Banjo Duet could not find Claude Code or Codex. Install one (or set CLAUDE_CODE_EXECUTABLE/CODEX_EXECUTABLE) and restart the agent.";
 const max_context_bytes = constants.max_context_bytes;
 const max_media_preview_bytes = constants.max_media_preview_bytes;
@@ -49,16 +49,9 @@ const prompt_poll_ms: i64 = 250;
 const nudge_prompt = "work on the next dot";
 
 const SessionConfig = struct {
-    auto_resume: bool,
     route: Route,
     primary_agent: Engine,
 };
-
-/// Check if auto-resume is enabled (default: true)
-fn autoResumeFromEnv() bool {
-    const val = std.posix.getenv("BANJO_AUTO_RESUME") orelse return true;
-    return falsey_env_values.get(val) == null;
-}
 
 /// Check if content indicates authentication is required
 fn isAuthRequiredContent(content: []const u8) bool {
@@ -93,7 +86,6 @@ fn primaryAgentFromEnv() Engine {
 
 fn configFromEnv() SessionConfig {
     return .{
-        .auto_resume = autoResumeFromEnv(),
         .route = routeFromEnv(),
         .primary_agent = primaryAgentFromEnv(),
     };
@@ -121,19 +113,16 @@ const bool_str_map = std.StaticStringMap(bool).initComptime(.{
 });
 
 const ConfigOptionId = enum {
-    auto_resume,
     route,
     primary_agent,
 };
 
 const config_option_map = std.StaticStringMap(ConfigOptionId).initComptime(.{
-    .{ "auto_resume", .auto_resume },
     .{ "route", .route },
     .{ "primary_agent", .primary_agent },
 });
 
 const SessionConfigUpdate = struct {
-    auto_resume: ?bool = null,
     route: ?Route = null,
     primary_agent: ?Engine = null,
 };
@@ -1816,7 +1805,6 @@ pub const Agent = struct {
     }
 
     fn buildClaudeStartOptions(session: *Session) Bridge.StartOptions {
-        const allow_resume = !session.force_new_claude;
         const mode = session.permission_mode;
         const skip = mode == .bypassPermissions;
         const mode_arg = if (skip) null else @tagName(mode);
@@ -1826,8 +1814,6 @@ pub const Agent = struct {
             mode_arg,
         });
         return .{
-            .resume_session_id = if (allow_resume) session.cli_session_id else null,
-            .continue_last = allow_resume and session.cli_session_id == null and session.config.auto_resume,
             .skip_permissions = skip,
             .permission_mode = mode_arg,
             .model = session.model,
@@ -1867,7 +1853,6 @@ pub const Agent = struct {
 
     fn buildCodexStartOptions(session: *Session) CodexBridge.StartOptions {
         return .{
-            .resume_last = !session.force_new_codex and session.codex_session_id == null,
             .model = null,
             .approval_policy = codexApprovalPolicy(session.permission_mode),
         };
@@ -3584,18 +3569,6 @@ pub const Agent = struct {
         };
 
         switch (config_id) {
-            .auto_resume => {
-                const value = bool_str_map.get(params.value) orelse {
-                    try self.writer.writeResponse(jsonrpc.Response.err(
-                        request.id,
-                        jsonrpc.Error.InvalidParams,
-                        "auto_resume expects \"true\" or \"false\"",
-                    ));
-                    return;
-                };
-                self.config_defaults.auto_resume = value;
-                self.updateAllSessions(.auto_resume, .{ .auto_resume = value });
-            },
             .route => {
                 const route = types.route_map.get(params.value) orelse {
                     try self.writer.writeResponse(jsonrpc.Response.err(
@@ -3703,9 +3676,6 @@ pub const Agent = struct {
         while (it.next()) |entry| {
             const session = entry.value_ptr.*;
             switch (config_id) {
-                .auto_resume => if (update.auto_resume) |val| {
-                    session.config.auto_resume = val;
-                },
                 .route => if (update.route) |val| {
                     session.config.route = val;
                 },
@@ -3996,6 +3966,53 @@ pub const Agent = struct {
         try self.writer.writeTypedResponse(request.id, protocol.PromptResponse{ .stopReason = .end_turn });
     }
 
+    /// Handle /new command - hard reset, destroy bridges entirely
+    fn handleNewCommand(self: *Agent, request: jsonrpc.Request, session: *Session, session_id: []const u8) !void {
+        // Destroy bridges entirely (not just stop)
+        if (session.bridge) |*b| {
+            b.deinit();
+            session.bridge = null;
+        }
+        if (session.codex_bridge) |*b| {
+            b.deinit();
+            session.codex_bridge = null;
+        }
+
+        // Clear all session state
+        self.resetCtx(session);
+
+        // Start fresh bridges
+        session.bridge = Bridge.init(self.allocator, session.cwd);
+        session.codex_bridge = CodexBridge.init(self.allocator, session.cwd);
+
+        var claude_ok = false;
+        var codex_ok = false;
+
+        self.startClaudeBridge(session, session_id) catch |err| {
+            log.err("Failed to start new Claude Code session: {}", .{err});
+        };
+        claude_ok = session.bridge != null and session.bridge.?.process != null;
+
+        self.startCodexBridge(session, session_id) catch |err| {
+            log.err("Failed to start new Codex session: {}", .{err});
+        };
+        codex_ok = session.codex_bridge != null and session.codex_bridge.?.process != null;
+
+        const status_text = blk: {
+            if (claude_ok and codex_ok) break :blk "Started fresh sessions for Claude Code and Codex.";
+            if (claude_ok and !codex_ok) break :blk "Started fresh Claude Code session. Codex unavailable.";
+            if (!claude_ok and codex_ok) break :blk "Started fresh Codex session. Claude Code unavailable.";
+            break :blk "Failed to start new sessions.";
+        };
+
+        try self.sendSessionUpdate(session_id, .{
+            .sessionUpdate = .agent_message_chunk,
+            .content = .{ .type = "text", .text = status_text },
+        });
+
+        try self.writer.writeTypedResponse(request.id, protocol.PromptResponse{ .stopReason = .end_turn });
+    }
+
     const NudgeArg = enum { on, off };
     const nudge_arg_map = std.StaticStringMap(NudgeArg).initComptime(.{
         .{ "on", .on },
@@ -4042,7 +4059,7 @@ pub const Agent = struct {
         }
     }
 
-    const Command = enum { version, note, notes, setup, explain, clear, nudge };
+    const Command = enum { version, note, notes, setup, explain, clear, new, nudge };
     const command_map = std.StaticStringMap(Command).initComptime(.{
         .{ "version", .version },
         .{ "note", .note },
@@ -4147,6 +4164,15 @@ pub const Agent = struct {
                     log.err("Clear command failed: {}", .{err});
                     self.sendErrorAndEnd(request, session_id, "Clear command failed") catch |send_err| {
                         log.warn("Failed to send clear error: {}", .{send_err});
+                    };
+                };
+                return null;
+            },
+            .new => {
+                self.handleNewCommand(request, session, session_id) catch |err| {
+                    log.err("New command failed: {}", .{err});
+                    self.sendErrorAndEnd(request, session_id, "New command failed") catch |send_err| {
+                        log.warn("Failed to send new error: {}", .{send_err});
                     };
                 };
                 return null;
@@ -4460,6 +4486,7 @@ pub const Agent = struct {
         .{ .name = "note", .description = "Note creation help (code actions)" },
         .{ .name = "version", .description = "Show banjo version" },
         .{ .name = "clear", .description = "Clear conversation context" },
+        .{ .name = "new", .description = "Start fresh session (no resume)" },
         .{ .name = "nudge", .description = "Toggle auto-continue when dots are pending (on/off)" },
     };
 
@@ -4513,11 +4540,6 @@ pub const Agent = struct {
         };
     }
 
-    const auto_resume_config_options = [_]protocol.SessionConfigSelectOption{
-        .{ .value = "true", .name = "On" },
-        .{ .value = "false", .name = "Off" },
-    };
-
     const route_config_options = [_]protocol.SessionConfigSelectOption{
         .{ .value = "claude", .name = "Claude" },
         .{ .value = "codex", .name = "Codex" },
@@ -4529,17 +4551,8 @@ pub const Agent = struct {
         .{ .value = "codex", .name = "Codex" },
     };
 
-    fn buildConfigOptions(session: *const Session) [3]protocol.SessionConfigOption {
-        const auto_resume_value = if (session.config.auto_resume) "true" else "false";
+    fn buildConfigOptions(session: *const Session) [2]protocol.SessionConfigOption {
         return .{
-            .{
-                .id = "auto_resume",
-                .name = "Auto-resume sessions",
-                .description = "Resume the last session on startup",
-                .type = .select,
-                .currentValue = auto_resume_value,
-                .options = auto_resume_config_options[0..],
-            },
             .{
                 .id = "route",
                 .name = "Default agent",
@@ -4751,7 +4764,7 @@ fn createTestSession(allocator: Allocator, opts: TestSessionOptions) !Agent.Sess
     return Agent.Session{
         .id = try allocator.dupe(u8, opts.id),
         .cwd = try allocator.dupe(u8, opts.cwd),
-        .config = .{ .auto_resume = true, .route = opts.route, .primary_agent = .claude },
+        .config = .{ .route = opts.route, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .permission_mode = opts.permission_mode,
         .pending_execute_tools = std.StringHashMap(void).init(allocator),
@@ -4776,6 +4789,7 @@ const expected_commands_json =
     "{\"name\":\"note\",\"description\":\"Note creation help (code actions)\"}," ++
     "{\"name\":\"version\",\"description\":\"Show banjo version\"}," ++
     "{\"name\":\"clear\",\"description\":\"Clear conversation context\"}," ++
+    "{\"name\":\"new\",\"description\":\"Start fresh session (no resume)\"}," ++
     "{\"name\":\"nudge\",\"description\":\"Toggle auto-continue when dots are pending (on/off)\"}," ++
     "{\"name\":\"claude\",\"description\":\"Switch routing mode to Claude\"}," ++
     "{\"name\":\"codex\",\"description\":\"Switch routing mode to Codex\"}," ++
@@ -5177,7 +5191,7 @@ test "Agent requestPermission sends request and parses response" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session-1"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
+        .config = .{ .route = .duet, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
@@ -5224,7 +5238,7 @@ test "Agent requestPermissionFromClient stores allow_always choice" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session-1"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
+        .config = .{ .route = .duet, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
@@ -5269,7 +5283,7 @@ test "bypass mode skips permission prompts" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session-1"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
+        .config = .{ .route = .claude, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .permission_mode = .bypassPermissions,
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
@@ -5401,7 +5415,7 @@ test "Agent sendEngineText omits prefix in solo mode" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session-1"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
+        .config = .{ .route = .claude, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
@@ -5428,7 +5442,7 @@ test "Agent sendEngineToolCall omits prefix in solo mode" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session-1"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .route = .codex, .primary_agent = .claude },
+        .config = .{ .route = .codex, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
@@ -5456,7 +5470,7 @@ test "Agent sendEngineToolCall skips quiet tools and tracks ID" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session-1"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
+        .config = .{ .route = .claude, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
@@ -5519,7 +5533,7 @@ test "Agent requestWriteTextFile sends request" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session-1"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
+        .config = .{ .route = .duet, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
@@ -5798,8 +5812,6 @@ test "Agent handleRequest - setModel" {
 test "Agent handleRequest - setConfig" {
     var guard_session = try EnvVarGuard.set(testing.allocator, "BANJO_TEST_SESSION_ID", "session-test");
     defer guard_session.deinit();
-    var guard_resume = try EnvVarGuard.set(testing.allocator, "BANJO_AUTO_RESUME", "true");
-    defer guard_resume.deinit();
     var guard_route = try EnvVarGuard.set(testing.allocator, "BANJO_ROUTE", "duet");
     defer guard_route.deinit();
     var guard_primary_agent = try EnvVarGuard.set(testing.allocator, "BANJO_PRIMARY_AGENT", "claude");
@@ -5833,8 +5845,8 @@ test "Agent handleRequest - setConfig" {
     var set_config_params = std.json.ObjectMap.init(testing.allocator);
     defer set_config_params.deinit();
     try set_config_params.put("sessionId", .{ .string = session_id });
-    try set_config_params.put("configId", .{ .string = "auto_resume" });
-    try set_config_params.put("value", .{ .string = "false" });
+    try set_config_params.put("configId", .{ .string = "route" });
+    try set_config_params.put("value", .{ .string = "claude" });
 
     const set_config_request = jsonrpc.Request{
         .method = "session/set_config_option",
@@ -5844,7 +5856,7 @@ test "Agent handleRequest - setConfig" {
     try agent.handleRequest(set_config_request);
 
     try (ohsnap{}).snap(@src(),
-        \\{"jsonrpc":"2.0","result":{"configOptions":[{"id":"auto_resume","name":"Auto-resume sessions","description":"Resume the last session on startup","type":"select","currentValue":"false","options":[{"value":"true","name":"On"},{"value":"false","name":"Off"}]},{"id":"route","name":"Default agent","description":"Agent to use for new prompts","type":"select","currentValue":"duet","options":[{"value":"claude","name":"Claude"},{"value":"codex","name":"Codex"},{"value":"duet","name":"Duet"}]},{"id":"primary_agent","name":"Primary agent","description":"First agent to answer in duet mode","type":"select","currentValue":"claude","options":[{"value":"claude","name":"Claude"},{"value":"codex","name":"Codex"}]}]},"id":2}
+        \\{"jsonrpc":"2.0","result":{"configOptions":[{"id":"route","name":"Default agent","description":"Agent to use for new prompts","type":"select","currentValue":"claude","options":[{"value":"claude","name":"Claude"},{"value":"codex","name":"Codex"},{"value":"duet","name":"Duet"}]},{"id":"primary_agent","name":"Primary agent","description":"First agent to answer in duet mode","type":"select","currentValue":"claude","options":[{"value":"claude","name":"Claude"},{"value":"codex","name":"Codex"}]}]},"id":2}
         \\
     ).diff(tw.getOutput(), true);
 }
@@ -5993,7 +6005,7 @@ test "property: collectPromptParts finds text regardless of position" {
             var session = Agent.Session{
                 .id = try testing.allocator.dupe(u8, "session"),
                 .cwd = try testing.allocator.dupe(u8, "."),
-                .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
+                .config = .{ .route = .duet, .primary_agent = .claude },
                 .availability = .{ .claude = true, .codex = true },
                 .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
                 .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
@@ -6025,7 +6037,7 @@ test "property: collectPromptParts returns null when no text block" {
             var session = Agent.Session{
                 .id = try testing.allocator.dupe(u8, "session"),
                 .cwd = try testing.allocator.dupe(u8, "."),
-                .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
+                .config = .{ .route = .duet, .primary_agent = .claude },
                 .availability = .{ .claude = true, .codex = true },
                 .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
                 .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
@@ -6054,7 +6066,7 @@ test "collectPromptParts handles empty blocks" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
+        .config = .{ .route = .duet, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
@@ -6093,7 +6105,7 @@ test "collectPromptParts skips codex image fallback when supported" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
+        .config = .{ .route = .duet, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
@@ -6372,7 +6384,7 @@ test "Agent handleRequest - prompt queued when already handling" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "test-session"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
+        .config = .{ .route = .claude, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = false },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
@@ -6546,11 +6558,11 @@ test "isUnsupportedCommand filters correctly" {
     ).expectEqual(summary);
 }
 
-test "buildClaudeStartOptions honors force_new" {
+test "buildClaudeStartOptions returns correct options" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
+        .config = .{ .route = .duet, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
@@ -6559,41 +6571,24 @@ test "buildClaudeStartOptions honors force_new" {
     };
     defer session.deinit(testing.allocator);
 
-    session.cli_session_id = try testing.allocator.dupe(u8, "resume-id");
-    session.force_new_claude = true;
-
-    const forced = Agent.buildClaudeStartOptions(&session);
-    const forced_summary = .{
-        .resume_session_id = forced.resume_session_id,
-        .continue_last = forced.continue_last,
-    };
-
-    session.force_new_claude = false;
-    const resume_opts = Agent.buildClaudeStartOptions(&session);
-    const resume_summary = .{
-        .resume_session_id = resume_opts.resume_session_id,
-    };
+    session.permission_mode = .acceptEdits;
+    const opts = Agent.buildClaudeStartOptions(&session);
     const summary = .{
-        .forced = forced_summary,
-        .resume_opts = resume_summary,
+        .skip_permissions = opts.skip_permissions,
+        .has_permission_mode = opts.permission_mode != null,
     };
     try (ohsnap{}).snap(@src(),
-        \\acp.agent.test.buildClaudeStartOptions honors force_new__struct_<^\d+$>
-        \\  .forced: acp.agent.test.buildClaudeStartOptions honors force_new__struct_<^\d+$>
-        \\    .resume_session_id: ?[]const u8
-        \\      null
-        \\    .continue_last: bool = false
-        \\  .resume_opts: acp.agent.test.buildClaudeStartOptions honors force_new__struct_<^\d+$>
-        \\    .resume_session_id: ?[]const u8
-        \\      "resume-id"
+        \\acp.agent.test.buildClaudeStartOptions returns correct options__struct_<^\d+$>
+        \\  .skip_permissions: bool = false
+        \\  .has_permission_mode: bool = true
     ).expectEqual(summary);
 }
 
-test "buildCodexStartOptions honors force_new" {
+test "buildCodexStartOptions returns correct options" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
+        .config = .{ .route = .duet, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
@@ -6602,20 +6597,9 @@ test "buildCodexStartOptions honors force_new" {
     };
     defer session.deinit(testing.allocator);
 
-    // force_new_codex = true should disable resume_last
-    session.force_new_codex = true;
-    const forced = Agent.buildCodexStartOptions(&session);
-    try testing.expect(!forced.resume_last);
-
-    // force_new_codex = false and no session_id should enable resume_last
-    session.force_new_codex = false;
-    const resume_opts = Agent.buildCodexStartOptions(&session);
-    try testing.expect(resume_opts.resume_last);
-
-    // With explicit session_id, resume_last should be false
-    session.codex_session_id = try testing.allocator.dupe(u8, "thread-id");
-    const with_id = Agent.buildCodexStartOptions(&session);
-    try testing.expect(!with_id.resume_last);
+    session.permission_mode = .acceptEdits;
+    const opts = Agent.buildCodexStartOptions(&session);
+    try testing.expectEqualStrings("untrusted", opts.approval_policy.?);
 }
 
 test "codex auto approval respects permission mode" {
@@ -6740,7 +6724,7 @@ test "prepareFreshSessions clears resume state" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .route = .duet, .primary_agent = .claude },
+        .config = .{ .route = .duet, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = true },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
@@ -6802,7 +6786,7 @@ test "requestWriteTextFile returns false when cancelled" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session-cancel"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
+        .config = .{ .route = .claude, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = false },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
@@ -6835,7 +6819,7 @@ test "requestReadTextFile returns null when cancelled" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session-cancel"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
+        .config = .{ .route = .claude, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = false },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
@@ -6860,7 +6844,7 @@ test "dots_setup_done flag starts false" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session-dots"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
+        .config = .{ .route = .claude, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = false },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
@@ -7021,7 +7005,7 @@ test "sendDotsPrompt handles missing bridge gracefully" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session-no-bridge"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
+        .config = .{ .route = .claude, .primary_agent = .claude },
         .availability = .{ .claude = false, .codex = false }, // No engines available
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),
@@ -7056,7 +7040,7 @@ test "dotsSessionSetup skips when no dot CLI" {
     var session = Agent.Session{
         .id = try testing.allocator.dupe(u8, "session-no-dot"),
         .cwd = try testing.allocator.dupe(u8, "."),
-        .config = .{ .auto_resume = true, .route = .claude, .primary_agent = .claude },
+        .config = .{ .route = .claude, .primary_agent = .claude },
         .availability = .{ .claude = true, .codex = false },
         .pending_execute_tools = std.StringHashMap(void).init(testing.allocator),
         .pending_edit_tools = std.StringHashMap(Agent.EditInfo).init(testing.allocator),

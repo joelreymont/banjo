@@ -610,7 +610,6 @@ pub const CodexBridge = struct {
     }
 
     pub const StartOptions = struct {
-        resume_last: bool = false,
         model: ?[]const u8 = null,
         approval_policy: ?[]const u8 = null,
     };
@@ -683,18 +682,6 @@ pub const CodexBridge = struct {
 
         self.approval_policy = opts.approval_policy;
         try self.initialize();
-
-        if (opts.resume_last) {
-            if (self.getMostRecentThread()) |tid| {
-                defer self.allocator.free(tid);
-                self.resumeThread(tid, opts.model) catch |err| {
-                    log.warn("Failed to resume Codex thread ({s}): {}", .{ tid, err });
-                    try self.startThread(opts.model);
-                    return;
-                };
-                return;
-            }
-        }
         try self.startThread(opts.model);
     }
 
@@ -2263,48 +2250,3 @@ test "Codex queue blocks when full" {
     try testing.expect(pending_len <= constants.bridge_queue_max_messages);
 }
 
-test "Codex resume_last resumes most recent thread for cwd" {
-    // Tests that resume_last successfully finds and resumes a thread.
-    // Does NOT test LLM memory - that's non-deterministic.
-    if (!config.live_cli_tests) return error.SkipZigTest;
-    if (!CodexBridge.isAvailable()) return error.SkipZigTest;
-
-    var bridge = CodexBridge.init(testing.allocator, ".");
-    defer bridge.deinit();
-
-    // First session - create a thread
-    try bridge.start(.{ .approval_policy = "never" });
-    const inputs1 = [_]UserInput{.{ .type = "text", .text = "Say OK" }};
-    try bridge.sendPrompt(inputs1[0..]);
-
-    const deadline1 = std.time.milliTimestamp() + constants.live_turn_timeout_ms;
-    while (std.time.milliTimestamp() < deadline1) {
-        var msg = bridge.readMessageWithTimeout(deadline1) catch break orelse break;
-        defer msg.deinit();
-        if (msg.event_type == .turn_completed) break;
-    }
-
-    // Verify we have a thread_id from first session
-    const first_thread_id = bridge.thread_id orelse {
-        std.debug.print("No thread_id after first session\n", .{});
-        return error.SkipZigTest;
-    };
-    const first_id_copy = try testing.allocator.dupe(u8, first_thread_id);
-    defer testing.allocator.free(first_id_copy);
-
-    bridge.stop();
-
-    // Second session with resume_last - should find and resume the thread
-    try bridge.start(.{ .approval_policy = "never", .resume_last = true });
-
-    // Verify thread_id is set (resume worked)
-    const resumed_thread_id = bridge.thread_id orelse {
-        std.debug.print("No thread_id after resume_last\n", .{});
-        return error.TestUnexpectedResult;
-    };
-
-    // The resumed thread should match our first session
-    try testing.expectEqualStrings(first_id_copy, resumed_thread_id);
-
-    bridge.stop();
-}
